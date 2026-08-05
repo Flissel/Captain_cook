@@ -22,7 +22,11 @@ from gateway.integration_setup_contracts import (
 )
 from blockchain.mariadb_storage import MariaDBStorage
 from tests.support.mariadb import assert_isolated_test_database
-from agenten.agent_factory.integration_setup import N8nCredentialMetadataV1
+from agenten.agent_factory.integration_setup import (
+    CredentialVerificationReceiptV1,
+    N8nCredentialMetadataV1,
+)
+from agenten.agent_runtime.contracts import ArtifactRef
 
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
@@ -59,6 +63,48 @@ class StaticCredentialSource:
                 credential_type="hubspotApi",
             ),
         )
+
+
+class RecordingVerificationSource:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def verify_credential(self, **kwargs):
+        self.calls.append(kwargs)
+        requirement = kwargs["requirement"]
+        credential = kwargs["credential"]
+        now = kwargs["now"]
+        workflow = ArtifactRef(
+            uri="artifact://portal-verification/workflow",
+            sha256="d" * 64,
+            media_type="application/json",
+        )
+        return CredentialVerificationReceiptV1(
+            integration_key=requirement.integration_key,
+            credential_alias=requirement.credential_alias,
+            credential_id=credential.credential_id,
+            credential_type=credential.credential_type,
+            project_id=credential.project_id,
+            status="passed",
+            occurred_at=now,
+            workflow_ref=workflow,
+            workflow_content_sha256=workflow.sha256,
+            execution_ref=ArtifactRef(
+                uri="artifact://portal-verification/execution",
+                sha256="e" * 64,
+                media_type="application/json",
+            ),
+        )
+
+
+class InvalidVerificationSource:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def verify_credential(self, **kwargs):
+        del kwargs
+        self.calls += 1
+        return {"provider_diagnostic": "private-provider-secret"}
 
 
 class FakePortalGatewayStore:
@@ -301,11 +347,13 @@ def test_real_gateway_portal_flow_is_tenant_scoped_and_digest_fenced() -> None:
             cursor.execute("DELETE FROM portal_setup_bindings")
     storage.clear()
     configured = settings().model_copy(update={"ledger_dsn": SecretStr(TEST_DSN)})
+    verification_source = RecordingVerificationSource()
     application = create_app(
         storage=storage,
         mirror=NullMirror(),
         settings=configured,
         portal_credential_source=StaticCredentialSource(),
+        portal_verification_source=verification_source,
         portal_clock=lambda: NOW,
     )
     org_a = PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
@@ -407,6 +455,67 @@ def test_real_gateway_portal_flow_is_tenant_scoped_and_digest_fenced() -> None:
                     "credential_id": "credential-1",
                 },
             )
+            verify_ticket = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/tickets",
+                headers=auth(),
+                json={"credential_alias": "CRM_PRIMARY", "action": "verify"},
+            ).json()
+            stale_verify_ticket = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/tickets",
+                headers=auth(),
+                json={"credential_alias": "CRM_PRIMARY", "action": "verify"},
+            ).json()
+            cross_tenant_verify_ticket = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/tickets",
+                headers=auth(),
+                json={"credential_alias": "CRM_PRIMARY", "action": "verify"},
+            ).json()
+            wrong_action_verify_ticket = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/tickets",
+                headers=auth(),
+                json={"credential_alias": "CRM_PRIMARY", "action": "verify"},
+            ).json()
+            application.state.portal_token_verifier = StaticVerifier(
+                PortalPrincipalV1(subject_id="user-b", organization_id="org-b")
+            )
+            cross_tenant_verified = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/verify",
+                headers=auth(),
+                json={
+                    "ticket_id": cross_tenant_verify_ticket["ticket_id"],
+                    "ticket": cross_tenant_verify_ticket["ticket"],
+                    "credential_alias": "CRM_PRIMARY",
+                },
+            )
+            application.state.portal_token_verifier = StaticVerifier(org_a)
+            wrong_action_verified = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/actions",
+                headers=auth(),
+                json={
+                    "ticket_id": wrong_action_verify_ticket["ticket_id"],
+                    "ticket": wrong_action_verify_ticket["ticket"],
+                    "credential_alias": "CRM_PRIMARY",
+                    "action": "revoked",
+                },
+            )
+            verified = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/verify",
+                headers=auth(),
+                json={
+                    "ticket_id": verify_ticket["ticket_id"],
+                    "ticket": verify_ticket["ticket"],
+                    "credential_alias": "CRM_PRIMARY",
+                },
+            )
+            stale_verified = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/verify",
+                headers=auth(),
+                json={
+                    "ticket_id": stale_verify_ticket["ticket_id"],
+                    "ticket": stale_verify_ticket["ticket"],
+                    "credential_alias": "CRM_PRIMARY",
+                },
+            )
             revoke_ticket = client.post(
                 f"/v1/portal/integration-setups/{JOB_ID}/tickets",
                 headers=auth(),
@@ -454,6 +563,15 @@ def test_real_gateway_portal_flow_is_tenant_scoped_and_digest_fenced() -> None:
         assert selected.status_code == 200
         assert selected.json()["overall_status"] == "verification_required"
         assert selected_replay.status_code == 403
+        assert verified.status_code == 200
+        assert verified.json()["overall_status"] == "ready"
+        assert stale_verified.status_code == 403
+        assert cross_tenant_verified.status_code == 403
+        assert wrong_action_verified.status_code == 403
+        assert len(verification_source.calls) == 1
+        call = verification_source.calls[0]
+        assert call["expected_revision"] == 3
+        assert call["expected_content_sha256"] == selected.json()["content_sha256"]
         assert revoked.status_code == 200
         assert revoked.json()["overall_status"] == "revoked"
         assert revoked_replay.status_code == 403
@@ -536,10 +654,57 @@ def test_real_gateway_rotation_ticket_is_action_bound_and_single_use() -> None:
                     "action": "rotation_requested",
                 },
             )
+            verify_ticket = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/tickets",
+                headers=auth(),
+                json={"credential_alias": "CRM_API_KEY", "action": "verify"},
+            ).json()
+            unavailable = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/verify",
+                headers=auth(),
+                json={
+                    "ticket_id": verify_ticket["ticket_id"],
+                    "ticket": verify_ticket["ticket"],
+                    "credential_alias": "CRM_API_KEY",
+                },
+            )
+
+        invalid_source = InvalidVerificationSource()
+        invalid_application = create_app(
+            storage=storage,
+            mirror=NullMirror(),
+            settings=configured,
+            portal_verification_source=invalid_source,
+            portal_clock=lambda: NOW,
+        )
+        invalid_application.state.portal_token_verifier = StaticVerifier(
+            PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+        )
+        with TestClient(invalid_application) as invalid_client:
+            invalid_ticket = invalid_client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/tickets",
+                headers=auth(),
+                json={"credential_alias": "CRM_API_KEY", "action": "verify"},
+            ).json()
+            invalid = invalid_client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/verify",
+                headers=auth(),
+                json={
+                    "ticket_id": invalid_ticket["ticket_id"],
+                    "ticket": invalid_ticket["ticket"],
+                    "credential_alias": "CRM_API_KEY",
+                },
+            )
 
         assert rotated.status_code == 200
         assert rotated.json()["overall_status"] == "verification_required"
         assert replay.status_code == 403
+        assert unavailable.status_code == 503
+        assert unavailable.json() == {"detail": "credential verification unavailable"}
+        assert invalid.status_code == 502
+        assert invalid.json() == {"detail": "credential verification failed"}
+        assert "private-provider-secret" not in invalid.text
+        assert invalid_source.calls == 1
     finally:
         with storage.transaction() as connection:
             with connection.cursor() as cursor:

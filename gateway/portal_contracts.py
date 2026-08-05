@@ -80,9 +80,26 @@ class PortalSetupActionRequestV1(_FrozenContract):
 PortalTicketAction = Literal[
     "discover",
     "select",
+    "verify",
     "rotation_requested",
     "revoked",
 ]
+
+
+class PortalTicketFenceV1(_FrozenContract):
+    """Exact secret-free setup target snapshot authorized by one ticket."""
+
+    revision: int = Field(ge=1, strict=True)
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    correlation_id: UUID
+    credential_alias: str = Field(pattern=IDENTIFIER_PATTERN)
+    credential_type: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
+    requirement_project_id: str | None = Field(default=None, pattern=r"^\S{1,256}$")
+    selected_credential_id: str | None = Field(default=None, pattern=r"^\S{1,256}$")
+    verification_workflow_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 class PortalSetupTicketIssueV1(_FrozenContract):

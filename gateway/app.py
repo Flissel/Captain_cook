@@ -82,7 +82,12 @@ from gateway.registry_feed import (
     runtime_result_projection,
 )
 from gateway.settings import GatewaySettings
-from gateway.store import AppendResult, GatewayStore, PortalCredentialMetadataSource
+from gateway.store import (
+    AppendResult,
+    GatewayStore,
+    PortalCredentialMetadataSource,
+    PortalCredentialVerificationSource,
+)
 from gateway.integration_setup_contracts import (
     IntegrationSetupMutationV1,
     IntegrationSetupSubmissionV1,
@@ -241,6 +246,7 @@ def create_app(
     settings: GatewaySettings | None = None,
     gateway_store: GatewayStore | None = None,
     portal_credential_source: PortalCredentialMetadataSource | None = None,
+    portal_verification_source: PortalCredentialVerificationSource | None = None,
     portal_clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
@@ -250,6 +256,7 @@ def create_app(
             storage,
             claim_ttl=timedelta(seconds=settings.claim_ttl_seconds),
             portal_credential_source=portal_credential_source,
+            portal_verification_source=portal_verification_source,
         )
         if storage and settings
         else GatewayStore(storage)
@@ -323,6 +330,7 @@ def create_app(
                         MariaDBStorage(dsn),
                         claim_ttl=timedelta(seconds=configured.claim_ttl_seconds),
                         portal_credential_source=portal_credential_source,
+                        portal_verification_source=portal_verification_source,
                     )
         return store
 
@@ -488,6 +496,24 @@ def create_app(
         principal: PortalPrincipalV1 = Depends(require_portal_principal),
     ) -> IntegrationSetupSurfaceV1:
         persisted = get_store().portal_select(
+            job_id=job_id,
+            principal=principal,
+            request=request,
+            now=portal_clock(),
+        )
+        configured = load_gateway_settings(app)
+        return build_integration_setup_surface(
+            persisted,
+            n8n_ui_base_url=configured.captain_n8n_ui_url,
+        )
+
+    @app.post("/v1/portal/integration-setups/{job_id}/verify")
+    async def verify_portal_credential(
+        job_id: UUID,
+        request: PortalSetupTicketUseV1,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> IntegrationSetupSurfaceV1:
+        persisted = get_store().portal_verify(
             job_id=job_id,
             principal=principal,
             request=request,

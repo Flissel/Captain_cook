@@ -16,6 +16,7 @@ vi.mock("./api", async (importOriginal) => {
       getSetupSurface: mocks.getSetupSurface,
       discoverCredentials: vi.fn(),
       selectCredential: vi.fn(),
+      verifyCredential: vi.fn(),
       requestRotation: vi.fn(),
       revokeCredential: vi.fn(),
     }),

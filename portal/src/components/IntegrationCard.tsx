@@ -7,6 +7,7 @@ interface IntegrationCardProps {
   busy: boolean;
   onDiscover: () => Promise<void> | void;
   onSelect: (credentialId: string) => Promise<void> | void;
+  onVerify: () => Promise<void> | void;
   onRotate: () => Promise<void> | void;
   onRevoke: () => Promise<void> | void;
 }
@@ -22,11 +23,13 @@ export function IntegrationCard({
   busy,
   onDiscover,
   onSelect,
+  onVerify,
   onRotate,
   onRevoke,
 }: IntegrationCardProps) {
   const canMutateSelection = action.status === "selection_required";
   const canRotateOrRevoke = action.selectedCredential !== null && action.status !== "revoked";
+  const canVerify = ["verification_required", "verification_failed", "expired"].includes(action.status);
 
   return (
     <article className="integration-card" aria-busy={busy}>
@@ -75,6 +78,11 @@ export function IntegrationCard({
         <button disabled={busy} type="button" onClick={() => void onDiscover()}>
           {canMutateSelection ? "Refresh connections" : "Check connections"}
         </button>
+        {canVerify && (
+          <button disabled={busy} type="button" onClick={() => void onVerify()}>
+            Verify connection
+          </button>
+        )}
         {canRotateOrRevoke && (
           <>
             <button disabled={busy} type="button" onClick={() => void onRotate()}>

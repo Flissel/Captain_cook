@@ -8,7 +8,7 @@ import {
 } from "./types";
 
 type Fetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
-type TicketAction = "discover" | "select" | "rotation_requested" | "revoked";
+type TicketAction = "discover" | "select" | "verify" | "rotation_requested" | "revoked";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
@@ -208,6 +208,7 @@ export interface PortalApi {
   getSetupSurface(jobId: string, accessToken: string): Promise<PortalSetupSurface>;
   discoverCredentials(jobId: string, alias: string, accessToken: string): Promise<PortalSetupSurface>;
   selectCredential(jobId: string, alias: string, credentialId: string, accessToken: string): Promise<PortalSetupSurface>;
+  verifyCredential(jobId: string, alias: string, accessToken: string): Promise<PortalSetupSurface>;
   requestRotation(jobId: string, alias: string, accessToken: string): Promise<PortalSetupSurface>;
   revokeCredential(jobId: string, alias: string, accessToken: string): Promise<PortalSetupSurface>;
 }
@@ -254,7 +255,7 @@ export function createPortalApi(fetcher: Fetcher = fetch): PortalApi {
     jobId: string,
     alias: string,
     action: TicketAction,
-    route: "discover" | "select" | "actions",
+    route: "discover" | "select" | "verify" | "actions",
     accessToken: string,
     additional: Readonly<Record<string, string>> = {},
   ): Promise<PortalSetupSurface> => {
@@ -276,6 +277,8 @@ export function createPortalApi(fetcher: Fetcher = fetch): PortalApi {
       consume(jobId, alias, "discover", "discover", accessToken),
     selectCredential: (jobId, alias, credentialId, accessToken) =>
       consume(jobId, alias, "select", "select", accessToken, { credential_id: credentialId }),
+    verifyCredential: (jobId, alias, accessToken) =>
+      consume(jobId, alias, "verify", "verify", accessToken),
     requestRotation: (jobId, alias, accessToken) =>
       consume(jobId, alias, "rotation_requested", "actions", accessToken, {
         action: "rotation_requested",

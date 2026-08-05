@@ -161,6 +161,11 @@ function PortalDashboard({ api }: { api: PortalApi }) {
                   api.selectCredential(resolvedJobId, action.credentialAlias, credentialId, accessToken),
                 )
               }
+              onVerify={() =>
+                mutate(action.credentialAlias, (resolvedJobId, accessToken) =>
+                  api.verifyCredential(resolvedJobId, action.credentialAlias, accessToken),
+                )
+              }
               onRotate={() =>
                 mutate(action.credentialAlias, (resolvedJobId, accessToken) =>
                   api.requestRotation(resolvedJobId, action.credentialAlias, accessToken),

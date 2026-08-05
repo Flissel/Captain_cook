@@ -144,6 +144,7 @@ from gateway.portal_contracts import (
     PortalSetupTicketUseV1,
     PortalSetupTicketV1,
     PortalTenantBindingV1,
+    PortalTicketFenceV1,
     PortalTicketAction,
 )
 from gateway.portal_store import PortalTicketStore
@@ -181,6 +182,21 @@ class PortalCredentialMetadataSource(Protocol):
         self,
         requirement: IntegrationCredentialRequirementV1,
     ) -> tuple[N8nCredentialMetadataV1, ...]: ...
+
+
+class PortalCredentialVerificationSource(Protocol):
+    """Provider adapter for a harmless, digest-bound credential probe."""
+
+    def verify_credential(
+        self,
+        *,
+        requirement: IntegrationCredentialRequirementV1,
+        credential: N8nCredentialMetadataV1,
+        correlation_id: UUID,
+        expected_content_sha256: str,
+        expected_revision: int,
+        now: datetime,
+    ) -> CredentialVerificationReceiptV1: ...
 
 
 class _IdempotentReplay(Exception):
@@ -226,12 +242,14 @@ class GatewayStore:
         *,
         claim_ttl: timedelta = timedelta(minutes=90),
         portal_credential_source: PortalCredentialMetadataSource | None = None,
+        portal_verification_source: PortalCredentialVerificationSource | None = None,
     ):
         if claim_ttl <= timedelta(0):
             raise ValueError("claim_ttl must be positive")
         self.storage = storage
         self._claim_ttl = claim_ttl
         self._portal_credential_source = portal_credential_source
+        self._portal_verification_source = portal_verification_source
         self._ensure_schema()
         self._portal_tickets = PortalTicketStore(storage)
 
@@ -718,14 +736,6 @@ class GatewayStore:
         action: PortalTicketAction,
         now: datetime,
     ) -> PortalSetupTicketV1:
-        persisted = self.integration_setup(job_id)
-        matches = tuple(
-            connection
-            for connection in persisted.submission.plan.connections
-            if connection.requirement.credential_alias == credential_alias
-        )
-        if len(matches) != 1:
-            raise HTTPException(status_code=404, detail="integration setup not found")
         try:
             return self._portal_tickets.issue(
                 job_id=job_id,
@@ -799,6 +809,51 @@ class GatewayStore:
             raise HTTPException(status_code=409, detail="credential selection is not allowed") from None
         return self._record_portal_observation(persisted, target_index, replacement, now)
 
+    def portal_verify(
+        self,
+        *,
+        job_id: UUID,
+        principal: PortalPrincipalV1,
+        request: PortalSetupTicketUseV1,
+        now: datetime,
+    ) -> PersistedIntegrationSetupV1:
+        self._consume_portal_ticket(
+            job_id=job_id,
+            principal=principal,
+            request=request,
+            action="verify",
+            now=now,
+        )
+        if self._portal_verification_source is None:
+            raise HTTPException(status_code=503, detail="credential verification unavailable")
+        persisted, target_index = self._portal_target(
+            job_id, principal.organization_id, request.credential_alias
+        )
+        target = persisted.submission.plan.connections[target_index]
+        selected = target.selected_credential
+        if selected is None:
+            raise HTTPException(status_code=409, detail="credential verification is not allowed")
+        try:
+            returned = self._portal_verification_source.verify_credential(
+                requirement=target.requirement,
+                credential=selected,
+                correlation_id=persisted.submission.correlation_id,
+                expected_content_sha256=persisted.content_sha256,
+                expected_revision=persisted.submission.revision,
+                now=now.astimezone(timezone.utc),
+            )
+            receipt = CredentialVerificationReceiptV1.model_validate(returned)
+            replacement = self._resolve_portal_connection(
+                target.requirement,
+                credentials=target.candidate_credentials,
+                selected_credential_id=selected.credential_id,
+                verification_receipt=receipt,
+                now=now,
+            )
+        except Exception:
+            raise HTTPException(status_code=502, detail="credential verification failed") from None
+        return self._record_portal_observation(persisted, target_index, replacement, now)
+
     def portal_mutate(
         self,
         *,
@@ -857,6 +912,13 @@ class GatewayStore:
         credential_alias: str,
     ) -> tuple[PersistedIntegrationSetupV1, int]:
         persisted = self.portal_integration_setup(job_id, organization_id)
+        return persisted, self._portal_target_index(persisted, credential_alias)
+
+    @staticmethod
+    def _portal_target_index(
+        persisted: PersistedIntegrationSetupV1,
+        credential_alias: str,
+    ) -> int:
         matches = tuple(
             index
             for index, connection in enumerate(persisted.submission.plan.connections)
@@ -864,7 +926,30 @@ class GatewayStore:
         )
         if len(matches) != 1:
             raise HTTPException(status_code=404, detail="integration setup not found")
-        return persisted, matches[0]
+        return matches[0]
+
+    @staticmethod
+    def _portal_ticket_fence(
+        persisted: PersistedIntegrationSetupV1,
+        target_index: int,
+    ) -> PortalTicketFenceV1:
+        current = persisted.submission
+        target = current.plan.connections[target_index]
+        receipt = target.verification_receipt
+        return PortalTicketFenceV1(
+            revision=current.revision,
+            content_sha256=persisted.content_sha256,
+            correlation_id=current.correlation_id,
+            credential_alias=target.requirement.credential_alias,
+            credential_type=target.requirement.credential_type,
+            requirement_project_id=target.requirement.project_id,
+            selected_credential_id=(
+                None if target.selected_credential is None else target.selected_credential.credential_id
+            ),
+            verification_workflow_sha256=(
+                None if receipt is None else receipt.workflow_content_sha256
+            ),
+        )
 
     @staticmethod
     def _resolve_portal_connection(

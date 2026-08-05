@@ -196,11 +196,12 @@ describe("portal API", () => {
 
     await api.discoverCredentials(jobId, "CRM_PRIMARY", accessToken);
     await api.selectCredential(jobId, "CRM_PRIMARY", "credential-1", accessToken);
+    await api.verifyCredential(jobId, "CRM_PRIMARY", accessToken);
     await api.requestRotation(jobId, "CRM_PRIMARY", accessToken);
     await api.revokeCredential(jobId, "CRM_PRIMARY", accessToken);
 
     const calls = fetcher.mock.calls;
-    expect(calls.filter(([url]) => String(url).endsWith("/tickets"))).toHaveLength(4);
+    expect(calls.filter(([url]) => String(url).endsWith("/tickets"))).toHaveLength(5);
     expect(JSON.parse(String(calls[1]?.[1]?.body))).toEqual({
       ticket_id: "20000000-0000-0000-0000-000000000001",
       ticket: "opaque-1",
@@ -212,12 +213,14 @@ describe("portal API", () => {
       credential_alias: "CRM_PRIMARY",
       credential_id: "credential-1",
     });
-    expect(JSON.parse(String(calls[5]?.[1]?.body))).toMatchObject({
-      ticket: "opaque-3",
-      action: "rotation_requested",
-    });
+    expect(JSON.parse(String(calls[5]?.[1]?.body))).toMatchObject({ ticket: "opaque-3" });
+    expect(String(calls[5]?.[0])).toContain("/verify");
     expect(JSON.parse(String(calls[7]?.[1]?.body))).toMatchObject({
       ticket: "opaque-4",
+      action: "rotation_requested",
+    });
+    expect(JSON.parse(String(calls[9]?.[1]?.body))).toMatchObject({
+      ticket: "opaque-5",
       action: "revoked",
     });
   });

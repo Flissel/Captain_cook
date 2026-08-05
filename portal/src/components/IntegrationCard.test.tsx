@@ -16,6 +16,7 @@ describe("IntegrationCard", () => {
         busy={false}
         onDiscover={vi.fn()}
         onSelect={vi.fn()}
+        onVerify={vi.fn()}
         onRotate={vi.fn()}
         onRevoke={vi.fn()}
       />,
@@ -48,6 +49,7 @@ describe("IntegrationCard", () => {
         busy={false}
         onDiscover={vi.fn()}
         onSelect={vi.fn()}
+        onVerify={vi.fn()}
         onRotate={vi.fn()}
         onRevoke={vi.fn()}
       />,
@@ -76,6 +78,7 @@ describe("IntegrationCard", () => {
         busy={false}
         onDiscover={vi.fn()}
         onSelect={onSelect}
+        onVerify={vi.fn()}
         onRotate={vi.fn()}
         onRevoke={vi.fn()}
       />,
@@ -92,6 +95,7 @@ describe("IntegrationCard", () => {
         busy
         onDiscover={vi.fn()}
         onSelect={vi.fn()}
+        onVerify={vi.fn()}
         onRotate={vi.fn()}
         onRevoke={vi.fn()}
       />,
@@ -101,4 +105,37 @@ describe("IntegrationCard", () => {
       expect(button).toBeDisabled();
     }
   });
+
+  it.each(["verification_required", "verification_failed", "expired"] as const)(
+    "offers verification for %s without credential input fields",
+    async (status) => {
+      const onVerify = vi.fn(async () => undefined);
+      const { container } = render(
+        <IntegrationCard
+          action={{
+            ...missingAction,
+            status,
+            selectedCredential: {
+              credentialId: "credential-1",
+              credentialName: "CRM Primary",
+              credentialType: "hubspotApi",
+              projectId: null,
+              projectName: null,
+            },
+          }}
+          n8nCredentialsUrl={n8nCredentialsUrl}
+          busy={false}
+          onDiscover={vi.fn()}
+          onSelect={vi.fn()}
+          onVerify={onVerify}
+          onRotate={vi.fn()}
+          onRevoke={vi.fn()}
+        />,
+      );
+
+      await userEvent.click(screen.getByRole("button", { name: "Verify connection" }));
+      expect(onVerify).toHaveBeenCalledOnce();
+      expect(container.querySelectorAll("input")).toHaveLength(0);
+    },
+  );
 });
