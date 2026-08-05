@@ -21,6 +21,7 @@ async function currentAccessToken(): Promise<string> {
 
 function SignIn() {
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [pending, setPending] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -29,11 +30,11 @@ function SignIn() {
     if (pending) return;
     setPending(true);
     setMessage(null);
-    const { error } = await portalSupabase().auth.signInWithOtp({
+    const { error } = await portalSupabase().auth.signInWithPassword({
       email,
-      options: { shouldCreateUser: false },
+      password,
     });
-    setMessage(error ? "Sign-in could not be started." : "Check your inbox for your sign-in link.");
+    setMessage(error ? "Sign-in failed." : null);
     setPending(false);
   }
 
@@ -54,8 +55,17 @@ function SignIn() {
             value={email}
             onChange={(event) => setEmail(event.target.value)}
           />
+          <label htmlFor="password">Password</label>
+          <input
+            id="password"
+            type="password"
+            autoComplete="current-password"
+            required
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+          />
           <button disabled={pending} type="submit">
-            {pending ? "Sending link…" : "Email me a sign-in link"}
+            {pending ? "Signing in…" : "Sign in"}
           </button>
         </form>
         {message && <p role="status" className="notice">{message}</p>}

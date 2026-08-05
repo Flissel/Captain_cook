@@ -4,7 +4,7 @@ import { beforeEach, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   getSetupSurface: vi.fn(),
-  signInWithOtp: vi.fn(async () => ({ error: null })),
+  signInWithPassword: vi.fn(async () => ({ error: null })),
   unsubscribe: vi.fn(),
 }));
 
@@ -28,7 +28,7 @@ vi.mock("./supabase", () => ({
     auth: {
       getSession: vi.fn(async () => ({ data: { session: null }, error: null })),
       onAuthStateChange: vi.fn(() => ({ data: { subscription: { unsubscribe: mocks.unsubscribe } } })),
-      signInWithOtp: mocks.signInWithOtp,
+      signInWithPassword: mocks.signInWithPassword,
       signOut: vi.fn(),
     },
   }),
@@ -47,17 +47,19 @@ it("does not call Gateway while the real App is unauthenticated", async () => {
   expect(mocks.getSetupSurface).not.toHaveBeenCalled();
 });
 
-it("requests an OTP only for an existing Supabase user", async () => {
+it("signs an existing Supabase user in with email and password", async () => {
   render(<App />);
   const email = await screen.findByLabelText("Work email");
+  const password = await screen.findByLabelText("Password");
 
   await userEvent.type(email, "operator@example.test");
-  await userEvent.click(screen.getByRole("button", { name: "Email me a sign-in link" }));
+  await userEvent.type(password, "correct-horse-battery-staple");
+  await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
 
   await waitFor(() =>
-    expect(mocks.signInWithOtp).toHaveBeenCalledWith({
+    expect(mocks.signInWithPassword).toHaveBeenCalledWith({
       email: "operator@example.test",
-      options: { shouldCreateUser: false },
+      password: "correct-horse-battery-staple",
     }),
   );
   expect(mocks.getSetupSurface).not.toHaveBeenCalled();
