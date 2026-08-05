@@ -64,6 +64,7 @@ from gateway.contracts import (
     PublishedHermesSkill,
 )
 from gateway.mirror import MirrorQueue
+from gateway.portal_auth import initialize_portal_auth
 from gateway.registry_feed import mirror_captain_projection
 from gateway.registry_feed import (
     MinibookProjectionFeedPage,
@@ -267,6 +268,7 @@ def create_app(
     )
     app.state.gateway_settings = settings
     app.state.gateway_settings_lock = Lock()
+    initialize_portal_auth(app)
 
     @app.exception_handler(RequestValidationError)
     async def sanitized_review_validation_error(

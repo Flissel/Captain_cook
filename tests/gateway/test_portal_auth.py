@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from threading import Lock
 
 import jwt
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr, ValidationError
 
 from gateway.auth import GatewayRole, require_actor
+from gateway import portal_auth as portal_auth_module
 from gateway.portal_auth import (
     CachingJwksKeyResolver,
     PortalTokenVerificationError,
@@ -40,6 +42,22 @@ class StaticKeyResolver:
         if kid != KID:
             raise PortalTokenVerificationError()
         return self.key
+
+
+class JwksResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+        self.read_limits: list[int] = []
+
+    def __enter__(self) -> "JwksResponse":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def read(self, limit: int = -1) -> bytes:
+        self.read_limits.append(limit)
+        return self._body if limit < 0 else self._body[:limit]
 
 
 def configured_settings() -> GatewaySettings:
@@ -73,6 +91,18 @@ def portal_client(
     return TestClient(app)
 
 
+def default_portal_client(settings: GatewaySettings) -> TestClient:
+    app = FastAPI()
+    app.state.gateway_settings = settings
+    app.state.gateway_settings_lock = Lock()
+
+    @app.get("/portal")
+    async def portal(principal: PortalPrincipalV1 = Depends(require_portal_principal)) -> dict[str, str]:
+        return principal.model_dump()
+
+    return TestClient(app)
+
+
 @pytest.fixture
 def private_key() -> RSAPrivateKey:
     return generate_private_key(public_exponent=65537, key_size=2048)
@@ -97,7 +127,12 @@ def token(private_key: RSAPrivateKey, **overrides: object) -> str:
         "iat": NOW,
         "exp": NOW + timedelta(minutes=5),
     }
+    remove = overrides.pop("_remove", ())
+    assert isinstance(remove, tuple)
     claims.update(overrides)
+    for claim_name in remove:
+        assert isinstance(claim_name, str)
+        claims.pop(claim_name, None)
     headers = claims.pop("_headers", {"kid": KID})
     assert isinstance(headers, dict)
     return jwt.encode(claims, private_key, algorithm="RS256", headers=headers)
@@ -105,6 +140,13 @@ def token(private_key: RSAPrivateKey, **overrides: object) -> str:
 
 def bearer(value: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {value}"}
+
+
+def jwks_document(private_key: RSAPrivateKey, **overrides: object) -> bytes:
+    key = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key()))
+    key.update({"kid": KID, "alg": "RS256", "use": "sig"})
+    key.update(overrides)
+    return json.dumps({"keys": [key]}).encode("utf-8")
 
 
 def test_valid_rs256_token_maps_subject_and_organization(
@@ -120,6 +162,75 @@ def test_valid_rs256_token_maps_subject_and_organization(
     assert response.status_code == 200
     assert response.json() == {"subject_id": "user-1", "organization_id": "org-1"}
     assert resolver.requests == [(KID, JWKS_URL)]
+
+
+def test_default_portal_dependency_reuses_one_key_then_refreshes_after_ttl(
+    private_key: RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+    fetch_count = 0
+    document = jwks_document(private_key)
+
+    def build_resolver() -> CachingJwksKeyResolver:
+        return CachingJwksKeyResolver(ttl_seconds=10, clock=lambda: now[0])
+
+    def fetch(*_: object, **__: object) -> JwksResponse:
+        nonlocal fetch_count
+        fetch_count += 1
+        return JwksResponse(document)
+
+    monkeypatch.setattr(portal_auth_module, "CachingJwksKeyResolver", build_resolver)
+    monkeypatch.setattr(portal_auth_module, "urlopen", fetch)
+    client = default_portal_client(configured_settings())
+    supplied = bearer(token(private_key))
+
+    assert client.get("/portal", headers=supplied).status_code == 200
+    assert client.get("/portal", headers=supplied).status_code == 200
+    assert fetch_count == 1
+    now[0] = 11.0
+    assert client.get("/portal", headers=supplied).status_code == 200
+    assert fetch_count == 2
+
+
+def test_jwks_resolver_requires_public_rsa_signing_metadata(
+    private_key: RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = JwksResponse(jwks_document(private_key, use="enc"))
+    monkeypatch.setattr(portal_auth_module, "urlopen", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(PortalTokenVerificationError):
+        CachingJwksKeyResolver().get_key(kid=KID, jwks_url=JWKS_URL)
+
+
+def test_jwks_resolver_caps_response_before_json_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = JwksResponse(b"x" * 1_048_577)
+    monkeypatch.setattr(portal_auth_module, "urlopen", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(PortalTokenVerificationError):
+        CachingJwksKeyResolver().get_key(kid=KID, jwks_url=JWKS_URL)
+
+    assert response.read_limits == [1_048_577]
+
+
+def test_configured_organization_claim_maps_to_the_portal_principal(
+    private_key: RSAPrivateKey,
+    verifier: PyJwtPortalVerifier,
+) -> None:
+    settings = configured_settings().model_copy(
+        update={"portal_organization_claim": "tenant_id"}
+    )
+
+    response = portal_client(settings, verifier).get(
+        "/portal",
+        headers=bearer(token(private_key, tenant_id="tenant-7")),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"subject_id": "user-1", "organization_id": "tenant-7"}
 
 
 @pytest.mark.parametrize(
@@ -178,6 +289,7 @@ def test_wrong_signature_or_algorithm_is_rejected(
     "replacement",
     (
         {"exp": NOW - timedelta(seconds=1)},
+        {"_remove": ("exp",)},
         {"sub": None},
         {"organization_id": None},
         {"sub": "   "},

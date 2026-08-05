@@ -70,13 +70,29 @@ class GatewaySettings(BaseModel):
     @field_validator(
         "portal_supabase_issuer",
         "portal_supabase_audience",
-        "portal_supabase_jwks_url",
     )
     @classmethod
     def _portal_setting_must_not_be_blank(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
             raise ValueError("portal settings must not be blank")
         return value
+
+    @field_validator("portal_supabase_jwks_url")
+    @classmethod
+    def _portal_jwks_url_must_be_safe(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("portal JWKS URL must be a safe HTTPS URL")
+        return value.rstrip("/")
 
     @field_validator("portal_organization_claim")
     @classmethod

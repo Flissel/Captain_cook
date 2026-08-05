@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping
 from time import monotonic
+from threading import Lock
 from typing import Protocol
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
@@ -17,6 +18,10 @@ from pydantic import ValidationError
 from gateway.auth import get_gateway_settings
 from gateway.portal_contracts import PortalPrincipalV1
 from gateway.settings import GatewaySettings
+
+
+MAX_JWKS_RESPONSE_BYTES = 1_048_576
+_application_initialization_lock = Lock()
 
 
 class PortalTokenVerificationError(Exception):
@@ -49,23 +54,34 @@ class CachingJwksKeyResolver:
         self._ttl_seconds = ttl_seconds
         self._clock = clock
         self._keys: dict[str, tuple[float, object]] = {}
+        self._lock = Lock()
 
     def get_key(self, *, kid: str, jwks_url: str) -> object:
-        cached = self._keys.get(kid)
-        now = self._clock()
-        if cached is not None and cached[0] > now:
-            return cached[1]
+        with self._lock:
+            cached = self._keys.get(kid)
+            now = self._clock()
+            if cached is not None and cached[0] > now:
+                return cached[1]
 
-        try:
-            request = UrlRequest(jwks_url, headers={"Accept": "application/json"})
-            with urlopen(request, timeout=5.0) as response:  # noqa: S310 - configured JWKS URL
-                decoded = json.loads(response.read().decode("utf-8"))
-            key = self._select_key(decoded, kid)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
-            raise PortalTokenVerificationError() from None
+            try:
+                request = UrlRequest(jwks_url, headers={"Accept": "application/json"})
+                with urlopen(request, timeout=5.0) as response:  # noqa: S310 - configured JWKS URL
+                    body = response.read(MAX_JWKS_RESPONSE_BYTES + 1)
+                if len(body) > MAX_JWKS_RESPONSE_BYTES:
+                    raise ValueError("JWKS response exceeds maximum size")
+                decoded = json.loads(body.decode("utf-8"))
+                key = self._select_key(decoded, kid)
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+                TypeError,
+            ):
+                raise PortalTokenVerificationError() from None
 
-        self._keys[kid] = (now + self._ttl_seconds, key)
-        return key
+            self._keys[kid] = (now + self._ttl_seconds, key)
+            return key
 
     @staticmethod
     def _select_key(document: object, kid: str) -> object:
@@ -75,11 +91,19 @@ class CachingJwksKeyResolver:
         if not isinstance(keys, list):
             raise PortalTokenVerificationError()
         for candidate in keys:
-            if isinstance(candidate, dict) and candidate.get("kid") == kid:
-                try:
-                    return jwt.PyJWK.from_dict(candidate).key
-                except (TypeError, ValueError, jwt.PyJWTError):
-                    raise PortalTokenVerificationError() from None
+            if not isinstance(candidate, dict) or candidate.get("kid") != kid:
+                continue
+            if (
+                candidate.get("kty") != "RSA"
+                or candidate.get("use") != "sig"
+                or candidate.get("alg") != "RS256"
+                or "d" in candidate
+            ):
+                raise PortalTokenVerificationError()
+            try:
+                return jwt.PyJWK.from_dict(candidate).key
+            except (TypeError, ValueError, jwt.PyJWTError):
+                raise PortalTokenVerificationError() from None
         raise PortalTokenVerificationError()
 
 
@@ -130,11 +154,27 @@ class PyJwtPortalVerifier:
 _portal_bearer = HTTPBearer(auto_error=False)
 
 
+def initialize_portal_auth(application: object) -> None:
+    """Install one verifier per FastAPI application before portal dependencies run."""
+
+    state = getattr(application, "state")
+    with _application_initialization_lock:
+        lock = getattr(state, "portal_token_verifier_lock", None)
+        if lock is None:
+            lock = Lock()
+            state.portal_token_verifier_lock = lock
+    with lock:
+        current = getattr(state, "portal_token_verifier", None)
+        if current is None or not callable(getattr(current, "verify", None)):
+            state.portal_token_verifier = PyJwtPortalVerifier()
+
+
 def get_portal_token_verifier(request: Request) -> PortalTokenVerifier:
+    initialize_portal_auth(request.app)
     current = getattr(request.app.state, "portal_token_verifier", None)
     if current is not None and callable(getattr(current, "verify", None)):
         return current
-    return PyJwtPortalVerifier()
+    raise PortalTokenVerificationError()
 
 
 def _invalid_portal_identity() -> HTTPException:
