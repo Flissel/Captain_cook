@@ -23,6 +23,12 @@ Gitea must never contain `.env` files, credentials, access tokens, or OAuth
 client secrets. The first release keeps the existing Captain-n8n service in
 place; moving it to the Mini-PC is a separate deployment decision.
 
+The Mini-PC portal reaches Captain only through a private mTLS service link.
+The browser never receives a Gateway role token, mTLS private key, or direct
+Gateway URL. The Mini-PC backend holds its client certificate in a local
+gitignored secret mount, and the Captain-side proxy accepts only that client
+certificate before forwarding portal traffic to the loopback Gateway.
+
 ## User journey
 
 1. The user signs in to the portal through Supabase Auth and selects an
@@ -76,6 +82,9 @@ Captain-only Gateway routes remain the sole persistence writer.
   status, not an inferred success.
 - Portal or Supabase downtime cannot change setup state; Captain keeps the
   latest accepted status and blocks required work until it is ready.
+- An unavailable, untrusted, expired, or wrong-client-certificate service link
+  returns an unavailable portal state and cannot fall back to a public Gateway
+  route.
 
 ## Security rules
 
@@ -93,17 +102,19 @@ Captain-only Gateway routes remain the sole persistence writer.
 ## Acceptance evidence
 
 1. A user from organization A cannot read or mutate organization B's setup.
-2. A valid ticket can discover metadata but cannot call Gateway mutations or
+2. A browser request cannot reach Gateway directly, and a request without the
+   Mini-PC client certificate is rejected before Gateway application handling.
+3. A valid ticket can discover metadata but cannot call Gateway mutations or
    n8n MCP operations directly.
-3. One matching credential reaches `verification_required`; two require an
+4. One matching credential reaches `verification_required`; two require an
    explicit selection; zero stays `missing`.
-4. A successful real Bearer probe and real OAuth probe become `ready` only
+5. A successful real Bearer probe and real OAuth probe become `ready` only
    with correctly fenced n8n deployment and execution evidence.
-5. Rotation, revoke, expiry, workflow-digest drift and restart/resume all
+6. Rotation, revoke, expiry, workflow-digest drift and restart/resume all
    fail closed and preserve an append-only Captain history.
-6. Repository, portal responses, Gateway records, Minibook projections and
+7. Repository, portal responses, Gateway records, Minibook projections and
    test artifacts contain no secret canary or provider token.
-7. The Mini-PC portal can be restarted without changing the authoritative
+8. The Mini-PC portal can be restarted without changing the authoritative
    Gateway state; Gitea receives no secret-bearing files.
 
 ## Delivery order
