@@ -34,6 +34,20 @@ def test_provider_deployer_keeps_secrets_remote_and_edge_terminates_tls() -> Non
         encoding="utf-8"
     )
     assert "up -d --no-deps --force-recreate mini-pc-edge" in edge_deployer
+    assert 'docker compose --project-name captain-mini-pc-edge -f compose.mini-pc-edge.yml exec -T mini-pc-edge nginx -t' in edge_deployer
+    assert "mini PC edge failed its post-deploy nginx validation" in edge_deployer
     assert "listen 9443 ssl;" in edge
     assert "proxy_pass http://127.0.0.1:9080;" in edge
     assert "proxy_set_header Authorization $http_authorization;" in edge
+    assert (
+        'location ~ "^/captain-factory/integration-verification-templates/'
+        'raw/commit/[0-9a-f]{40}/verification/(bearer|oauth2)\\.json$" {'
+        in edge
+    )
+    assert "include /run/mini-pc-edge/gitea-template-auth.conf;" in edge
+    edge_compose = (
+        ROOT / "deploy" / "mini-pc-edge" / "compose.mini-pc-edge.yml"
+    ).read_text(encoding="utf-8")
+    assert "gitea-template-auth.conf" in edge_compose
+    assert "/home/debian/.captain-secrets/gitea-factory.env" in edge_deployer
+    assert "CAPTAIN_GITEA_TEMPLATE_READ_TOKEN" in edge_deployer

@@ -25,6 +25,10 @@ services:
         source: ./.secrets/mini-pc-edge.key
         target: /run/mini-pc-edge/mini-pc-edge.key
         read_only: true
+      - type: bind
+        source: ./.secrets/gitea-template-auth.conf
+        target: /run/mini-pc-edge/gitea-template-auth.conf
+        read_only: true
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider --no-check-certificate https://127.0.0.1:5443/auth/v1/health"]
       interval: 5s

@@ -54,13 +54,31 @@ foreach ($transfer in @(
 
 $remoteApply = @"
 set -eu
+. /home/debian/.captain-secrets/gitea-factory.env
+case "`$CAPTAIN_GITEA_TEMPLATE_READ_TOKEN" in
+  *[!A-Za-z0-9_-]*|'') printf '%s\n' 'invalid Gitea template read token' >&2; exit 1 ;;
+esac
+printf 'proxy_set_header Authorization "token %s";\n' "`$CAPTAIN_GITEA_TEMPLATE_READ_TOKEN" > '$RemoteRoot/.secrets/gitea-template-auth.conf.incoming'
 sudo -n install -o 101 -g 101 -m 400 '$RemoteRoot/.secrets/mini-pc-edge.crt.incoming' '$RemoteRoot/.secrets/mini-pc-edge.crt'
 sudo -n install -o 101 -g 101 -m 400 '$RemoteRoot/.secrets/mini-pc-edge.key.incoming' '$RemoteRoot/.secrets/mini-pc-edge.key'
+sudo -n install -o 101 -g 101 -m 400 '$RemoteRoot/.secrets/gitea-template-auth.conf.incoming' '$RemoteRoot/.secrets/gitea-template-auth.conf'
 install -m 400 '$RemoteRoot/.secrets/mini-pc-edge-ca.crt.incoming' '$RemoteRoot/.secrets/mini-pc-edge-ca.crt'
-rm -f '$RemoteRoot/.secrets/mini-pc-edge.crt.incoming' '$RemoteRoot/.secrets/mini-pc-edge.key.incoming' '$RemoteRoot/.secrets/mini-pc-edge-ca.crt.incoming'
+rm -f '$RemoteRoot/.secrets/mini-pc-edge.crt.incoming' '$RemoteRoot/.secrets/mini-pc-edge.key.incoming' '$RemoteRoot/.secrets/mini-pc-edge-ca.crt.incoming' '$RemoteRoot/.secrets/gitea-template-auth.conf.incoming'
 cd '$RemoteRoot'
 docker compose --project-name captain-mini-pc-edge -f compose.mini-pc-edge.yml config --quiet
 docker compose --project-name captain-mini-pc-edge -f compose.mini-pc-edge.yml up -d --no-deps --force-recreate mini-pc-edge
+validated=false
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  if docker compose --project-name captain-mini-pc-edge -f compose.mini-pc-edge.yml exec -T mini-pc-edge nginx -t >/dev/null 2>&1; then
+    validated=true
+    break
+  fi
+  sleep 1
+done
+if [ "`$validated" != true ]; then
+  printf '%s\n' 'mini PC edge failed its post-deploy nginx validation' >&2
+  exit 1
+fi
 "@
 & ssh $SshHost $remoteApply *> $null
 if ($LASTEXITCODE -ne 0) {
