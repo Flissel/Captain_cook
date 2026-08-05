@@ -49,6 +49,16 @@ credential metadata and issues execution authority only after a safe probe.
 - [ ] Prove one real API-key/Bearer integration and one OAuth integration.
 - [ ] Run clean-checkout, architecture, security-audit, and live evidence gates.
 
+The fail-closed portal live harness is now
+`tests/live/test_portal_integration_live.py`. Without
+`CAPTAIN_PORTAL_LIVE_E2E=1` and its complete disposable configuration group,
+every case skips before network access. Its current verified-local and blocked
+live status, including the exact operator commands, is recorded in
+`docs/superpowers/plans/2026-08-05-self-service-integration-portal-live-evidence-gaps.md`.
+The unchecked provider and clean-checkout items above remain unchecked until
+that gate records real provider-backed evidence; configured URLs or metadata
+discovery do not satisfy them.
+
 On 2026-08-05 WSL and Docker recovered without deleting or reconfiguring any
 Captain or VibeMind volume. Captain MariaDB's isolated `captain_test` compose
 service passed the authenticated Gateway API restart/replay, rotation, and
