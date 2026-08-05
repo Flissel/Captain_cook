@@ -64,16 +64,20 @@ This is verified-local safety evidence, not provider evidence.
   redaction canaries. MariaDB-backed finalization, rebuild, rotation/revoke and
   fencing tests passed against isolated `captain_test`.
 
-### Blocked live
+### Aggregate live closure
 
 The correlation-bound provider-audit, provider-control, restart-control and
-aggregate-evidence endpoints are implemented. The remaining live closure must
-combine the proven components into one run and prove:
+aggregate-evidence endpoints are implemented and one post-regression live run
+proved:
 
-- three complete provider traces for one correlation ID;
-- the digest-pinned Gitea release used by those traces;
-- the accepted Gateway decision and execution reference;
-- Minibook projection and drift rebuild for the same correlation ID.
+- three unique complete Bearer/OAuth/Bearer traces for one correlation ID;
+- three provider invocations and three completions;
+- the digest-pinned Gitea releases used by those traces;
+- an accepted Gateway decision and execution reference;
+- controlled restart/resume without a duplicate effect;
+- Minibook projection and converged rebuild for the same correlation ID;
+- rotation request followed by terminal Bearer revoke at revision 9;
+- no secret emitted in the runner summary or durable evidence.
 
 The harness requires every URL, dedicated capability and health reference
 before constructing a client. It cannot run against the currently known
@@ -137,10 +141,9 @@ disposable value exists. Absent prerequisites remain skipped, not passed.
 
 ## Single next operator action
 
-Run one disposable, correlation-bound aggregate scenario using the existing
-Bearer and OAuth credentials: three provider traces, controlled restart
-receipt, Minibook acknowledgement/rebuild receipt, then fail-closed
-finalization and read-only evidence query.
+No live closure action remains. Preserve the ignored credential environments
+and rerun `scripts/run_portal_control_plane_live.py` only after regression
+fixtures have finished with the isolated `captain_test` database.
 
 ## Merged production goal
 
@@ -161,7 +164,7 @@ they are not a separate follow-up project:
   and read-only aggregate-evidence routes.
 - [x] Persist Minibook integration-setup acknowledgement and rebuild convergence
   for the same run, job, and correlation.
-- [ ] Run the isolated Bearer and OAuth paths, controlled restart/resume,
+- [x] Run the isolated Bearer and OAuth paths, controlled restart/resume,
   rotation/revoke, and three distinct provider traces before any live claim.
 
 ## 2026-08-05 transport evidence checkpoint

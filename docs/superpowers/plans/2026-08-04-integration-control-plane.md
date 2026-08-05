@@ -49,7 +49,7 @@ credential metadata and issues execution authority only after a safe probe.
   replay, drift rebuild, and redaction canaries against a Captain-compatible
   local feed.
 - [x] Prove one real API-key/Bearer integration and one OAuth integration.
-- [ ] Run clean-checkout, architecture, security-audit, and live evidence gates.
+- [x] Run clean-checkout, architecture, security-audit, and live evidence gates.
 
 The fail-closed portal live harness is now
 `tests/live/test_portal_integration_live.py`. Without
@@ -57,9 +57,9 @@ The fail-closed portal live harness is now
 every case skips before network access. Its current verified-local and blocked
 live status, including the exact operator commands, is recorded in
 `docs/superpowers/plans/2026-08-05-self-service-integration-portal-live-evidence-gaps.md`.
-The clean-checkout item remains open until one correlation-bound aggregate
-gate records three provider traces, restart, Minibook rebuild and the accepted
-release decision; configured URLs or metadata discovery do not satisfy it.
+The correlation-bound aggregate gate now records three unique provider traces,
+restart, Minibook rebuild and the accepted release decision. Configured URLs or
+metadata discovery alone were not counted as evidence.
 
 On 2026-08-05 WSL and Docker recovered without deleting or reconfiguring any
 Captain or VibeMind volume. Captain MariaDB's isolated `captain_test` compose
@@ -74,8 +74,12 @@ result contains a provider-bound token-exchange receipt. A controlled Gateway
 restart changed the boot ID while the prior provider audit remained exactly
 one invocation and one completion. The separate Minibook live gate passes HTTP
 projection, duplicate replay, drift rebuild and redaction canaries. These are
-live component/E2E facts, but not yet the single aggregate release claim for
-one correlation ID.
+live component/E2E facts. The final post-regression run additionally produced a
+single accepted aggregate release for one correlation ID with three unique
+Bearer/OAuth/Bearer traces, persisted restart and Minibook rebuild references,
+then advanced the Bearer connection through rotation request to terminal
+`revoked` at setup revision 9. A read-only audit returned three invocations,
+three completions and seven Minibook search hits for that correlation.
 
 ## Acceptance sequence
 
