@@ -91,6 +91,9 @@ def test_portal_deploy_requires_only_public_config_and_local_link_secrets() -> N
         assert forbidden not in source
     assert ".secrets/mini-pc/wireguard/mini-pc.conf" in source
     assert ".secrets/mini-pc/mini-pc-client.key" in source
+    assert "CAPTAIN_PORTAL_TLS_CERT_PATH" in source
+    assert "CAPTAIN_PORTAL_TLS_KEY_PATH" in source
+    assert "required local portal TLS file is missing" in source
 
 
 def test_portal_container_is_static_non_root_read_only_and_same_origin() -> None:
@@ -105,12 +108,22 @@ def test_portal_container_is_static_non_root_read_only_and_same_origin() -> None
     assert "HEALTHCHECK" in dockerfile
     assert "location /v1/portal/" in web_config
     assert "proxy_pass http://127.0.0.1:8443" in web_config
+    assert "listen 8444 ssl" in web_config
+    assert "listen 127.0.0.1:8088" in web_config
+    assert "listen 8088;" not in web_config
+    assert "ssl_certificate /run/portal-tls/portal.crt" in web_config
+    assert "ssl_certificate_key /run/portal-tls/portal.key" in web_config
     assert "CAPTAIN_PORTAL_GATEWAY" not in dockerfile + web_config + compose
     assert "network_mode: host" in compose
     assert "read_only: true" in compose
     assert "no-new-privileges:true" in compose
     assert "VITE_SUPABASE_URL" in compose
     assert "VITE_SUPABASE_ANON_KEY" in compose
+    assert "CAPTAIN_PORTAL_TLS_CERT_PATH" in compose
+    assert "CAPTAIN_PORTAL_TLS_KEY_PATH" in compose
+    assert "target: /run/portal-tls/portal.crt" in compose
+    assert "target: /run/portal-tls/portal.key" in compose
+    assert compose.count("read_only: true") >= 3
     assert "node_modules" in dockerignore
     assert "dist" in dockerignore
     assert ".env" in dockerignore
@@ -132,6 +145,8 @@ def test_preflight_is_read_only_bounded_and_emits_redacted_json_schema() -> None
     assert "Authorization" not in source
     assert "Invoke-WebRequest" in source
     assert "MaximumRedirection 0" in source
+    assert "portal public endpoint requires HTTPS" in source
+    assert "CAPTAIN_PORTAL_ALLOW_HTTP_LOOPBACK_TEST" in source
     assert "portal" in source
     assert "portal_link" in source
     assert "supabase_auth" in source
@@ -149,6 +164,8 @@ def test_deploy_missing_environment_fails_before_docker() -> None:
         "CAPTAIN_PORTAL_SUPABASE_URL": "",
         "CAPTAIN_PORTAL_SUPABASE_ANON_KEY": "",
         "CAPTAIN_PORTAL_GITEA_URL": "",
+        "CAPTAIN_PORTAL_TLS_CERT_PATH": "",
+        "CAPTAIN_PORTAL_TLS_KEY_PATH": "",
     }
     result = subprocess.run(
         ["pwsh", "-NoProfile", "-File", str(DEPLOY_SCRIPT), "-Apply"],
@@ -171,6 +188,7 @@ def test_preflight_returns_only_redacted_schema_when_endpoints_are_unreachable()
         "CAPTAIN_PORTAL_URL": "http://127.0.0.1:9/private/path?secret=canary",
         "CAPTAIN_PORTAL_SUPABASE_URL": "http://127.0.0.1:9/hidden",
         "CAPTAIN_PORTAL_GITEA_URL": "http://127.0.0.1:9/hidden",
+        "CAPTAIN_PORTAL_ALLOW_HTTP_LOOPBACK_TEST": "true",
     }
     result = subprocess.run(
         ["pwsh", "-NoProfile", "-File", str(PREFLIGHT_SCRIPT), "-TimeoutSeconds", "1"],
@@ -239,6 +257,7 @@ def test_preflight_does_not_follow_cross_origin_redirects() -> None:
             "CAPTAIN_PORTAL_URL": base,
             "CAPTAIN_PORTAL_SUPABASE_URL": base,
             "CAPTAIN_PORTAL_GITEA_URL": base,
+            "CAPTAIN_PORTAL_ALLOW_HTTP_LOOPBACK_TEST": "true",
         }
         result = subprocess.run(
             ["pwsh", "-NoProfile", "-File", str(PREFLIGHT_SCRIPT), "-TimeoutSeconds", "1"],
@@ -297,6 +316,7 @@ def test_portal_link_503_is_reachable_but_not_ready() -> None:
             "CAPTAIN_PORTAL_URL": base,
             "CAPTAIN_PORTAL_SUPABASE_URL": base,
             "CAPTAIN_PORTAL_GITEA_URL": base,
+            "CAPTAIN_PORTAL_ALLOW_HTTP_LOOPBACK_TEST": "true",
         }
         result = subprocess.run(
             ["pwsh", "-NoProfile", "-File", str(PREFLIGHT_SCRIPT), "-TimeoutSeconds", "1"],
@@ -320,3 +340,33 @@ def test_portal_link_503_is_reachable_but_not_ready() -> None:
     assert link_check["reachable"] is True
     assert link_check["readiness"] is False
     assert report["readiness"] is False
+
+
+def test_preflight_rejects_plaintext_non_loopback_portal_origin() -> None:
+    env = {
+        **os.environ,
+        "CAPTAIN_PORTAL_URL": "http://mini-pc.local:8088",
+        "CAPTAIN_PORTAL_SUPABASE_URL": "https://supabase.example.test",
+        "CAPTAIN_PORTAL_GITEA_URL": "https://gitea.example.test",
+        "CAPTAIN_PORTAL_ALLOW_HTTP_LOOPBACK_TEST": "",
+    }
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(PREFLIGHT_SCRIPT), "-TimeoutSeconds", "1"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "portal public endpoint requires HTTPS" in result.stderr
+
+
+def test_public_portal_example_uses_https() -> None:
+    environment_example = _source(ROOT / ".env.example")
+    operations = _source(ROOT / "docs" / "OPERATIONS.md")
+
+    assert "CAPTAIN_PORTAL_URL=https://mini-pc.local:8444" in environment_example
+    assert "http://mini-pc.local:8088" not in environment_example + operations

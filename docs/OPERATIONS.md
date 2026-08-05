@@ -11,10 +11,13 @@ MariaDB and the Captain-side Gateway are also outside that script's authority.
 Install Docker Compose, WireGuard kernel support and PowerShell 7 on the
 Mini-PC. Provision these public environment values locally:
 
-- `CAPTAIN_PORTAL_URL`: the browser-visible portal origin, normally port 8088.
+- `CAPTAIN_PORTAL_URL`: the HTTPS browser-visible portal origin, normally port 8444.
 - `CAPTAIN_PORTAL_SUPABASE_URL`: the Supabase origin.
 - `CAPTAIN_PORTAL_SUPABASE_ANON_KEY`: the public browser anon key.
 - `CAPTAIN_PORTAL_GITEA_URL`: the Gitea origin used by the read-only preflight.
+- `CAPTAIN_PORTAL_TLS_CERT_PATH` and `CAPTAIN_PORTAL_TLS_KEY_PATH`: local paths
+  to the Mini-PC portal server certificate and private key. Their contents
+  never enter environment variables or the image.
 - `CAPTAIN_PORTAL_IMAGE_TAG`: local tag written only by the normal build/deploy
   path; it is never rollback authority.
 - `CAPTAIN_PORTAL_ACCEPTED_IMAGE`: exact accepted
@@ -38,11 +41,20 @@ deploy/portal-link/.secrets/mini-pc/mini-pc-client.crt
 deploy/portal-link/.secrets/mini-pc/mini-pc-client.key
 ```
 
+Provision a browser-trusted certificate for the portal hostname separately and
+store it outside Git. The normal example paths are
+`C:/captain-portal-secrets/portal.crt` and
+`C:/captain-portal-secrets/portal.key`; set the two TLS path variables to those
+files. The Compose mounts are read-only.
+
 The Captain host separately owns its WireGuard peer, server certificate/key
 and Mini-PC client CA under `deploy/portal-link/.secrets/captain/`. The Captain
 proxy listens only on `10.77.0.1:443`, requires the Mini-PC client certificate
 and forwards only `/v1/portal/` to Gateway loopback. There is no LAN/public
 Gateway fallback. The Mini-PC link listens only on `127.0.0.1:8443`.
+The browser-facing portal listens with TLS on port `8444`. Its plaintext port
+`8088` is loopback-only and exposes only `/healthz`; it is never a user entry
+point and never receives Supabase bearer tokens.
 
 ## Tenant provisioning
 
@@ -71,6 +83,7 @@ Only `portal`, `mini-pc-wireguard` and `mini-pc-portal-link` are passed to
 Compose `up`. The script never runs Compose `down`, removes volumes, or manages
 n8n, MariaDB, Supabase or Gitea. The portal container is non-root and read-only;
 its Same-Origin proxy is fixed to the loopback link.
+The deploy fails before Compose if either portal TLS file is missing.
 
 The read-only preflight sends unauthenticated GET requests with five-second
 timeouts and emits one redacted JSON document. It prints hosts, status codes,

@@ -7,7 +7,10 @@ param(
 $ErrorActionPreference = "Stop"
 
 function Get-RequiredEndpoint {
-    param([Parameter(Mandatory)][string]$Name)
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [switch]$RequirePublicHttps
+    )
 
     $value = [Environment]::GetEnvironmentVariable($Name)
     if ([string]::IsNullOrWhiteSpace($value)) {
@@ -17,6 +20,14 @@ function Get-RequiredEndpoint {
     if (($uri.Scheme -ne "http" -and $uri.Scheme -ne "https") -or
         -not [string]::IsNullOrEmpty($uri.UserInfo)) {
         throw "portal preflight endpoint is unsafe"
+    }
+    if ($RequirePublicHttps -and $uri.Scheme -ne "https") {
+        $allowLoopback = [Environment]::GetEnvironmentVariable(
+            "CAPTAIN_PORTAL_ALLOW_HTTP_LOOPBACK_TEST"
+        ) -eq "true"
+        if (-not $allowLoopback -or -not $uri.IsLoopback) {
+            throw "portal public endpoint requires HTTPS"
+        }
     }
     return $uri
 }
@@ -70,7 +81,7 @@ function Test-Endpoint {
     }
 }
 
-$portalBase = Get-RequiredEndpoint -Name "CAPTAIN_PORTAL_URL"
+$portalBase = Get-RequiredEndpoint -Name "CAPTAIN_PORTAL_URL" -RequirePublicHttps
 $supabaseBase = Get-RequiredEndpoint -Name "CAPTAIN_PORTAL_SUPABASE_URL"
 $giteaBase = Get-RequiredEndpoint -Name "CAPTAIN_PORTAL_GITEA_URL"
 

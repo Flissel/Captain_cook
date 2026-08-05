@@ -48,6 +48,16 @@ if ($missingSecretFiles.Count -gt 0) {
     throw "required local portal-link secret file is missing"
 }
 
+$portalTlsFiles = @(
+    [Environment]::GetEnvironmentVariable("CAPTAIN_PORTAL_TLS_CERT_PATH"),
+    [Environment]::GetEnvironmentVariable("CAPTAIN_PORTAL_TLS_KEY_PATH")
+)
+if ($portalTlsFiles | Where-Object {
+    [string]::IsNullOrWhiteSpace($_) -or -not (Test-Path -LiteralPath $_ -PathType Leaf)
+}) {
+    throw "required local portal TLS file is missing"
+}
+
 $mode = "deploy"
 if ($Rollback) {
     $acceptedImage = [Environment]::GetEnvironmentVariable("CAPTAIN_PORTAL_ACCEPTED_IMAGE")

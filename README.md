@@ -358,6 +358,8 @@ The static portal uses Supabase user authentication and sends its bearer only
 to same-origin `/v1/portal/...`. On the Mini-PC that route traverses the
 loopback portal-link, mTLS and the fixed WireGuard peers (`10.77.0.2` to
 `10.77.0.1`); the browser never receives a Gateway URL or role token.
+The browser origin itself is HTTPS (default `https://mini-pc.local:8444`);
+plaintext port 8088 is loopback-only health checking and cannot serve the SPA.
 
 After installing the local certificates and WireGuard configuration described
 in [docs/OPERATIONS.md](docs/OPERATIONS.md), validate without changing services:
