@@ -10,11 +10,35 @@ def test_link_requires_client_certificate_and_forwards_only_portal_routes() -> N
     assert "location / {" in config and "return 404" in config
 
 
-def test_captain_proxy_replaces_untrusted_authorization_with_fixed_identity() -> None:
+def test_captain_proxy_preserves_supabase_bearer_with_fixed_link_identity() -> None:
     config = Path("deploy/portal-link/captain-proxy.conf").read_text(encoding="utf-8")
 
-    assert 'proxy_set_header Authorization "";' in config
+    portal_location = config.split("location /v1/portal/ {", 1)[1].split("}", 1)[0]
+    assert "proxy_set_header Authorization $http_authorization;" in portal_location
+    assert 'proxy_set_header Authorization "";' not in portal_location
     assert 'proxy_set_header X-Captain-Portal-Link-Identity "mini-pc-portal";' in config
+
+
+def test_authorization_is_forwarded_only_inside_the_portal_location() -> None:
+    config = Path("deploy/portal-link/captain-proxy.conf").read_text(encoding="utf-8")
+
+    assert config.count("proxy_set_header Authorization $http_authorization;") == 1
+    default_location = config.split("location / {", 1)[1]
+    assert "proxy_set_header Authorization" not in default_location
+    assert "return 404;" in default_location
+
+
+def test_supabase_bearer_survives_every_canonical_proxy_hop() -> None:
+    configs = (
+        Path("portal/nginx.conf").read_text(encoding="utf-8"),
+        Path("deploy/portal-link/mini-pc-proxy.conf").read_text(encoding="utf-8"),
+        Path("deploy/portal-link/captain-proxy.conf").read_text(encoding="utf-8"),
+    )
+
+    for config in configs:
+        portal_location = config.split("location /v1/portal/ {", 1)[1].split("}", 1)[0]
+        assert "proxy_set_header Authorization $http_authorization;" in portal_location
+        assert config.count("proxy_set_header Authorization $http_authorization;") == 1
 
 
 def test_mini_pc_proxy_verifies_captain_tls_and_denies_non_portal_routes() -> None:
@@ -52,6 +76,15 @@ def test_compose_uses_ignored_read_only_secret_mounts_and_separate_roles() -> No
         assert "read_only: true" in mount
     assert 'profiles: ["captain"]' in compose
     assert 'profiles: ["mini-pc"]' in compose
+
+
+def test_mini_pc_mtls_proxy_is_ordered_after_wireguard() -> None:
+    compose = Path("deploy/portal-link/compose.portal-link.yml").read_text(encoding="utf-8")
+
+    mini_pc_link = compose.split("  mini-pc-portal-link:", 1)[1]
+    assert "depends_on:" in mini_pc_link
+    assert "mini-pc-wireguard:" in mini_pc_link
+    assert "condition: service_started" in mini_pc_link
 
 
 def test_captain_proxy_binds_only_the_wireguard_endpoint() -> None:

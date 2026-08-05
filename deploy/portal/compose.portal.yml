@@ -1,0 +1,20 @@
+services:
+  portal:
+    build:
+      context: ../../portal
+      dockerfile: Dockerfile
+      args:
+        VITE_SUPABASE_URL: ${CAPTAIN_PORTAL_SUPABASE_URL:?CAPTAIN_PORTAL_SUPABASE_URL is required}
+        VITE_SUPABASE_ANON_KEY: ${CAPTAIN_PORTAL_SUPABASE_ANON_KEY:?CAPTAIN_PORTAL_SUPABASE_ANON_KEY is required}
+    image: captain-integration-portal:${CAPTAIN_PORTAL_IMAGE_TAG:-local}
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
