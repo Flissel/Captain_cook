@@ -12,6 +12,7 @@ from agenten.agent_factory.integration_setup import (
     N8nCredentialMetadataV1,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_factory.gitea_template_contracts import GiteaTemplateReleaseV1
 from agenten.targets.n8n import (
     N8nDeployment,
     N8nExecutionEvidence,
@@ -24,6 +25,7 @@ def seal_provider_verification(
     requirement: IntegrationCredentialRequirementV1,
     credential: N8nCredentialMetadataV1,
     template_ref: ArtifactRef | None = None,
+    template_release: GiteaTemplateReleaseV1 | None = None,
     workflow_artifact: SealedArtifact,
     deployment: N8nDeployment,
     execution: N8nExecutionEvidence,
@@ -50,6 +52,8 @@ def seal_provider_verification(
         or released_template_ref.sha256 != requirement.verification_workflow_sha256
     ):
         raise ValueError("workflow does not match Captain verification workflow release")
+    if template_release is not None and template_release.sha256 != released_template_ref.sha256:
+        raise ValueError("Gitea release does not match Captain verification workflow")
     if (
         execution.workflow_id != deployment.workflow_id
         or execution.artifact_digest != deployment.artifact_digest
@@ -77,6 +81,7 @@ def seal_provider_verification(
         status="passed",
         occurred_at=occurred_at,
         template_ref=template_ref,
+        verification_release=template_release,
         template_content_sha256=(None if template_ref is None else template_ref.sha256),
         workflow_ref=ArtifactRef(
             uri=f"artifact://n8n-workflow/{workflow_digest}",

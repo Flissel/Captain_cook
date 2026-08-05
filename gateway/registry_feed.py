@@ -203,6 +203,55 @@ def factory_registry_mirror_event(
     )
 
 
+def integration_setup_registry_mirror_event(
+    acknowledgement: MinibookProjectionAcknowledgementV1,
+    submission: IntegrationSetupSubmissionV1,
+    job: dict[str, Any],
+) -> DeliveryEventEnvelope:
+    """Bind a Minibook acknowledgement to one exact setup projection."""
+
+    projection = integration_setup_projection(submission, job)
+    rendered = MinibookProjector.render(projection)
+    expected_post_id = "captain-projection-" + hashlib.sha256(
+        str(projection.event_id).encode("utf-8")
+    ).hexdigest()[:32]
+    expected = {
+        "projection_event_id": projection.event_id,
+        "correlation_id": projection.correlation_id,
+        "subject_id": projection.subject_id,
+        "subject_version": projection.subject_version,
+        "project_id": MinibookProjector.PROJECTION_PROJECT_ID,
+        "post_id": expected_post_id,
+        "content_sha256": rendered.content_hash,
+        "outcome": "mirrored",
+    }
+    if acknowledgement.model_dump(include=set(expected)) != expected:
+        raise ValueError("Minibook acknowledgement does not match integration setup")
+    return DeliveryEventEnvelope.model_validate(
+        {
+            "event_id": acknowledgement.acknowledgement_id,
+            "event_type": "registry_mirror",
+            "occurred_at": acknowledgement.acknowledged_at,
+            "actor": "captain-gateway",
+            "trace": {
+                "project_id": f"factory:{submission.job_id}",
+                "run_id": f"integration-setup:{submission.revision}",
+                "trace_id": f"minibook-projection:{projection.event_id}",
+                "artifact_id": acknowledgement.post_id,
+                "job_id": submission.job_id,
+                "correlation_id": projection.correlation_id,
+                "subject_version": projection.subject_version,
+            },
+            "payload": {
+                "event_type": "registry_mirror",
+                "capability_id": "integration_setup",
+                "capability_version": str(submission.revision),
+                "outcome": "mirrored",
+            },
+        }
+    )
+
+
 def _factory_subject_reference(job_id: str) -> str:
     """Keep valid v4 job IDs stable and canonicalize all other UUIDs."""
 

@@ -121,7 +121,10 @@ from gateway.contracts import (
     project_release,
 )
 from gateway.release_policy import ReleaseReadiness, evaluate_release_readiness
-from gateway.registry_feed import factory_registry_mirror_event
+from gateway.registry_feed import (
+    factory_registry_mirror_event,
+    integration_setup_registry_mirror_event,
+)
 from gateway.integration_setup_contracts import (
     IntegrationSetupMutationV1,
     IntegrationSetupSubmissionV1,
@@ -136,6 +139,7 @@ from agenten.agent_factory.integration_setup import (
     IntegrationConnectionV1,
     IntegrationCredentialRequirementV1,
     IntegrationSetupPlanner,
+    IntegrationSetupStatus,
     N8nCredentialMetadataV1,
 )
 from gateway.portal_contracts import (
@@ -149,6 +153,14 @@ from gateway.portal_contracts import (
     PortalTicketAction,
 )
 from gateway.portal_store import PortalTicketStore
+from gateway.portal_live_contracts import (
+    PortalProviderAuditQueryV1,
+    PortalProviderAuditV1,
+    PortalProviderProbeCompletionV1,
+    PortalProviderProbeRequestV1,
+    PortalProviderProbeStartedV1,
+    PortalProviderProbeWriteReceiptV1,
+)
 
 
 CAPTAIN_BLOCK_TYPES = frozenset({"problem", "work_batch", "holdout"})
@@ -465,6 +477,43 @@ class GatewayStore:
                             (job_id, revision),
                         CONSTRAINT fk_factory_integration_setup_block
                             FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS portal_provider_probe_starts (
+                        probe_request_id CHAR(36) NOT NULL PRIMARY KEY,
+                        run_id VARCHAR(128) NOT NULL,
+                        job_id CHAR(36) NOT NULL,
+                        correlation_id CHAR(36) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        INDEX idx_portal_probe_start_run
+                            (run_id, job_id, correlation_id, block_index),
+                        CONSTRAINT fk_portal_probe_start_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS portal_provider_probe_completions (
+                        probe_request_id CHAR(36) NOT NULL PRIMARY KEY,
+                        trace_id CHAR(36) NOT NULL UNIQUE,
+                        run_id VARCHAR(128) NOT NULL,
+                        job_id CHAR(36) NOT NULL,
+                        correlation_id CHAR(36) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        INDEX idx_portal_probe_completion_run
+                            (run_id, job_id, correlation_id, block_index),
+                        CONSTRAINT fk_portal_probe_completion_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE,
+                        CONSTRAINT fk_portal_probe_completion_start
+                            FOREIGN KEY (probe_request_id)
+                            REFERENCES portal_provider_probe_starts (probe_request_id)
+                            ON DELETE CASCADE
                     ) ENGINE=InnoDB
                     """
                 )
@@ -989,6 +1038,366 @@ class GatewayStore:
             ),
         )
         return self.portal_integration_setup(job_id, principal.organization_id)
+
+    def record_portal_provider_probe_start(
+        self,
+        request: PortalProviderProbeRequestV1,
+        *,
+        occurred_at: datetime,
+    ) -> PortalProviderProbeWriteReceiptV1:
+        started = PortalProviderProbeStartedV1(request=request, occurred_at=occurred_at)
+        canonical = started.model_dump(mode="json")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM portal_provider_probe_starts "
+                    "WHERE probe_request_id = %s FOR UPDATE",
+                    (str(request.probe_request_id),),
+                )
+                replay = cursor.fetchone()
+                if replay is not None:
+                    stored_start = PortalProviderProbeStartedV1.model_validate(
+                        self._decode_json(replay["payload"])
+                    )
+                    if stored_start.request != request:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="provider probe request already exists with different content",
+                        )
+                    return PortalProviderProbeWriteReceiptV1(
+                        probe_request_id=request.probe_request_id,
+                        status="started",
+                        replayed=True,
+                    )
+                cursor.execute(
+                    "SELECT payload, content_sha256 FROM factory_integration_setup_events "
+                    "WHERE job_id = %s ORDER BY revision DESC LIMIT 1 FOR UPDATE",
+                    (str(request.job_id),),
+                )
+                setup_row = cursor.fetchone()
+                if setup_row is None:
+                    raise HTTPException(status_code=409, detail="integration setup is unavailable")
+                setup = IntegrationSetupSubmissionV1.model_validate(
+                    self._decode_json(setup_row["payload"])
+                )
+                self._assert_provider_probe_matches_setup(
+                    request,
+                    setup=setup,
+                    content_sha256=str(setup_row["content_sha256"]),
+                )
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(request.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job is unavailable")
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="portal_provider_probe_started",
+                    data=canonical,
+                    status="started",
+                    parent_index=job_block["index"],
+                    metadata={"schema": "captain.portal-provider-probe-started.v1"},
+                )
+                self._insert(cursor, block)
+                cursor.execute(
+                    """INSERT INTO portal_provider_probe_starts
+                       (probe_request_id, run_id, job_id, correlation_id, block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (
+                        str(request.probe_request_id),
+                        request.run_id,
+                        str(request.job_id),
+                        str(request.correlation_id),
+                        index,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+        return PortalProviderProbeWriteReceiptV1(
+            probe_request_id=request.probe_request_id,
+            status="started",
+            replayed=False,
+        )
+
+    def record_portal_provider_probe_completion(
+        self,
+        completion: PortalProviderProbeCompletionV1,
+    ) -> PortalProviderProbeWriteReceiptV1:
+        canonical = completion.model_dump(mode="json")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM portal_provider_probe_completions "
+                    "WHERE probe_request_id = %s FOR UPDATE",
+                    (str(completion.probe_request_id),),
+                )
+                replay = cursor.fetchone()
+                if replay is not None:
+                    if self._decode_json(replay["payload"]) != canonical:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="provider probe completion already exists with different content",
+                        )
+                    return PortalProviderProbeWriteReceiptV1(
+                        probe_request_id=completion.probe_request_id,
+                        trace_id=completion.trace_id,
+                        status="passed",
+                        replayed=True,
+                    )
+                cursor.execute(
+                    "SELECT payload FROM portal_provider_probe_starts "
+                    "WHERE probe_request_id = %s FOR UPDATE",
+                    (str(completion.probe_request_id),),
+                )
+                start_row = cursor.fetchone()
+                if start_row is None:
+                    raise HTTPException(status_code=409, detail="provider probe start is unavailable")
+                started = PortalProviderProbeStartedV1.model_validate(
+                    self._decode_json(start_row["payload"])
+                )
+                self._assert_provider_probe_completion(started, completion)
+                cursor.execute(
+                    "SELECT probe_request_id FROM portal_provider_probe_completions "
+                    "WHERE trace_id = %s FOR UPDATE",
+                    (str(completion.trace_id),),
+                )
+                if cursor.fetchone() is not None:
+                    raise HTTPException(status_code=409, detail="provider trace already exists")
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(completion.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job is unavailable")
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="portal_provider_probe_completed",
+                    data=canonical,
+                    status="passed",
+                    parent_index=job_block["index"],
+                    metadata={"schema": "captain.portal-provider-probe-completion.v1"},
+                )
+                self._insert(cursor, block)
+                cursor.execute(
+                    """INSERT INTO portal_provider_probe_completions
+                       (probe_request_id, trace_id, run_id, job_id, correlation_id,
+                        block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        str(completion.probe_request_id),
+                        str(completion.trace_id),
+                        completion.run_id,
+                        str(completion.job_id),
+                        str(completion.correlation_id),
+                        index,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+        return PortalProviderProbeWriteReceiptV1(
+            probe_request_id=completion.probe_request_id,
+            trace_id=completion.trace_id,
+            status="passed",
+            replayed=False,
+        )
+
+    def portal_provider_audit(
+        self,
+        query: PortalProviderAuditQueryV1,
+        *,
+        observed_at: datetime,
+    ) -> PortalProviderAuditV1:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                values = (query.run_id, str(query.job_id), str(query.correlation_id))
+                cursor.execute(
+                    "SELECT COUNT(*) AS count FROM portal_provider_probe_starts "
+                    "WHERE run_id = %s AND job_id = %s AND correlation_id = %s",
+                    values,
+                )
+                invocation_count = int(cursor.fetchone()["count"])
+                cursor.execute(
+                    "SELECT trace_id FROM portal_provider_probe_completions "
+                    "WHERE run_id = %s AND job_id = %s AND correlation_id = %s "
+                    "ORDER BY block_index",
+                    values,
+                )
+                trace_ids = tuple(UUID(str(row["trace_id"])) for row in cursor.fetchall())
+        return PortalProviderAuditV1(
+            **query.model_dump(),
+            invocation_count=invocation_count,
+            completion_count=len(trace_ids),
+            trace_ids=trace_ids,
+            observed_at=observed_at,
+        )
+
+    def portal_provider_probe_completion(
+        self,
+        probe_request_id: UUID,
+    ) -> PortalProviderProbeCompletionV1 | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM portal_provider_probe_completions "
+                    "WHERE probe_request_id = %s",
+                    (str(probe_request_id),),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        return PortalProviderProbeCompletionV1.model_validate(
+            self._decode_json(row["payload"])
+        )
+
+    def run_portal_provider_probe(
+        self,
+        request: PortalProviderProbeRequestV1,
+        *,
+        now: datetime,
+    ) -> PortalProviderProbeCompletionV1:
+        if self._portal_verification_source is None:
+            raise HTTPException(status_code=503, detail="credential verification unavailable")
+        started = self.record_portal_provider_probe_start(request, occurred_at=now)
+        if started.replayed:
+            completed = self.portal_provider_probe_completion(request.probe_request_id)
+            if completed is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="provider probe already started without completion",
+                )
+            return completed
+
+        persisted = self.integration_setup(request.job_id)
+        target = next(
+            connection
+            for connection in persisted.submission.plan.connections
+            if connection.requirement.credential_alias == request.credential_alias
+        )
+        selected = target.selected_credential
+        assert selected is not None
+        probe_time = _after(now, now)
+        try:
+            returned = self._portal_verification_source.verify_credential(
+                requirement=target.requirement,
+                credential=selected,
+                job_id=request.job_id,
+                correlation_id=request.correlation_id,
+                expected_content_sha256=request.setup_content_sha256,
+                expected_revision=request.setup_revision,
+                expected_workflow_content_sha256=request.verification_template_sha256,
+                now=probe_time,
+            )
+            receipt = CredentialVerificationReceiptV1.model_validate(returned)
+            IntegrationConnectionV1.model_validate(
+                target.model_copy(update={"verification_receipt": receipt})
+            )
+        except Exception:
+            raise HTTPException(status_code=502, detail="credential verification failed") from None
+
+        template_ref = receipt.template_ref or receipt.workflow_ref
+        if receipt.verification_release is None:
+            raise HTTPException(status_code=502, detail="credential verification failed")
+        completion = PortalProviderProbeCompletionV1(
+            probe_request_id=request.probe_request_id,
+            trace_id=uuid5(
+                NAMESPACE_URL,
+                "|".join(
+                    (
+                        "captain-portal-provider-trace",
+                        str(request.probe_request_id),
+                        receipt.execution_ref.sha256,
+                    )
+                ),
+            ),
+            run_id=request.run_id,
+            job_id=request.job_id,
+            correlation_id=request.correlation_id,
+            integration_kind=request.integration_kind,
+            credential_alias=request.credential_alias,
+            credential_id=request.credential_id,
+            setup_revision=request.setup_revision,
+            setup_content_sha256=request.setup_content_sha256,
+            template_ref=template_ref,
+            template_release=receipt.verification_release,
+            deployed_workflow_ref=receipt.workflow_ref,
+            execution_ref=receipt.execution_ref,
+            consent_ref=receipt.oauth_consent_ref,
+            callback_ref=receipt.oauth_callback_ref,
+            status="passed",
+            occurred_at=receipt.occurred_at,
+        )
+        self.record_portal_provider_probe_completion(completion)
+        return completion
+
+    @staticmethod
+    def _assert_provider_probe_matches_setup(
+        request: PortalProviderProbeRequestV1,
+        *,
+        setup: IntegrationSetupSubmissionV1,
+        content_sha256: str,
+    ) -> None:
+        if (
+            setup.job_id != request.job_id
+            or setup.correlation_id != request.correlation_id
+            or setup.revision != request.setup_revision
+            or content_sha256 != request.setup_content_sha256
+        ):
+            raise HTTPException(status_code=409, detail="provider probe setup fence mismatch")
+        matches = tuple(
+            connection
+            for connection in setup.plan.connections
+            if connection.requirement.credential_alias == request.credential_alias
+        )
+        if len(matches) != 1:
+            raise HTTPException(status_code=409, detail="provider probe credential is unavailable")
+        connection = matches[0]
+        selected = connection.selected_credential
+        expected_kind = (
+            "bearer"
+            if connection.requirement.credential_type == "httpBearerAuth"
+            else "oauth2"
+            if connection.requirement.credential_type == "oAuth2Api"
+            else None
+        )
+        if (
+            connection.status is not IntegrationSetupStatus.READY
+            or selected is None
+            or selected.credential_id != request.credential_id
+            or expected_kind != request.integration_kind
+            or connection.requirement.verification_workflow_sha256
+            != request.verification_template_sha256
+        ):
+            raise HTTPException(status_code=409, detail="provider probe credential is unavailable")
+
+    @staticmethod
+    def _assert_provider_probe_completion(
+        started: PortalProviderProbeStartedV1,
+        completion: PortalProviderProbeCompletionV1,
+    ) -> None:
+        request = started.request
+        if (
+            completion.probe_request_id != request.probe_request_id
+            or completion.run_id != request.run_id
+            or completion.job_id != request.job_id
+            or completion.correlation_id != request.correlation_id
+            or completion.integration_kind != request.integration_kind
+            or completion.credential_alias != request.credential_alias
+            or completion.credential_id != request.credential_id
+            or completion.setup_revision != request.setup_revision
+            or completion.setup_content_sha256 != request.setup_content_sha256
+            or completion.template_ref.sha256 != request.verification_template_sha256
+            or completion.occurred_at <= started.occurred_at
+        ):
+            raise HTTPException(status_code=409, detail="provider probe completion fence mismatch")
 
     def _consume_portal_ticket(
         self,
@@ -3798,10 +4207,24 @@ class GatewayStore:
             acknowledgement.projection_event_id
         )
         if source is None:
-            raise HTTPException(
-                status_code=409,
-                detail="Factory promotion projection event is unavailable",
+            integration_source = self.integration_setup_source(
+                acknowledgement.projection_event_id
             )
+            if integration_source is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Minibook projection event is unavailable",
+                )
+            submission, integration_job = integration_source
+            try:
+                mirror = integration_setup_registry_mirror_event(
+                    acknowledgement,
+                    submission,
+                    integration_job,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return self.append_delivery_event(mirror)
         block, job = source
         benchmark_summary = None
         if job.get("schema") == "captain.agent-factory-job.v3":
@@ -3842,6 +4265,32 @@ class GatewayStore:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return self.append_delivery_event(mirror)
+
+    def integration_setup_source(
+        self,
+        projection_event_id: UUID,
+    ) -> tuple[IntegrationSetupSubmissionV1, dict[str, Any]] | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT event.payload AS event_payload, parent.data AS parent_data
+                       FROM factory_integration_setup_events AS event
+                       JOIN blocks AS event_block ON event_block.`index` = event.block_index
+                       JOIN blocks AS parent ON parent.`index` = event_block.parent_index
+                       WHERE event.event_id = %s
+                         AND parent.block_type = 'agent_factory_job'
+                       LIMIT 1""",
+                    (str(projection_event_id),),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        return (
+            IntegrationSetupSubmissionV1.model_validate(
+                self._decode_json(row["event_payload"])
+            ),
+            self._decode_json(row["parent_data"]),
+        )
 
     def factory_promotion_source(
         self,

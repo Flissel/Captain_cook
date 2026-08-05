@@ -245,6 +245,7 @@ class PortalN8nCredentialVerificationSource:
             requirement=requirement,
             credential=credential,
             template_ref=bound.template_ref,
+            template_release=release,
             workflow_artifact=bound.artifact,
             deployment=deployment,
             execution=execution,

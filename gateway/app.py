@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Callable, Literal, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response, status
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -66,6 +66,7 @@ from gateway.contracts import (
 )
 from gateway.mirror import MirrorQueue
 from gateway.portal_auth import initialize_portal_auth, require_portal_principal
+from gateway.portal_control_auth import PortalControlRole, require_provider_control
 from gateway.portal_contracts import (
     PortalPrincipalV1,
     PortalSetupActionRequestV1,
@@ -96,6 +97,12 @@ from gateway.integration_setup_contracts import (
     PersistedIntegrationSetupV1,
     IntegrationSetupSurfaceV1,
     build_integration_setup_surface,
+)
+from gateway.portal_live_contracts import (
+    PortalProviderAuditQueryV1,
+    PortalProviderAuditV1,
+    PortalProviderProbeCompletionV1,
+    PortalProviderProbeRequestV1,
 )
 
 
@@ -265,6 +272,7 @@ def create_app(
         else None
     )
     portal_clock = portal_clock or (lambda: datetime.now(timezone.utc))
+    portal_control_boot_id = str(uuid4())
     sink_calls: list[dict[str, Any]] = []
 
     @asynccontextmanager
@@ -350,6 +358,38 @@ def create_app(
                 detail="gateway unavailable",
             ) from None
         return {"status": "ok", "database": "ready"}
+
+    @app.get("/v1/control/provider/health")
+    async def provider_control_health(
+        _: PortalControlRole = Depends(require_provider_control),
+    ) -> dict[str, str]:
+        return {
+            "status": "ok",
+            "service_version": "captain.portal-provider-control.v1",
+            "boot_id": portal_control_boot_id,
+        }
+
+    @app.post("/v1/control/provider/probes")
+    async def run_provider_control_probe(
+        request: PortalProviderProbeRequestV1,
+        _: PortalControlRole = Depends(require_provider_control),
+    ) -> PortalProviderProbeCompletionV1:
+        return await run_in_threadpool(
+            get_store().run_portal_provider_probe,
+            request,
+            now=portal_clock(),
+        )
+
+    @app.post("/v1/control/provider/audit")
+    async def query_provider_control_audit(
+        request: PortalProviderAuditQueryV1,
+        _: PortalControlRole = Depends(require_provider_control),
+    ) -> PortalProviderAuditV1:
+        return await run_in_threadpool(
+            get_store().portal_provider_audit,
+            request,
+            observed_at=portal_clock(),
+        )
 
     @app.get("/batches")
     async def list_batches(

@@ -40,6 +40,9 @@ class GatewaySettings(BaseModel):
     portal_supabase_audience: str | None = None
     portal_supabase_jwks_url: str | None = None
     portal_organization_claim: str = "organization_id"
+    portal_provider_control_token: SecretStr | None = None
+    portal_evidence_token: SecretStr | None = None
+    portal_restart_control_token: SecretStr | None = None
 
     @field_validator(
         "ledger_dsn",
@@ -117,6 +120,25 @@ class GatewaySettings(BaseModel):
             value is not None for value in portal_settings
         ):
             raise ValueError("portal identity settings must be configured together")
+        control_tokens = (
+            self.portal_provider_control_token,
+            self.portal_evidence_token,
+            self.portal_restart_control_token,
+        )
+        if any(value is not None for value in control_tokens) and not all(
+            value is not None for value in control_tokens
+        ):
+            raise ValueError("portal control tokens must be configured together")
+        if all(value is not None for value in control_tokens):
+            values = (
+                self.captain_gateway_token.get_secret_value(),
+                self.worker_gateway_token.get_secret_value(),
+                *(value.get_secret_value() for value in control_tokens if value is not None),
+            )
+            if any(not value.strip() for value in values[2:]):
+                raise ValueError("portal control tokens must not be blank")
+            if len(values) != len(set(values)):
+                raise ValueError("portal control tokens must be distinct")
         return self
 
     @property
@@ -127,6 +149,17 @@ class GatewaySettings(BaseModel):
                 self.portal_supabase_issuer,
                 self.portal_supabase_audience,
                 self.portal_supabase_jwks_url,
+            )
+        )
+
+    @property
+    def portal_control_configured(self) -> bool:
+        return all(
+            value is not None
+            for value in (
+                self.portal_provider_control_token,
+                self.portal_evidence_token,
+                self.portal_restart_control_token,
             )
         )
 
@@ -191,6 +224,21 @@ class GatewaySettings(BaseModel):
                 portal_organization_claim=source.get(
                     "PORTAL_ORGANIZATION_CLAIM",
                     "organization_id",
+                ),
+                portal_provider_control_token=(
+                    SecretStr(source["PORTAL_PROVIDER_CONTROL_TOKEN"])
+                    if source.get("PORTAL_PROVIDER_CONTROL_TOKEN") is not None
+                    else None
+                ),
+                portal_evidence_token=(
+                    SecretStr(source["PORTAL_EVIDENCE_TOKEN"])
+                    if source.get("PORTAL_EVIDENCE_TOKEN") is not None
+                    else None
+                ),
+                portal_restart_control_token=(
+                    SecretStr(source["PORTAL_RESTART_CONTROL_TOKEN"])
+                    if source.get("PORTAL_RESTART_CONTROL_TOKEN") is not None
+                    else None
                 ),
             )
         except ValidationError:

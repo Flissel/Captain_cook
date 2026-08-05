@@ -444,6 +444,14 @@ class MinibookProjector:
                 fields.append(
                     ("Benchmark reasons", ", ".join(payload.benchmark_reason_codes))
                 )
+        if payload.integration_status is not None:
+            fields.extend(
+                (
+                    ("Integration status", payload.integration_status),
+                    ("Required integrations", str(payload.required_integration_count)),
+                    ("Ready integrations", str(payload.ready_integration_count)),
+                )
+            )
         content = "\n".join(f"- **{label}:** {value}" for label, value in fields)
         title = f"[{event.event_type}] {cls._template_title(payload.template_id)}"
         identity_tags = (
@@ -474,6 +482,7 @@ class MinibookProjector:
             "runtime_validation_recorded": "Runtime validation recorded",
             "runtime_replanning_requested": "Runtime replanning requested",
             "factory_capability_ready_to_use": "Factory capability ready to use",
+            "integration_setup_status": "Integration setup status",
         }[template_id]
 
     @staticmethod

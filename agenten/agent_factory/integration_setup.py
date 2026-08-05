@@ -13,6 +13,7 @@ from agenten.agent_factory.input_contracts import (
     RequestedIntegration,
 )
 from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN
+from agenten.agent_factory.gitea_template_contracts import GiteaTemplateReleaseV1
 
 
 _CREDENTIAL_ID_PATTERN = r"^\S{1,256}$"
@@ -91,6 +92,7 @@ class CredentialVerificationReceiptV1(_FrozenContract):
     status: Literal["passed", "failed"]
     occurred_at: datetime
     template_ref: ArtifactRef | None = None
+    verification_release: GiteaTemplateReleaseV1 | None = None
     template_content_sha256: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
@@ -98,6 +100,8 @@ class CredentialVerificationReceiptV1(_FrozenContract):
     workflow_ref: ArtifactRef
     workflow_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     execution_ref: ArtifactRef
+    oauth_consent_ref: ArtifactRef | None = None
+    oauth_callback_ref: ArtifactRef | None = None
     valid_until: datetime | None = None
 
     @field_validator("credential_alias")
@@ -126,6 +130,16 @@ class CredentialVerificationReceiptV1(_FrozenContract):
             and self.template_content_sha256 != self.template_ref.sha256
         ):
             raise ValueError("verification receipt template digest mismatch")
+        if self.verification_release is not None:
+            release_digest = (
+                self.template_ref.sha256
+                if self.template_ref is not None
+                else self.workflow_ref.sha256
+            )
+            if self.verification_release.sha256 != release_digest:
+                raise ValueError("verification receipt Gitea release digest mismatch")
+        if (self.oauth_consent_ref is None) != (self.oauth_callback_ref is None):
+            raise ValueError("OAuth verification evidence is incomplete")
         if self.valid_until is not None and self.valid_until <= self.occurred_at:
             raise ValueError("verification receipt validity must end after verification")
         return self
