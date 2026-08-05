@@ -1,8 +1,24 @@
 services:
+  captain-wireguard:
+    image: lscr.io/linuxserver/wireguard:latest
+    profiles: ["captain"]
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    volumes:
+      - type: bind
+        source: ./.secrets/captain/wireguard/captain.conf
+        target: /config/wg_confs/wg0.conf
+        read_only: true
+
   captain-portal-link:
     image: nginx:1.27-alpine
     profiles: ["captain"]
     network_mode: host
+    depends_on:
+      captain-wireguard:
+        condition: service_started
     read_only: true
     tmpfs:
       - /var/cache/nginx
@@ -25,10 +41,26 @@ services:
         target: /run/portal-link/mini-pc-client-ca.crt
         read_only: true
 
+  mini-pc-wireguard:
+    image: lscr.io/linuxserver/wireguard:latest
+    profiles: ["mini-pc"]
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    volumes:
+      - type: bind
+        source: ./.secrets/mini-pc/wireguard/mini-pc.conf
+        target: /config/wg_confs/wg0.conf
+        read_only: true
+
   mini-pc-portal-link:
     image: nginx:1.27-alpine
     profiles: ["mini-pc"]
     network_mode: host
+    depends_on:
+      mini-pc-wireguard:
+        condition: service_started
     read_only: true
     tmpfs:
       - /var/cache/nginx

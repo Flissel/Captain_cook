@@ -32,19 +32,46 @@ def test_compose_uses_ignored_read_only_secret_mounts_and_separate_roles() -> No
     gitignore = Path("deploy/portal-link/.gitignore").read_text(encoding="utf-8")
 
     assert ".secrets/" in gitignore
-    assert "source: ./.secrets/captain/captain-server.crt" in compose
-    assert "source: ./.secrets/captain/captain-server.key" in compose
-    assert "source: ./.secrets/captain/mini-pc-client-ca.crt" in compose
-    assert "source: ./.secrets/mini-pc/mini-pc-client.crt" in compose
-    assert "source: ./.secrets/mini-pc/mini-pc-client.key" in compose
-    assert "source: ./.secrets/mini-pc/captain-server-ca.crt" in compose
-    assert compose.count("read_only: true") == 10
+    assert "wireguard/*.conf" in gitignore
+    for source in (
+        "./.secrets/captain/captain-server.crt",
+        "./.secrets/captain/captain-server.key",
+        "./.secrets/captain/mini-pc-client-ca.crt",
+        "./.secrets/captain/wireguard/captain.conf",
+        "./.secrets/mini-pc/captain-server-ca.crt",
+        "./.secrets/mini-pc/mini-pc-client.crt",
+        "./.secrets/mini-pc/mini-pc-client.key",
+        "./.secrets/mini-pc/wireguard/mini-pc.conf",
+    ):
+        assert f"source: {source}\n        target:" in compose
+        start = compose.index(f"source: {source}")
+        end = compose.find("      - type: bind", start + 1)
+        mount = compose[start:] if end == -1 else compose[start:end]
+        assert "read_only: true" in mount
     assert 'profiles: ["captain"]' in compose
     assert 'profiles: ["mini-pc"]' in compose
 
 
-def test_captain_proxy_binds_only_the_private_loopback_endpoint() -> None:
+def test_captain_proxy_binds_only_the_wireguard_endpoint() -> None:
     config = Path("deploy/portal-link/captain-proxy.conf").read_text(encoding="utf-8")
 
-    assert "listen 127.0.0.1:443 ssl;" in config
+    assert "listen 10.77.0.1:443 ssl;" in config
+    assert "listen 127.0.0.1:443 ssl;" not in config
     assert "listen 443 ssl;" not in config
+
+
+def test_wireguard_examples_define_the_fixed_private_peers_without_keys() -> None:
+    captain = Path("deploy/portal-link/wireguard/captain.conf.example").read_text(
+        encoding="utf-8"
+    )
+    mini_pc = Path("deploy/portal-link/wireguard/mini-pc.conf.example").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Address = 10.77.0.1/30" in captain
+    assert "ListenPort = 51820" in captain
+    assert "AllowedIPs = 10.77.0.2/32" in captain
+    assert "Address = 10.77.0.2/30" in mini_pc
+    assert "AllowedIPs = 10.77.0.1/32" in mini_pc
+    assert "CAPTAIN_WIREGUARD_PRIVATE_KEY_FROM_LOCAL_SECRET" in captain
+    assert "MINI_PC_WIREGUARD_PRIVATE_KEY_FROM_LOCAL_SECRET" in mini_pc

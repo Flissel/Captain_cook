@@ -1,0 +1,11 @@
+# Copy this file to .secrets/captain/wireguard/captain.conf and replace only
+# the local-secret placeholders. Never commit the copied file or any key.
+[Interface]
+Address = 10.77.0.1/30
+ListenPort = 51820
+PrivateKey = <CAPTAIN_WIREGUARD_PRIVATE_KEY_FROM_LOCAL_SECRET>
+
+[Peer]
+# Mini-PC portal link peer
+PublicKey = <MINI_PC_WIREGUARD_PUBLIC_KEY_FROM_LOCAL_SECRET>
+AllowedIPs = 10.77.0.2/32
