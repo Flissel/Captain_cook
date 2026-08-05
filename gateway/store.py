@@ -6,10 +6,11 @@ import hashlib
 import json
 import secrets
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Callable, Protocol, TypeVar
+from typing import Any, Callable, Iterator, Protocol, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import HTTPException
@@ -195,6 +196,7 @@ class PortalCredentialVerificationSource(Protocol):
         correlation_id: UUID,
         expected_content_sha256: str,
         expected_revision: int,
+        expected_workflow_content_sha256: str,
         now: datetime,
     ) -> CredentialVerificationReceiptV1: ...
 
@@ -462,7 +464,33 @@ class GatewayStore:
                     """
                 )
 
+    @contextmanager
+    def _integration_setup_lock(self, job_id: UUID) -> Iterator[None]:
+        lock_name = f"captain:integration-setup:{job_id}"
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT GET_LOCK(%s, 30) AS acquired", (lock_name,))
+                row = cursor.fetchone()
+                if row is None or int(row["acquired"] or 0) != 1:
+                    raise HTTPException(status_code=409, detail="integration setup is busy")
+                try:
+                    yield
+                finally:
+                    cursor.execute("SELECT RELEASE_LOCK(%s) AS released", (lock_name,))
+
     def record_integration_setup(
+        self,
+        submission: IntegrationSetupSubmissionV1,
+        *,
+        controlled_mutation: bool = False,
+    ) -> IntegrationSetupWriteReceiptV1:
+        with self._integration_setup_lock(submission.job_id):
+            return self._record_integration_setup_locked(
+                submission,
+                controlled_mutation=controlled_mutation,
+            )
+
+    def _record_integration_setup_locked(
         self,
         submission: IntegrationSetupSubmissionV1,
         *,
@@ -594,6 +622,14 @@ class GatewayStore:
         job_id: UUID,
         mutation: IntegrationSetupMutationV1,
     ) -> IntegrationSetupWriteReceiptV1:
+        with self._integration_setup_lock(job_id):
+            return self._mutate_integration_setup_locked(job_id, mutation)
+
+    def _mutate_integration_setup_locked(
+        self,
+        job_id: UUID,
+        mutation: IntegrationSetupMutationV1,
+    ) -> IntegrationSetupWriteReceiptV1:
         replay = self._integration_setup_mutation_replay(job_id, mutation)
         if replay is not None:
             return replay
@@ -607,7 +643,7 @@ class GatewayStore:
                 status_code=409,
                 detail="integration setup mutation is not allowed",
             ) from None
-        return self.record_integration_setup(
+        return self._record_integration_setup_locked(
             submission,
             controlled_mutation=True,
         )
@@ -755,7 +791,23 @@ class GatewayStore:
         request: PortalSetupTicketUseV1,
         now: datetime,
     ) -> PersistedIntegrationSetupV1:
-        self._consume_portal_ticket(
+        with self._integration_setup_lock(job_id):
+            return self._portal_discover_locked(
+                job_id=job_id,
+                principal=principal,
+                request=request,
+                now=now,
+            )
+
+    def _portal_discover_locked(
+        self,
+        *,
+        job_id: UUID,
+        principal: PortalPrincipalV1,
+        request: PortalSetupTicketUseV1,
+        now: datetime,
+    ) -> PersistedIntegrationSetupV1:
+        persisted, target_index = self._consume_portal_ticket(
             job_id=job_id,
             principal=principal,
             request=request,
@@ -764,9 +816,6 @@ class GatewayStore:
         )
         if self._portal_credential_source is None:
             raise HTTPException(status_code=503, detail="credential discovery unavailable")
-        persisted, target_index = self._portal_target(
-            job_id, principal.organization_id, request.credential_alias
-        )
         target = persisted.submission.plan.connections[target_index]
         credentials = self._portal_credential_source.list_credentials(target.requirement)
         replacement = self._resolve_portal_connection(
@@ -786,15 +835,28 @@ class GatewayStore:
         request: PortalSetupSelectionRequestV1,
         now: datetime,
     ) -> PersistedIntegrationSetupV1:
-        self._consume_portal_ticket(
+        with self._integration_setup_lock(job_id):
+            return self._portal_select_locked(
+                job_id=job_id,
+                principal=principal,
+                request=request,
+                now=now,
+            )
+
+    def _portal_select_locked(
+        self,
+        *,
+        job_id: UUID,
+        principal: PortalPrincipalV1,
+        request: PortalSetupSelectionRequestV1,
+        now: datetime,
+    ) -> PersistedIntegrationSetupV1:
+        persisted, target_index = self._consume_portal_ticket(
             job_id=job_id,
             principal=principal,
             request=request,
             action="select",
             now=now,
-        )
-        persisted, target_index = self._portal_target(
-            job_id, principal.organization_id, request.credential_alias
         )
         target = persisted.submission.plan.connections[target_index]
         try:
@@ -817,7 +879,23 @@ class GatewayStore:
         request: PortalSetupTicketUseV1,
         now: datetime,
     ) -> PersistedIntegrationSetupV1:
-        self._consume_portal_ticket(
+        with self._integration_setup_lock(job_id):
+            return self._portal_verify_locked(
+                job_id=job_id,
+                principal=principal,
+                request=request,
+                now=now,
+            )
+
+    def _portal_verify_locked(
+        self,
+        *,
+        job_id: UUID,
+        principal: PortalPrincipalV1,
+        request: PortalSetupTicketUseV1,
+        now: datetime,
+    ) -> PersistedIntegrationSetupV1:
+        persisted, target_index = self._consume_portal_ticket(
             job_id=job_id,
             principal=principal,
             request=request,
@@ -826,12 +904,12 @@ class GatewayStore:
         )
         if self._portal_verification_source is None:
             raise HTTPException(status_code=503, detail="credential verification unavailable")
-        persisted, target_index = self._portal_target(
-            job_id, principal.organization_id, request.credential_alias
-        )
         target = persisted.submission.plan.connections[target_index]
         selected = target.selected_credential
         if selected is None:
+            raise HTTPException(status_code=409, detail="credential verification is not allowed")
+        expected_workflow_sha256 = target.requirement.verification_workflow_sha256
+        if expected_workflow_sha256 is None:
             raise HTTPException(status_code=409, detail="credential verification is not allowed")
         try:
             returned = self._portal_verification_source.verify_credential(
@@ -840,9 +918,12 @@ class GatewayStore:
                 correlation_id=persisted.submission.correlation_id,
                 expected_content_sha256=persisted.content_sha256,
                 expected_revision=persisted.submission.revision,
+                expected_workflow_content_sha256=expected_workflow_sha256,
                 now=now.astimezone(timezone.utc),
             )
             receipt = CredentialVerificationReceiptV1.model_validate(returned)
+            if receipt.workflow_content_sha256 != expected_workflow_sha256:
+                raise ValueError("verification workflow digest mismatch")
             replacement = self._resolve_portal_connection(
                 target.requirement,
                 credentials=target.candidate_credentials,
@@ -862,16 +943,31 @@ class GatewayStore:
         request: PortalSetupActionRequestV1,
         now: datetime,
     ) -> PersistedIntegrationSetupV1:
-        self._consume_portal_ticket(
+        with self._integration_setup_lock(job_id):
+            return self._portal_mutate_locked(
+                job_id=job_id,
+                principal=principal,
+                request=request,
+                now=now,
+            )
+
+    def _portal_mutate_locked(
+        self,
+        *,
+        job_id: UUID,
+        principal: PortalPrincipalV1,
+        request: PortalSetupActionRequestV1,
+        now: datetime,
+    ) -> PersistedIntegrationSetupV1:
+        persisted, _ = self._consume_portal_ticket(
             job_id=job_id,
             principal=principal,
             request=request,
             action=request.action,
             now=now,
         )
-        persisted = self.portal_integration_setup(job_id, principal.organization_id)
         occurred_at = _after(now, persisted.submission.occurred_at)
-        self.mutate_integration_setup(
+        self._mutate_integration_setup_locked(
             job_id,
             IntegrationSetupMutationV1(
                 event_id=uuid4(),
@@ -891,7 +987,9 @@ class GatewayStore:
         request: PortalSetupTicketUseV1 | PortalSetupActionRequestV1,
         action: PortalTicketAction,
         now: datetime,
-    ) -> None:
+    ) -> tuple[PersistedIntegrationSetupV1, int]:
+        persisted = self.integration_setup(job_id)
+        target_index = self._portal_target_index(persisted, request.credential_alias)
         try:
             self._portal_tickets.consume(
                 job_id=job_id,
@@ -904,6 +1002,7 @@ class GatewayStore:
             )
         except PermissionError:
             raise HTTPException(status_code=403, detail="invalid portal setup ticket") from None
+        return persisted, target_index
 
     def _portal_target(
         self,
@@ -945,6 +1044,9 @@ class GatewayStore:
             requirement_project_id=target.requirement.project_id,
             selected_credential_id=(
                 None if target.selected_credential is None else target.selected_credential.credential_id
+            ),
+            expected_verification_workflow_sha256=(
+                target.requirement.verification_workflow_sha256
             ),
             verification_workflow_sha256=(
                 None if receipt is None else receipt.workflow_content_sha256
@@ -1008,7 +1110,7 @@ class GatewayStore:
             change_kind="observed",
             plan=current.plan.model_copy(update={"connections": connections}),
         )
-        self.record_integration_setup(submission)
+        self._record_integration_setup_locked(submission)
         return self.integration_setup(current.job_id)
 
     def append_delivery_event(

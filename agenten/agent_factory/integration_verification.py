@@ -40,6 +40,12 @@ def seal_provider_verification(
     if deployment.artifact_digest != workflow_artifact.artifact_digest:
         raise ValueError("workflow deployment does not match sealed artifact")
     if (
+        requirement.verification_workflow_sha256 is None
+        or workflow_artifact.artifact_digest
+        != requirement.verification_workflow_sha256
+    ):
+        raise ValueError("workflow does not match Captain verification workflow release")
+    if (
         execution.workflow_id != deployment.workflow_id
         or execution.artifact_digest != deployment.artifact_digest
         or execution.correlation_id != expected_correlation_id

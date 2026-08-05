@@ -48,6 +48,10 @@ class IntegrationCredentialRequirementV1(_FrozenContract):
     setup_method: Literal["n8n_ui"]
     setup_label: str = Field(min_length=1, max_length=128)
     project_id: str | None = Field(default=None, pattern=_CREDENTIAL_ID_PATTERN)
+    verification_workflow_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
     @field_validator("credential_alias")
     @classmethod
@@ -151,6 +155,14 @@ class IntegrationConnectionV1(_FrozenContract):
             ):
                 raise ValueError("expired connection requires an expiring passed receipt")
         if receipt is not None and selected is not None:
+            expected_workflow = self.requirement.verification_workflow_sha256
+            if (
+                expected_workflow is None
+                or receipt.workflow_content_sha256 != expected_workflow
+            ):
+                raise ValueError(
+                    "verification receipt does not match Captain verification workflow"
+                )
             if (
                 receipt.integration_key != self.requirement.integration_key
                 or receipt.credential_alias != self.requirement.credential_alias

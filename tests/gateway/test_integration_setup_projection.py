@@ -31,6 +31,7 @@ def test_integration_setup_projection_exposes_only_aggregate_readiness() -> None
                             "setup_method": "n8n_ui",
                             "setup_label": "Connect CRM",
                             "project_id": None,
+                            "verification_workflow_sha256": "d" * 64,
                         },
                         "status": "missing",
                         "candidate_credentials": [],

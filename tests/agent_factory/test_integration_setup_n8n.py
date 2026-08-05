@@ -33,6 +33,7 @@ def requirement() -> IntegrationCredentialRequirementV1:
         setup_method="n8n_ui",
         setup_label="Bearer Auth",
         project_id="captain-production",
+        verification_workflow_sha256="a" * 64,
     )
 
 

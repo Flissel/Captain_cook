@@ -119,6 +119,7 @@ async def test_integration_bound_tool_requires_verified_connection() -> None:
         required=True,
         setup_method="n8n_ui",
         setup_label="Bearer Auth",
+        verification_workflow_sha256="a" * 64,
     )
     metadata = N8nCredentialMetadataV1(
         credential_id="cred-prod",

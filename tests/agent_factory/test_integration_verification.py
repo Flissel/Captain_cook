@@ -29,6 +29,7 @@ def requirement() -> IntegrationCredentialRequirementV1:
         setup_method="n8n_ui",
         setup_label="Bearer Auth",
         project_id="captain-production",
+        verification_workflow_sha256="a" * 64,
     )
 
 
@@ -126,6 +127,18 @@ def test_foreign_project_or_workflow_digest_cannot_be_sealed() -> None:
             workflow_artifact=artifact(),
             deployment=deployment(),
             execution=evidence(),
+            expected_correlation_id=CORRELATION_ID,
+            occurred_at=NOW,
+        )
+
+    foreign_artifact = artifact().model_copy(update={"artifact_digest": "b" * 64})
+    with pytest.raises(ValueError, match="Captain verification workflow"):
+        seal_provider_verification(
+            requirement=requirement(),
+            credential=credential(),
+            workflow_artifact=foreign_artifact,
+            deployment=deployment().model_copy(update={"artifact_digest": "b" * 64}),
+            execution=evidence().model_copy(update={"artifact_digest": "b" * 64}),
             expected_correlation_id=CORRELATION_ID,
             occurred_at=NOW,
         )

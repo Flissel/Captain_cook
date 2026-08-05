@@ -72,6 +72,7 @@ class PortalTicketStore:
                     ("credential_type", "VARCHAR(128) NULL"),
                     ("requirement_project_id", "VARCHAR(256) NULL"),
                     ("selected_credential_id", "VARCHAR(256) NULL"),
+                    ("expected_verification_workflow_sha256", "CHAR(64) NULL"),
                     ("verification_workflow_sha256", "CHAR(64) NULL"),
                 ):
                     cursor.execute(
@@ -157,10 +158,11 @@ class PortalTicketStore:
                        (ticket_id, token_sha256, job_id, organization_id, subject_id,
                         credential_alias, action, setup_revision, setup_content_sha256,
                         correlation_id, credential_type, requirement_project_id,
-                        selected_credential_id, verification_workflow_sha256,
+                        selected_credential_id, expected_verification_workflow_sha256,
+                        verification_workflow_sha256,
                         expires_at, used_at)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                               %s, %s, %s, %s, NULL)""",
+                               %s, %s, %s, %s, %s, NULL)""",
                     (
                         str(ticket_id),
                         token_sha256,
@@ -175,6 +177,7 @@ class PortalTicketStore:
                         current_fence.credential_type,
                         current_fence.requirement_project_id,
                         current_fence.selected_credential_id,
+                        current_fence.expected_verification_workflow_sha256,
                         current_fence.verification_workflow_sha256,
                         expires_at.replace(tzinfo=None),
                     ),
@@ -210,6 +213,7 @@ class PortalTicketStore:
                               credential_alias, action, setup_revision,
                               setup_content_sha256, correlation_id, credential_type,
                               requirement_project_id, selected_credential_id,
+                              expected_verification_workflow_sha256,
                               verification_workflow_sha256, expires_at, used_at
                        FROM portal_setup_tickets
                        WHERE ticket_id = %s FOR UPDATE""",
@@ -265,6 +269,9 @@ def _row_fence(row: dict[str, object]) -> PortalTicketFenceV1 | None:
             credential_type=row["credential_type"],
             requirement_project_id=row["requirement_project_id"],
             selected_credential_id=row["selected_credential_id"],
+            expected_verification_workflow_sha256=row[
+                "expected_verification_workflow_sha256"
+            ],
             verification_workflow_sha256=row["verification_workflow_sha256"],
         )
     except (KeyError, ValueError):
@@ -321,6 +328,9 @@ def _current_fence(
             requirement_project_id=requirement.get("project_id"),
             selected_credential_id=(
                 None if selected is None else selected["credential_id"]
+            ),
+            expected_verification_workflow_sha256=requirement.get(
+                "verification_workflow_sha256"
             ),
             verification_workflow_sha256=(
                 None if receipt is None else receipt["workflow_content_sha256"]

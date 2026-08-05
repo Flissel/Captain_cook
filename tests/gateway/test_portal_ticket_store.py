@@ -32,6 +32,7 @@ def fence(*, revision: int = 1, selected: str | None = None) -> PortalTicketFenc
         credential_type="hubspotApi",
         requirement_project_id=None,
         selected_credential_id=selected,
+        expected_verification_workflow_sha256="d" * 64,
         verification_workflow_sha256=None,
     )
 
@@ -276,6 +277,7 @@ def test_every_ticket_action_fails_closed_when_setup_fence_changes(
         ("credential_type", "oauth2Api"),
         ("requirement_project_id", "project-2"),
         ("selected_credential_id", "credential-2"),
+        ("expected_verification_workflow_sha256", "e" * 64),
         ("verification_workflow_sha256", "d" * 64),
     ],
 )

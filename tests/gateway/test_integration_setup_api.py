@@ -100,6 +100,7 @@ def setup_payload(
                         "setup_method": "n8n_ui",
                         "setup_label": "Connect HubSpot in n8n",
                         "project_id": None,
+                        "verification_workflow_sha256": "d" * 64,
                     },
                     "status": "missing",
                     "candidate_credentials": [],

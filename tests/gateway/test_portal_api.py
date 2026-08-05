@@ -2,16 +2,24 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from threading import Event
 from typing import Any
 from uuid import UUID
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from gateway.app import create_app
 from gateway.portal_auth import PortalTokenVerifier
-from gateway.portal_contracts import PortalPrincipalV1, PortalSetupTicketV1
+from gateway.portal_contracts import (
+    PortalPrincipalV1,
+    PortalSetupTicketUseV1,
+    PortalSetupTicketV1,
+    PortalTenantBindingV1,
+)
 from gateway.settings import GatewaySettings
 from tests.gateway.test_integration_setup_api import ready_setup_payload, setup_payload
 from tests.agent_factory.test_state_machine import job
@@ -27,6 +35,7 @@ from agenten.agent_factory.integration_setup import (
     N8nCredentialMetadataV1,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
+from gateway.store import GatewayStore
 
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
@@ -66,8 +75,9 @@ class StaticCredentialSource:
 
 
 class RecordingVerificationSource:
-    def __init__(self) -> None:
+    def __init__(self, workflow_digest: str = "d" * 64) -> None:
         self.calls: list[dict[str, object]] = []
+        self.workflow_digest = workflow_digest
 
     def verify_credential(self, **kwargs):
         self.calls.append(kwargs)
@@ -76,7 +86,7 @@ class RecordingVerificationSource:
         now = kwargs["now"]
         workflow = ArtifactRef(
             uri="artifact://portal-verification/workflow",
-            sha256="d" * 64,
+            sha256=self.workflow_digest,
             media_type="application/json",
         )
         return CredentialVerificationReceiptV1(
@@ -105,6 +115,19 @@ class InvalidVerificationSource:
         del kwargs
         self.calls += 1
         return {"provider_diagnostic": "private-provider-secret"}
+
+
+class BlockingVerificationSource(RecordingVerificationSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = Event()
+        self.release = Event()
+
+    def verify_credential(self, **kwargs):
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise RuntimeError("test verification barrier timed out")
+        return super().verify_credential(**kwargs)
 
 
 class FakePortalGatewayStore:
@@ -572,6 +595,7 @@ def test_real_gateway_portal_flow_is_tenant_scoped_and_digest_fenced() -> None:
         call = verification_source.calls[0]
         assert call["expected_revision"] == 3
         assert call["expected_content_sha256"] == selected.json()["content_sha256"]
+        assert call["expected_workflow_content_sha256"] == "d" * 64
         assert revoked.status_code == 200
         assert revoked.json()["overall_status"] == "revoked"
         assert revoked_replay.status_code == 403
@@ -695,6 +719,32 @@ def test_real_gateway_rotation_ticket_is_action_bound_and_single_use() -> None:
                     "credential_alias": "CRM_API_KEY",
                 },
             )
+        mismatched_source = RecordingVerificationSource("f" * 64)
+        mismatched_application = create_app(
+            storage=storage,
+            mirror=NullMirror(),
+            settings=configured,
+            portal_verification_source=mismatched_source,
+            portal_clock=lambda: NOW,
+        )
+        mismatched_application.state.portal_token_verifier = StaticVerifier(
+            PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+        )
+        with TestClient(mismatched_application) as mismatched_client:
+            mismatch_ticket = mismatched_client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/tickets",
+                headers=auth(),
+                json={"credential_alias": "CRM_API_KEY", "action": "verify"},
+            ).json()
+            mismatched = mismatched_client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/verify",
+                headers=auth(),
+                json={
+                    "ticket_id": mismatch_ticket["ticket_id"],
+                    "ticket": mismatch_ticket["ticket"],
+                    "credential_alias": "CRM_API_KEY",
+                },
+            )
 
         assert rotated.status_code == 200
         assert rotated.json()["overall_status"] == "verification_required"
@@ -705,7 +755,148 @@ def test_real_gateway_rotation_ticket_is_action_bound_and_single_use() -> None:
         assert invalid.json() == {"detail": "credential verification failed"}
         assert "private-provider-secret" not in invalid.text
         assert invalid_source.calls == 1
+        assert mismatched.status_code == 502
+        assert mismatched.json() == {"detail": "credential verification failed"}
+        assert len(mismatched_source.calls) == 1
     finally:
+        with storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM portal_setup_tickets")
+                cursor.execute("DELETE FROM portal_setup_bindings")
+        storage.clear()
+
+
+@pytest.mark.skipif(not TEST_DSN, reason="TEST_MARIADB_DSN is not configured")
+def test_portal_verification_serializes_concurrent_setup_revision_until_persisted() -> None:
+    assert TEST_DSN is not None
+    assert_isolated_test_database(TEST_DSN)
+    storage = MariaDBStorage(TEST_DSN)
+    from gateway.portal_store import PortalTicketStore
+
+    PortalTicketStore(storage)
+    with storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM portal_setup_tickets")
+            cursor.execute("DELETE FROM portal_setup_bindings")
+    storage.clear()
+    source = BlockingVerificationSource()
+    store = GatewayStore(storage, portal_verification_source=source)
+    principal = PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+    factory_job = job().model_copy(update={"job_id": JOB_ID})
+    payload = setup_payload(factory_job)
+    metadata = {
+        "schema": "captain.n8n-credential-metadata.v1",
+        "credential_id": "credential-1",
+        "credential_name": "HubSpot One",
+        "credential_type": "hubspotApi",
+        "project_id": None,
+        "project_name": None,
+    }
+    connection = payload["plan"]["connections"][0]
+    connection.update(
+        {
+            "status": "verification_required",
+            "candidate_credentials": [metadata],
+            "selected_credential": metadata,
+        }
+    )
+
+    try:
+        store.record_factory_job(factory_job)
+        store.record_integration_setup(
+            IntegrationSetupSubmissionV1.model_validate(payload)
+        )
+        store.provision_portal_tenant(
+            PortalTenantBindingV1(job_id=JOB_ID, organization_id="org-a")
+        )
+        ticket = store.issue_portal_ticket(
+            job_id=JOB_ID,
+            principal=principal,
+            credential_alias="CRM_PRIMARY",
+            action="verify",
+            now=NOW,
+        )
+        before = store.integration_setup(JOB_ID)
+        stale_submission = before.submission.model_copy(
+            update={
+                "event_id": UUID("80000000-0000-0000-0000-000000000099"),
+                "revision": before.submission.revision + 1,
+                "previous_content_sha256": before.content_sha256,
+                "occurred_at": NOW + timedelta(seconds=1),
+            }
+        )
+        use = PortalSetupTicketUseV1(
+            ticket_id=ticket.ticket_id,
+            ticket=ticket.ticket,
+            credential_alias="CRM_PRIMARY",
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            verification = executor.submit(
+                store.portal_verify,
+                job_id=JOB_ID,
+                principal=principal,
+                request=use,
+                now=NOW,
+            )
+            assert source.entered.wait(timeout=5)
+            concurrent_write = executor.submit(
+                store.record_integration_setup,
+                stale_submission,
+            )
+            with pytest.raises(FutureTimeout):
+                concurrent_write.result(timeout=0.2)
+            source.release.set()
+            verified = verification.result(timeout=5)
+            with pytest.raises(HTTPException) as stale:
+                concurrent_write.result(timeout=5)
+
+        assert verified.submission.revision == 2
+        assert stale.value.status_code == 409
+        assert len(source.calls) == 1
+
+        no_digest_job_id = UUID("10000000-0000-0000-0000-000000000002")
+        no_digest_job = job().model_copy(update={"job_id": no_digest_job_id})
+        no_digest_payload = setup_payload(no_digest_job)
+        no_digest_payload["event_id"] = "80000000-0000-0000-0000-000000000098"
+        no_digest_connection = no_digest_payload["plan"]["connections"][0]
+        no_digest_connection["requirement"]["verification_workflow_sha256"] = None
+        no_digest_connection.update(
+            {
+                "status": "verification_required",
+                "candidate_credentials": [metadata],
+                "selected_credential": metadata,
+            }
+        )
+        store.record_factory_job(no_digest_job)
+        store.record_integration_setup(
+            IntegrationSetupSubmissionV1.model_validate(no_digest_payload)
+        )
+        store.provision_portal_tenant(
+            PortalTenantBindingV1(job_id=no_digest_job_id, organization_id="org-a")
+        )
+        no_digest_ticket = store.issue_portal_ticket(
+            job_id=no_digest_job_id,
+            principal=principal,
+            credential_alias="CRM_PRIMARY",
+            action="verify",
+            now=NOW,
+        )
+        with pytest.raises(HTTPException) as absent:
+            store.portal_verify(
+                job_id=no_digest_job_id,
+                principal=principal,
+                request=PortalSetupTicketUseV1(
+                    ticket_id=no_digest_ticket.ticket_id,
+                    ticket=no_digest_ticket.ticket,
+                    credential_alias="CRM_PRIMARY",
+                ),
+                now=NOW,
+            )
+        assert absent.value.status_code == 409
+        assert len(source.calls) == 1
+    finally:
+        source.release.set()
         with storage.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute("DELETE FROM portal_setup_tickets")

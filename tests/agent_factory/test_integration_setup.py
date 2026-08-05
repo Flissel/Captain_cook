@@ -41,6 +41,7 @@ def requirement(*, required: bool = True) -> IntegrationCredentialRequirementV1:
         required=required,
         setup_method="n8n_ui",
         setup_label="Bearer Auth",
+        verification_workflow_sha256="a" * 64,
     )
 
 
