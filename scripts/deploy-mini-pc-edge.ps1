@@ -60,7 +60,7 @@ install -m 400 '$RemoteRoot/.secrets/mini-pc-edge-ca.crt.incoming' '$RemoteRoot/
 rm -f '$RemoteRoot/.secrets/mini-pc-edge.crt.incoming' '$RemoteRoot/.secrets/mini-pc-edge.key.incoming' '$RemoteRoot/.secrets/mini-pc-edge-ca.crt.incoming'
 cd '$RemoteRoot'
 docker compose --project-name captain-mini-pc-edge -f compose.mini-pc-edge.yml config --quiet
-docker compose --project-name captain-mini-pc-edge -f compose.mini-pc-edge.yml up -d --no-deps mini-pc-edge
+docker compose --project-name captain-mini-pc-edge -f compose.mini-pc-edge.yml up -d --no-deps --force-recreate mini-pc-edge
 "@
 & ssh $SshHost $remoteApply *> $null
 if ($LASTEXITCODE -ne 0) {
