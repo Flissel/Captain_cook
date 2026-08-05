@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import ssl
 from types import SimpleNamespace
 
+import certifi
 import pytest
 
+from gateway import portal_n8n_composition
 from gateway.portal_n8n_adapters import (
     PortalN8nCredentialMetadataSource,
     PortalN8nCredentialVerificationSource,
@@ -65,6 +68,14 @@ def test_default_bundle_builds_both_lease_bound_adapters_without_secret_repr() -
     )
     assert "api-test-secret" not in repr(bundle)
     assert "mcp-test-secret" not in repr(bundle)
+
+
+def test_private_https_clients_use_the_explicit_gateway_ca_bundle() -> None:
+    settings = _settings().model_copy(
+        update={"tls_ca_bundle_path": certifi.where()}
+    )
+
+    assert isinstance(portal_n8n_composition._tls_verify(settings), ssl.SSLContext)
 
 
 def test_configured_release_source_rejects_every_unpinned_digest() -> None:

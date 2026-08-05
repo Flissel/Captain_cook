@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,6 +82,9 @@ def script_sandbox(tmp_path: Path) -> dict[str, Any]:
     (root / "docker-compose.captain-n8n.yml").write_text(
         "name: captain-n8n-builder\nservices: {}\n", encoding="utf-8"
     )
+    ca_bundle = root / "deploy" / "mini-pc-edge" / ".secrets" / "mini-pc-edge-ca.crt"
+    ca_bundle.parent.mkdir(parents=True, exist_ok=True)
+    ca_bundle.write_text("test-ca", encoding="utf-8")
 
     owner_secret = "Owner" + "123" + "Fixture"
     env_file = root / ".env.captain-n8n"
@@ -115,6 +119,14 @@ def _write_environment(
         "CAPTAIN_N8N_POSTGRES_USER=captain_n8n",
         "CAPTAIN_N8N_POSTGRES_DB=captain_n8n",
         f"CAPTAIN_N8N_OWNER_PASSWORD={sandbox['owner_secret']}",
+        "CAPTAIN_N8N_CA_BUNDLE_PATH="
+        + str(
+            sandbox["root"]
+            / "deploy"
+            / "mini-pc-edge"
+            / ".secrets"
+            / "mini-pc-edge-ca.crt"
+        ),
     ]
     if api_key is not None:
         lines.append(f"CAPTAIN_N8N_API_KEY={api_key}")
@@ -225,6 +237,29 @@ def test_lifecycle_script_uses_secure_secrets_and_safe_operations() -> None:
     assert "$IsWindows" not in source
 
 
+def test_n8n_container_uses_only_the_explicit_read_only_provider_ca() -> None:
+    compose = yaml.safe_load(
+        (ROOT / "docker-compose.captain-n8n.yml").read_text(encoding="utf-8")
+    )
+    n8n = compose["services"]["n8n"]
+
+    assert "NODE_EXTRA_CA_CERTS=/run/captain-ca/provider-ca.crt" in n8n["environment"]
+    ca_mounts = [
+        mount
+        for mount in n8n["volumes"]
+        if isinstance(mount, dict)
+        and mount.get("target") == "/run/captain-ca/provider-ca.crt"
+    ]
+    assert ca_mounts == [
+        {
+            "type": "bind",
+            "source": "${CAPTAIN_N8N_CA_BUNDLE_PATH:?missing}",
+            "target": "/run/captain-ca/provider-ca.crt",
+            "read_only": True,
+        }
+    ]
+
+
 def test_bootstrap_never_echoes_secret_values() -> None:
     source = (ROOT / "scripts" / "captain-n8n.ps1").read_text(encoding="utf-8")
 
@@ -286,6 +321,51 @@ def test_start_and_stop_invoke_only_fully_scoped_compose_commands(
     assert any(call.endswith("up -d --wait") for call in compose_calls)
     assert any(call.endswith("stop") for call in compose_calls)
     assert not any(" down" in call or " -v" in call for call in compose_calls)
+
+
+def test_stop_migrates_existing_environment_to_the_required_ca_contract(
+    script_sandbox: dict[str, Any],
+) -> None:
+    port = _free_port()
+    _write_environment(script_sandbox, port)
+    ca_bundle = (
+        script_sandbox["root"]
+        / "deploy"
+        / "mini-pc-edge"
+        / ".secrets"
+        / "mini-pc-edge-ca.crt"
+    )
+    ca_bundle.parent.mkdir(parents=True, exist_ok=True)
+    ca_bundle.write_text("test-ca", encoding="utf-8")
+
+    stopped = _run_action(script_sandbox, "stop")
+
+    assert stopped.returncode == 0, stopped.stdout + stopped.stderr
+    persisted = script_sandbox["env_file"].read_text(encoding="utf-8")
+    assert f"CAPTAIN_N8N_CA_BUNDLE_PATH={ca_bundle}" in persisted
+
+
+def test_init_can_upgrade_the_ca_contract_while_captain_n8n_is_running(
+    script_sandbox: dict[str, Any],
+) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = int(listener.getsockname()[1])
+        _write_environment(script_sandbox, port)
+        ca_bundle = (
+            script_sandbox["root"]
+            / "deploy"
+            / "mini-pc-edge"
+            / ".secrets"
+            / "mini-pc-edge-ca.crt"
+        )
+        ca_bundle.parent.mkdir(parents=True, exist_ok=True)
+        ca_bundle.write_text("test-ca", encoding="utf-8")
+
+        initialized = _run_action(script_sandbox, "init")
+
+    assert initialized.returncode == 0, initialized.stdout + initialized.stderr
 
 
 def test_bootstrap_rejects_malformed_owner_response_without_emitting_secret(

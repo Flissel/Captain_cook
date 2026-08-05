@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import ssl
 
 import httpx
 
@@ -55,7 +56,16 @@ class ConfiguredVerificationReleaseSource:
             raise ValueError("verification workflow release is not configured") from None
 
 
+def _tls_verify(settings: GatewaySettings) -> ssl.SSLContext | bool:
+    if settings.tls_ca_bundle_path is None:
+        return True
+    return ssl.create_default_context(cafile=settings.tls_ca_bundle_path)
+
+
 class _BoundedMetadataClient:
+    def __init__(self, verify: ssl.SSLContext | bool) -> None:
+        self._verify = verify
+
     async def discover(
         self,
         *,
@@ -68,6 +78,7 @@ class _BoundedMetadataClient:
         async with httpx.AsyncClient(
             follow_redirects=False,
             trust_env=False,
+            verify=self._verify,
         ) as http:
             return await CaptainN8nCredentialMetadataClient(http=http).discover(
                 lease=lease,
@@ -79,8 +90,9 @@ class _BoundedMetadataClient:
 
 
 class _BoundedTemplateSource:
-    def __init__(self, origin: str) -> None:
+    def __init__(self, origin: str, verify: ssl.SSLContext | bool) -> None:
         self._origin = origin
+        self._verify = verify
 
     async def fetch_verified_payload(
         self,
@@ -89,6 +101,7 @@ class _BoundedTemplateSource:
         async with httpx.AsyncClient(
             follow_redirects=False,
             trust_env=False,
+            verify=self._verify,
         ) as http:
             return await GiteaTemplateClient(
                 origin=self._origin,
@@ -97,8 +110,13 @@ class _BoundedTemplateSource:
 
 
 class _BoundedN8nTarget:
-    def __init__(self, endpoint: N8nEndpoint) -> None:
+    def __init__(
+        self,
+        endpoint: N8nEndpoint,
+        verify: ssl.SSLContext | bool,
+    ) -> None:
         self._endpoint = endpoint
+        self._verify = verify
 
     def _target(self, http: httpx.AsyncClient) -> N8nTarget:
         return N8nTarget(N8nHttpClient.from_endpoint(self._endpoint, http))
@@ -107,6 +125,7 @@ class _BoundedN8nTarget:
         async with httpx.AsyncClient(
             follow_redirects=False,
             trust_env=False,
+            verify=self._verify,
         ) as http:
             return await self._target(http).deploy(artifact)
 
@@ -118,6 +137,7 @@ class _BoundedN8nTarget:
         async with httpx.AsyncClient(
             follow_redirects=False,
             trust_env=False,
+            verify=self._verify,
         ) as http:
             return await self._target(http).execute(deployment, case)
 
@@ -148,11 +168,12 @@ def build_portal_n8n_adapter_bundle(
             "CAPTAIN_N8N_MCP_TOKEN": settings.portal_n8n_mcp_token.get_secret_value(),
         }
     )
+    verify = _tls_verify(settings)
     leases = GatewayPortalN8nLeaseSource(reader)
     return PortalN8nAdapterBundle(
         credential_source=PortalN8nCredentialMetadataSource(
             leases=leases,
-            client=_BoundedMetadataClient(),
+            client=_BoundedMetadataClient(verify),
             endpoint=endpoint,
         ),
         verification_source=PortalN8nCredentialVerificationSource(
@@ -160,7 +181,7 @@ def build_portal_n8n_adapter_bundle(
             releases=ConfiguredVerificationReleaseSource(
                 settings.portal_verification_releases
             ),
-            templates=_BoundedTemplateSource(settings.portal_gitea_origin),
-            target=_BoundedN8nTarget(endpoint),
+            templates=_BoundedTemplateSource(settings.portal_gitea_origin, verify),
+            target=_BoundedN8nTarget(endpoint, verify),
         ),
     )

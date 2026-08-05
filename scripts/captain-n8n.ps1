@@ -16,6 +16,7 @@ $ProjectLabel = "com.docker.compose.project=captain-n8n-builder"
 $OwnerEmail = "captain@local.test"
 $ApiKeyLabel = "Captain local builder"
 $DefaultPort = 5679
+$DefaultCaBundlePath = Join-Path $Root "deploy/mini-pc-edge/.secrets/mini-pc-edge-ca.crt"
 
 $AllowedEnvironmentKeys = @(
     "CAPTAIN_N8N_PORT",
@@ -27,7 +28,8 @@ $AllowedEnvironmentKeys = @(
     "CAPTAIN_N8N_API_KEY",
     "CAPTAIN_N8N_MCP_TOKEN",
     "CAPTAIN_N8N_MCP_BROKER_URL",
-    "CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET"
+    "CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET",
+    "CAPTAIN_N8N_CA_BUNDLE_PATH"
 )
 
 function Assert-LocalContractFiles {
@@ -211,6 +213,7 @@ function Initialize-CaptainEnvironment {
         CAPTAIN_N8N_PORT = [string]$DefaultPort
         CAPTAIN_N8N_POSTGRES_USER = "captain_n8n"
         CAPTAIN_N8N_POSTGRES_DB = "captain_n8n"
+        CAPTAIN_N8N_CA_BUNDLE_PATH = $DefaultCaBundlePath
     }
 
     foreach ($entry in $defaults.GetEnumerator()) {
@@ -247,11 +250,19 @@ function Assert-EnvironmentReady {
         "CAPTAIN_N8N_POSTGRES_PASSWORD",
         "CAPTAIN_N8N_POSTGRES_USER",
         "CAPTAIN_N8N_POSTGRES_DB",
-        "CAPTAIN_N8N_OWNER_PASSWORD"
+        "CAPTAIN_N8N_OWNER_PASSWORD",
+        "CAPTAIN_N8N_CA_BUNDLE_PATH"
     )) {
         if (-not $values.ContainsKey($required) -or [string]::IsNullOrWhiteSpace($values[$required])) {
             throw "Missing $required in .env.captain-n8n; rerun init."
         }
+    }
+    $caBundlePath = [string]$values["CAPTAIN_N8N_CA_BUNDLE_PATH"]
+    if (
+        -not [System.IO.Path]::IsPathRooted($caBundlePath) -or
+        -not (Test-Path -LiteralPath $caBundlePath -PathType Leaf)
+    ) {
+        throw "CAPTAIN_N8N_CA_BUNDLE_PATH must identify an existing absolute CA file."
     }
 }
 
@@ -623,8 +634,10 @@ function Invoke-CaptainMcpBootstrap {
 function Invoke-Init {
     Assert-LocalContractFiles
     Assert-DockerAvailable
-    Assert-LoopbackPortAvailable -Port (Get-CaptainPort)
     Initialize-CaptainEnvironment
+    if (-not (Test-CaptainN8nRunning)) {
+        Assert-LoopbackPortAvailable -Port (Get-CaptainPort)
+    }
     Invoke-ComposeConfigValidation
     Write-Output "Captain n8n environment initialized and Compose contract validated."
 }
@@ -632,6 +645,7 @@ function Invoke-Init {
 function Invoke-Start {
     Assert-LocalContractFiles
     Assert-DockerAvailable
+    Initialize-CaptainEnvironment
     Assert-EnvironmentReady
     Invoke-ComposeConfigValidation
 
@@ -819,6 +833,7 @@ function Invoke-Status {
 function Invoke-Stop {
     Assert-LocalContractFiles
     Assert-DockerAvailable
+    Initialize-CaptainEnvironment
     Assert-EnvironmentReady
     & docker compose -p captain-n8n-builder --env-file $EnvFile -f $ComposeFile stop
     if ($LASTEXITCODE -ne 0) {

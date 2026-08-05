@@ -7,6 +7,7 @@ import json
 import re
 import secrets
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -55,6 +56,7 @@ class GatewaySettings(BaseModel):
     portal_n8n_mcp_token: SecretStr | None = None
     portal_gitea_origin: str | None = None
     portal_verification_releases: tuple[GiteaTemplateReleaseV1, ...] = ()
+    tls_ca_bundle_path: str | None = None
 
     @field_validator(
         "ledger_dsn",
@@ -118,6 +120,24 @@ class GatewaySettings(BaseModel):
         ):
             raise ValueError("portal organization claim must be a safe claim path")
         return value
+
+    @field_validator("tls_ca_bundle_path")
+    @classmethod
+    def _tls_ca_bundle_must_be_an_existing_absolute_file(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        candidate = Path(value)
+        if (
+            value != value.strip()
+            or any(ord(character) < 32 for character in value)
+            or not candidate.is_absolute()
+            or not candidate.is_file()
+        ):
+            raise ValueError("TLS CA bundle must be an existing absolute file")
+        return str(candidate)
 
     @model_validator(mode="after")
     def _role_tokens_must_be_distinct(self) -> "GatewaySettings":
@@ -334,6 +354,7 @@ class GatewaySettings(BaseModel):
                     else None
                 ),
                 portal_verification_releases=releases,
+                tls_ca_bundle_path=source.get("SSL_CERT_FILE"),
             )
         except ValidationError:
             raise GatewayConfigurationError("invalid gateway configuration") from None

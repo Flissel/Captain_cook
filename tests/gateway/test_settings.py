@@ -95,6 +95,23 @@ def test_portal_n8n_adapters_require_one_complete_explicit_group() -> None:
     assert "mcp-test-secret" not in repr(configured)
 
 
+def test_portal_tls_ca_bundle_must_be_an_existing_absolute_file(tmp_path) -> None:
+    ca_bundle = tmp_path / "mini-pc-ca.pem"
+    ca_bundle.write_text("test-ca", encoding="utf-8")
+
+    configured = GatewaySettings.from_env(
+        valid_environment(SSL_CERT_FILE=str(ca_bundle.resolve()))
+    )
+
+    assert configured.tls_ca_bundle_path == str(ca_bundle.resolve())
+    with pytest.raises(GatewayConfigurationError):
+        GatewaySettings.from_env(valid_environment(SSL_CERT_FILE="relative-ca.pem"))
+    with pytest.raises(GatewayConfigurationError):
+        GatewaySettings.from_env(
+            valid_environment(SSL_CERT_FILE=str((tmp_path / "missing.pem").resolve()))
+        )
+
+
 @pytest.mark.parametrize(
     "missing_name",
     (
