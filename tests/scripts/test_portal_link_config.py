@@ -20,6 +20,8 @@ def test_captain_proxy_replaces_untrusted_authorization_with_fixed_identity() ->
 def test_mini_pc_proxy_verifies_captain_tls_and_denies_non_portal_routes() -> None:
     config = Path("deploy/portal-link/mini-pc-proxy.conf").read_text(encoding="utf-8")
 
+    assert "proxy_pass https://10.77.0.1;" in config
+    assert "proxy_pass https://captain-portal-link.internal;" not in config
     assert "proxy_ssl_server_name on;" in config
     assert "proxy_ssl_name captain-portal-link.internal;" in config
     assert "proxy_ssl_verify on;" in config
@@ -75,3 +77,14 @@ def test_wireguard_examples_define_the_fixed_private_peers_without_keys() -> Non
     assert "AllowedIPs = 10.77.0.1/32" in mini_pc
     assert "CAPTAIN_WIREGUARD_PRIVATE_KEY_FROM_LOCAL_SECRET" in captain
     assert "MINI_PC_WIREGUARD_PRIVATE_KEY_FROM_LOCAL_SECRET" in mini_pc
+
+
+def test_compose_pins_the_available_wireguard_image_without_latest() -> None:
+    compose = Path("deploy/portal-link/compose.portal-link.yml").read_text(encoding="utf-8")
+    image = (
+        "lscr.io/linuxserver/wireguard@"
+        "sha256:ac43e1226878d2611315172d6ea357a95cb326ee73124b91108118efc8666889"
+    )
+
+    assert compose.count(f"image: {image}") == 2
+    assert "lscr.io/linuxserver/wireguard:latest" not in compose
