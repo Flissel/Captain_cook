@@ -1,0 +1,50 @@
+services:
+  captain-portal-link:
+    image: nginx:1.27-alpine
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    volumes:
+      - type: bind
+        source: ./captain-proxy.conf
+        target: /etc/nginx/conf.d/default.conf
+        read_only: true
+      - type: bind
+        source: ./.secrets/captain/captain-server.crt
+        target: /run/portal-link/captain-server.crt
+        read_only: true
+      - type: bind
+        source: ./.secrets/captain/captain-server.key
+        target: /run/portal-link/captain-server.key
+        read_only: true
+      - type: bind
+        source: ./.secrets/captain/mini-pc-client-ca.crt
+        target: /run/portal-link/mini-pc-client-ca.crt
+        read_only: true
+
+  mini-pc-portal-link:
+    image: nginx:1.27-alpine
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    volumes:
+      - type: bind
+        source: ./mini-pc-proxy.conf
+        target: /etc/nginx/conf.d/default.conf
+        read_only: true
+      - type: bind
+        source: ./.secrets/mini-pc/captain-server-ca.crt
+        target: /run/portal-link/captain-server-ca.crt
+        read_only: true
+      - type: bind
+        source: ./.secrets/mini-pc/mini-pc-client.crt
+        target: /run/portal-link/mini-pc-client.crt
+        read_only: true
+      - type: bind
+        source: ./.secrets/mini-pc/mini-pc-client.key
+        target: /run/portal-link/mini-pc-client.key
+        read_only: true
