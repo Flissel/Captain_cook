@@ -222,6 +222,7 @@ class PortalCredentialVerificationSource(Protocol):
         expected_content_sha256: str,
         expected_revision: int,
         expected_workflow_content_sha256: str,
+        probe_id: UUID | None = None,
         now: datetime,
     ) -> CredentialVerificationReceiptV1: ...
 
@@ -1693,6 +1694,7 @@ class GatewayStore:
                 expected_content_sha256=request.setup_content_sha256,
                 expected_revision=request.setup_revision,
                 expected_workflow_content_sha256=request.verification_template_sha256,
+                probe_id=request.probe_request_id,
                 now=probe_time,
             )
             receipt = CredentialVerificationReceiptV1.model_validate(returned)

@@ -155,7 +155,7 @@ def consume_incremental_projection(
             result = projector.project(event)
             page_results.append(result)
             if (
-                event.event_type == "capability.promoted"
+                event.event_type in {"capability.promoted", "integration.setup"}
                 and result.outcome in {"projected", "duplicate"}
             ):
                 feed.acknowledge(projector.acknowledgement(event))
@@ -248,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
                         "full rebuild did not converge before acknowledgement"
                     )
                 for event in events:
-                    if event.event_type == "capability.promoted":
+                    if event.event_type in {"capability.promoted", "integration.setup"}:
                         feed.acknowledge(projector.acknowledgement(event))
                 cursor_store.checkpoint_v2_feed(feed.last_cursor)
             else:

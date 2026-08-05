@@ -152,3 +152,32 @@ def test_gateway_acknowledges_exact_integration_setup_projection() -> None:
     assert appended == [
         integration_setup_registry_mirror_event(acknowledgement, submission, job)
     ]
+
+
+def test_integration_setup_projection_versions_by_setup_revision() -> None:
+    submission = IntegrationSetupSubmissionV1.model_validate(
+        {
+            "schema": "captain.integration-setup-submission.v1",
+            "event_id": "81000000-0000-4000-8000-000000000003",
+            "job_id": "11000000-0000-4000-8000-000000000001",
+            "correlation_id": "21000000-0000-4000-8000-000000000001",
+            "subject_version": 1,
+            "revision": 3,
+            "previous_content_sha256": "f" * 64,
+            "occurred_at": "2026-08-05T12:00:00Z",
+            "plan": {
+                "schema": "captain.integration-setup-plan.v1",
+                "connections": [],
+            },
+        }
+    )
+
+    event = integration_setup_projection(
+        submission,
+        {
+            "event_id": "31000000-0000-4000-8000-000000000001",
+            "correlation_id": str(submission.correlation_id),
+        },
+    )
+
+    assert event.subject_version == 3

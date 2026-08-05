@@ -144,6 +144,51 @@ def test_factory_promotion_rebuild_is_visible_and_idempotent_with_same_correlati
     )
 
 
+def test_integration_setup_projection_is_acknowledged_after_projection(
+    tmp_path: Path,
+    projection_api: MinibookClient,
+) -> None:
+    event = MinibookProjectionEvent.model_validate(
+        {
+            "schema": "captain.minibook-projection.v2",
+            "event_id": "11000000-0000-4000-8000-000000000001",
+            "correlation_id": "12000000-0000-4000-8000-000000000001",
+            "causation_id": "13000000-0000-4000-8000-000000000001",
+            "occurred_at": "2026-08-05T20:00:00Z",
+            "producer": "captain-gateway",
+            "subject_id": "subject:14000000-0000-4000-8000-000000000001",
+            "subject_version": 2,
+            "event_type": "integration.setup",
+            "payload": {
+                "view": "validation",
+                "template_id": "integration_setup_status",
+                "status_id": "observed",
+                "actor_role_id": "captain_gateway",
+                "integration_status": "ready",
+                "required_integration_count": 2,
+                "ready_integration_count": 2,
+            },
+        }
+    )
+    requests: list[httpx.Request] = []
+    feed = _single_page_feed(
+        [event.model_dump(mode="json", by_alias=True)],
+        cursor="integration-setup-1",
+        requests=requests,
+    )
+    store = ProjectionCursorStore(tmp_path / "integration-setup-projection.db")
+    projector = MinibookProjector(projection_api, store)
+
+    results = consume_incremental_projection(feed, projector, store, apply=True)
+
+    assert [result.outcome for result in results] == ["projected"]
+    acknowledgements = [request for request in requests if request.method == "POST"]
+    assert len(acknowledgements) == 1
+    assert acknowledgements[0].url.path == (
+        "/api/v1/projections/minibook/acknowledgements"
+    )
+
+
 def _seed_projection_post(
     client: MinibookClient,
     *,

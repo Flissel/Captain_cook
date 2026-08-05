@@ -79,6 +79,9 @@ def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
     source = MINIBOOK.read_text(encoding="utf-8")
     assert 'ValidateSet("start", "bootstrap", "status", "stop")' in source
     assert "CAPTAIN_DEMO_MINIBOOK_API_KEY" in source
+    assert "CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY" in source
+    assert "RandomNumberGenerator]::GetBytes(32)" in source
+    assert "$env:MINIBOOK_PROJECTION_API_KEY" in source
     assert "/api/v1/agents/me" in source
     assert "/api/v1/agents" in source
     assert "captain-demo-service" in source
@@ -86,6 +89,7 @@ def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
     assert "Minibook demo service credential recovered locally" in source
     assert "SELECT api_key FROM agents WHERE name" in source
     assert "Write-Output $apiKey" not in source
+    assert "Write-Output $projectionApiKey" not in source
     assert "minibook-demo.pid" in source
     assert "$baseUrl = 'http://127.0.0.1:8080'" in source
     assert "Get-Command python.exe -CommandType Application" in source

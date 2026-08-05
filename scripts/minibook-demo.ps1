@@ -19,22 +19,42 @@ function Read-Env {
     $values = [ordered]@{}
     if (Test-Path $envFile) { foreach ($line in [IO.File]::ReadAllLines($envFile)) {
         if ($line -match '^CAPTAIN_DEMO_MINIBOOK_API_KEY=(.*)$') { $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = $Matches[1] }
+        if ($line -match '^CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY=(.*)$') { $values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY'] = $Matches[1] }
     }}
     $values
 }
 function Save-Env($values) {
-    $lines = [Collections.Generic.List[string]]::new(); $written = $false
+    $lines = [Collections.Generic.List[string]]::new()
+    $written = @{
+        CAPTAIN_DEMO_MINIBOOK_API_KEY = $false
+        CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY = $false
+    }
     if (Test-Path $envFile) { foreach ($line in [IO.File]::ReadAllLines($envFile)) {
-        if ($line -match '^CAPTAIN_DEMO_MINIBOOK_API_KEY=') { $lines.Add("CAPTAIN_DEMO_MINIBOOK_API_KEY=$($values['CAPTAIN_DEMO_MINIBOOK_API_KEY'])"); $written=$true } else { $lines.Add($line) }
+        if ($line -match '^CAPTAIN_DEMO_MINIBOOK_API_KEY=') {
+            $lines.Add("CAPTAIN_DEMO_MINIBOOK_API_KEY=$($values['CAPTAIN_DEMO_MINIBOOK_API_KEY'])")
+            $written['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = $true
+        } elseif ($line -match '^CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY=') {
+            $lines.Add("CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY=$($values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY'])")
+            $written['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY'] = $true
+        } else { $lines.Add($line) }
     }}
-    if (-not $written) { $lines.Add("CAPTAIN_DEMO_MINIBOOK_API_KEY=$($values['CAPTAIN_DEMO_MINIBOOK_API_KEY'])") }
+    foreach ($name in $written.Keys) {
+        if (-not $written[$name] -and $values.Contains($name)) {
+            $lines.Add("$name=$($values[$name])")
+        }
+    }
     [IO.File]::WriteAllLines($envFile, $lines, [Text.UTF8Encoding]::new($false))
 }
 function Test-Health {
     try { (Invoke-WebRequest "$baseUrl/health" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200 } catch { $false }
 }
-function Start-Service {
+function Start-Service($values) {
     if (Test-Health) { Write-Host '[ready] Minibook local instance'; return }
+    $projectionApiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY']
+    if ([string]::IsNullOrWhiteSpace($projectionApiKey)) {
+        throw 'Minibook projection credential is unavailable; run bootstrap first.'
+    }
+    $env:MINIBOOK_PROJECTION_API_KEY = $projectionApiKey
     New-Item -ItemType Directory -Force $stateDir | Out-Null
     $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python.exe -CommandType Application).Source }
     $process = Start-Process $python -ArgumentList 'run.py' -WorkingDirectory (Join-Path $root 'minibook') -WindowStyle Hidden -PassThru
@@ -59,8 +79,16 @@ function Recover-ServiceCredential($values) {
     Write-Host '[ready] Minibook demo service credential recovered locally (credential redacted)'
 }
 function Bootstrap-Service {
-    Start-Service
     $values = Read-Env
+    $projectionApiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY']
+    if ([string]::IsNullOrWhiteSpace($projectionApiKey)) {
+        $projectionApiKey = [Convert]::ToHexString(
+            [Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
+        ).ToLowerInvariant()
+        $values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY'] = $projectionApiKey
+        Save-Env $values
+    }
+    Start-Service $values
     $apiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_API_KEY']
     if ($apiKey) {
         try {
@@ -94,7 +122,7 @@ function Stop-Service {
     Write-Host '[ready] managed Minibook process stopped'
 }
 switch ($Action) {
-    start { Start-Service }
+    start { Start-Service (Read-Env) }
     bootstrap { Bootstrap-Service }
     status { if (-not (Test-Health)) { throw 'Minibook is not healthy.' }; Write-Host '[ready] Minibook healthy' }
     stop { Stop-Service }

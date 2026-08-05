@@ -191,6 +191,7 @@ class PortalN8nCredentialVerificationSource:
         expected_content_sha256: str,
         expected_revision: int,
         expected_workflow_content_sha256: str,
+        probe_id: UUID | None = None,
         now: datetime,
     ) -> CredentialVerificationReceiptV1:
         if requirement.verification_workflow_sha256 != expected_workflow_content_sha256:
@@ -208,6 +209,7 @@ class PortalN8nCredentialVerificationSource:
                 correlation_id=correlation_id,
                 expected_content_sha256=expected_content_sha256,
                 expected_revision=expected_revision,
+                probe_id=probe_id,
                 now=now,
             )
         )
@@ -221,6 +223,7 @@ class PortalN8nCredentialVerificationSource:
         correlation_id: UUID,
         expected_content_sha256: str,
         expected_revision: int,
+        probe_id: UUID | None,
         now: datetime,
     ) -> CredentialVerificationReceiptV1:
         assert requirement.verification_workflow_sha256 is not None
@@ -232,13 +235,14 @@ class PortalN8nCredentialVerificationSource:
             credential=credential,
         )
         deployment = await self._target.deploy(bound.artifact)
-        probe_id = uuid5(
-            NAMESPACE_URL,
-            (
-                "captain:portal-verification:"
-                f"{job_id}:{correlation_id}:{expected_revision}:{credential.credential_id}"
-            ),
-        )
+        if probe_id is None:
+            probe_id = uuid5(
+                NAMESPACE_URL,
+                (
+                    "captain:portal-verification:"
+                    f"{job_id}:{correlation_id}:{expected_revision}:{credential.credential_id}"
+                ),
+            )
         execution = await self._target.execute(
             deployment,
             ValidationCase(

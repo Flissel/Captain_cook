@@ -129,7 +129,7 @@ def integration_setup_projection(
             "occurred_at": submission.occurred_at,
             "producer": "captain-gateway",
             "subject_id": _factory_subject_reference(str(submission.job_id)),
-            "subject_version": submission.subject_version,
+            "subject_version": submission.revision,
             "event_type": "integration.setup",
             "payload": {
                 "view": "validation",

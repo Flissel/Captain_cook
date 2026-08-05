@@ -246,3 +246,63 @@ def test_verification_adapter_seals_template_and_bound_workflow_digests() -> Non
     }
     probe_id = UUID(target.case.case_id)
     assert receipt.provider_probe_id == probe_id
+
+
+def test_verification_adapter_uses_explicit_control_probe_identity() -> None:
+    workflow = {
+        "nodes": [
+            {
+                "name": "Provider probe",
+                "type": "n8n-nodes-base.httpRequest",
+                "parameters": {"url": "https://provider.example/health"},
+                "credentials": {
+                    "httpBearerAuth": {
+                        "id": "{{CAPTAIN_CREDENTIAL_ID}}",
+                        "name": "{{CAPTAIN_CREDENTIAL_NAME}}",
+                    }
+                },
+            }
+        ],
+        "connections": {},
+    }
+    content = json.dumps(workflow, sort_keys=True, separators=(",", ":")).encode()
+    digest = hashlib.sha256(content).hexdigest()
+    payload = VerifiedTemplatePayload(
+        ref=ArtifactRef(
+            uri=f"artifact://gitea/{digest}", sha256=digest,
+            media_type="application/json",
+        ),
+        content=content,
+    )
+    release = GiteaTemplateReleaseV1(
+        repository="captain/templates", revision="1" * 40,
+        path="verification/bearer.json",
+        contents_url=("https://gitea.example/captain/templates/raw/commit/" + "1" * 40 + "/verification/bearer.json"),
+        sha256=digest,
+    )
+    leases = StaticLeaseSource()
+    target = RecordingTarget()
+    source = PortalN8nCredentialVerificationSource(
+        leases=leases, releases=StaticReleaseSource(release),
+        templates=StaticTemplateClient(payload), target=target,
+    )
+    explicit_probe_id = UUID("71000000-0000-4000-8000-000000000001")
+
+    source.verify_credential(
+        requirement=requirement().model_copy(
+            update={"verification_workflow_sha256": digest}
+        ),
+        credential=N8nCredentialMetadataV1(
+            credential_id="cred-prod", credential_name="CRM production",
+            credential_type="httpBearerAuth", project_id="captain-production",
+        ),
+        job_id=leases.lease.job_id,
+        correlation_id=leases.lease.correlation_id,
+        expected_content_sha256="c" * 64,
+        expected_revision=7,
+        expected_workflow_content_sha256=digest,
+        probe_id=explicit_probe_id,
+        now=NOW,
+    )
+
+    assert target.case.case_id == str(explicit_probe_id)
