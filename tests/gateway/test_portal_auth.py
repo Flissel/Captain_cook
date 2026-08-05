@@ -8,6 +8,11 @@ from threading import Event, Lock, Thread
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, generate_private_key
+from cryptography.hazmat.primitives.asymmetric.ec import (
+    SECP256R1,
+    EllipticCurvePrivateKey,
+    generate_private_key as generate_ec_private_key,
+)
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr, ValidationError
@@ -171,6 +176,34 @@ def test_valid_rs256_token_maps_subject_and_organization(
     assert resolver.requests == [(KID, JWKS_URL)]
 
 
+def test_valid_supabase_es256_token_maps_subject_and_organization() -> None:
+    private_key: EllipticCurvePrivateKey = generate_ec_private_key(SECP256R1())
+    verifier = PyJwtPortalVerifier(
+        key_resolver=StaticKeyResolver(private_key.public_key())
+    )
+    claims = {
+        "sub": "user-es256",
+        "organization_id": "org-es256",
+        "iss": ISSUER,
+        "aud": AUDIENCE,
+        "iat": NOW,
+        "exp": NOW + timedelta(minutes=5),
+    }
+    supplied = jwt.encode(
+        claims,
+        private_key,
+        algorithm="ES256",
+        headers={"kid": KID},
+    )
+
+    principal = verifier.verify(supplied, configured_settings())
+
+    assert principal == PortalPrincipalV1(
+        subject_id="user-es256",
+        organization_id="org-es256",
+    )
+
+
 def test_default_portal_dependency_reuses_one_key_then_refreshes_after_ttl(
     private_key: RSAPrivateKey,
     monkeypatch: pytest.MonkeyPatch,
@@ -209,6 +242,20 @@ def test_jwks_resolver_requires_public_rsa_signing_metadata(
 
     with pytest.raises(PortalTokenVerificationError):
         CachingJwksKeyResolver().get_key(kid=KID, jwks_url=JWKS_URL)
+
+
+def test_jwks_resolver_accepts_public_supabase_es256_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_key: EllipticCurvePrivateKey = generate_ec_private_key(SECP256R1())
+    key = json.loads(jwt.algorithms.ECAlgorithm.to_jwk(private_key.public_key()))
+    key.update({"kid": KID, "alg": "ES256", "use": "sig"})
+    response = JwksResponse(json.dumps({"keys": [key]}).encode("utf-8"))
+    monkeypatch.setattr(portal_auth_module, "urlopen", lambda *_args, **_kwargs: response)
+
+    resolved = CachingJwksKeyResolver().get_key(kid=KID, jwks_url=JWKS_URL)
+
+    assert resolved.public_numbers() == private_key.public_key().public_numbers()
 
 
 def test_jwks_resolver_caps_response_before_json_parsing(

@@ -117,10 +117,10 @@ class CachingJwksKeyResolver:
         for candidate in keys:
             if not isinstance(candidate, dict) or candidate.get("kid") != kid:
                 continue
+            key_algorithm = (candidate.get("kty"), candidate.get("alg"))
             if (
-                candidate.get("kty") != "RSA"
+                key_algorithm not in {("RSA", "RS256"), ("EC", "ES256")}
                 or candidate.get("use") != "sig"
-                or candidate.get("alg") != "RS256"
                 or "d" in candidate
             ):
                 raise PortalTokenVerificationError()
@@ -150,13 +150,18 @@ class PyJwtPortalVerifier:
         try:
             header = jwt.get_unverified_header(token)
             kid = header.get("kid")
-            if header.get("alg") != "RS256" or not isinstance(kid, str) or not kid.strip():
+            algorithm = header.get("alg")
+            if (
+                algorithm not in {"RS256", "ES256"}
+                or not isinstance(kid, str)
+                or not kid.strip()
+            ):
                 raise PortalTokenVerificationError()
             key = self._key_resolver.get_key(kid=kid, jwks_url=jwks_url)
             claims = jwt.decode(
                 token,
                 key,
-                algorithms=["RS256"],
+                algorithms=[algorithm],
                 audience=audience,
                 issuer=issuer,
                 options={"require": ["exp", "sub", settings.portal_organization_claim]},
