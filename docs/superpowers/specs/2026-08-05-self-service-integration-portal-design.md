@@ -23,11 +23,15 @@ Gitea must never contain `.env` files, credentials, access tokens, or OAuth
 client secrets. The first release keeps the existing Captain-n8n service in
 place; moving it to the Mini-PC is a separate deployment decision.
 
-The Mini-PC portal reaches Captain only through a private mTLS service link.
+The Mini-PC portal reaches Captain only through WireGuard subnet
+`10.77.0.0/30`, with Captain at `10.77.0.1` and the Mini-PC at `10.77.0.2`.
+mTLS remains mandatory over that private transport.
 The browser never receives a Gateway role token, mTLS private key, or direct
 Gateway URL. The Mini-PC backend holds its client certificate in a local
 gitignored secret mount, and the Captain-side proxy accepts only that client
-certificate before forwarding portal traffic to the loopback Gateway.
+certificate before forwarding portal traffic to the loopback Gateway. The
+Captain proxy listens only on `10.77.0.1:443`; no LAN or public listener is
+permitted. WireGuard and mTLS keys remain local and gitignored.
 
 ## User journey
 

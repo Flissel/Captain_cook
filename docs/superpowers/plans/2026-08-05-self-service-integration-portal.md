@@ -14,7 +14,7 @@
 - Credentials are created and rotated in n8n UI only; Captain reads metadata through `list_credentials` and binds exact ID/type/project.
 - Tickets are subject-, organization-, job- and credential-alias-bound, valid at most ten minutes, stored as SHA-256 only and consumed transactionally once.
 - Gateway remains the sole MariaDB writer; Supabase is identity and tenant isolation only.
-- The Mini-PC backend reaches Gateway only over a private mTLS service link; browsers receive no Gateway URL, role token or mTLS material, and Gateway has no public fallback route.
+- The Mini-PC backend reaches Gateway only over WireGuard subnet `10.77.0.0/30` (`10.77.0.1` Captain, `10.77.0.2` Mini-PC) with mandatory mTLS above it; browsers receive no Gateway URL, role token or key material, and Gateway has no LAN/public fallback route.
 - Required non-ready integrations fail closed; only digest/project/correlation/deployment/execution-fenced receipts reach `ready`.
 - Do not migrate, adopt, stop or delete VibeMind n8n resources or volumes.
 
@@ -31,9 +31,9 @@
 
 ### Task 0: Establish the private mTLS service link
 
-**Files:** Create `deploy/portal-link/captain-proxy.conf`, `deploy/portal-link/mini-pc-proxy.conf`, `deploy/portal-link/compose.portal-link.yml`, and `tests/scripts/test_portal_link_config.py`.
+**Files:** Create `deploy/portal-link/captain-proxy.conf`, `deploy/portal-link/mini-pc-proxy.conf`, `deploy/portal-link/compose.portal-link.yml`, `deploy/portal-link/wireguard/captain.conf.example`, `deploy/portal-link/wireguard/mini-pc.conf.example`, and `tests/scripts/test_portal_link_config.py`.
 
-**Interfaces:** The Mini-PC backend sends requests to `https://captain-portal-link.internal`; the Captain proxy requires a trusted Mini-PC client certificate and forwards only `/v1/portal/` to `http://127.0.0.1:8090`.
+**Interfaces:** WireGuard exposes only `10.77.0.1:443` from Captain to peer `10.77.0.2`. The Mini-PC backend sends requests to `https://captain-portal-link.internal`; the Captain proxy requires a trusted Mini-PC client certificate and forwards only `/v1/portal/` to `http://127.0.0.1:8090`.
 
 - [ ] **Step 1: Write the failing proxy-boundary test**
 
@@ -46,17 +46,17 @@
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `py -3.11 -m pytest -q tests/scripts/test_portal_link_config.py`
+Run: `py -3.11 -m pytest -q --no-cov tests/scripts/test_portal_link_config.py`
 
 Expected: FAIL because the service-link configuration is absent.
 
 - [ ] **Step 3: Implement mTLS proxy configuration**
 
-Mount the Captain server certificate/key and Mini-PC client CA only from local gitignored secret paths. Set `ssl_verify_client on`, allow only the exact portal prefix, strip inbound `Authorization` headers, add a fixed internal forwarding identity header at the Captain proxy, and return 404 for every other route. The Mini-PC proxy must verify the Captain certificate hostname and never disable TLS verification.
+Bind the Captain proxy only to `10.77.0.1:443`. Define WireGuard peers on `10.77.0.0/30`, permitting Captain UDP `51820` and allowing the Mini-PC peer only `10.77.0.1/32`. Mount WireGuard keys, Captain server certificate/key and Mini-PC client CA only from local gitignored secret paths. Set `ssl_verify_client on`, allow only the exact portal prefix, strip inbound `Authorization` headers, add a fixed internal forwarding identity header at the Captain proxy, and return 404 for every other route. The Mini-PC proxy must verify the Captain certificate hostname and never disable TLS verification.
 
 - [ ] **Step 4: Run configuration tests and compose validation**
 
-Run: `py -3.11 -m pytest -q tests/scripts/test_portal_link_config.py; docker compose -f deploy/portal-link/compose.portal-link.yml config`
+Run: `py -3.11 -m pytest -q --no-cov tests/scripts/test_portal_link_config.py; docker compose -f deploy/portal-link/compose.portal-link.yml config`
 
 Expected: PASS without starting a container.
 
