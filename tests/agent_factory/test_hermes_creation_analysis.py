@@ -84,6 +84,7 @@ def _job_and_creation(artifacts: ContentAddressedArtifactStore):
         compiled=compiled,
         creation_key="factory-create-" + "a" * 64,
         released_skill=released,
+        architect_lease_id="architect-lease-test",
     )
     return job, creation
 
@@ -174,6 +175,8 @@ async def test_creation_analysis_materializes_exact_hermes_evidence_and_replays(
             {"command_id": "artifact.read", "max_seconds": 60},
             {"command_id": "hermes.creation-analysis", "max_seconds": 60},
         ]
+        assert "credential is owned by the approved n8n path" in request["instruction"]
+        assert "secret-like field name" in request["instruction"]
         calls.append(prompt)
         usage_file.write_text(json.dumps(_usage()), encoding="utf-8")
         return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

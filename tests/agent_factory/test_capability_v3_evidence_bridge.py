@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -13,6 +14,7 @@ from agenten.agent_factory.candidate_evaluation import ResolvedFactoryCandidate
 from agenten.agent_factory.capability_factory_production import (
     EvidenceLifecycleRequest,
     EvidenceRunRequest,
+    EvidenceWorkflowReviewRequest,
 )
 from agenten.agent_factory.capability_live_adapters import ContentAddressedArtifactStore
 from agenten.agent_factory.capability_v3_evidence_bridge import (
@@ -21,11 +23,13 @@ from agenten.agent_factory.capability_v3_evidence_bridge import (
     CapabilityControlledHoldoutReceiptV1,
     CapabilityControlledRecoveryResultV1,
     CapabilityV3EvidenceBuilderContext,
+    build_v3_job_from_package_c,
     build_capability_evidence_backend,
 )
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV2,
     AgentFactoryJobV3,
+    FactoryEvidenceBlock,
     FactoryRole,
 )
 from agenten.agent_factory.execution_budget import FactoryUsageReceiptV1
@@ -42,8 +46,10 @@ from agenten.agent_factory.orchestration import FactoryDispatch
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import (
     FACTORY_SKILL_ID_BY_STEP,
+    FactoryFeedbackV1,
     FactorySkillInvocationV1,
     FactorySkillStep,
+    TeamEvaluationV1,
     TeamExecutionEvidenceV1,
 )
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
@@ -143,6 +149,45 @@ def _policy() -> FactoryExecutionPolicyV1:
     )
 
 
+def test_v3_bridge_reuses_the_captain_registered_v3_job_identity() -> None:
+    v2 = _job()
+    v3 = AgentFactoryJobV3.model_validate(
+        {
+            **v2.model_dump(mode="json", by_alias=True),
+            "schema": "captain.agent-factory-job.v3",
+            "execution_policy": _policy().model_dump(mode="json", by_alias=True),
+        }
+    )
+
+    assert build_v3_job_from_package_c(v3, _policy()) is v3
+
+
+def test_runtime_evidence_request_preserves_registered_v3_job_on_json_round_trip() -> None:
+    v2 = _job()
+    v3 = AgentFactoryJobV3.model_validate(
+        {
+            **v2.model_dump(mode="json", by_alias=True),
+            "schema": "captain.agent-factory-job.v3",
+            "execution_policy": _policy().model_dump(mode="json", by_alias=True),
+        }
+    )
+    result = _result(v2)
+    candidate = _candidate(v2, result)
+    request = EvidenceRunRequest(
+        job=v3,
+        creation_result=result,
+        candidate=candidate,
+        run_number=1,
+    )
+
+    restored = EvidenceRunRequest.model_validate_json(
+        request.model_dump_json(by_alias=True)
+    )
+
+    assert isinstance(restored.job, AgentFactoryJobV3)
+    assert restored.job.job_id == v3.job_id
+
+
 class _Catalog(ReleasedFactorySkillCatalog):
     def released_for(self, job: object, step: FactorySkillStep) -> ReleasedHermesSkill:
         assert isinstance(job, AgentFactoryJobV3)
@@ -172,7 +217,11 @@ class _Authority:
         default_factory=dict
     )
     leases: list[object] = field(default_factory=list)
+    blocks: list[FactoryEvidenceBlock] = field(default_factory=list)
     usage: list[FactoryUsageReceiptV1] = field(default_factory=list)
+    artifacts: list[TeamExecutionEvidenceV1 | TeamEvaluationV1 | FactoryFeedbackV1] = field(
+        default_factory=list
+    )
 
     def register(self, job: AgentFactoryJobV3) -> None:
         existing = self.jobs.get(job.job_id)
@@ -198,8 +247,24 @@ class _Authority:
         if lease not in self.leases:
             self.leases.append(lease)
 
+    def record_block(self, block: FactoryEvidenceBlock) -> None:
+        if block not in self.blocks:
+            self.blocks.append(block)
+
     def usage_receipts(self, job_id: UUID) -> tuple[FactoryUsageReceiptV1, ...]:
         return tuple(item for item in self.usage if item.job_id == job_id)
+
+    def workflow_artifacts(
+        self, job_id: UUID
+    ) -> tuple[TeamExecutionEvidenceV1 | TeamEvaluationV1 | FactoryFeedbackV1, ...]:
+        return tuple(item for item in self.artifacts if item.job_id == job_id)
+
+    async def persist_workflow_artifact(
+        self,
+        artifact: TeamExecutionEvidenceV1 | TeamEvaluationV1 | FactoryFeedbackV1,
+    ) -> None:
+        if artifact not in self.artifacts:
+            self.artifacts.append(artifact)
 
 
 @dataclass
@@ -523,7 +588,14 @@ async def test_bridge_persists_v3_authority_and_issues_recovery_then_three_runs(
     assert v3.input_ref == job.input_ref
     assert v3.correlation_id == job.correlation_id
     assert set(step for current_job, step in AUTHORITY.assignments if current_job == v3.job_id) == set(FactorySkillStep)
-    assert {lease.role for lease in AUTHORITY.leases} == set(FactoryRole)
+    # The candidate attestation must become Captain's Build evidence before
+    # the paid execute-team capability can obtain its tester lease.  Quality
+    # remains deferred until the run evidence is complete.
+    assert tuple(block.phase.value for block in AUTHORITY.blocks) == ("build_passed",)
+    assert tuple(lease.role for lease in AUTHORITY.leases) == (
+        FactoryRole.TOOL_INTEGRATOR,
+        FactoryRole.REAL_CASE_TESTER,
+    )
     assert tuple(item.record.kind for item in accepted) == (
         "recovery",
         "normal",
@@ -532,14 +604,43 @@ async def test_bridge_persists_v3_authority_and_issues_recovery_then_three_runs(
     )
     assert len({item.record.run_id for item in accepted}) == 4
     assert len({item.reference.sha256 for item in accepted}) == 4
+    assertion_refs = tuple(
+        reference
+        for receipt in accepted
+        for result in receipt.record.assertion_results
+        for reference in result.evidence_refs
+    )
+    assert len(assertion_refs) == len({reference.sha256 for reference in assertion_refs})
+    for reference in assertion_refs:
+        payload = json.loads(artifacts.read_bytes(reference))
+        assert payload["schema"] == "captain.capability-assertion-evidence.v1"
+        assert payload["producer"] == "captain"
     assert len({item.invocation_id for item in AUTHORITY.usage}) == 4
     assert sum((item.cost_usd for item in AUTHORITY.usage), Decimal("0")) == Decimal("0.40")
     assert accepted[0].record.private_holdout_evidence[0].holdout_id == job.private_holdout_refs[0].holdout_id
-    assert tuple(block.lease_id for block in lifecycle) == (
-        next(lease.lease_id for lease in AUTHORITY.leases if lease.role is FactoryRole.TOOL_INTEGRATOR),
-        next(lease.lease_id for lease in AUTHORITY.leases if lease.role is FactoryRole.REAL_CASE_TESTER),
-        next(lease.lease_id for lease in AUTHORITY.leases if lease.role is FactoryRole.QUALITY_WARDEN),
+    assert tuple(block.role for block in lifecycle) == (
+        FactoryRole.TOOL_INTEGRATOR,
+        FactoryRole.REAL_CASE_TESTER,
+        FactoryRole.QUALITY_WARDEN,
     )
+    assert all(block.lease_id is not None for block in lifecycle)
+
+    await backend.workflow_review(
+        EvidenceWorkflowReviewRequest(
+            job=job,
+            candidate=candidate,
+            receipts=accepted,
+        )
+    )
+    assert len(
+        [item for item in AUTHORITY.artifacts if isinstance(item, TeamExecutionEvidenceV1)]
+    ) == 3
+    assert len(
+        [item for item in AUTHORITY.artifacts if isinstance(item, TeamEvaluationV1)]
+    ) == 1
+    assert len(
+        [item for item in AUTHORITY.artifacts if isinstance(item, FactoryFeedbackV1)]
+    ) == 1
 
     replayed = await backend.run(
         EvidenceRunRequest(

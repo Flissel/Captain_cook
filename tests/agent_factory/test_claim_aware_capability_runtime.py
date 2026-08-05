@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid5
@@ -161,6 +162,26 @@ def test_prepare_is_deterministic_and_binds_authority_to_same_correlation(tmp_pa
     assert first.grant.command_id == first.command.event_id
     assert first.grant.batch_version == factory_job.subject_version
     assert first.claim_owner_id == "capability-factory-runtime"
+
+
+def test_prepare_never_predates_capability_publication(tmp_path: Path) -> None:
+    factory_job = job()
+    catalog = authority().model_copy(
+        update={"published_at": factory_job.occurred_at + timedelta(seconds=1)}
+    )
+    adapter = runtime(tmp_path, FailingExecutor(), now=factory_job.occurred_at)
+    package_ref = adapter._artifacts.put(  # noqa: SLF001 - prepares the sealed CAS fixture.
+        b"{}", "application/json", namespace="capability-package"
+    )
+    catalog = catalog.model_copy(update={"package_ref": package_ref})
+
+    plan = asyncio.run(adapter.prepare(factory_job, catalog))
+
+    assert plan.command.occurred_at == catalog.published_at
+    assert plan.grant.issued_at == catalog.published_at
+    prompt = json.loads(adapter._artifacts.read_bytes(plan.command.payload.prompt_ref))  # noqa: SLF001
+    assert "release-validation run" in prompt["instruction"]
+    assert "Do not fail solely because a live claim" in prompt["instruction"]
 
 
 def test_execute_rejects_foreign_claim_before_provider_call(tmp_path: Path) -> None:

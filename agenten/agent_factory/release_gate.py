@@ -30,6 +30,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactoryFeedbackRecommendation,
     TeamEvaluationV1,
     TeamExecutionEvidenceV1,
+    released_skill_capability_matches_job,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 
@@ -190,7 +191,18 @@ def derive_terminal_decision(
             now,
         )
 
-    evaluation_reason = factory_evaluation_block_reason(job, evaluation)
+    v3_workflow_approved = (
+        isinstance(job, AgentFactoryJobV3)
+        and projection.workflow_evaluation_ref is not None
+        and projection.feedback_ref is not None
+        and projection.feedback_recommendation
+        is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
+    )
+    evaluation_reason = (
+        None
+        if v3_workflow_approved
+        else factory_evaluation_block_reason(job, evaluation)
+    )
     if evaluation_reason is not None and _evaluation_is_rejection(evaluation_reason):
         return _terminal_decision(
             job,
@@ -229,6 +241,7 @@ def derive_terminal_decision(
     all_tool_gaps = (
         *((() if validation is None else validation.tool_gaps)),
         *((() if evaluation is None else evaluation_tool_gaps(evaluation))),
+        *(projection.tool_gaps if isinstance(job, AgentFactoryJobV3) else ()),
     )
     required_gaps = tuple(
         marker
@@ -306,12 +319,17 @@ def derive_terminal_decision(
             now,
         )
 
-    assert evaluation is not None
+    if v3_workflow_approved:
+        assert projection.workflow_evaluation_ref is not None
+        evidence_refs = (*validation.release_evidence_refs, projection.workflow_evaluation_ref)
+    else:
+        assert evaluation is not None
+        evidence_refs = (*validation.release_evidence_refs, evaluation.evidence_ref)
     return _terminal_decision(
         job,
         FactoryTerminalState.READY_TO_USE,
         FactoryTerminalReasonCode.READY_TO_USE,
-        (*validation.release_evidence_refs, evaluation.evidence_ref),
+        evidence_refs,
         now,
     )
 
@@ -622,7 +640,9 @@ def factory_evaluation_block_reason(
         )
     ):
         return "skill evaluation subject version does not match the factory job"
-    if request.released_skill.capability != job.required_capability:
+    if not released_skill_capability_matches_job(
+        request.released_skill.capability, job.required_capability
+    ):
         return "released skill capability does not match the factory job"
     required_assertions = set(job.acceptance_assertion_ids)
     if set(request.acceptance_assertion_ids) != required_assertions:

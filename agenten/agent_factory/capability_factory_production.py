@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import secrets
 from collections.abc import Awaitable, Callable
@@ -20,26 +21,64 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 
 from agenten.agent_factory.capability_factory_entrypoint import (
     CapabilityReleaseRunReceipt,
 )
-from agenten.agent_factory.contracts import AgentFactoryJobV2, FactoryEvidenceBlock
+from agenten.agent_factory.contracts import (
+    AgentFactoryJobV2,
+    AgentFactoryJobV3,
+    FactoryEvidenceBlock,
+)
 from agenten.agent_factory.forge_contracts import (
     CreationJobV1,
     CreationResultV1,
     CreationSubmissionReceipt,
 )
+from agenten.agent_factory.leases import FactoryLeaseDenied
 from agenten.agent_factory.outcome_contracts import ForgeCapabilityPackageCandidateV1
+from agenten.agent_factory.service import FactoryRepositoryError
 from agenten.agent_runtime.http_server import RuntimeCommandExecutor, create_runtime_app
 
 
 _SYMBOL = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SAFE_LOCAL_DIAGNOSTIC = re.compile(r"^[A-Za-z0-9 _.,:;()/-]{1,240}$")
 
 
 class CapabilityProductionConfigurationError(ValueError):
     """A production port or manifest is incomplete or ambiguous."""
+
+
+def _backend_failure_detail(code: str, exc: Exception) -> dict[str, str]:
+    """Return a narrowly safe diagnostic for the authenticated runtime boundary."""
+
+    detail = {"code": code, "exception_type": type(exc).__name__}
+    if isinstance(exc, (FactoryRepositoryError, FactoryLeaseDenied)) or type(exc).__name__ == "ProductionCandidatePortError":
+        detail["reason"] = str(exc)
+    elif isinstance(exc, ValidationError):
+        detail["reason"] = "; ".join(
+            f"{'.'.join(str(item) for item in error['loc'])}:{error['msg']}"
+            for error in exc.errors(include_input=False)
+        )
+    elif type(exc).__name__ == "ProductionToolRequired" and _SAFE_LOCAL_DIAGNOSTIC.fullmatch(
+        str(exc)
+    ):
+        # TODO_TOOL markers are part of Captain's external contract. The restricted
+        # alphabet keeps this typed configuration reason redacted.
+        detail["reason"] = str(exc)
+    elif (
+        isinstance(exc, (ValueError, HTTPException))
+        and os.environ.get("CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS") == "1"
+        and _SAFE_LOCAL_DIAGNOSTIC.fullmatch(
+            str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+        )
+    ):
+        # Opt-in local diagnostic for composing a new provider graph.  The
+        # restricted alphabet deliberately refuses values that can carry a
+        # bearer credential, URL query, or serialized provider payload.
+        detail["reason"] = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+    return detail
 
 
 class AdapterManifestKind(str, Enum):
@@ -157,6 +196,37 @@ class MinibookSwarmCreationHttpPort:
             raise ValueError("Minibook preparation evidence does not match the factory job")
         return blocks[0], blocks[1]
 
+    async def architect_block(
+        self,
+        job: AgentFactoryJobV2,
+        creation_job: CreationJobV1,
+    ) -> FactoryEvidenceBlock:
+        response = await self._get_when_ready(
+            f"{self._base_url}/api/v1/creation-jobs/{creation_job.creation_job_id}/architect-block",
+            deadline=self._submitted_deadline(creation_job.creation_job_id),
+        )
+        block = FactoryEvidenceBlock.model_validate(response.json())
+        if block.job_id != job.job_id:
+            raise ValueError("Minibook architect evidence does not match the factory job")
+        return block
+
+    async def resume_tool_integrator(
+        self,
+        creation_job: CreationJobV1,
+        *,
+        lease_id: str,
+    ) -> None:
+        response = await self._http.post(
+            f"{self._base_url}/api/v1/creation-jobs/{creation_job.creation_job_id}/resume",
+            headers=self._headers(),
+            json={
+                "schema": "minibook.creation-resume-grant.v1",
+                "creation_job_id": str(creation_job.creation_job_id),
+                "tool_integrator_lease_id": lease_id,
+            },
+        )
+        _raise_for_status(response)
+
     async def submit(self, creation_job: CreationJobV1) -> CreationSubmissionReceipt:
         response = await self._http.post(
             f"{self._base_url}/api/v1/creation-jobs",
@@ -228,7 +298,7 @@ class MinibookSwarmCreationHttpPort:
 class EvidenceRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    job: AgentFactoryJobV2
+    job: AgentFactoryJobV3 | AgentFactoryJobV2
     creation_result: CreationResultV1
     candidate: ForgeCapabilityPackageCandidateV1
     run_number: int = Field(ge=1, le=4, strict=True)
@@ -268,7 +338,17 @@ class EvidenceRunRequest(BaseModel):
 class EvidenceLifecycleRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    job: AgentFactoryJobV2
+    job: AgentFactoryJobV3 | AgentFactoryJobV2
+    receipts: tuple[CapabilityReleaseRunReceipt, ...] = Field(min_length=4)
+
+
+class EvidenceWorkflowReviewRequest(BaseModel):
+    """Request a persisted V3 review after Captain records real-case evidence."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    job: AgentFactoryJobV3 | AgentFactoryJobV2
+    candidate: ForgeCapabilityPackageCandidateV1
     receipts: tuple[CapabilityReleaseRunReceipt, ...] = Field(min_length=4)
 
 
@@ -323,6 +403,24 @@ class RuntimeCaptainEvidenceHttpPort:
             raise ValueError("runtime lifecycle evidence does not match the factory job")
         return blocks[0], blocks[1], blocks[2]
 
+    async def workflow_review(
+        self,
+        job: AgentFactoryJobV2,
+        candidate: ForgeCapabilityPackageCandidateV1,
+        receipts: tuple[CapabilityReleaseRunReceipt, ...],
+    ) -> None:
+        request = EvidenceWorkflowReviewRequest(
+            job=job,
+            candidate=candidate,
+            receipts=receipts,
+        )
+        response = await self._http.post(
+            f"{self._base_url}/v1/capability-factory/workflow-review",
+            headers=self._headers(),
+            json=request.model_dump(mode="json", by_alias=True),
+        )
+        _raise_for_status(response)
+
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token.get_secret_value()}"}
 
@@ -332,6 +430,7 @@ class CapabilityEvidenceBackend(Protocol):
     async def lifecycle_blocks(
         self, request: EvidenceLifecycleRequest
     ) -> tuple[FactoryEvidenceBlock, FactoryEvidenceBlock, FactoryEvidenceBlock]: ...
+    async def workflow_review(self, request: EvidenceWorkflowReviewRequest) -> None: ...
 
 
 def create_capability_factory_runtime_app(
@@ -363,7 +462,13 @@ def create_capability_factory_runtime_app(
         request: EvidenceRunRequest,
         _: None = Depends(authorize),
     ) -> CapabilityReleaseRunReceipt:
-        receipt = await backend.run(request)
+        try:
+            receipt = await backend.run(request)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=_backend_failure_detail("capability_evidence_backend_failed", exc),
+            ) from exc
         if receipt is None:
             raise HTTPException(status_code=409, detail="evidence run is not available")
         return receipt
@@ -373,7 +478,29 @@ def create_capability_factory_runtime_app(
         request: EvidenceLifecycleRequest,
         _: None = Depends(authorize),
     ) -> tuple[FactoryEvidenceBlock, FactoryEvidenceBlock, FactoryEvidenceBlock]:
-        return await backend.lifecycle_blocks(request)
+        try:
+            return await backend.lifecycle_blocks(request)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=_backend_failure_detail("capability_lifecycle_backend_failed", exc),
+            ) from exc
+
+    @app.post(
+        "/v1/capability-factory/workflow-review",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def workflow_review(
+        request: EvidenceWorkflowReviewRequest,
+        _: None = Depends(authorize),
+    ) -> None:
+        try:
+            await backend.workflow_review(request)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=_backend_failure_detail("capability_workflow_review_failed", exc),
+            ) from exc
 
     return app
 
@@ -398,7 +525,22 @@ def _raise_for_status(response: Any) -> None:
     try:
         response.raise_for_status()
     except Exception as exc:
-        raise RuntimeError("production capability service request failed") from exc
+        detail = None
+        try:
+            body = response.json()
+            candidate = body.get("detail") if isinstance(body, dict) else None
+            if isinstance(candidate, dict):
+                code = candidate.get("code")
+                exception_type = candidate.get("exception_type")
+                if isinstance(code, str) and isinstance(exception_type, str):
+                    detail = f"{code}:{exception_type}"
+                    reason = candidate.get("reason")
+                    if isinstance(reason, str) and reason:
+                        detail = f"{detail} {reason}"
+        except Exception:
+            pass
+        suffix = "" if detail is None else f" ({detail})"
+        raise RuntimeError(f"production capability service request failed{suffix}") from exc
 
 
 def _retry_after_seconds(response: Any) -> float:

@@ -100,8 +100,8 @@ if ($LASTEXITCODE -ne 0) {
     throw "Could not inspect the Captain n8n project inventory."
 }
 $ids = @($ids | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-if ($ids.Count -ne 2) {
-    throw "Captain n8n inventory must contain exactly two project-scoped containers."
+if ($ids.Count -ne 3) {
+    throw "Captain n8n inventory must contain exactly three project-scoped containers."
 }
 
 $services = @()
@@ -113,7 +113,7 @@ foreach ($id in $ids) {
     $services += ([string]$service).Trim()
 }
 $actualServiceList = (@($services | Sort-Object) -join ",")
-$expectedServiceList = (@(@("n8n", "postgres") | Sort-Object) -join ",")
+$expectedServiceList = (@(@("mcp-broker", "n8n", "postgres") | Sort-Object) -join ",")
 if ($actualServiceList -ne $expectedServiceList) {
     throw "Captain n8n inventory contains an unexpected service."
 }

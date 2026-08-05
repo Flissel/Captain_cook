@@ -62,6 +62,16 @@ def test_factory_workflow_bundle_is_non_authoritative_operator_aid() -> None:
     }
 
 
+def test_factory_workflow_bundle_is_a_real_released_hermes_skill() -> None:
+    skill = Path("agenten/agent_factory/skills/captain-agent-factory-loop/SKILL.md")
+
+    content = skill.read_text(encoding="utf-8")
+
+    assert "name: captain-agent-factory-loop" in content
+    for step in SKILLS:
+        assert step in content
+
+
 def test_report_classifies_tool_credential_infrastructure_and_adapter_gaps() -> None:
     path = Path(
         "agenten/agent_factory/skills/captain-factory-report-captain/"

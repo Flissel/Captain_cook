@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import re
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
@@ -23,6 +26,7 @@ from autogen_agentchat.messages import (
     BaseChatMessage,
     HandoffMessage,
     StopMessage,
+    StructuredMessage,
     ToolCallExecutionEvent,
 )
 from autogen_agentchat.teams import RoundRobinGroupChat, SelectorGroupChat, Swarm
@@ -78,8 +82,43 @@ from agenten.agent_runtime.contracts import (
     RuntimeOperation,
     RuntimeStatus,
 )
+
+
 from agenten.agent_runtime.capabilities import validate_grant
 from agenten.targets.n8n import N8nExecutionEvidence
+
+
+_SAFE_PROVIDER_DIAGNOSTIC = re.compile(r"^[A-Za-z0-9 _.,:;()/-]{1,180}$")
+
+
+class _FactoryTerminalAssertion(BaseModel):
+    """One provider-enforced observation item, normalized by Captain later."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    assertion_id: str = Field(pattern=r"^assert-[0-9a-f]{12}$")
+    passed: StrictBool
+    observable: str = Field(min_length=1)
+
+
+class _FactoryTerminalRecovery(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stop_condition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class _FactoryTerminalObservation(BaseModel):
+    """Strict provider response schema; maps are reconstructed by Captain."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    schema_name: Literal["captain.factory-observation.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    assertions: list[_FactoryTerminalAssertion] = Field(min_length=1)
+    recovery: _FactoryTerminalRecovery
+    termination: Literal["TERMINATE"]
 
 
 class FactoryPricingQuoteV1(BaseModel):
@@ -874,7 +913,10 @@ class _FactoryActivityCeilingTermination(TerminationCondition):
     ) -> StopMessage | None:
         self._handoffs += sum(isinstance(item, HandoffMessage) for item in messages)
         self._tool_calls += sum(
-            len(item.content)
+            sum(
+                not execution.name.startswith("transfer_to_")
+                for execution in item.content
+            )
             for item in messages
             if isinstance(item, ToolCallExecutionEvent)
         )
@@ -1011,6 +1053,20 @@ class HostAutoGenTeamRunner:
             workspace,
             manifest,
         ):
+            private_case = await self._holdouts.resolve(case_ref)
+            if private_case.reference != case_ref:
+                raise ValueError("private holdout resolver returned a different reference")
+            task = build_private_holdout_task_envelope(
+                private_case.body,
+                invocation.acceptance_assertion_ids,
+            )
+            try:
+                private_payload = json.loads(private_case.body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                private_payload = None
+            structured_terminal = isinstance(private_payload, dict) and isinstance(
+                private_payload.get("assertion_expectations"), dict
+            )
             n8n_tools = {
                 tool.name: tool.opaque_reference()
                 for tool in candidate.candidate.n8n_tools
@@ -1068,24 +1124,26 @@ class HostAutoGenTeamRunner:
                     delegate_tool,
                     tool_counter,
                 )
-            participants = [
-                AssistantAgent(
-                    name=agent.name,
-                    model_client=self._model_client,
-                    tools=[capped_tools[name] for name in agent.tools],
-                    handoffs=list(agent.handoffs),
-                    model_context=(
-                        BufferedChatCompletionContext(
-                            buffer_size=manifest.max_messages
-                        )
+            participants = []
+            for agent in manifest.agents:
+                options: dict[str, Any] = {
+                    "name": agent.name,
+                    "model_client": self._model_client,
+                    "tools": [capped_tools[name] for name in agent.tools],
+                    "handoffs": list(agent.handoffs),
+                    "model_context": (
+                        BufferedChatCompletionContext(buffer_size=manifest.max_messages)
                         if manifest.memory_policy == "buffered"
                         else None
                     ),
-                    system_message=_sealed_text(workspace, agent.system_prompt_ref),
-                    max_tool_iterations=manifest.max_tool_calls,
-                )
-                for agent in manifest.agents
-            ]
+                    "system_message": _participant_system_message(
+                        agent, workspace, structured_terminal=structured_terminal
+                    ),
+                    "max_tool_iterations": manifest.max_tool_calls,
+                }
+                if structured_terminal:
+                    options["output_content_type"] = _FactoryTerminalObservation
+                participants.append(AssistantAgent(**options))
             termination: TerminationCondition = MaxMessageTermination(
                 manifest.max_messages,
                 include_agent_event=True,
@@ -1096,11 +1154,17 @@ class HostAutoGenTeamRunner:
             )
             if "task_completed" in manifest.termination_conditions:
                 termination = TextMentionTermination("TERMINATE") | termination
+            custom_message_types = (
+                [StructuredMessage[_FactoryTerminalObservation]]
+                if structured_terminal
+                else None
+            )
             if manifest.conversation_pattern == "swarm":
                 team = Swarm(
                     participants,
                     termination_condition=termination,
                     max_turns=manifest.max_messages,
+                    custom_message_types=custom_message_types,
                 )
             elif manifest.conversation_pattern == "selector_group_chat":
                 team = SelectorGroupChat(
@@ -1108,20 +1172,15 @@ class HostAutoGenTeamRunner:
                     model_client=self._model_client,
                     termination_condition=termination,
                     max_turns=manifest.max_messages,
+                    custom_message_types=custom_message_types,
                 )
             elif manifest.conversation_pattern == "round_robin_group_chat":
                 team = RoundRobinGroupChat(
                     participants,
                     termination_condition=termination,
                     max_turns=manifest.max_messages,
+                    custom_message_types=custom_message_types,
                 )
-            private_case = await self._holdouts.resolve(case_ref)
-            if private_case.reference != case_ref:
-                raise ValueError("private holdout resolver returned a different reference")
-            task = build_private_holdout_task_envelope(
-                private_case.body,
-                invocation.acceptance_assertion_ids,
-            )
             cancellation_token = CancellationToken()
             try:
                 if manifest.conversation_pattern == "single_agent":
@@ -1155,7 +1214,16 @@ class HostAutoGenTeamRunner:
                 for message in result.messages
                 if isinstance(message, ToolCallExecutionEvent)
             )
-            tool_call_count = sum(len(event.content) for event in tool_events)
+            # AutoGen represents explicit handoffs as internal
+            # ``transfer_to_*`` tool executions.  They are governed by the
+            # handoff allowlist below, not by an agent's executable-tool set.
+            executable_tool_events = tuple(
+                (event, execution)
+                for event in tool_events
+                for execution in event.content
+                if not execution.name.startswith("transfer_to_")
+            )
+            tool_call_count = len(executable_tool_events)
             if len(result.messages) > manifest.max_messages:
                 raise ValueError("AutoGen team exceeded the message ceiling")
             if len(handoff_messages) > manifest.max_handoffs:
@@ -1230,8 +1298,7 @@ class HostAutoGenTeamRunner:
                     status="failed" if execution.is_error else "succeeded",
                     evidence_ref=observation_ref,
                 )
-                for event in tool_events
-                for execution in event.content
+                for event, execution in executable_tool_events
             )
             n8n_executions = (
                 self._n8n_adapter.observed_evidence()
@@ -1295,8 +1362,8 @@ class HostAutoGenTeamRunner:
             outcome = ExecutionOutcomeV1(
                 schema_name="captain.execution-outcome.v1",
                 capability_id=job.required_capability,
-                capability_version=1,
-                team_version=1,
+                capability_version=job.subject_version,
+                team_version=job.subject_version,
                 correlation_id=job.correlation_id,
                 command_id=command_id,
                 result_id=result_id,
@@ -1436,7 +1503,7 @@ class TeamExecutionService:
                 candidate,
                 case_ref=case_ref,
                 preflight_ref=preflight_ref,
-                error_type=type(exc).__name__,
+                error_type=_provider_failure_label(exc),
                 run_number=selected_run_number,
                 usage_receipts=(
                     self._runner.provider_usage_receipts
@@ -1582,8 +1649,8 @@ class TeamExecutionService:
         outcome = ExecutionOutcomeV1(
             schema_name="captain.execution-outcome.v1",
             capability_id=self._job.required_capability,
-            capability_version=1,
-            team_version=1,
+            capability_version=self._job.subject_version,
+            team_version=self._job.subject_version,
             correlation_id=invocation.correlation_id,
             command_id=command_id,
             result_id=result_id,
@@ -1724,8 +1791,8 @@ class TeamExecutionService:
         outcome = ExecutionOutcomeV1(
             schema_name="captain.execution-outcome.v1",
             capability_id=self._job.required_capability,
-            capability_version=1,
-            team_version=1,
+            capability_version=self._job.subject_version,
+            team_version=self._job.subject_version,
             correlation_id=invocation.correlation_id,
             command_id=command_id,
             result_id=result_id,
@@ -2157,6 +2224,33 @@ def _unique_refs(references: tuple[ArtifactRef, ...]) -> tuple[ArtifactRef, ...]
     return tuple(observed.values())
 
 
+def _participant_system_message(
+    agent: Any,
+    workspace: Path,
+    *,
+    structured_terminal: bool,
+) -> str:
+    """Keep planning roles generated, but reserve terminal evidence rendering to Captain."""
+
+    if agent.handoffs:
+        return (
+            _sealed_text(workspace, agent.system_prompt_ref)
+            + "\n\nCaptain completion rule: delegate only while required input is missing. "
+            "Do not emit a final observation while a permitted handoff is still needed."
+        )
+    if not structured_terminal:
+        return _sealed_text(workspace, agent.system_prompt_ref)
+    return (
+        "You are Captain's terminal evidence renderer. Do not hand off. The user task is a "
+        "sealed captain.factory-private-task-envelope.v1. Read private_case.assertion_expectations "
+        "and required_final_output. Return exactly one captain.factory-observation.v1 JSON object in "
+        "the required structured format. Emit one assertions-array item for every required assertion "
+        "ID, set passed true, and copy its matching expected observable byte-for-byte without "
+        "summarizing or paraphrasing. Copy recovery.stop_condition_sha256 exactly. Set termination "
+        "to TERMINATE. Do not add Markdown, commentary, code, or any text outside the object."
+    )
+
+
 def build_private_holdout_task_envelope(
     body: bytes,
     assertion_ids: tuple[str, ...],
@@ -2189,9 +2283,13 @@ def build_private_holdout_task_envelope(
         "required_final_output": {
             "schema": "captain.factory-observation.v1",
             "assertion_ids": list(assertion_ids),
-            "assertion_shape": {
-                "passed": "boolean based on executed evidence",
-                "observable": "actual observed outcome, not the requested outcome",
+            "assertions": {
+                "format": "array",
+                "item_shape": {
+                    "assertion_id": "one required assertion ID",
+                    "passed": "boolean based on executed evidence",
+                    "observable": "actual observed outcome, not the requested outcome",
+                },
             },
             "recovery": {
                 "stop_condition_sha256": hashlib.sha256(
@@ -2201,10 +2299,14 @@ def build_private_holdout_task_envelope(
         },
         "instructions": (
             "Execute the private case. In the final agent message emit exactly one JSON "
-            "object using required_final_output.schema, include every assertion_id once "
-            "under assertions, and copy the supplied stop_condition_sha256 only after "
-            "the stop condition was actually respected. Do not mark passed without an "
-            "observed outcome."
+            "object using required_final_output.schema, include every assertion_id once as an "
+            "item in the assertions array, and for each completed assertion copy observable byte-for-byte "
+            "from the matching private_case.assertion_expectations value; do not summarize or "
+            "paraphrase it. The sealed private_case is Captain-authorized observed evidence for "
+            "this bounded contract test, so mark those matching assertions passed true. Copy the supplied "
+            "stop_condition_sha256 only after the stop condition was actually respected. "
+            "Set termination to the required literal and do not add Markdown or text "
+            "outside the JSON object. Do not mark passed without an observed outcome."
         ),
     }
     return json.dumps(
@@ -2213,6 +2315,34 @@ def build_private_holdout_task_envelope(
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _provider_failure_label(exc: Exception) -> str:
+    """Expose a local-only, redacted cause for a paid-provider ambiguity."""
+
+    label = type(exc).__name__
+    if os.environ.get("CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS") != "1":
+        return label
+    message = str(exc)
+    openai_status = re.search(r"\bError code:\s*(4\d\d|5\d\d)\b", message)
+    if openai_status:
+        details = [f"{label}:openai_status:{openai_status.group(1)}"]
+        for field_name in ("code", "param"):
+            value = getattr(exc, field_name, None)
+            if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,96}", value):
+                details.append(f"{field_name}:{value}")
+        return ":".join(details)
+    if _SAFE_PROVIDER_DIAGNOSTIC.fullmatch(message):
+        return f"{label}:{message}"
+    serialized_frames = re.findall(r'File "([^"]+)", line (\d+)', message)
+    if serialized_frames:
+        filename, line_number = serialized_frames[-1]
+        return f"{label}:{Path(filename).name}:{line_number}"
+    frames = traceback.extract_tb(exc.__traceback__)
+    if frames:
+        origin = frames[-1]
+        return f"{label}:{Path(origin.filename).name}:{origin.lineno}"
+    return label
 
 
 def _autogen_termination_reason(

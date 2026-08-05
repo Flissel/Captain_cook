@@ -13,9 +13,10 @@ from minibook.swarm.contracts import (
     CreationCompletionEvidenceV1,
     CreationJobV1,
     CreationPreparationEvidenceV1,
+    CreationResumeGrantV1,
 )
 from minibook.swarm.creation_runtime import BackgroundCreationRuntime
-from minibook.swarm.job_store import CreationConflictError, CreationJobStore
+from minibook.swarm.job_store import CreationConflictError, CreationJobStore, CreationNotFoundError
 from minibook.swarm.pipeline_adapter import SwarmPipelineAdapter, SwarmStep
 from minibook.tests.test_creation_evidence_api import (
     _completion_payload,
@@ -198,6 +199,23 @@ async def test_background_runtime_persists_real_step_evidence_with_success_resul
     runtime = BackgroundCreationRuntime(store, PipelineFactory())
 
     await runtime.start()
+    architect = None
+    for _ in range(200):
+        try:
+            architect = store.architect(job.creation_job_id)
+        except CreationNotFoundError:
+            pass
+        if architect is not None and store.progress(job.creation_job_id).status == "awaiting_tool_integrator":
+            break
+        await asyncio.sleep(0.01)
+    assert architect is not None and architect.lease_id == job.architect_lease_id
+    assert store.resume(
+        CreationResumeGrantV1(
+            creation_job_id=job.creation_job_id,
+            tool_integrator_lease_id="captain-tool-integrator-lease-1",
+        )
+    ) is False
+    runtime.schedule(job.creation_job_id)
     await _wait_for_completion(store, job)
     await runtime.stop()
 
@@ -220,6 +238,8 @@ async def test_background_runtime_persists_real_step_evidence_with_success_resul
     assert not preparation.blocks[0].assertion_ids
     assert not preparation.blocks[1].assertion_ids
     assert not completion.block.assertion_ids
+    assert preparation.blocks[1].lease_id == "captain-tool-integrator-lease-1"
+    assert completion.block.lease_id == "captain-tool-integrator-lease-1"
 
 
 def test_finish_with_completion_rolls_back_result_when_evidence_binding_is_invalid(

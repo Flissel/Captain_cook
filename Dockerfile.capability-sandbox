@@ -3,6 +3,16 @@ FROM python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627a
 LABEL org.opencontainers.image.title="captain-capability-sandbox"
 LABEL org.opencontainers.image.description="Minimal non-root Python sandbox for Captain-issued capability work"
 
+# Generated teams are imported and tested inside this image.  Keep this
+# deliberately limited to the deterministic AutoGen runtime surface; the
+# candidate workspace itself remains a read-only bind and has no network.
+RUN pip install --no-cache-dir \
+    autogen-agentchat==0.7.5 \
+    autogen-ext[openai]==0.7.5 \
+    PyYAML==6.0.3 \
+    httpx==0.28.1 \
+    pytest==9.0.2
+
 WORKDIR /workspace
 USER 65532:65532
 

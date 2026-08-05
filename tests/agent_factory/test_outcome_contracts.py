@@ -149,6 +149,17 @@ def test_adapter_declaration_requires_an_adapter_root() -> None:
         CapabilityPackageManifestV1.model_validate(payload)
 
 
+def test_package_accepts_runtime_config_artifact() -> None:
+    payload = _fixture("capability_package_manifest.v1.json")
+    payload["artifacts"].append(
+        _artifact("runtime/capability-runtime.json", "b" * 64, kind="runtime_config")
+    )
+
+    manifest = CapabilityPackageManifestV1.model_validate(payload)
+
+    assert manifest.artifacts[-1].kind == "runtime_config"
+
+
 @pytest.mark.parametrize(
     "unsafe_path",
     ("../secret.txt", "/tmp/code.py", "C:\\work\\code.py", "autogen\\..\\secret.py"),

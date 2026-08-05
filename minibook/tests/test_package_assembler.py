@@ -93,6 +93,112 @@ def test_same_inputs_produce_same_archive_digest_and_complete_manifest(tmp_path:
     assert all("sha256" in entry for entry in manifest["files"])
 
 
+def test_code_only_package_has_a_candidate_descriptor_without_n8n(tmp_path: Path) -> None:
+    assembled = PackageAssembler().assemble(
+        candidate(tmp_path),
+        tmp_path / "code-only.zip",
+        startup_command=("python", "autogen/main.py"),
+    )
+
+    with zipfile.ZipFile(assembled.archive_path) as archive:
+        descriptor = json.loads(archive.read("adapters/factory-candidate.json"))
+    assert descriptor["workflow_artifacts"] == []
+    assert descriptor["tool_schema_artifacts"] == []
+    assert descriptor["n8n_tools"] == []
+
+
+def test_code_only_descriptor_normalizes_local_tool_objects_without_n8n(
+    tmp_path: Path,
+) -> None:
+    source = candidate(tmp_path)
+    agent = source / "agents" / "worker"
+    agent.mkdir(parents=True)
+    (agent / "agent.yml").write_text(
+        "name: worker\n"
+        "system_message: Use the generated helper.\n"
+        "tools:\n"
+        "  - name: local_helper\n"
+        "    mcp_server: none\n"
+        "handoffs: []\n",
+        encoding="utf-8",
+    )
+
+    assembled = PackageAssembler().assemble(
+        source,
+        tmp_path / "local-tools.zip",
+        startup_command=("python", "autogen/main.py"),
+    )
+
+    with zipfile.ZipFile(assembled.archive_path) as archive:
+        execution = json.loads(archive.read("adapters/execution-team.json"))
+    assert execution["agents"][0]["tools"] == []
+
+
+def test_integration_export_grants_only_declared_n8n_tools_not_local_helpers(
+    tmp_path: Path,
+) -> None:
+    source = integrated_candidate(tmp_path)
+    agent = source / "agents" / "worker" / "agent.yml"
+    agent.write_text(
+        "name: worker\n"
+        "system_message: Use local helpers and the approved workflow.\n"
+        "tools:\n"
+        "  - customer_sync\n"
+        "  - local_helper\n"
+        "handoffs: []\n",
+        encoding="utf-8",
+    )
+
+    assembled = PackageAssembler().assemble(
+        source,
+        tmp_path / "integrated.zip",
+        startup_command=("python", "autogen/main.py"),
+        integration_contracts=(integration_contract(),),
+    )
+
+    with zipfile.ZipFile(assembled.archive_path) as archive:
+        execution = json.loads(archive.read("adapters/execution-team.json"))
+    assert execution["agents"][0]["tools"] == ["customer_sync"]
+
+
+def test_swarm_export_removes_backward_handoffs_to_create_a_terminal_agent(
+    tmp_path: Path,
+) -> None:
+    source = candidate(tmp_path)
+    for name, handoffs in (("planner", ["researcher"]), ("researcher", ["planner"])):
+        agent = source / "agents" / name
+        agent.mkdir(parents=True)
+        (agent / "agent.yml").write_text(
+            "\n".join(
+                (
+                    f"name: {name}",
+                    "system_message: Complete the assigned work.",
+                    "tools: []",
+                    f"handoffs: {handoffs}",
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    (source / "project.yml").write_text("pattern: swarm\n", encoding="utf-8")
+
+    assembled = PackageAssembler().assemble(
+        source,
+        tmp_path / "swarm.zip",
+        startup_command=("python", "autogen/main.py"),
+    )
+
+    with zipfile.ZipFile(assembled.archive_path) as archive:
+        execution = json.loads(archive.read("adapters/execution-team.json"))
+        terminal_prompt = archive.read("adapters/prompts/researcher.md").decode("utf-8")
+    handoffs = {item["name"]: item["handoffs"] for item in execution["agents"]}
+    assert handoffs == {"planner": ["researcher"], "researcher": []}
+    assert (
+        "Return exactly one parseable captain.factory-observation.v1 JSON object:"
+        in terminal_prompt
+    )
+
+
 def test_startup_validation_uses_package_validation_mode(tmp_path: Path) -> None:
     root = candidate(tmp_path)
     (root / "autogen/main.py").write_text(
@@ -235,6 +341,7 @@ def test_legacy_export_materializes_deterministic_package_c_from_real_results(
         capability_version=2,
         pipeline_results=pipeline_results,
         hermes_skill_usage_receipt=receipt,
+        integration_keys=("observability", "audit_log"),
     )
     second = assembler.materialize_legacy_export(
         source,
@@ -243,6 +350,7 @@ def test_legacy_export_materializes_deterministic_package_c_from_real_results(
         capability_version=2,
         pipeline_results=pipeline_results,
         hermes_skill_usage_receipt=receipt,
+        integration_keys=("observability", "audit_log"),
     )
 
     required = {
@@ -279,6 +387,51 @@ def test_legacy_export_materializes_deterministic_package_c_from_real_results(
         if path.is_file()
     }
     assert first_bytes == second_bytes
+
+
+def test_legacy_export_seals_input_derived_n8n_templates_without_credentials(
+    tmp_path: Path,
+) -> None:
+    source = _legacy_export(tmp_path)
+    package = PackageAssembler().materialize_legacy_export(
+        source,
+        tmp_path / "package-c",
+        capability_id="incident-team",
+        capability_version=1,
+        pipeline_results={
+            "build": {"status": "PASS"},
+            "run": {"status": "PASS"},
+            "output_evaluation": {"status": "PASS"},
+        },
+        hermes_skill_usage_receipt=b'{"schema":"hermes.skill-usage-receipt.v1","outcome":"passed"}',
+        integration_keys=("observability", "audit_log"),
+    )
+
+    descriptor = json.loads(
+        (package / "adapters/factory-candidate.json").read_text(encoding="utf-8")
+    )
+    names = {
+        path.relative_to(package).as_posix()
+        for path in package.rglob("*")
+        if path.is_file()
+    }
+    assert [item["name"] for item in descriptor["n8n_tools"]] == [
+        "audit_log",
+        "observability",
+    ]
+    assert "n8n/audit_log.json" in names
+    assert "n8n/observability.json" in names
+    package_index = json.loads(
+        (package / "evidence/package-index.json").read_text(encoding="utf-8")
+    )
+    kinds = {item["path"]: item["kind"] for item in package_index["files"]}
+    assert kinds["runtime/capability-runtime.json"] == "runtime_config"
+    assert kinds["runtime/requirements.txt"] == "runtime_config"
+    assert all("TOKEN" not in item for item in names)
+    schema_digests = {
+        item["reference"]["sha256"] for item in descriptor["tool_schema_artifacts"]
+    }
+    assert len(schema_digests) == 4
 
 
 def test_legacy_export_reports_exact_missing_real_outputs_as_todo_tool(

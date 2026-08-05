@@ -44,6 +44,12 @@ class ClaimAwareRuntimeRecoveryRequired(RuntimeError):
     """A provider effect may have started but no durable result is available."""
 
 
+def capability_runtime_batch_id(job: AgentFactoryJobV2) -> str:
+    """Return the bounded, immutable Gateway batch identity for one release."""
+
+    return f"capability-release-{job.job_id.hex[:12]}"
+
+
 class CapabilityEffectStorePort(Protocol):
     def claim(
         self,
@@ -181,14 +187,30 @@ class ClaimAwareCapabilityRuntime:
         authority: CapabilityCatalogRecord,
     ) -> CapabilityExecutionPlan:
         _require_job_authority(job, authority)
+        try:
+            package_manifest = json.loads(
+                self._artifacts.read_bytes(authority.package_ref).decode("utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError("released capability package is unavailable in the shared CAS") from exc
         prompt_ref = self._artifacts.put(
             _canonical_bytes(
                 {
                     "schema": "captain.capability-execution-prompt.v1",
                     "instruction": (
-                        "Execute the released capability. Persist exactly one typed "
+                        "Execute the released capability described by package_manifest. "
+                        "The manifest below is the complete Captain authority; do not "
+                        "attempt to resolve another package. Persist exactly one typed "
                         "captain.execution-outcome.v1 JSON artifact in the shared CAS "
-                        "and reference it from the terminal runtime result."
+                        "and reference it from the terminal runtime result. This is a "
+                        "release-validation run, not a production business event: when "
+                        "the package contains generated tests but no canonical business "
+                        "payload, validate its declared artifacts and generated tests "
+                        "using only redacted synthetic examples derived from the released "
+                        "schemas and Real cases. Do not fail solely because a live claim, "
+                        "customer, or other external production input is absent. Fail "
+                        "closed for a missing package artifact, test failure, unresolved "
+                        "required tool gap, or any attempt to perform a binding action."
                     ),
                     "correlation_id": str(job.correlation_id),
                     "factory_job_id": str(job.job_id),
@@ -196,6 +218,7 @@ class ClaimAwareCapabilityRuntime:
                     "capability_version": authority.capability_version,
                     "team_version": authority.team_version,
                     "package_ref": authority.package_ref.model_dump(mode="json"),
+                    "package_manifest": package_manifest,
                     "accepted_assertion_ids": list(authority.accepted_assertion_ids),
                 }
             ),
@@ -216,20 +239,23 @@ class ClaimAwareCapabilityRuntime:
                 )
             ),
         )
+        admission_at = max(job.occurred_at, authority.published_at)
+        if admission_at >= job.deadline_at:
+            raise ValueError("capability publication exhausted the runtime authority window")
         command = AgentRuntimeCommand.model_validate(
             {
                 "schema": "captain.agent-runtime-command.v1",
                 "event_id": str(command_id),
                 "correlation_id": str(job.correlation_id),
                 "causation_id": str(authority.terminal_decision_id),
-                "occurred_at": job.occurred_at,
+                "occurred_at": admission_at,
                 "producer": "captain",
                 "subject_id": "capability-execution",
                 "subject_version": job.subject_version,
                 "payload": {
                     "operation": RuntimeOperation.CODEX_RUN.value,
                     "project_id": "capability-factory",
-                    "batch_id": "capability-release",
+                    "batch_id": capability_runtime_batch_id(job),
                     "subtask_id": "capability-execution",
                     "workspace_ref": (
                         f"workspace://capability-factory/{job.correlation_id}"
@@ -251,14 +277,14 @@ class ClaimAwareCapabilityRuntime:
             schema_name="captain.capability-grant.v1",
             grant_id=f"capability-release-{command_id}",
             command_id=command.event_id,
-            batch_id="capability-release",
+            batch_id=capability_runtime_batch_id(job),
             batch_version=job.subject_version,
             subtask_id="capability-execution",
             workspace_ref=command.payload.workspace_ref or "",
             profile=CapabilityProfile.CODE_BUILDER,
             capabilities=tuple(sorted(PROFILE_CAPABILITIES[CapabilityProfile.CODE_BUILDER])),
             mcp_servers=(),
-            issued_at=job.occurred_at,
+            issued_at=admission_at,
             expires_at=job.deadline_at,
         )
         return CapabilityExecutionPlan(

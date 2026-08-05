@@ -70,7 +70,8 @@ class CreationRunner:
         job_id: UUID,
         *,
         persist_result: bool = True,
-    ) -> CreationResultV1:
+        pause_after_architect: bool = False,
+    ) -> CreationResultV1 | None:
         existing = self.store.result(job_id)
         if existing is not None:
             return existing
@@ -111,6 +112,8 @@ class CreationRunner:
                 self.store.record_external_effect(job_id, effect_key, outcome.effect_receipt)
             self.store.complete_step(job_id, step, effect_key, outcome.snapshot)
             snapshot = outcome.snapshot
+            if pause_after_architect and step == "architect":
+                return None
         result = self.pipeline.assemble_result(job, snapshot)
         return self.store.finish(result) if persist_result else result
 

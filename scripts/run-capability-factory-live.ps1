@@ -11,6 +11,8 @@ param(
     [string]$CheckpointDirectory = '.superpowers/sdd/capability-factory-checkpoints',
     [string]$SandboxImage,
     [Guid]$CorrelationId = [Guid]::NewGuid(),
+    [ValidateRange(1, 2147483647)]
+    [int]$SubjectVersion = 1,
     [ValidateRange(1, 86400)]
     [int]$WallClockBudgetSeconds = 600
 )
@@ -36,10 +38,14 @@ function Read-LocalEnvironment([string]$Path) {
         'FACTORY_LIVE_RUNTIME_ADAPTER_MANIFEST', 'FACTORY_LIVE_RUNTIME_ADAPTER_SHA256',
         'CAPTAIN_FACTORY_JOB_ID', 'OPENAI_API_KEY', 'OPENAI_MODEL', 'LLM_PROVIDER', 'CONTEXT7_API_KEY',
         'CAPTAIN_FACTORY_SKILL_ROOT', 'CAPTAIN_FACTORY_WORKSPACE_REF',
-        'CAPTAIN_FACTORY_PROVIDER', 'CAPTAIN_FACTORY_HERMES_PROVIDER', 'CAPTAIN_FACTORY_HERMES_MODEL', 'CAPTAIN_FACTORY_MODEL',
+        'CAPTAIN_FACTORY_PROVIDER', 'CAPTAIN_FACTORY_HERMES_PROVIDER', 'CAPTAIN_FACTORY_HERMES_MODEL', 'CAPTAIN_FACTORY_HERMES_MAX_COST_PER_CALL_USD', 'CAPTAIN_FACTORY_MODEL',
         'CAPTAIN_FACTORY_MAX_COST_USD', 'CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD',
-        'CAPTAIN_FACTORY_RUNTIME_SECONDS',
-        'HERMES_EXECUTABLE', 'CODEX_EXECUTABLE', 'CAPTAIN_RUNTIME_ARTIFACT_ROOT'
+        'CAPTAIN_FACTORY_RUNTIME_SECONDS', 'CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS',
+        'HERMES_EXECUTABLE', 'CODEX_EXECUTABLE', 'CAPTAIN_RUNTIME_ARTIFACT_ROOT',
+        'CAPTAIN_N8N_URL', 'CAPTAIN_N8N_API_KEY', 'CAPTAIN_N8N_MCP_TOKEN',
+        'CAPTAIN_N8N_MCP_BROKER_URL', 'CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET',
+        'CAPTAIN_N8N_BATCH_ID', 'CAPTAIN_N8N_PROJECT_ID',
+        'CAPTAIN_N8N_WORKSPACE_REF', 'CAPTAIN_FACTORY_N8N_WORKFLOW_ID'
     )
     $values = [ordered]@{}
     foreach ($line in [IO.File]::ReadAllLines($Path)) {
@@ -89,9 +95,15 @@ try {
     if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
         throw 'The project Python 3.11 environment is required.'
     }
+    # A caller may opt into the narrowly-redacted local diagnostics even when
+    # the checked-in demo environment keeps that switch disabled.
+    $diagnosticOverride = [Environment]::GetEnvironmentVariable('CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS', 'Process')
     $values = Read-LocalEnvironment $rootEnv
     foreach ($item in $values.GetEnumerator()) {
         [Environment]::SetEnvironmentVariable([string]$item.Key, [string]$item.Value, 'Process')
+    }
+    if ($diagnosticOverride -eq '1') {
+        [Environment]::SetEnvironmentVariable('CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS', '1', 'Process')
     }
     $selectedInput = Resolve-SafeWorkspacePath $InputPath 'InputPath'
     if (-not (Test-Path -LiteralPath $selectedInput -PathType Leaf)) {
@@ -122,6 +134,7 @@ try {
         '--minibook-url', $MinibookUrl,
         '--sandbox-image', $SandboxImage,
         '--correlation-id', $CorrelationId.ToString(),
+        '--subject-version', $SubjectVersion.ToString(),
         '--wall-clock-budget-seconds', $WallClockBudgetSeconds.ToString()
     )
 
@@ -196,9 +209,20 @@ if row is None or row["database_name"] != "captain_test":
     }
 
     # Execute creation/reuse, publication when needed, and one capability run.
-    $runJson = Invoke-PythonFactory $commonArguments
-    $run = $runJson | ConvertFrom-Json
-    if ($run.status -ne 'ready_to_use') { throw 'Capability factory did not reach ready_to_use.' }
+    $run = $null
+    foreach ($attempt in 1..80) {
+        $runJson = Invoke-PythonFactory $commonArguments
+        $run = $runJson | ConvertFrom-Json
+        if ($run.status -ne 'ready_to_use') { throw 'Capability factory did not reach ready_to_use.' }
+        if ($run.summary.execution_state -eq 'completed') { break }
+        if ($run.summary.execution_state -ne 'retry_pending') {
+            throw 'Capability runtime did not reach a replayable terminal state.'
+        }
+        Start-Sleep -Seconds 15
+    }
+    if ($null -eq $run -or $run.summary.execution_state -ne 'completed') {
+        throw 'Capability runtime did not complete within the bounded replay window.'
+    }
 
     # STEP 6: bind the content-addressed manifest into the explicit provider-backed live gate.
     $manifestPath = Join-Path $root ([string]$run.manifest)

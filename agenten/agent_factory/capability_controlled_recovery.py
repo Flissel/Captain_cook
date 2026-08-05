@@ -88,17 +88,31 @@ class DurableControlledRecoveryEffectV1(_FrozenContract):
     @model_validator(mode="after")
     def require_execution_binding(self) -> "DurableControlledRecoveryEffectV1":
         execution = self.execution
-        if (
-            execution.job_id != self.job_id
-            or execution.correlation_id != self.correlation_id
-            or execution.subject_version != self.subject_version
-            or execution.attempt != self.attempt
-            or execution.invocation_id != self.invocation_id
-            or execution.usage_receipt_refs != self.provider_usage_receipt_refs
-            or execution.status != "succeeded"
-            or execution.execution_outcome.status != "succeeded"
-        ):
-            raise ValueError("durable controlled recovery effect binding changed")
+        mismatches = tuple(
+            field
+            for field, valid in (
+                ("job_id", execution.job_id == self.job_id),
+                ("correlation_id", execution.correlation_id == self.correlation_id),
+                ("subject_version", execution.subject_version == self.subject_version),
+                ("attempt", execution.attempt == self.attempt),
+                ("invocation_id", execution.invocation_id == self.invocation_id),
+                (
+                    "usage_receipt_refs",
+                    execution.usage_receipt_refs == self.provider_usage_receipt_refs,
+                ),
+                ("execution_status", execution.status == "succeeded"),
+                (
+                    "runtime_status",
+                    execution.execution_outcome.status == "succeeded",
+                ),
+            )
+            if not valid
+        )
+        if mismatches:
+            raise ValueError(
+                "durable controlled recovery effect binding changed: "
+                + ",".join(mismatches)
+            )
         return self
 
 
@@ -267,6 +281,19 @@ class _PostEffectInterruptionExecutor(FactoryLiveEffectExecutor):
             holdout,
             run_number=1,
         )
+        if (
+            execution.status != "succeeded"
+            or execution.execution_outcome.status != "succeeded"
+        ):
+            failed_assertions = sum(
+                outcome.status != "passed"
+                for outcome in execution.execution_outcome.assertion_outcomes
+            )
+            raise ValueError(
+                "controlled recovery execution failed: "
+                f"team:{execution.status},runtime:{execution.execution_outcome.status},"
+                f"failed_assertions:{failed_assertions}"
+            )
         persisted_at = self._utc_now()
         durable = DurableControlledRecoveryEffectV1(
             effect_id=request.effect_id,
@@ -280,6 +307,10 @@ class _PostEffectInterruptionExecutor(FactoryLiveEffectExecutor):
             persisted_at=persisted_at,
         )
         self._effects.persist(durable)
+        if self._effects.load(request.effect_id) is None:
+            raise ValueError(
+                "controlled recovery provider effect was not durable after persistence"
+            )
         raise FactoryInfrastructureFailure(
             "controlled post-effect process interruption"
         )
@@ -350,10 +381,10 @@ class FactoryLiveControlledRecoveryPort:
             or dispatch.role is not FactoryRole.REAL_CASE_TESTER
             or dispatch.lease is None
             or dispatch.lease.role is not FactoryRole.REAL_CASE_TESTER
-            or len(job.private_holdout_refs) != 1
+            or not job.private_holdout_refs
         ):
             raise ValueError(
-                "controlled recovery requires one exact tester dispatch and private holdout"
+                "controlled recovery requires one exact tester dispatch and private holdout scope"
             )
         if self._repository.job(job.job_id) != job:
             raise ValueError("controlled recovery job does not match persisted authority")
@@ -402,6 +433,11 @@ class FactoryLiveControlledRecoveryPort:
                 raise ValueError(
                     "controlled recovery did not stop after the provider effect"
                 )
+            if self._effects.load(request.effect_id) is None:
+                reason = first.reasons[0] if first.reasons else "unknown"
+                raise ValueError(
+                    "controlled recovery provider effect was not persisted: " + reason
+                )
             records = tuple(
                 record
                 for record in self._ledger.history(job.job_id)
@@ -430,7 +466,6 @@ class FactoryLiveControlledRecoveryPort:
         if stored is None:
             raise ValueError("controlled recovery provider evidence was not persisted")
         execution = stored.record.execution
-        holdout = job.private_holdout_refs[0]
         recovery_id = f"controlled-recovery-{str(request.effect_id).replace('-', '')[:24]}"
         return CapabilityControlledRecoveryResultV1(
             recovery_id=recovery_id,
@@ -439,13 +474,16 @@ class FactoryLiveControlledRecoveryPort:
             interrupted=interrupted,
             resumed=resumed,
             provider_effect_receipt_ref=stored.reference,
-            holdout_receipts=(
+            holdout_receipts=tuple(
                 CapabilityControlledHoldoutReceiptV1(
                     holdout_ref=holdout,
-                    assertion_id=job.acceptance_assertion_ids[0],
+                    assertion_id=job.acceptance_assertion_ids[
+                        index % len(job.acceptance_assertion_ids)
+                    ],
                     status="passed",
                     evidence_ref=execution.artifact_ref,
-                ),
+                )
+                for index, holdout in enumerate(job.private_holdout_refs)
             ),
         )
 

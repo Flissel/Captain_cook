@@ -28,6 +28,7 @@ from agenten.agent_factory.capability_factory_entrypoint import (
 from agenten.agent_factory.capability_factory_production import (
     EvidenceLifecycleRequest,
     EvidenceRunRequest,
+    EvidenceWorkflowReviewRequest,
 )
 from agenten.agent_factory.capability_live_adapters import (
     CaptainCapabilityReleaseReceipt,
@@ -38,12 +39,15 @@ from agenten.agent_factory.capability_live_adapters import (
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV2,
     AgentFactoryJobV3,
+    FactoryBlockStatus,
     FactoryEvidenceBlock,
     FactoryLease,
+    FactoryPhase,
     FactoryRole,
 )
 from agenten.agent_factory.execution_budget import FactoryUsageReceiptV1
 from agenten.agent_factory.execution_policy import FactoryExecutionPolicyV1
+from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
 from agenten.agent_factory.factory_live_runner import FactoryLiveRunReport
 from agenten.agent_factory.forge_contracts import CreationResultV1
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
@@ -57,10 +61,14 @@ from agenten.agent_factory.orchestration import FactoryDispatch
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import (
     FACTORY_SKILL_ID_BY_STEP,
+    FactoryFeedbackV1,
     FactorySkillStep,
+    released_skill_capability_matches_job,
+    TeamEvaluationV1,
     TeamExecutionEvidenceV1,
 )
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
+from agenten.agent_factory.team_evaluation import TeamEvaluationService
 from agenten.agent_factory.team_execution import TeamExecutionCandidateAdapter
 from agenten.agent_runtime.contracts import ArtifactRef
 
@@ -218,7 +226,18 @@ class CapabilityV3AuthorityPort(Protocol):
 
     def record_lease(self, lease: FactoryLease) -> None: ...
 
+    def record_block(self, block: FactoryEvidenceBlock) -> None: ...
+
     def usage_receipts(self, job_id: UUID) -> tuple[FactoryUsageReceiptV1, ...]: ...
+
+    def workflow_artifacts(
+        self, job_id: UUID
+    ) -> tuple[TeamExecutionEvidenceV1 | TeamEvaluationV1 | FactoryFeedbackV1, ...]: ...
+
+    async def persist_workflow_artifact(
+        self,
+        artifact: TeamExecutionEvidenceV1 | TeamEvaluationV1 | FactoryFeedbackV1,
+    ) -> None: ...
 
 
 class CapabilityReleasedSkillSourcePort(Protocol):
@@ -324,6 +343,12 @@ class PackageCV3CapabilityReleaseExecutor:
         if attestation.job_id != v3.job_id or attestation.candidate_ref != candidate.source_ref:
             raise ValueError("candidate sandbox attestation does not match V3 authority")
         leases = self._leases(v3, attempt=creation_result.attempt)
+        self._record_attested_build(v3, creation_result.attempt, attestation, leases)
+        # Gateway is the authority for every paid model effect.  The tester
+        # lease therefore has to be durable before the controlled-recovery
+        # call can reserve or write a provider receipt.  Do not pre-register
+        # the build or quality leases: their lifecycle actions occur later.
+        self._context.authority.record_lease(leases[FactoryRole.REAL_CASE_TESTER])
         dispatch = FactoryDispatch(
             job=v3,
             action=FactoryAction(
@@ -350,6 +375,10 @@ class PackageCV3CapabilityReleaseExecutor:
             )
         usage = self._require_paid_execution(v3, execution, candidate)
         self._require_distinct_provider_run(job.job_id, run_number, execution, usage)
+        if run_number > 1:
+            # Only the three normal runs are workflow-release evidence.  The
+            # controlled recovery remains a separate fail-closed proof.
+            await self._context.authority.persist_workflow_artifact(execution)
         run_evidence = CapabilityV3RunEvidenceV1(
             package_c_job_id=job.job_id,
             factory_v3_job_id=v3.job_id,
@@ -379,12 +408,19 @@ class PackageCV3CapabilityReleaseExecutor:
         self._context.artifact_store.bind(
             "v3-run-evidence", f"{job.job_id}/{run_number}", run_ref
         )
+        run_id = self._run_id(job.job_id, execution.invocation_id, run_number)
         assertions = tuple(
             CapabilityAssertionResult(
                 assertion_id=item.assertion_id,
                 status=item.status,
                 integration_intent=item.integration_intent,
-                evidence_refs=(run_ref,),
+                evidence_refs=(
+                    self._assertion_evidence_ref(
+                        run_id=run_id,
+                        assertion_id=item.assertion_id,
+                        status=item.status,
+                    ),
+                ),
             )
             for item in execution.execution_outcome.assertion_outcomes
         )
@@ -393,7 +429,7 @@ class PackageCV3CapabilityReleaseExecutor:
             raise ValueError("Package-C release observation exceeded its authority deadline")
         is_recovery = recovery is not None
         observation = CapabilityReleaseObservation(
-            run_id=self._run_id(job.job_id, execution.invocation_id, run_number),
+            run_id=run_id,
             capability_version=candidate.capability_version,
             extracted_tree_sha256=attestation.extracted_tree_sha256,
             kind="recovery" if is_recovery else "normal",
@@ -431,6 +467,118 @@ class PackageCV3CapabilityReleaseExecutor:
         )
         return observation
 
+    async def materialize_workflow_review(
+        self,
+        job: AgentFactoryJobV2,
+        candidate: ForgeCapabilityPackageCandidateV1,
+        receipts: tuple[CapabilityReleaseRunReceipt, ...],
+    ) -> None:
+        """Persist deterministic Hermes evaluation and feedback after real-case proof."""
+
+        if tuple(item.record.run_number for item in receipts) != (1, 2, 3, 4):
+            raise ValueError("workflow review requires recovery then three normal runs")
+        v3 = self._prepare_v3_authority(job, attempt=receipts[0].record.attempt)
+        existing = self._context.authority.workflow_artifacts(v3.job_id)
+        existing_evaluations = tuple(
+            item for item in existing if isinstance(item, TeamEvaluationV1)
+        )
+        existing_feedback = tuple(
+            item for item in existing if isinstance(item, FactoryFeedbackV1)
+        )
+        if existing_evaluations or existing_feedback:
+            if len(existing_evaluations) == len(existing_feedback) == 1:
+                return
+            raise ValueError("workflow review replay is incomplete or ambiguous")
+        executions = tuple(
+            item
+            for item in existing
+            if isinstance(item, TeamExecutionEvidenceV1)
+        )
+        if len(executions) != v3.execution_policy.required_live_runs:
+            raise ValueError("workflow review lacks exactly three normal execution artifacts")
+        ordered = tuple(sorted(executions, key=lambda item: item.run_number))
+        if tuple(item.run_number for item in ordered) != tuple(
+            range(1, v3.execution_policy.required_live_runs + 1)
+        ):
+            raise ValueError("workflow execution runs are not consecutive")
+        if any(item.candidate_ref != candidate.source_ref for item in ordered):
+            raise ValueError("workflow execution candidate changed before evaluation")
+        leases = self._leases(v3, attempt=receipts[0].record.attempt)
+        quality_lease = leases[FactoryRole.QUALITY_WARDEN]
+        self._context.authority.record_lease(quality_lease)
+        evaluation_dispatch = FactoryDispatch(
+            job=v3,
+            action=FactoryAction(
+                kind=FactoryActionKind.DISPATCH_QUALITY_WARDEN,
+                attempt=receipts[0].record.attempt,
+                job_id=v3.job_id,
+            ),
+            role=FactoryRole.QUALITY_WARDEN,
+            lease=quality_lease,
+        )
+        from agenten.agent_factory.hermes_cli import _factory_invocation
+
+        evaluation_invocation = _factory_invocation(
+            evaluation_dispatch,
+            step=FactorySkillStep.EVALUATE_TEAM,
+            released_skill=self._context.authority.released_for(
+                v3, FactorySkillStep.EVALUATE_TEAM
+            ),
+            input_ref=v3.input_ref,
+        )
+        evaluation = TeamEvaluationService(clock=self._context.clock).evaluate(
+            evaluation_invocation,
+            candidate.source_ref,
+            ordered,
+        )
+        await self._context.authority.persist_workflow_artifact(evaluation)
+        feedback_invocation = _factory_invocation(
+            evaluation_dispatch,
+            step=FactorySkillStep.REPORT_CAPTAIN,
+            released_skill=self._context.authority.released_for(
+                v3, FactorySkillStep.REPORT_CAPTAIN
+            ),
+            input_ref=evaluation.artifact_ref,
+        )
+        feedback = FactoryFeedbackBuilder(clock=self._context.clock).build(
+            invocation=feedback_invocation,
+            candidate_ref=candidate.source_ref,
+            evaluation=evaluation,
+        )
+        await self._context.authority.persist_workflow_artifact(feedback)
+
+    def _record_attested_build(
+        self,
+        job: AgentFactoryJobV3,
+        attempt: int,
+        attestation: CapabilityCandidateAttestationV1,
+        leases: dict[FactoryRole, FactoryLease],
+    ) -> None:
+        """Advance Captain from sealed candidate to the paid tester action."""
+
+        build_lease = leases[FactoryRole.TOOL_INTEGRATOR]
+        self._context.authority.record_lease(build_lease)
+        self._context.authority.record_block(
+            FactoryEvidenceBlock(
+                schema_name="captain.agent-factory-block.v1",
+                event_id=uuid5(job.event_id, "capability-v3-attested-build:1"),
+                job_id=job.job_id,
+                correlation_id=job.correlation_id,
+                causation_id=job.event_id,
+                # A retry must reproduce byte-identical Build evidence before
+                # it can reuse the same Gateway event id.
+                occurred_at=job.occurred_at,
+                producer="hermes",
+                subject_version=job.subject_version,
+                attempt=attempt,
+                phase=FactoryPhase.BUILD_PASSED,
+                role=FactoryRole.TOOL_INTEGRATOR,
+                status=FactoryBlockStatus.SUCCEEDED,
+                evidence_refs=(attestation.sandbox_evidence_ref,),
+                lease_id=build_lease.lease_id,
+            )
+        )
+
     def _prepare_v3_authority(
         self, job: AgentFactoryJobV2, *, attempt: int
     ) -> AgentFactoryJobV3:
@@ -447,7 +595,9 @@ class PackageCV3CapabilityReleaseExecutor:
             released = self._context.authority.released_for(v3, step)
             if (
                 released.skill_id != FACTORY_SKILL_ID_BY_STEP[step]
-                or released.capability != v3.required_capability
+                or not released_skill_capability_matches_job(
+                    released.capability, v3.required_capability
+                )
                 or released != self._context.released_skills.released_for(v3, step)
             ):
                 raise ValueError("V3 released six-skill assignment changed")
@@ -473,7 +623,6 @@ class PackageCV3CapabilityReleaseExecutor:
                 attempt=attempt,
                 now=now,
             )
-            self._context.authority.record_lease(lease)
             leases[role] = lease
         return leases
 
@@ -584,6 +733,28 @@ class PackageCV3CapabilityReleaseExecutor:
         ).hexdigest()
         return ("controlled-recovery-" if run_number == 1 else "normal-e2e-") + digest[:24]
 
+    def _assertion_evidence_ref(
+        self,
+        *,
+        run_id: str,
+        assertion_id: str,
+        status: Literal["passed", "failed"],
+    ) -> ArtifactRef:
+        """Bind each assertion to its own Captain-authored evidence record."""
+
+        payload = {
+            "schema": "captain.capability-assertion-evidence.v1",
+            "run_id": run_id,
+            "assertion_id": assertion_id,
+            "status": status,
+            "producer": "captain",
+        }
+        return self._context.artifact_store.put(
+            _canonical_json(payload).encode("utf-8"),
+            "application/json",
+            namespace="capability-assertion-evidence",
+        )
+
 
 class PackageCV3CapabilityEvidenceBackend:
     """Concrete authenticated-runtime backend returning Package-C receipt types."""
@@ -594,6 +765,7 @@ class PackageCV3CapabilityEvidenceBackend:
         executor: PackageCV3CapabilityReleaseExecutor,
         artifact_store: ContentAddressedArtifactStore,
     ) -> None:
+        self._executor = executor
         self._issuer = CaptainEvidenceIssuerAdapter(
             executor=executor,
             artifact_store=artifact_store,
@@ -627,12 +799,26 @@ class PackageCV3CapabilityEvidenceBackend:
         )
         return await self._issuer.lifecycle_blocks(request.job, receipts)
 
+    async def workflow_review(self, request: EvidenceWorkflowReviewRequest) -> None:
+        await self._executor.materialize_workflow_review(
+            request.job,
+            request.candidate,
+            request.receipts,
+        )
+
 
 def build_v3_job_from_package_c(
     job: AgentFactoryJobV2,
     execution_policy: FactoryExecutionPolicyV1,
 ) -> AgentFactoryJobV3:
     """Derive one byte-stable V3 job while preserving all V2 authority fields."""
+
+    if isinstance(job, AgentFactoryJobV3):
+        if job.execution_policy != execution_policy:
+            raise CapabilityV3BridgeConfigurationError(
+                "registered V3 execution policy does not match Package-C authority"
+            )
+        return job
 
     duration = job.deadline_at - job.occurred_at
     if duration.total_seconds() != execution_policy.max_runtime_seconds:

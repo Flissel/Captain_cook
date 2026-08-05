@@ -31,6 +31,7 @@ from agenten.agent_factory.capability_factory_entrypoint import (
     DockerCommandResult,
     FileCapabilityFactoryCheckpointStore,
     InMemoryCapabilityFactoryCheckpointStore,
+    _SANDBOX_SCRIPT,
     _StaticAdapterAttestation,
     _load_production_entrypoint,
     parse_capability_factory_args,
@@ -39,10 +40,17 @@ from agenten.agent_factory.capability_factory_entrypoint import (
 )
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV2,
+    AgentFactoryJobV3,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
+    FactoryLease,
     FactoryPhase,
     FactoryRole,
+)
+from agenten.agent_factory.execution_policy import (
+    FactoryExecutionMode,
+    FactoryExecutionPolicyV1,
+    FactoryLiveCapability,
 )
 from agenten.agent_factory.forge_contracts import (
     CreationJobV1,
@@ -635,6 +643,7 @@ class ScriptedGatewayStore:
     clock: MutableClock
     jobs: dict[UUID, AgentFactoryJobV2] = field(default_factory=dict)
     blocks_by_job: dict[UUID, dict[UUID, FactoryEvidenceBlock]] = field(default_factory=dict)
+    leases: dict[str, FactoryLease] = field(default_factory=dict)
     evaluations: dict[UUID, StoredSkillEvaluation] = field(default_factory=dict)
     release_decisions: dict[UUID, FactoryReleaseDecision] = field(default_factory=dict)
     terminal_decisions: dict[UUID, object] = field(default_factory=dict)
@@ -689,7 +698,15 @@ class ScriptedGatewayStore:
         return SimpleNamespace(
             job=self.jobs[job_id],
             blocks=tuple(self.blocks_by_job.get(job_id, {}).values()),
+            leases=tuple(lease for lease in self.leases.values() if lease.job_id == job_id),
         )
+
+    def record_factory_lease(self, lease: FactoryLease) -> object:
+        existing = self.leases.get(lease.lease_id)
+        if existing is not None and existing != lease:
+            raise AssertionError("changed factory lease replay")
+        self.leases[lease.lease_id] = lease
+        return SimpleNamespace(replayed=existing is not None)
 
     def record_factory_block(self, block: FactoryEvidenceBlock) -> object:
         records = self.blocks_by_job.setdefault(block.job_id, {})
@@ -706,6 +723,10 @@ class ScriptedGatewayStore:
 
     def factory_release_decision(self, job_id: UUID) -> FactoryReleaseDecision | None:
         return self.release_decisions.get(job_id)
+
+    def factory_workflow_artifacts(self, job_id: UUID) -> tuple[object, ...]:
+        assert job_id in self.jobs
+        return ()
 
     def record_factory_release_decision(
         self,
@@ -1022,6 +1043,27 @@ class ScriptedCreationPort:
     submitted_jobs: dict[UUID, CreationJobV1] = field(default_factory=dict)
     _crashed_after_submit: bool = False
 
+    async def architect_block(
+        self,
+        job: AgentFactoryJobV2,
+        creation_job: CreationJobV1,
+    ) -> FactoryEvidenceBlock:
+        return _block(
+            job,
+            FactoryPhase.BLUEPRINT_CREATED,
+            occurred_at=job.occurred_at + timedelta(seconds=5),
+        ).model_copy(update={"lease_id": creation_job.architect_lease_id})
+
+    async def resume_tool_integrator(
+        self,
+        creation_job: CreationJobV1,
+        *,
+        lease_id: str,
+    ) -> None:
+        self.submitted_jobs[creation_job.creation_job_id] = creation_job.model_copy(
+            update={"idempotency_key": creation_job.idempotency_key}
+        )
+
     async def preparation_blocks(
         self,
         job: AgentFactoryJobV2,
@@ -1041,16 +1083,12 @@ class ScriptedCreationPort:
             self.prepared[creation_job.creation_job_id] = package
             self.gateway.evaluations[job.job_id] = package.evaluation
         return (
-            _block(
-                job,
-                FactoryPhase.BLUEPRINT_CREATED,
-                occurred_at=job.occurred_at + timedelta(seconds=5),
-            ),
+            (await self.architect_block(job, creation_job)),
             _block(
                 job,
                 FactoryPhase.TOOL_CANDIDATE_TESTED,
                 occurred_at=job.occurred_at + timedelta(seconds=6),
-            ),
+            ).model_copy(update={"lease_id": next(lease.lease_id for lease in self.gateway.leases.values() if lease.job_id == job.job_id and lease.role is FactoryRole.TOOL_INTEGRATOR)}),
         )
 
     async def submit(self, creation_job: CreationJobV1) -> CreationSubmissionReceipt:
@@ -1090,7 +1128,7 @@ class ScriptedCreationPort:
                     result.package_manifest_ref.model_dump(mode="json")
                 ),
             ),
-        )
+        ).model_copy(update={"lease_id": next(lease.lease_id for lease in self.gateway.leases.values() if lease.job_id == job.job_id and lease.role is FactoryRole.TOOL_INTEGRATOR)})
 
 
 @dataclass
@@ -1416,7 +1454,12 @@ class FullChainHarness:
     projector: MinibookProjector
     released_skill: ReleasedSkillRefV1
 
-    def entrypoint(self) -> CapabilityFactoryEntrypoint:
+    def entrypoint(
+        self,
+        *,
+        execution_policy: FactoryExecutionPolicyV1 | None = None,
+        workspace_ref: str | None = None,
+    ) -> CapabilityFactoryEntrypoint:
         repository = GatewayFactoryRepository(self.gateway)  # real Package-C adapter
         return CapabilityFactoryEntrypoint(
             checkpoint_store=FileCapabilityFactoryCheckpointStore(self.checkpoint_dir),
@@ -1432,6 +1475,8 @@ class FullChainHarness:
             runtime=self.runtime,
             projector=self.projector,
             clock=self.clock,
+            execution_policy=execution_policy,
+            workspace_ref=workspace_ref,
         )
 
 
@@ -1485,6 +1530,43 @@ def _harness(tmp_path: Path) -> FullChainHarness:
         minibook=minibook,
         projector=projector,
         released_skill=released_skill,
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_policy_registers_v3_before_the_first_captain_lease(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    policy = FactoryExecutionPolicyV1.model_validate(
+        {
+            "schema": "captain.factory-execution-policy.v1",
+            "mode": FactoryExecutionMode.RELEASE.value,
+            "live_execution": True,
+            "max_cost_usd": "1.00",
+            "max_runtime_seconds": 600,
+            "required_live_runs": 3,
+            "allowed_models": ("approved-model-id",),
+            "live_capabilities": (FactoryLiveCapability.MODEL_INVOKE.value,),
+        }
+    )
+
+    with pytest.raises(SimulatedProcessCrash, match="creation submission"):
+        await harness.entrypoint(
+            execution_policy=policy,
+            workspace_ref="workspace://captain/capability-live",
+        ).run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    job = next(iter(harness.gateway.jobs.values()))
+    assert isinstance(job, AgentFactoryJobV3)
+    assert job.execution_policy == policy
+    assert next(iter(harness.gateway.leases.values())).workspace_ref == (
+        "workspace://captain/capability-live"
     )
 
 
@@ -2565,6 +2647,10 @@ def _sandbox_request(tmp_path: Path) -> CapabilitySandboxRequest:
         package_archive_sha256="c" * 64,
         timeout_seconds=30,
     )
+
+
+def test_sandbox_script_supplies_pytest_with_a_mutable_argument_list() -> None:
+    assert 'pytest.main(["-q", "-p", "no:cacheprovider"' in _SANDBOX_SCRIPT
 
 
 @pytest.mark.asyncio

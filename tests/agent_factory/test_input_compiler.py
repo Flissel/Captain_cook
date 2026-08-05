@@ -35,9 +35,13 @@ def test_compiler_emits_stable_assertions_holdout_refs_and_topological_dag(tmp_p
     assert all(ref.uri.startswith("holdout://") for ref in first.private_holdout_refs)
     assert tuple(TopologicalSorter(first.dependencies).static_order())
     assert len(store) == len(first.private_holdout_refs)
-    private_body = store.get(first.private_holdout_refs[0].uri)
+    private_body = json.loads(store.get(first.private_holdout_refs[0].uri))
     assert "observable_expected" in private_body
-    assert private_body not in first.model_dump_json()
+    assert private_body["assertion_expectations"] == {
+        assertion.assertion_id: assertion.observable_expected
+        for assertion in first.assertions
+    }
+    assert json.dumps(private_body, sort_keys=True) not in first.model_dump_json()
 
 
 def test_compiler_preserves_business_oracles_and_assigns_each_requested_item_once(tmp_path: Path) -> None:

@@ -485,7 +485,7 @@ async def test_minibook_export_to_zip_to_provider_to_attestation(
     with zipfile.ZipFile(assembled.archive_path) as archive:
         for item in assembled.artifacts:
             reference = store.put(
-                archive.read(item.path), item.media_type, namespace="package-file"
+                archive.read(item.path), item.media_type, namespace="candidate-file"
             )
             assert reference.uri == item.uri
             assert reference.sha256 == item.sha256

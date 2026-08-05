@@ -355,6 +355,16 @@ def classify_task_domain(task_description: str) -> dict:
 
 _LOCAL_BASE_CACHE: str | None = None
 
+
+def _compose_project_name(build_dir: Path) -> str:
+    """Return a Docker-image-safe Compose project name for an ephemeral build."""
+
+    slug = re.sub(r"[^a-z0-9]+", "-", build_dir.name.lower()).strip("-")
+    if not slug:
+        slug = "build"
+    return f"autogen-{slug}"[:63].rstrip("-")
+
+
 def _check_local_base_image() -> str | None:
     """Return local base image name if available, else None."""
     global _LOCAL_BASE_CACHE
@@ -727,8 +737,9 @@ async def docker_build_test(build_dir: Path) -> dict:
     print(f"  [Build] Dir: {build_dir}")
     print(f"  [Build] Files: {[f.name for f in files]}")
     try:
+        project_name = _compose_project_name(build_dir)
         proc = await asyncio.create_subprocess_exec(
-            "docker", "compose", "build",
+            "docker", "compose", "--project-name", project_name, "build",
             cwd=str(build_dir),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
         )
@@ -741,7 +752,8 @@ async def docker_build_test(build_dir: Path) -> dict:
             # Clean up partial build containers
             try:
                 cleanup = await asyncio.create_subprocess_exec(
-                    "docker", "compose", "down", "-v", "--remove-orphans",
+                    "docker", "compose", "--project-name", project_name,
+                    "down", "-v", "--remove-orphans",
                     cwd=str(build_dir),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 await asyncio.wait_for(cleanup.communicate(), timeout=15)
@@ -755,7 +767,8 @@ async def docker_build_test(build_dir: Path) -> dict:
             # Clean up failed build containers
             try:
                 cleanup = await asyncio.create_subprocess_exec(
-                    "docker", "compose", "down", "-v", "--remove-orphans",
+                    "docker", "compose", "--project-name", project_name,
+                    "down", "-v", "--remove-orphans",
                     cwd=str(build_dir),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 await asyncio.wait_for(cleanup.communicate(), timeout=15)
@@ -771,8 +784,10 @@ async def docker_run_test(build_dir: Path, timeout: int = 300) -> dict:
     """Run docker compose up, capture logs. Returns result dict."""
     start = time.time()
     try:
+        project_name = _compose_project_name(build_dir)
         proc = await asyncio.create_subprocess_exec(
-            "docker", "compose", "up", "--abort-on-container-exit",
+            "docker", "compose", "--project-name", project_name,
+            "up", "--abort-on-container-exit",
             cwd=str(build_dir),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
         )
@@ -803,7 +818,8 @@ async def docker_run_test(build_dir: Path, timeout: int = 300) -> dict:
         # Cleanup containers
         try:
             cleanup = await asyncio.create_subprocess_exec(
-                "docker", "compose", "down", "-v", "--remove-orphans",
+                "docker", "compose", "--project-name", project_name,
+                "down", "-v", "--remove-orphans",
                 cwd=str(build_dir),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
@@ -812,13 +828,27 @@ async def docker_run_test(build_dir: Path, timeout: int = 300) -> dict:
             pass
 
 
-async def docker_run_test_with_args(build_dir: Path, args: list, timeout: int = 300) -> dict:
+async def docker_run_test_with_args(
+    build_dir: Path,
+    args: list,
+    timeout: int = 300,
+    environment: dict[str, str] | None = None,
+) -> dict:
     """Run docker compose run with custom args (for eval tasks).
     Example: docker_run_test_with_args(build_dir, ["python", "main.py", "Write a calculator"])
     """
     start = time.time()
     try:
-        cmd = ["docker", "compose", "run", "--rm", "app"] + args
+        project_name = _compose_project_name(build_dir)
+        cmd = [
+            "docker", "compose", "--project-name", project_name,
+            "run", "--rm",
+        ]
+        for name, value in sorted((environment or {}).items()):
+            if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name) or "\n" in value:
+                raise ValueError("docker run environment is invalid")
+            cmd.extend(("-e", f"{name}={value}"))
+        cmd.extend(("app", *args))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(build_dir),
@@ -843,7 +873,8 @@ async def docker_run_test_with_args(build_dir: Path, args: list, timeout: int = 
     finally:
         try:
             cleanup = await asyncio.create_subprocess_exec(
-                "docker", "compose", "down", "-v", "--remove-orphans",
+                "docker", "compose", "--project-name", project_name,
+                "down", "-v", "--remove-orphans",
                 cwd=str(build_dir),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )

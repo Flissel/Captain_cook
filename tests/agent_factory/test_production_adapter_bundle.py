@@ -15,10 +15,13 @@ from agenten.agent_factory.capability_factory_production import (
     RuntimeCaptainEvidenceHttpPort,
 )
 from agenten.agent_factory.production_adapter_bundle import (
+    MAX_RUNTIME_CLI_EVIDENCE_BYTES,
     ContentAddressedRuntimeArtifactPort,
     GatewayCapabilityFactoryPort,
     ProductionCapabilityFactoryEntrypoint,
     ProductionToolRequired,
+    _codex_provider_session_id,
+    _json_line_events,
     build_capability_factory_entrypoint,
     build_factory_live_runtime,
     production_manifest_commands,
@@ -63,6 +66,31 @@ def test_runtime_artifact_port_requires_exact_content_address(tmp_path: Path) ->
         asyncio.run(port.require(reference))
 
 
+def test_codex_provider_session_comes_from_the_thread_started_event() -> None:
+    events = _json_line_events(
+        b'{"type":"thread.started","thread_id":"019f-session-123"}\n'
+        b'{"type":"item.completed","item":{"type":"agent_message"}}\n'
+    )
+
+    assert _codex_provider_session_id(events) == "codex-thread:019f-session-123"
+
+
+def test_codex_provider_session_rejects_missing_or_ambiguous_threads() -> None:
+    with pytest.raises(ValueError, match="one durable provider thread"):
+        _codex_provider_session_id(_json_line_events(b'{"type":"turn.completed"}\n'))
+    with pytest.raises(ValueError, match="one durable provider thread"):
+        _codex_provider_session_id(
+            _json_line_events(
+                b'{"type":"thread.started","thread_id":"first"}\n'
+                b'{"type":"thread.started","thread_id":"second"}\n'
+            )
+        )
+
+
+def test_runtime_cli_evidence_limit_allows_documentation_heavy_json_streams() -> None:
+    assert MAX_RUNTIME_CLI_EVIDENCE_BYTES == 8 * 1024 * 1024
+
+
 def test_capability_entrypoint_factory_is_real_but_blocks_unimplemented_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -90,7 +118,12 @@ def test_capability_entrypoint_factory_is_real_but_blocks_unimplemented_effects(
     monkeypatch.setenv("HERMES_EXECUTABLE", sys.executable)
     monkeypatch.setenv("CAPTAIN_FACTORY_HERMES_PROVIDER", "openai-api")
     monkeypatch.setenv("CAPTAIN_FACTORY_HERMES_MODEL", "gpt-5.6-terra")
+    monkeypatch.setenv("CAPTAIN_FACTORY_HERMES_MAX_COST_PER_CALL_USD", "0.25")
     monkeypatch.setenv("CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD", "0.25")
+    monkeypatch.setenv("CAPTAIN_FACTORY_MAX_COST_USD", "1.00")
+    monkeypatch.setenv("CAPTAIN_FACTORY_MODEL", "gpt-5.6-terra")
+    monkeypatch.setenv("CAPTAIN_FACTORY_RUNTIME_SECONDS", "600")
+    monkeypatch.setenv("CAPTAIN_FACTORY_WORKSPACE_REF", "workspace://captain/live")
 
     entrypoint = build_capability_factory_entrypoint(config)
 
@@ -101,6 +134,10 @@ def test_capability_entrypoint_factory_is_real_but_blocks_unimplemented_effects(
     assert isinstance(entrypoint._runtime, ClaimAwareCapabilityRuntime)
     assert entrypoint._creation_analysis._hermes._settings.provider == "openai-api"
     assert entrypoint._creation_analysis._hermes._settings.model == "gpt-5.6-terra"
+    assert entrypoint._execution_policy is not None
+    assert entrypoint._execution_policy.max_runtime_seconds == 600
+    assert entrypoint._workspace_ref == "workspace://captain/live"
+    assert entrypoint._creation._http.timeout.read == 660.0
 
 
 def test_capability_entrypoint_rejects_split_runtime_and_creation_cas(
@@ -213,6 +250,7 @@ def test_production_entrypoint_materializes_creation_contract_in_shared_cas(
         compiled=compiled,
         creation_key="create-sales-pipeline",
         released_skill=released_skill,
+        architect_lease_id="architect-lease-test",
     )
 
     for reference in (

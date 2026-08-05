@@ -30,7 +30,10 @@ from agenten.agent_factory.outcome_contracts import (
     PrivateHoldoutReceipt,
 )
 from agenten.agent_factory.skill_evaluation import HermesSkillUsageReceipt
-from agenten.agent_runtime.contracts import ArtifactRef, SHA256_PATTERN
+from agenten.agent_factory.skill_workflow_contracts import (
+    released_skill_capability_matches_job,
+)
+from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent, SHA256_PATTERN
 
 
 class ReadOnlyCapabilityContentStore(Protocol):
@@ -536,7 +539,9 @@ class CapabilityPackageValidator:
             raise CapabilityPackageValidationError(
                 "skill receipt correlation does not match Captain job"
             )
-        if receipt.released_skill.capability != job.required_capability:
+        if not released_skill_capability_matches_job(
+            receipt.released_skill.capability, job.required_capability
+        ):
             raise CapabilityPackageValidationError(
                 "skill receipt capability does not match Captain job"
             )
@@ -899,15 +904,24 @@ def _build_captain_manifest(
         for item in recovery.assertion_results
         if item.assertion_id == recovery_assertion_id
     )
+    declares_n8n = any(item.kind == "n8n_workflow" for item in candidate.artifacts)
     assertion_outcomes = tuple(
         AssertionOutcome(
             assertion_id=assertion_id,
             status="passed",
-            integration_intent=next(
-                result.integration_intent
-                for item in release_evidence
-                for result in item.assertion_results
-                if result.assertion_id == assertion_id
+            # The package manifest is Captain's immutable declaration of a
+            # sealed workflow contract. A focused holdout can skip a declared
+            # n8n workflow, but the first accepted package assertion carries
+            # the capability intent needed by the release catalog.
+            integration_intent=(
+                IntegrationIntent.N8N
+                if declares_n8n and assertion_id == job.acceptance_assertion_ids[0]
+                else next(
+                    result.integration_intent
+                    for item in release_evidence
+                    for result in item.assertion_results
+                    if result.assertion_id == assertion_id
+                )
             ),
             evidence_refs=_unique_references(
                 reference
@@ -1165,7 +1179,11 @@ def _require_kind_path_relationship(artifact: PackageArtifact) -> None:
         "team_manifest": path == "team-manifest.json",
         "autogen_source": path.startswith("autogen/") and path.endswith(".py"),
         "n8n_workflow": path.startswith("n8n/") and path.endswith(".json"),
-        "local_adapter": path.startswith("adapters/") and path.endswith(".py"),
+        # Captain-generated adapter descriptors and terminal prompts are sealed
+        # local adapters too; their formats are validated by the descriptor
+        # and team-manifest contracts rather than by a Python-only suffix rule.
+        "local_adapter": path.startswith("adapters/"),
+        "runtime_config": path.startswith("runtime/"),
         "skill": path.startswith("skills/"),
         "test": path.startswith("tests/test_") and path.endswith(".py"),
         "evidence": path.startswith("evidence/"),

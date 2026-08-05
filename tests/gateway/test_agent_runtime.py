@@ -112,14 +112,14 @@ def test_gateway_initializes_capability_runtime_authority_schema(
     assert "credential_sha256" in execution_claim_columns
 
 
-def release_batch(client: TestClient) -> None:
+def release_batch(client: TestClient, *, batch_id: str = "batch-1") -> None:
     response = client.post(
         "/blocks",
         json={
             "block_type": "work_batch",
             "status": "pending",
             "data": {
-                "batch_id": "batch-1",
+                "batch_id": batch_id,
                 "title": "Runtime integration",
                 "goal": "Execute the released runtime command",
                 "subtask_ids": ["subtask-1"],
@@ -161,6 +161,23 @@ def test_runtime_command_is_idempotent_and_version_fenced(
     stale["event_id"] = str(uuid4())
     stale["subject_version"] -= 1
     assert client.post("/v1/runtime/commands", json=stale).status_code == 409
+
+
+def test_runtime_subject_version_fence_is_scoped_to_released_batch(
+    client: TestClient,
+) -> None:
+    release_batch(client, batch_id="batch-1")
+    first = load("agent_runtime_command.v1.json")
+    assert client.post("/v1/runtime/commands", json=first).status_code == 202
+
+    release_batch(client, batch_id="batch-2")
+    independent = copy.deepcopy(first)
+    independent["event_id"] = str(uuid4())
+    independent["subject_version"] = 1
+    independent["payload"]["batch_id"] = "batch-2"
+
+    accepted = client.post("/v1/runtime/commands", json=independent)
+    assert accepted.status_code == 202, accepted.text
 
 
 def test_runtime_command_replay_fails_closed_without_atomic_batch_admission(

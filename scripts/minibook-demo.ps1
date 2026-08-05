@@ -18,7 +18,7 @@ $serviceName = 'captain-demo-service'
 function Read-Env {
     $values = [ordered]@{}
     if (Test-Path $envFile) { foreach ($line in [IO.File]::ReadAllLines($envFile)) {
-        if ($line -match '^(CAPTAIN_DEMO_MINIBOOK_API_KEY|MINIBOOK_API_KEY|MINIBOOK_PROJECTION_API_KEY)=(.*)$') { $values[$Matches[1]] = $Matches[2] }
+        if ($line -match '^(CAPTAIN_DEMO_MINIBOOK_API_KEY|MINIBOOK_API_KEY|MINIBOOK_PROJECTION_API_KEY|MINIBOOK_CREATION_DB|MINIBOOK_CREATION_ARTIFACTS|CAPTAIN_RUNTIME_ARTIFACT_ROOT)=(.*)$') { $values[$Matches[1]] = $Matches[2] }
     }}
     $values
 }
@@ -57,7 +57,8 @@ function Start-Service {
     if (Test-Health) {
         $managed = Get-ManagedServiceProcess
         if (-not $managed) { throw 'Healthy Minibook endpoint is not the managed demo process.' }
-        Stop-Process -Id $managed.Id -ErrorAction Stop
+        & taskkill.exe /PID $managed.Id /T /F *> $null
+        if ($LASTEXITCODE -ne 0) { throw 'Managed Minibook process tree could not be stopped.' }
         Remove-Item $pidFile -Force
         Write-Host '[ready] managed Minibook restarted for current configuration'
     }
@@ -65,13 +66,19 @@ function Start-Service {
     $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python).Source }
     $previousProjectionKey = [Environment]::GetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY','Process')
     $previousMinibookUrl = [Environment]::GetEnvironmentVariable('MINIBOOK_URL','Process')
+    $previousCreationDb = [Environment]::GetEnvironmentVariable('MINIBOOK_CREATION_DB','Process')
+    $previousCreationArtifacts = [Environment]::GetEnvironmentVariable('MINIBOOK_CREATION_ARTIFACTS','Process')
     try {
         [Environment]::SetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY',$projectionKey,'Process')
         [Environment]::SetEnvironmentVariable('MINIBOOK_URL',$baseUrl,'Process')
+        [Environment]::SetEnvironmentVariable('MINIBOOK_CREATION_DB',[string]$values['MINIBOOK_CREATION_DB'],'Process')
+        [Environment]::SetEnvironmentVariable('MINIBOOK_CREATION_ARTIFACTS',[string]$values['MINIBOOK_CREATION_ARTIFACTS'],'Process')
         $process = Start-Process $python -ArgumentList 'run.py' -WorkingDirectory (Join-Path $root 'minibook') -WindowStyle Hidden -PassThru
     } finally {
         [Environment]::SetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY',$previousProjectionKey,'Process')
         [Environment]::SetEnvironmentVariable('MINIBOOK_URL',$previousMinibookUrl,'Process')
+        [Environment]::SetEnvironmentVariable('MINIBOOK_CREATION_DB',$previousCreationDb,'Process')
+        [Environment]::SetEnvironmentVariable('MINIBOOK_CREATION_ARTIFACTS',$previousCreationArtifacts,'Process')
     }
     $identity = @{ pid=$process.Id; started_at=$process.StartTime.ToUniversalTime().ToString('o'); executable=$python }
     [IO.File]::WriteAllText($pidFile, ($identity | ConvertTo-Json -Compress))
@@ -126,7 +133,8 @@ function Bootstrap-Service {
 function Stop-Service {
     $process = Get-ManagedServiceProcess
     if (-not $process) { Write-Host '[ready] no managed Minibook process'; return }
-    Stop-Process -Id $process.Id -ErrorAction Stop
+    & taskkill.exe /PID $process.Id /T /F *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'Managed Minibook process tree could not be stopped.' }
     Remove-Item $pidFile -Force
     Write-Host '[ready] managed Minibook process stopped'
 }

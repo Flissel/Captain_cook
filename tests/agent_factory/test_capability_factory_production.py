@@ -5,12 +5,14 @@ import json
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
-from pydantic import SecretStr
+from pydantic import BaseModel, SecretStr, ValidationError
 
 from agenten.agent_factory.capability_factory_production import (
     AdapterManifestKind,
     RuntimeCaptainEvidenceHttpPort,
+    _backend_failure_detail,
     create_capability_factory_runtime_app,
     generate_adapter_manifest,
 )
@@ -21,6 +23,10 @@ from agenten.agent_factory.capability_factory_entrypoint import (
 )
 from agenten.agent_factory.forge_contracts import CreationResultV1
 from agenten.agent_factory.outcome_contracts import ForgeCapabilityPackageCandidateV1
+from agenten.agent_factory.production_candidate_ports import ProductionCandidatePortError
+from agenten.agent_factory.production_adapter_bundle import ProductionToolRequired
+from agenten.agent_factory.leases import FactoryLeaseDenied
+from agenten.agent_factory.service import FactoryRepositoryError
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.factory_live_runtime import FactoryLiveBootstrapError, load_factory_live_environment
 from tests.agent_factory.test_release_gate import accepted_manifest, capability_e2e
@@ -30,6 +36,111 @@ from tests.agent_factory.test_state_machine import v2_job
 def _module(path: Path, symbol: str) -> Path:
     path.write_text(f"def {symbol}(context):\n    return context\n", encoding="utf-8")
     return path
+
+
+def test_backend_failure_detail_exposes_only_repository_reason() -> None:
+    repository = _backend_failure_detail(
+        "capability_evidence_backend_failed",
+        FactoryRepositoryError("factory job not found"),
+    )
+    arbitrary = _backend_failure_detail(
+        "capability_evidence_backend_failed", RuntimeError("secret-like detail")
+    )
+
+    assert repository == {
+        "code": "capability_evidence_backend_failed",
+        "exception_type": "FactoryRepositoryError",
+        "reason": "factory job not found",
+    }
+    assert arbitrary == {
+        "code": "capability_evidence_backend_failed",
+        "exception_type": "RuntimeError",
+    }
+
+
+def test_backend_failure_detail_exposes_typed_lease_denial_reason() -> None:
+    detail = _backend_failure_detail(
+        "capability_evidence_backend_failed",
+        FactoryLeaseDenied("factory lease role is not the next authorized action"),
+    )
+
+    assert detail["reason"] == "factory lease role is not the next authorized action"
+
+
+def test_backend_failure_detail_exposes_the_safe_candidate_port_reason() -> None:
+    detail = _backend_failure_detail(
+        "capability_evidence_backend_failed",
+        ProductionCandidatePortError("candidate sandbox did not pass with the required isolation"),
+    )
+
+    assert detail == {
+        "code": "capability_evidence_backend_failed",
+        "exception_type": "ProductionCandidatePortError",
+        "reason": "candidate sandbox did not pass with the required isolation",
+    }
+
+
+def test_backend_failure_detail_exposes_only_safe_opt_in_value_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS", "1")
+
+    safe = _backend_failure_detail(
+        "capability_evidence_backend_failed", ValueError("sealed candidate is missing")
+    )
+    unsafe = _backend_failure_detail(
+        "capability_evidence_backend_failed", ValueError("token=secret-value")
+    )
+
+    assert safe["reason"] == "sealed candidate is missing"
+    assert "reason" not in unsafe
+
+
+def test_backend_failure_detail_exposes_only_safe_required_tool_reason() -> None:
+
+    safe = _backend_failure_detail(
+        "capability_evidence_backend_failed",
+        ProductionToolRequired("TODO_TOOL:configuration:CAPTAIN_N8N_PROJECT_ID"),
+    )
+    unsafe = _backend_failure_detail(
+        "capability_evidence_backend_failed",
+        ProductionToolRequired("token=secret-value"),
+    )
+
+    assert safe["reason"] == "TODO_TOOL:configuration:CAPTAIN_N8N_PROJECT_ID"
+    assert "reason" not in unsafe
+
+
+def test_backend_failure_detail_exposes_only_safe_opt_in_http_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS", "1")
+
+    safe = _backend_failure_detail(
+        "capability_evidence_backend_failed", HTTPException(409, "factory lease is missing")
+    )
+    unsafe = _backend_failure_detail(
+        "capability_evidence_backend_failed", HTTPException(409, "token=secret-value")
+    )
+
+    assert safe["reason"] == "factory lease is missing"
+    assert "reason" not in unsafe
+
+
+def test_backend_failure_detail_redacts_validation_inputs() -> None:
+    class Contract(BaseModel):
+        count: int
+
+    try:
+        Contract.model_validate({"count": "secret-like-value"})
+    except ValidationError as exc:
+        detail = _backend_failure_detail("capability_evidence_backend_failed", exc)
+    else:  # pragma: no cover - documents the validation setup
+        raise AssertionError("expected a validation error")
+
+    assert detail["exception_type"] == "ValidationError"
+    assert detail["reason"].startswith("count:")
+    assert "secret-like-value" not in detail["reason"]
 
 
 def test_manifest_generator_uses_distinct_attested_contracts(tmp_path: Path) -> None:

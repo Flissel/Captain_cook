@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID
 
 from .contracts import (
+    CreationResumeGrantV1,
     CreationCompletionEvidenceV1,
     CreationJobV1,
     CreationPreparationEvidenceV1,
@@ -67,6 +68,9 @@ class CreationJobStore:
                     job_id TEXT PRIMARY KEY, payload TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS creation_preparation_evidence (
+                    job_id TEXT PRIMARY KEY, payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS creation_architect_evidence (
                     job_id TEXT PRIMARY KEY, payload TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS creation_completion_evidence (
@@ -135,14 +139,53 @@ class CreationJobStore:
             ).fetchone()
             if existing is not None:
                 if existing["payload"] != encoded:
-                    raise CreationConflictError(
-                        "creation completion evidence already differs"
-                    )
+                    raise CreationConflictError("creation completion evidence already differs")
                 return True
             db.execute(
                 "INSERT INTO creation_completion_evidence VALUES (?, ?)",
                 (str(result.creation_job_id), encoded),
             )
+        return False
+
+    def record_architect(self, creation_job_id: UUID, block: object) -> bool:
+        encoded = _json(block)
+        job_id = str(creation_job_id)
+        with self._connect() as db:
+            existing = db.execute("SELECT payload FROM creation_architect_evidence WHERE job_id = ?", (job_id,)).fetchone()
+            if existing is not None:
+                if existing["payload"] != encoded:
+                    raise CreationConflictError("creation architect evidence already differs")
+                return True
+            db.execute("INSERT INTO creation_architect_evidence VALUES (?, ?)", (job_id, encoded))
+        return False
+
+    def architect(self, job_id: UUID):
+        from .contracts import FactoryEvidenceBlockV1
+        with self._connect() as db:
+            row = db.execute("SELECT payload FROM creation_architect_evidence WHERE job_id = ?", (str(job_id),)).fetchone()
+        if row is None:
+            raise CreationNotFoundError(str(job_id))
+        return FactoryEvidenceBlockV1.model_validate_json(row["payload"])
+
+    def pause_for_tool_integrator(self, job_id: UUID) -> None:
+        with self._connect() as db:
+            head = self._head(job_id, db)
+            db.execute("INSERT INTO creation_heads VALUES (?, ?, 'awaiting_tool_integrator', ?, ?)", (str(job_id), head["version"] + 1, head["checkpoint"], head["snapshot"]))
+
+    def resume(self, grant: CreationResumeGrantV1) -> bool:
+        job_id = grant.creation_job_id
+        with self._connect() as db:
+            head = self._head(job_id, db)
+            snapshot = json.loads(head["snapshot"])
+            previous = snapshot.get("tool_integrator_lease_id")
+            if previous is not None:
+                if previous != grant.tool_integrator_lease_id:
+                    raise CreationConflictError("creation resume grant already differs")
+                return True
+            if head["status"] != "awaiting_tool_integrator":
+                raise CreationConflictError("creation job is not awaiting tool-integrator authority")
+            snapshot["tool_integrator_lease_id"] = grant.tool_integrator_lease_id
+            db.execute("INSERT INTO creation_heads VALUES (?, ?, 'queued', ?, ?)", (str(job_id), head["version"] + 1, head["checkpoint"], _json(snapshot)))
         return False
 
     def finish_with_completion(
@@ -307,6 +350,7 @@ class CreationJobStore:
             job_id
             for job_id in job_ids
             if self.result(job_id) is None
+            and self.job(job_id).architect_lease_id is not None
             and self.progress(job_id).status in {"queued", "running"}
         )
 

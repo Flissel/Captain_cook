@@ -314,6 +314,7 @@ async def test_production_factory_exports_legacy_swarm_through_package_c_or_exac
     tmp_path: Path,
 ) -> None:
     from minibook.swarm.creation_runtime import ProductionSwarmPipelineFactory
+    from minibook.swarm.contracts import ArtifactRef
     from minibook.swarm.pipeline_adapter import (
         ContentAddressedCreationArtifacts,
         SwarmSnapshot,
@@ -406,6 +407,258 @@ async def test_production_factory_exports_legacy_swarm_through_package_c_or_exac
         "required_output"
     ]
     assert "tests/ (real executable tests)" in marker["required_output"]
+
+
+def test_production_factory_recovers_only_canonical_integration_keys(
+    tmp_path: Path,
+) -> None:
+    from minibook.swarm.creation_runtime import ProductionSwarmPipelineFactory
+    from minibook.swarm.contracts import CreationJobV1
+    from minibook.swarm.pipeline_adapter import ContentAddressedCreationArtifacts
+
+    artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
+    graph_ref = artifacts.put(
+        json.dumps(
+            {
+                "schema": "captain.factory-work-graph.v1",
+                "nodes": [
+                    {"kind": "architecture", "integration_keys": []},
+                    {"kind": "integration_decision", "integration_keys": ["audit_log"]},
+                    {"kind": "integration_decision", "integration_keys": ["observability"]},
+                ],
+            },
+            sort_keys=True,
+        ).encode(),
+        "application/json",
+        namespace="factory-work-graph",
+    )
+    payload = creation_job().model_dump(mode="json", by_alias=True)
+    payload["dependency_graph_ref"] = graph_ref.model_dump(mode="json")
+    job = CreationJobV1.model_validate(payload)
+
+    factory = ProductionSwarmPipelineFactory(artifacts)
+
+    assert factory._compiled_integration_keys(job) == ("audit_log", "observability")
+
+
+@pytest.mark.asyncio
+async def test_noninteractive_factory_replaces_ui_export_handoffs_with_local_candidate(
+    tmp_path: Path,
+) -> None:
+    from minibook.swarm.creation_runtime import ProductionSwarmPipelineFactory
+    from minibook.swarm.pipeline_adapter import (
+        ContentAddressedCreationArtifacts,
+        SwarmSnapshot,
+        SwarmStep,
+    )
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+    output = tmp_path / "local-candidate"
+    output.mkdir()
+    observed: list[str] = []
+    created: list[object] = []
+
+    async def setup_agents(_session: Session) -> dict[str, object]:
+        return {"SwarmManager": object()}
+
+    async def setup_project(
+        _session: Session, _agents: dict[str, object], _name: str
+    ) -> str:
+        return "project-1"
+
+    class Pipeline:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            created.append(self)
+            self.interactive = False
+            self.output_path = output
+            self.completed_steps: set[str] = set()
+            self.export_result = None
+
+        async def step_feedback_loop(self, session: Session) -> None:
+            del session
+            observed.append("interactive-feedback")
+
+        async def step_eval_reporter(self, session: Session) -> None:
+            del session
+            observed.append("interactive-report")
+
+        async def step_export(self, session: Session) -> None:
+            del session
+            observed.append("interactive-export")
+
+    artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
+    factory = ProductionSwarmPipelineFactory(
+        artifacts,
+        session_factory=Session,
+        setup_agents=setup_agents,
+        setup_project=setup_project,
+        pipeline_type=Pipeline,
+        input_resolver=lambda _reference: "Build the requested team",
+    )
+
+    async with factory.open(creation_job()) as adapter:
+        snapshot = SwarmSnapshot(creation_job_id=creation_job().creation_job_id).model_dump()
+        for step in (
+            SwarmStep.FEEDBACK_LOOP,
+            SwarmStep.EVALUATION_REPORT,
+            SwarmStep.EXPORT,
+        ):
+            snapshot = (
+                await adapter.run_step(creation_job(), step.value, snapshot, step.value, None)
+            ).snapshot
+
+    assert observed == []
+    assert getattr(created[0], "captain_package_contract_mode") is True
+    assert snapshot["pipeline_state_ref"] is not None
+
+
+@pytest.mark.asyncio
+async def test_noninteractive_factory_repeats_failed_quality_evaluation_without_ui_wait(
+    tmp_path: Path,
+) -> None:
+    from minibook.swarm.creation_runtime import ProductionSwarmPipelineFactory
+    from minibook.swarm.contracts import ArtifactRef
+    from minibook.swarm.pipeline_adapter import (
+        ContentAddressedCreationArtifacts,
+        SwarmSnapshot,
+        SwarmStep,
+    )
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+    class Pipeline:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            self.interactive = False
+            self.completed_steps: set[str] = set()
+            self.output_eval = {"status": "FAIL", "test_task": "bounded task"}
+            self.output_path = tmp_path
+            self.export_result = None
+            self.quality_trigger = None
+
+        async def poll_mention(self, *_args, **_kwargs):
+            raise AssertionError("the non-interactive retry must replace the UI poll")
+
+        async def step_output_eval(self, _session, *, test_task_override=None) -> None:
+            self.quality_trigger = test_task_override
+            self.output_eval = {"status": "PASS", "score": "8"}
+
+        async def step_eval_reporter(self, _session) -> None:
+            return None
+
+        async def step_export(self, _session) -> None:
+            self.export_result = {"status": "SUCCESS", "path": str(self.output_path)}
+
+    async def setup_agents(_session: Session) -> dict[str, object]:
+        return {"SwarmManager": object()}
+
+    async def setup_project(
+        _session: Session, _agents: dict[str, object], _name: str
+    ) -> str:
+        return "project-1"
+
+    artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
+    factory = ProductionSwarmPipelineFactory(
+        artifacts,
+        session_factory=Session,
+        setup_agents=setup_agents,
+        setup_project=setup_project,
+        pipeline_type=Pipeline,
+        input_resolver=lambda _reference: "Build the requested team",
+    )
+    job = creation_job()
+    async with factory.open(job) as adapter:
+        outcome = await adapter.run_step(
+            job,
+            SwarmStep.FEEDBACK_LOOP.value,
+            SwarmSnapshot(creation_job_id=job.creation_job_id).model_dump(),
+            "feedback",
+            None,
+        )
+
+    state = json.loads(artifacts.read(ArtifactRef.model_validate(outcome.snapshot["pipeline_state_ref"])))
+    assert state["output_eval"] == {"status": "PASS", "score": "8"}
+
+
+@pytest.mark.asyncio
+async def test_noninteractive_factory_runs_initial_output_evaluation_without_ui_wait(
+    tmp_path: Path,
+) -> None:
+    from minibook.swarm.creation_runtime import ProductionSwarmPipelineFactory
+    from minibook.swarm.pipeline_adapter import (
+        ContentAddressedCreationArtifacts,
+        SwarmSnapshot,
+        SwarmStep,
+    )
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+    class Pipeline:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            self.interactive = False
+            self.completed_steps: set[str] = set()
+            self.output_path = tmp_path
+            self.export_result = None
+            self.output_eval = None
+
+        async def poll_mention(self, *_args, **_kwargs):
+            raise AssertionError("Captain must replace the UI poll")
+
+        async def step_output_eval(self, _session) -> None:
+            trigger = await self.poll_mention(None, "OutputEvalAgent")
+            assert trigger["post"]["content"] == "Captain factory quality evaluation"
+            self.output_eval = {"status": "PASS", "score": "8"}
+            self.completed_steps.add("OutputEvalAgent")
+
+        async def step_export(self, _session) -> None:
+            self.export_result = {"status": "SUCCESS", "path": str(self.output_path)}
+
+    async def setup_agents(_session: Session) -> dict[str, object]:
+        return {"SwarmManager": object()}
+
+    async def setup_project(
+        _session: Session, _agents: dict[str, object], _name: str
+    ) -> str:
+        return "project-1"
+
+    artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
+    factory = ProductionSwarmPipelineFactory(
+        artifacts,
+        session_factory=Session,
+        setup_agents=setup_agents,
+        setup_project=setup_project,
+        pipeline_type=Pipeline,
+        input_resolver=lambda _reference: "Build the requested team",
+    )
+    job = creation_job()
+    async with factory.open(job) as adapter:
+        outcome = await adapter.run_step(
+            job,
+            SwarmStep.OUTPUT_EVALUATION.value,
+            SwarmSnapshot(creation_job_id=job.creation_job_id).model_dump(),
+            "output-evaluation",
+            None,
+        )
+
+    assert "output_evaluation" in outcome.snapshot["completed_steps"]
 
 
 @pytest.mark.asyncio

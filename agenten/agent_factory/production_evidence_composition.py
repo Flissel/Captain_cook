@@ -38,7 +38,16 @@ from agenten.agent_factory.capability_v3_evidence_bridge import (
     PackageCV3CapabilityEvidenceBackend,
     build_capability_evidence_backend,
 )
-from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryLease
+from agenten.agent_factory.contracts import (
+    AgentFactoryJobV3,
+    FactoryEvidenceBlock,
+    FactoryLease,
+)
+from agenten.agent_factory.skill_workflow_contracts import (
+    FactoryFeedbackV1,
+    TeamEvaluationV1,
+    TeamExecutionEvidenceV1,
+)
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.execution_budget import FactoryUsageReceiptV1
 from agenten.agent_factory.execution_policy import (
@@ -54,6 +63,7 @@ from agenten.agent_factory.hermes_cli import (
 from agenten.agent_factory.live_holdouts import (
     CaptainPrivateHoldoutAdapter,
     CaptainPrivateHoldoutEvaluationPort,
+    CaptainPrivateHoldoutSelector,
     CaptainPrivateHoldoutSourcePort,
 )
 from agenten.agent_factory.live_pricing import (
@@ -78,6 +88,16 @@ from gateway.factory_repository import (
     GatewayFactoryBudgetLedger,
     GatewayFactoryLiveEffectLedger,
     GatewayFactoryRepository,
+    GatewayFactoryWorkflowArtifactSink,
+)
+
+
+# This is release metadata for the six checked-out factory skills, not a
+# per-job timestamp.  Gateway stores a released skill immutably by
+# (skill_id, version), so deriving this value from a candidate job would make
+# the same released version conflict on the next legitimate execution.
+FACTORY_SKILL_RELEASED_AT = datetime(
+    2026, 7, 22, 7, 4, 50, 479098, tzinfo=timezone.utc
 )
 from gateway.production_store import build_local_captain_test_gateway_store
 from gateway.store import GatewayStore
@@ -213,13 +233,33 @@ class GatewayCapabilityV3Authority(CapabilityV3AuthorityPort):
         return self._repository.released_for(job, step)
 
     def record_lease(self, lease: FactoryLease) -> None:
-        self._store.record_factory_lease(lease)
+        # Go through the repository so a restart can recognise a previously
+        # persisted deterministic lease before Gateway evaluates the current
+        # workflow action.  Direct writes reject that valid replay once the
+        # workflow has advanced beyond the original lease action.
+        self._repository.record_lease(lease)
+
+    def record_block(self, block: FactoryEvidenceBlock) -> None:
+        """Append the attested Build transition through the Gateway authority."""
+
+        self._repository.append(block)
 
     def usage_receipts(
         self,
         job_id: UUID,
     ) -> tuple[FactoryUsageReceiptV1, ...]:
         return self._repository.workflow_usage_receipts(job_id)
+
+    def workflow_artifacts(
+        self, job_id: UUID
+    ) -> tuple[TeamExecutionEvidenceV1 | TeamEvaluationV1 | FactoryFeedbackV1, ...]:
+        return tuple(self._repository.workflow_artifacts(job_id))
+
+    async def persist_workflow_artifact(
+        self,
+        artifact: TeamExecutionEvidenceV1 | TeamEvaluationV1 | FactoryFeedbackV1,
+    ) -> None:
+        await GatewayFactoryWorkflowArtifactSink(self._store).persist(artifact)
 
 
 class DirectoryReleasedSkillSource:
@@ -241,16 +281,19 @@ class DirectoryReleasedSkillSource:
         return ReleasedHermesSkill(
             schema_name="captain.released-hermes-skill.v1",
             skill_id=skill_id,
-            version=1,
-            capability=job.required_capability,
+            # Version 1 was published with the pre-runtime artifact contract.
+            # The Gateway registry is immutable per (skill_id, version), so
+            # the Captain-compatible release must advance rather than mutate it.
+            version=2,
+            capability="factory_workflow",
             content_ref=ArtifactRef(
-                uri=f"artifact://released-factory-skill/{skill_id}/{digest}",
+                uri=f"artifact://released-skills/{skill_id}/v2",
                 sha256=digest,
-                media_type="application/vnd.captain.hermes-skill-directory",
+                media_type="application/json",
             ),
             content_sha256=digest,
             status="released",
-            released_at=job.occurred_at,
+            released_at=FACTORY_SKILL_RELEASED_AT,
             producer="captain",
         )
 
@@ -407,9 +450,21 @@ def build_production_v3_evidence_backend_from_environment(
                 max_cost_per_call=settings.max_cost_per_call,
                 clock=resolved_clock,
             ),
+            holdout_selector=CaptainPrivateHoldoutSelector(
+                job=job,
+                holdout_id=job.private_holdout_refs[0].holdout_id,
+            ),
         )
         adapters[job.job_id] = adapter
         return adapter
+
+    def selected_holdout_for(job: AgentFactoryJobV3):
+        """Carry Captain's explicit scope through the outer recovery adapter."""
+
+        return CaptainPrivateHoldoutSelector(
+            job=job,
+            holdout_id=job.private_holdout_refs[0].holdout_id,
+        )(job)
 
     team_execution = TeamExecutionCandidateAdapter(
         service_for=lambda job, invocation: adapter_for(job).service_for(
@@ -418,6 +473,7 @@ def build_production_v3_evidence_backend_from_environment(
         invocation_for=lambda dispatch: adapter_for(dispatch.job).invocation_for(
             dispatch
         ),
+        holdout_for=selected_holdout_for,
     )
     prepared = PreparedControlledRecoveryTeamDispatcher(
         team_execution=team_execution,

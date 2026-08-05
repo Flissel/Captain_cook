@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from uuid import UUID
 
 import pytest
@@ -148,3 +149,16 @@ def test_generated_adapter_contract_is_preserved_for_catalog_reuse() -> None:
         GatewayCapabilityCatalog(_CatalogRepository(record)).compatible_record(v2_job())
         == record
     )
+
+
+def test_release_request_declares_n8n_for_sealed_n8n_workflows() -> None:
+    from agenten.agent_factory.capability_factory_entrypoint import _release_request
+    from agenten.agent_factory.outcome_validation import _build_captain_manifest
+
+    source = inspect.getsource(_release_request)
+    manifest_source = inspect.getsource(_build_captain_manifest)
+
+    assert "artifact.kind == \"n8n_workflow\"" in source
+    assert "IntegrationIntent.N8N" in source
+    assert "item.kind == \"n8n_workflow\"" in manifest_source
+    assert "assertion_id == job.acceptance_assertion_ids[0]" in manifest_source

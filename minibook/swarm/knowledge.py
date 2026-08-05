@@ -214,8 +214,11 @@ import httpx
 from pathlib import Path
 from datetime import datetime
 
-OUTPUT_DIR = Path("/app/output")
-OUTPUT_DIR.mkdir(exist_ok=True)
+def _output_dir() -> Path:
+    # Create output storage only when a tool actually writes a result.
+    path = Path("/app/output") if Path("/app").exists() else Path("output")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 MCP_GATEWAY_URL = os.environ.get("MCP_GATEWAY_URL", "http://host.docker.internal:8808")
 MCP_GATEWAY_AUTH_TOKEN = os.environ.get("MCP_GATEWAY_AUTH_TOKEN", "")
@@ -309,21 +312,21 @@ async def fetch_json_api(url: str) -> str:
 # --- File I/O tools (for report/output agents) ---
 async def write_report(filename: str, content: str) -> str:
     \"\"\"Write a report file to the output directory. Returns the file path.\"\"\"
-    path = OUTPUT_DIR / filename
+    path = _output_dir() / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return f"Written {len(content)} chars to {path}"
 
 async def read_file(filename: str) -> str:
     \"\"\"Read a file from the output directory.\"\"\"
-    path = OUTPUT_DIR / filename
+    path = _output_dir() / filename
     if path.exists():
         return path.read_text(encoding="utf-8")[:5000]
     return f"File not found: {filename}"
 
 async def append_to_file(filename: str, content: str) -> str:
     \"\"\"Append content to an existing file in the output directory.\"\"\"
-    path = OUTPUT_DIR / filename
+    path = _output_dir() / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(content + "\\n")
@@ -868,7 +871,12 @@ import asyncio, inspect, os, sys, importlib, functools, re
 from pathlib import Path
 import yaml
 import json as _json
-import tools as _tools_module
+try:
+    # Package-C validates this module as ``autogen.main`` in an isolated
+    # workspace.  Keep the script-mode fallback for ``python autogen/main.py``.
+    from . import tools as _tools_module
+except ImportError:
+    import tools as _tools_module
 
 TOOL_REGISTRY = {
     name: func for name, func in inspect.getmembers(_tools_module, inspect.isfunction)

@@ -57,6 +57,7 @@ class LegacySwarmStepIncomplete(RuntimeError):
 class SwarmSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     creation_job_id: UUID
+    tool_integrator_lease_id: str | None = None
     completed_steps: tuple[str, ...] = ()
     output_digests: dict[str, str] = Field(default_factory=dict)
     artifact_bindings: dict[str, ArtifactRef] = Field(default_factory=dict)
@@ -230,7 +231,7 @@ class ExportArtifactSnapshotter:
             return "evidence"
         if path.startswith("n8n/") and path.endswith(".json"):
             return "n8n_workflow"
-        if path.startswith("adapters/") and path.endswith(".py"):
+        if path.startswith("adapters/"):
             return "local_adapter"
         return None
 
@@ -403,10 +404,33 @@ class ExportArtifactSnapshotter:
             for name, content in all_files
             if self._artifact_kind(name) is not None
         ]
+        released_skill_bytes = self.artifacts.read(job.released_skill.content_ref)
+        if hashlib.sha256(released_skill_bytes).hexdigest() != job.released_skill.content_sha256:
+            raise ValueError("released Captain skill content digest changed")
+        matching_skill_paths = [
+            name
+            for name, content, kind in files
+            if kind == "skill"
+            and hashlib.sha256(content).hexdigest()
+            == job.released_skill.content_sha256
+        ]
+        if len(matching_skill_paths) > 1:
+            return self._required_gap(
+                "forge-capability-candidate-contract",
+                "released Captain skill is ambiguous in export bytes",
+            )
+        released_skill_path = (
+            matching_skill_paths[0]
+            if matching_skill_paths
+            else "skills/captain-released-factory-workflow.json"
+        )
+        if not matching_skill_paths:
+            files.append((released_skill_path, released_skill_bytes, "skill"))
         by_path = {name: content for name, content, _kind in files}
         required = {
             "team-manifest.json",
             "RUNBOOK.md",
+            "adapters/factory-candidate.json",
             "evidence/tool-gaps.json",
             "evidence/hermes-skill-usage-receipt.json",
         }
@@ -450,10 +474,14 @@ class ExportArtifactSnapshotter:
         references: dict[str, ArtifactRef] = {}
         for name, content, kind in files:
             assert kind is not None
-            reference = self.artifacts.put(
-                content,
-                self._media_type(name),
-                namespace="candidate-file",
+            reference = (
+                job.released_skill.content_ref
+                if name == released_skill_path
+                else self.artifacts.put(
+                    content,
+                    self._media_type(name),
+                    namespace="candidate-file",
+                )
             )
             references[name] = reference
             package_artifacts.append(
@@ -760,6 +788,7 @@ class SwarmPipelineAdapter:
                     role="tool_integrator",
                     occurred_at=tool_at,
                     evidence_ref=tool_ref,
+                    lease_id=state.tool_integrator_lease_id,
                 ),
             ),
         )
@@ -786,6 +815,7 @@ class SwarmPipelineAdapter:
                 occurred_at=occurred_at,
                 evidence_ref=result.package_manifest_ref,
                 additional_evidence_ref=result.skill_usage_receipt_ref,
+                lease_id=state.tool_integrator_lease_id,
             ),
         )
 
@@ -798,6 +828,7 @@ class SwarmPipelineAdapter:
         occurred_at: datetime,
         evidence_ref: ArtifactRef,
         additional_evidence_ref: ArtifactRef | None = None,
+        lease_id: str | None = None,
     ) -> FactoryEvidenceBlockV1:
         evidence_refs = (
             (evidence_ref,)
@@ -818,8 +849,18 @@ class SwarmPipelineAdapter:
             status="succeeded",
             evidence_refs=evidence_refs,
             assertion_ids=(),
-            lease_id=f"minibook-swarm-{job.creation_job_id}",
+            lease_id=lease_id or job.architect_lease_id,
         )
+
+    def architect_evidence(self, job: CreationJobV1, snapshot: dict[str, Any]) -> FactoryEvidenceBlockV1:
+        if job.architect_lease_id is None:
+            raise ValueError("architect evidence requires a Captain architect lease")
+        state = SwarmSnapshot.model_validate(snapshot)
+        reference = state.evidence_step_refs.get(SwarmStep.ARCHITECT.value)
+        occurred_at = state.evidence_step_times.get(SwarmStep.ARCHITECT.value)
+        if reference is None or occurred_at is None:
+            raise ValueError("creation architect evidence is not available")
+        return self._evidence_block(job, phase="blueprint_created", role="agent_architect", occurred_at=occurred_at, evidence_ref=reference, lease_id=job.architect_lease_id)
 
     async def _dispatch(self, pipeline: Any, step: SwarmStep, job: CreationJobV1) -> Any:
         if step is SwarmStep.MANAGER:

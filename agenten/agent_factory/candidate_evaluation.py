@@ -191,9 +191,11 @@ class FactoryCandidateManifest(_FrozenModel):
     candidate_id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
     source_archive_ref: ArtifactRef
     team_manifest: FactoryCandidateArtifact
-    workflow_artifacts: tuple[FactoryCandidateArtifact, ...] = Field(min_length=1)
-    tool_schema_artifacts: tuple[FactoryCandidateArtifact, ...] = Field(min_length=2)
-    n8n_tools: tuple[TypedN8nTool, ...] = Field(min_length=1)
+    # Code-only teams have no n8n artifacts.  A non-empty tool set is
+    # validated where an integration is actually declared and granted.
+    workflow_artifacts: tuple[FactoryCandidateArtifact, ...] = ()
+    tool_schema_artifacts: tuple[FactoryCandidateArtifact, ...] = ()
+    n8n_tools: tuple[TypedN8nTool, ...] = ()
     n8n_tool_references: tuple[OpaqueN8nToolReference, ...] = ()
     build_command: tuple[str, ...] = Field(min_length=1)
     real_case_command: tuple[str, ...] = Field(min_length=1)

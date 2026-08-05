@@ -12,6 +12,7 @@ from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
     AgentFactoryJobV2,
     FactoryEvidenceBlock,
+    FactoryLease,
     FactoryJob,
     FactoryPhase,
 )
@@ -119,6 +120,9 @@ class FactoryRepository(Protocol):
     def append(self, block: FactoryEvidenceBlock) -> bool:
         """Append an evidence block, returning false for an identical replay."""
 
+    def record_lease(self, lease: FactoryLease) -> bool:
+        """Persist one Captain-issued role lease before worker evidence."""
+
     def blocks(self, job_id: UUID) -> tuple[FactoryEvidenceBlock, ...]:
         """Return blocks in their append order."""
 
@@ -160,6 +164,7 @@ class InMemoryFactoryRepository:
     _jobs: dict[UUID, FactoryJob] = field(default_factory=dict)
     _blocks: dict[UUID, list[FactoryEvidenceBlock]] = field(default_factory=dict)
     _event_ids: dict[UUID, FactoryEvidenceBlock] = field(default_factory=dict)
+    _leases: dict[str, FactoryLease] = field(default_factory=dict)
     _evaluations_by_job: dict[UUID, StoredSkillEvaluation] = field(default_factory=dict)
     _release_decisions_by_job: dict[UUID, FactoryReleaseDecision] = field(
         default_factory=dict
@@ -192,6 +197,16 @@ class InMemoryFactoryRepository:
             return False
         self._event_ids[block.event_id] = block
         self._blocks[block.job_id].append(block)
+        return True
+
+    def record_lease(self, lease: FactoryLease) -> bool:
+        self.job(lease.job_id)
+        existing = self._leases.get(lease.lease_id)
+        if existing is not None:
+            if existing != lease:
+                raise FactoryRepositoryError("lease_id already exists with different content")
+            return False
+        self._leases[lease.lease_id] = lease
         return True
 
     def blocks(self, job_id: UUID) -> tuple[FactoryEvidenceBlock, ...]:

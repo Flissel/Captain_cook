@@ -82,3 +82,14 @@ def test_configured_creation_store_fails_closed_without_an_api_key(tmp_path: Pat
 
     assert response.status_code == 503
     assert response.json() == {"detail": "Creation API authentication is not configured"}
+
+
+def test_creation_submit_rejects_legacy_job_without_captain_lease(tmp_path: Path) -> None:
+    api, _ = client(tmp_path)
+    legacy = payload()
+    del legacy["architect_lease_id"]
+
+    response = api.post("/api/v1/creation-jobs", json=legacy, headers=HEADERS)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Creation job requires a Captain architect lease"

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from minibook.swarm.knowledge import GENERIC_MAIN_PY
 from minibook.swarm.pipeline import _render_export_smoke_test
+
+
+def test_generated_main_supports_package_import_inside_capability_sandbox() -> None:
+    assert "from . import tools as _tools_module" in GENERIC_MAIN_PY
 
 
 def test_export_smoke_test_checks_packaged_autogen_modules(tmp_path: Path) -> None:

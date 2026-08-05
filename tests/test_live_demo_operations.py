@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PREFLIGHT = ROOT / "scripts" / "demo-preflight.ps1"
 RUNNER = ROOT / "scripts" / "run-live-demo.ps1"
+CAPABILITY_RUNNER = ROOT / "scripts" / "run-capability-factory-live.ps1"
 SERVICES = ROOT / "scripts" / "live-demo-services.ps1"
 MINIBOOK = ROOT / "scripts" / "minibook-demo.ps1"
 SANDBOX_DOCKERFILE = ROOT / "Dockerfile.capability-sandbox"
@@ -34,6 +35,26 @@ def test_demo_runner_requires_explicit_provider_opt_in() -> None:
     assert "[switch]$LiveProviders" in source
     assert "scripts/run-gate-e.ps1" in source
     assert "if (-not $LiveProviders)" in source
+
+
+def test_capability_runner_passes_the_separate_hermes_cost_cap() -> None:
+    source = CAPABILITY_RUNNER.read_text(encoding="utf-8")
+
+    assert "CAPTAIN_FACTORY_HERMES_MAX_COST_PER_CALL_USD" in source
+    assert "CAPTAIN_FACTORY_N8N_WORKFLOW_ID" in source
+    assert "CAPTAIN_N8N_MCP_BROKER_URL" in source
+    assert "CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET" in source
+    assert "[int]$SubjectVersion = 1" in source
+    assert "'--subject-version', $SubjectVersion.ToString()" in source
+
+
+def test_capability_sandbox_has_the_generated_autogen_runtime_dependencies() -> None:
+    source = SANDBOX_DOCKERFILE.read_text(encoding="utf-8")
+    assert "autogen-agentchat==0.7.5" in source
+    assert "autogen-ext[openai]==0.7.5" in source
+    assert "PyYAML==6.0.3" in source
+    assert "httpx==0.28.1" in source
+    assert "pytest==9.0.2" in source
 
 
 def test_normalize_writes_safe_defaults_and_aliases_without_secret_output(tmp_path: Path) -> None:
@@ -156,6 +177,8 @@ def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
     assert "executable=$process.Path" not in source
     assert "SetEnvironmentVariable('MINIBOOK_URL',$baseUrl,'Process')" in source
     assert "managed Minibook restarted for current configuration" in source
+    assert "taskkill.exe /PID $managed.Id /T /F" in source
+    assert "taskkill.exe /PID $process.Id /T /F" in source
 
 
 def test_live_demo_services_only_operates_captain_resources() -> None:
@@ -184,6 +207,7 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "MINIBOOK_API_KEY" in source
     assert "MINIBOOK_PROJECTION_API_KEY" in source
     assert "CAPTAIN_CAPABILITY_SANDBOX_IMAGE" in source
+    assert "CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS', 'Process'" in source
     assert "Set-Missing $values 'MINIBOOK_PROJECTION_API_KEY'" in source
     assert "RandomNumberGenerator" in source
     assert "[switch]$RecoverDemoCredentials" in source
@@ -209,6 +233,7 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "CAPTAIN_FACTORY_MAX_COST_USD" in source
     assert "CAPTAIN_FACTORY_HERMES_PROVIDER" in source
     assert "CAPTAIN_FACTORY_HERMES_MODEL" in source
+    assert "CAPTAIN_FACTORY_HERMES_MAX_COST_PER_CALL_USD" in source
     assert "CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD" in source
     assert "CAPTAIN_FACTORY_PRICING_VERSION" in source
     assert "CAPTAIN_FACTORY_PRICING_INPUT_COST_PER_MILLION_USD" in source

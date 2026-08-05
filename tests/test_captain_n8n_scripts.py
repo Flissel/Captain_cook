@@ -35,12 +35,18 @@ if "%1"=="ps" (
   if not errorlevel 1 (
     echo id-n8n
     echo id-postgres
+    echo id-mcp-broker
     exit /b 0
   )
   echo id-n8n
   exit /b 0
 )
 if "%1"=="inspect" (
+  echo %* | %SystemRoot%\\System32\\findstr.exe /C:"id-mcp-broker" >nul
+  if not errorlevel 1 (
+    echo mcp-broker
+    exit /b 0
+  )
   echo %* | %SystemRoot%\\System32\\findstr.exe /C:"id-postgres" >nul
   if not errorlevel 1 (
     echo postgres

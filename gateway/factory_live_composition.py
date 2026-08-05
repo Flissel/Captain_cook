@@ -20,6 +20,7 @@ from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import (
     FACTORY_SKILL_ID_BY_STEP,
     FactorySkillStep,
+    released_skill_capability_matches_job,
 )
 from gateway.factory_repository import (
     GatewayFactoryBudgetLedger,
@@ -160,7 +161,9 @@ class GatewayPreparedFactoryLiveAdapterFactory:
             released = repository.released_for(job, step)
             if (
                 released.skill_id != expected_id
-                or released.capability != job.required_capability
+                or not released_skill_capability_matches_job(
+                    released.capability, job.required_capability
+                )
                 or released.content_sha256 != expected_skill_digests[expected_id]
             ):
                 raise FactoryLiveConfigurationError(

@@ -58,6 +58,21 @@ FACTORY_SKILL_ID_BY_STEP: dict[FactorySkillStep, str] = {
     FactorySkillStep.REPORT_CAPTAIN: "captain-factory-report-captain",
 }
 
+# The released Hermes skills implement the Captain-owned factory workflow,
+# while a V3 job names the concrete capability it asks that workflow to build.
+# A job-specific release remains valid for backwards-compatible fixtures, but
+# a generic workflow release is the reusable production contract.
+FACTORY_WORKFLOW_CAPABILITY = "factory_workflow"
+
+
+def released_skill_capability_matches_job(
+    released_capability: str,
+    required_capability: str,
+) -> bool:
+    """Accept an exact legacy release or the reusable factory workflow skill."""
+
+    return released_capability in {required_capability, FACTORY_WORKFLOW_CAPABILITY}
+
 
 class FactoryFeedbackRecommendation(str, Enum):
     PROMOTE_CANDIDATE = "PROMOTE_CANDIDATE"

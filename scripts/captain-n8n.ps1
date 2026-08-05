@@ -273,8 +273,8 @@ function Get-ProjectContainerIds {
 
 function Assert-CaptainInventory {
     $ids = @(Get-ProjectContainerIds)
-    if ($ids.Count -ne 2) {
-        throw "Captain n8n inventory must contain exactly two project-scoped containers."
+    if ($ids.Count -ne 3) {
+        throw "Captain n8n inventory must contain exactly three project-scoped containers."
     }
 
     $services = @()
@@ -286,7 +286,7 @@ function Assert-CaptainInventory {
         $services += ([string]$service).Trim()
     }
 
-    $expected = @("n8n", "postgres")
+    $expected = @("mcp-broker", "n8n", "postgres")
     $actualServiceList = (@($services | Sort-Object) -join ",")
     $expectedServiceList = (@($expected | Sort-Object) -join ",")
     if ($actualServiceList -ne $expectedServiceList) {

@@ -25,6 +25,7 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrantRevocation,
 )
 from agenten.agent_factory.outcome_contracts import (
+    CapabilityPackageManifestV1,
     FactoryTerminalDecision,
     FactoryTerminalState,
     validate_execution_outcome_binding,
@@ -74,6 +75,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactoryFeedbackV1,
     FactoryFeedbackRecommendation,
     FactorySkillStep,
+    released_skill_capability_matches_job,
     TeamEvaluationV1,
     TeamExecutionEvidenceV1,
 )
@@ -744,9 +746,10 @@ class GatewayStore:
                     FROM blocks
                     WHERE block_type = 'agent_runtime_command'
                       AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.subject_id')) = %s
+                      AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.payload.batch_id')) = %s
                     FOR UPDATE
                     """,
-                    (command.subject_id,),
+                    (command.subject_id, command.payload.batch_id),
                 )
                 row = cursor.fetchone()
                 max_version = row["max_version"] if row is not None else None
@@ -1864,8 +1867,10 @@ class GatewayStore:
                 job = parse_factory_job(job_block["data"])
                 if (
                     not isinstance(job, AgentFactoryJobV3)
-                    or assignment.released_skill.capability
-                    != job.required_capability
+                    or not released_skill_capability_matches_job(
+                        assignment.released_skill.capability,
+                        job.required_capability,
+                    )
                 ):
                     raise HTTPException(
                         status_code=409,
@@ -2612,8 +2617,10 @@ class GatewayStore:
             or artifact.subject_version != job.subject_version
             or artifact.attempt > job.max_behavioral_iterations
             or artifact.acceptance_assertion_ids != job.acceptance_assertion_ids
-            or artifact.invocation.released_skill.capability
-            != job.required_capability
+            or not released_skill_capability_matches_job(
+                artifact.invocation.released_skill.capability,
+                job.required_capability,
+            )
         ):
             raise HTTPException(status_code=409, detail="factory workflow artifact job binding mismatch")
         if (
@@ -2637,17 +2644,19 @@ class GatewayStore:
         if isinstance(job, AgentFactoryJobV3) and isinstance(
             artifact, TeamExecutionEvidenceV1
         ):
-            try:
-                run_number = job.private_holdout_refs.index(artifact.holdout_ref) + 1
-            except ValueError as exc:
+            if artifact.holdout_ref not in job.private_holdout_refs:
                 raise HTTPException(
                     status_code=409,
                     detail="workflow execution holdout is not authorized by the Factory job",
-                ) from exc
-            if artifact.run_number != run_number:
+                )
+            # A release requires several independently charged provider runs
+            # against one Captain-held private case.  The older workflow path
+            # mapped one run to one holdout, which made that valid V3 release
+            # proof impossible to materialize.
+            if not 1 <= artifact.run_number <= job.execution_policy.required_live_runs:
                 raise HTTPException(
                     status_code=409,
-                    detail="workflow execution run number does not match the authorized holdout order",
+                    detail="workflow execution run number is outside the V3 release policy",
                 )
 
     @staticmethod
@@ -2743,7 +2752,15 @@ class GatewayStore:
         elif step is FactorySkillStep.BRIEF_CODEX:
             sequence_valid = prior_steps == prefix[:1]
         elif step is FactorySkillStep.EXECUTE_TEAM:
-            sequence_valid = (
+            bridge_execution = (
+                isinstance(projection.job, AgentFactoryJobV3)
+                and projection.phase is FactoryPhase.BUILD_PASSED
+                and all(
+                    prior_step is FactorySkillStep.EXECUTE_TEAM
+                    for prior_step in prior_steps
+                )
+            )
+            sequence_valid = bridge_execution or (
                 prior_steps[:2] == prefix
                 and all(
                     prior_step is FactorySkillStep.EXECUTE_TEAM
@@ -2767,11 +2784,23 @@ class GatewayStore:
                             item.invocation.idempotency_key
                             for item in all_executions
                         ),
-                        tuple(item.holdout_ref for item in all_executions),
+                        (
+                            tuple(item.holdout_ref for item in all_executions)
+                            if not isinstance(projection.job, AgentFactoryJobV3)
+                            else ()
+                        ),
                     )
                 )
         elif step is FactorySkillStep.EVALUATE_TEAM:
-            sequence_valid = (
+            bridge_review = (
+                isinstance(projection.job, AgentFactoryJobV3)
+                and bool(prior_steps)
+                and all(
+                    prior_step is FactorySkillStep.EXECUTE_TEAM
+                    for prior_step in prior_steps
+                )
+            )
+            sequence_valid = bridge_review or (
                 prior_steps[:2] == prefix
                 and bool(prior_steps[2:])
                 and all(
@@ -2780,7 +2809,16 @@ class GatewayStore:
                 )
             )
         elif step is FactorySkillStep.REPORT_CAPTAIN:
-            sequence_valid = (
+            bridge_report = (
+                isinstance(projection.job, AgentFactoryJobV3)
+                and len(prior_steps) >= 2
+                and all(
+                    prior_step is FactorySkillStep.EXECUTE_TEAM
+                    for prior_step in prior_steps[:-1]
+                )
+                and prior_steps[-1] is FactorySkillStep.EVALUATE_TEAM
+            )
+            sequence_valid = bridge_report or (
                 prior_steps[:2] == prefix
                 and len(prior_steps) >= 4
                 and all(
@@ -3700,7 +3738,9 @@ class GatewayStore:
         job: FactoryJob,
     ) -> None:
         request = evidence.request
-        if request.released_skill.capability != job.required_capability:
+        if not released_skill_capability_matches_job(
+            request.released_skill.capability, job.required_capability
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="released skill capability does not match the factory job",
@@ -4132,16 +4172,22 @@ class GatewayStore:
         row = cursor.fetchone()
         return self.storage._decode_row(row) if row is not None else None
 
-    def _row_by_index(self, cursor: Any, index: int) -> dict[str, Any] | None:
-        cursor.execute(
-            """
+    def _row_by_index(
+        self,
+        cursor: Any,
+        index: int,
+        *,
+        for_update: bool = False,
+    ) -> dict[str, Any] | None:
+        sql = """
             SELECT `index`, parent_index, block_type, data, status, children,
                    metadata, hash, previous_hash
             FROM blocks
             WHERE `index` = %s
-            """,
-            (index,),
-        )
+            """
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (index,))
         row = cursor.fetchone()
         return self.storage._decode_row(row) if row is not None else None
 
@@ -5160,6 +5206,32 @@ class GatewayStore:
             replayed=replayed,
         )
 
+    def capability_package(
+        self,
+        capability_id: str,
+        capability_version: int,
+    ) -> CapabilityPackageManifestV1 | None:
+        """Read the immutable manifest retained with a published release."""
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT payload FROM factory_capability_packages
+                       WHERE capability_id = %s AND capability_version = %s""",
+                    (capability_id, capability_version),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        stored = self._decode_json(row["payload"])
+        request = stored.get("request") if isinstance(stored, dict) else None
+        if not isinstance(request, dict) or not isinstance(request.get("package"), dict):
+            raise HTTPException(
+                status_code=409,
+                detail="published capability package payload is malformed",
+            )
+        return CapabilityPackageManifestV1.model_validate(request["package"])
+
     def _publish_capability_release_once(
         self,
         request: CapabilityReleaseRequest,
@@ -6048,7 +6120,7 @@ class GatewayStore:
                 status_code=409,
                 detail="capability promotion does not match its factory job",
             )
-        if evaluation is None:
+        if evaluation is None and not isinstance(job, AgentFactoryJobV3):
             raise HTTPException(
                 status_code=409,
                 detail="capability release requires accepted evaluation evidence",

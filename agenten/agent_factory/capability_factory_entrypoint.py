@@ -41,8 +41,10 @@ from agenten.agent_factory.capability_resolution import (
 )
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV2,
+    AgentFactoryJobV3,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
+    FactoryRole,
     FactoryPhase,
     PromotedCapability,
 )
@@ -60,8 +62,10 @@ from agenten.agent_factory.input_compiler import (
     CompiledFactorySpecification,
     FactoryInputCompiler,
 )
+from agenten.agent_factory.execution_policy import FactoryExecutionPolicyV1
 from agenten.agent_factory.input_document import load_factory_input
 from agenten.agent_factory.job_builder import build_factory_job
+from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.outcome_contracts import (
     CapabilityPackageManifestV1,
     CapabilityReleaseEvidenceV1,
@@ -96,11 +100,16 @@ from agenten.agent_factory.service import (
     FactoryRepositoryError,
 )
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
+from agenten.agent_factory.skill_workflow_contracts import (
+    FactoryFeedbackV1,
+    TeamEvaluationV1,
+)
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
     ArtifactRef,
     CapabilityGrant,
+    IntegrationIntent,
     ProviderEffectReceipt,
 )
 from agenten.delivery.minibook_events import MinibookProjectionEvent
@@ -323,6 +332,19 @@ class CapabilityFactoryRunSummary(BaseModel):
 
 
 class CapabilityCreationPort(Protocol):
+    async def architect_block(
+        self,
+        job: AgentFactoryJobV2,
+        creation_job: CreationJobV1,
+    ) -> FactoryEvidenceBlock: ...
+
+    async def resume_tool_integrator(
+        self,
+        creation_job: CreationJobV1,
+        *,
+        lease_id: str,
+    ) -> None: ...
+
     async def preparation_blocks(
         self,
         job: AgentFactoryJobV2,
@@ -366,6 +388,13 @@ class CaptainEvidenceIssuerPort(Protocol):
         job: AgentFactoryJobV2,
         receipts: tuple[CapabilityReleaseRunReceipt, ...],
     ) -> tuple[FactoryEvidenceBlock, FactoryEvidenceBlock, FactoryEvidenceBlock]: ...
+
+    async def workflow_review(
+        self,
+        job: AgentFactoryJobV2,
+        candidate: ForgeCapabilityPackageCandidateV1,
+        receipts: tuple[CapabilityReleaseRunReceipt, ...],
+    ) -> None: ...
 
 
 class CapabilityRuntimePort(Protocol):
@@ -689,7 +718,7 @@ except Exception:
     raise SystemExit(30)
 try:
     import pytest
-    status = pytest.main(("-q", "-p", "no:cacheprovider", "--basetemp=/tmp/pytest", *tests))
+    status = pytest.main(["-q", "-p", "no:cacheprovider", "--basetemp=/tmp/pytest", *tests])
 except Exception:
     raise SystemExit(40)
 raise SystemExit(0 if status == 0 else 40)
@@ -1398,7 +1427,21 @@ def main(arguments: tuple[str, ...] | None = None) -> int:
     except CapabilityFactoryConfigurationError as exc:
         sys.stderr.write(f"capability factory blocked: {exc}\n")
         return 2
-    except Exception:
+    except Exception as exc:
+        diagnostic = str(exc)
+        if os.environ.get("CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS") == "1":
+            sys.stderr.write(
+                f"capability factory diagnostic type: {type(exc).__name__}\n"
+            )
+            redacted_diagnostic = re.sub(
+                r"[^A-Za-z0-9 _.,:;()/-]",
+                "?",
+                diagnostic,
+            )[:240]
+            if redacted_diagnostic:
+                sys.stderr.write(
+                    f"capability factory diagnostic: {redacted_diagnostic}\n"
+                )
         sys.stderr.write(
             "capability factory failed closed; inspect redacted service logs for details\n"
         )
@@ -1539,6 +1582,8 @@ class CapabilityFactoryEntrypoint:
         projector: MinibookProjector,
         clock: CapabilityFactoryClock,
         creation_analysis: HermesCreationAnalysisPort | None = None,
+        execution_policy: FactoryExecutionPolicyV1 | None = None,
+        workspace_ref: str | None = None,
     ) -> None:
         self._checkpoint_store = checkpoint_store
         self._holdout_store = holdout_store
@@ -1554,6 +1599,12 @@ class CapabilityFactoryEntrypoint:
         self._projector = projector
         self._clock = clock
         self._creation_analysis = creation_analysis
+        self._execution_policy = execution_policy
+        if workspace_ref is not None and not workspace_ref.startswith("workspace://"):
+            raise CapabilityFactoryConfigurationError(
+                "factory workspace reference must use workspace://"
+            )
+        self._workspace_ref = workspace_ref
 
     async def run(
         self,
@@ -1589,6 +1640,11 @@ class CapabilityFactoryEntrypoint:
             now=registration_time,
             wall_clock_budget_seconds=wall_clock_budget_seconds,
         )
+        if self._execution_policy is not None:
+            proposed_job = _upgrade_job_to_v3(
+                proposed_job,
+                self._execution_policy,
+            )
         job = self._resume_job(proposed_job)
         self._checkpoint_store.bind(
             CapabilityFactoryCheckpoint(
@@ -1616,21 +1672,43 @@ class CapabilityFactoryEntrypoint:
         if resolution.kind != "create" or resolution.creation_key is None:
             raise RuntimeError("released capability reuse execution is not configured")
 
+        coordinator.record(_captain_forge_requested(job))
+        architect_lease = issue_factory_lease(
+            job=job,
+            role=FactoryRole.AGENT_ARCHITECT,
+            attempt=1,
+            workspace_ref=self._lease_workspace_ref(job),
+            now=job.occurred_at,
+        )
+        self._repository.record_lease(architect_lease)
         creation_job = self._build_creation_job(
             job,
             compiled=compiled,
             creation_key=resolution.creation_key,
             released_skill=self._released_skill,
+            architect_lease_id=architect_lease.lease_id,
         )
         if self._creation_analysis is not None:
             await self._creation_analysis.analyze(job, creation_job)
-        coordinator.record(_captain_forge_requested(job))
         receipt = await self._creation.submit(creation_job)
         if (
             receipt.creation_job_id != creation_job.creation_job_id
             or receipt.subject_version != job.subject_version
         ):
             raise ValueError("creation submission receipt does not match the factory job")
+        coordinator.record(await self._creation.architect_block(job, creation_job))
+        tool_lease = issue_factory_lease(
+            job=job,
+            role=FactoryRole.TOOL_INTEGRATOR,
+            attempt=1,
+            workspace_ref=self._lease_workspace_ref(job),
+            now=job.occurred_at,
+        )
+        self._repository.record_lease(tool_lease)
+        await self._creation.resume_tool_integrator(
+            creation_job,
+            lease_id=tool_lease.lease_id,
+        )
         preparation = await self._creation.preparation_blocks(job, creation_job)
         if len(preparation) != 2:
             raise ValueError("creation preparation must return blueprint and tool evidence")
@@ -1707,7 +1785,13 @@ class CapabilityFactoryEntrypoint:
                 candidate=candidate,
                 release_evidence_refs=tuple(item.reference for item in run_receipts),
             )
-        except CapabilityPackageValidationError:
+        except CapabilityPackageValidationError as exc:
+            detail = str(exc)
+            if (
+                os.environ.get("CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS") == "1"
+                and re.fullmatch(r"[A-Za-z0-9 _.,:;()/-]{1,240}", detail)
+            ):
+                sys.stderr.write(f"capability package validation diagnostic: {detail}\n")
             failure = CapabilityValidationFailure(
                 reason_code=FactoryTerminalReasonCode.DIGEST_VIOLATION,
                 evidence_ref=_fixed_evidence_ref(
@@ -1733,6 +1817,69 @@ class CapabilityFactoryEntrypoint:
                 evaluation=coordinator.evaluation_for_job(job.job_id),
                 evidence=evidence,
             )
+
+        # V3 quality feedback is derived from the authenticated four-run
+        # lifecycle evidence.  Persist those Captain blocks before deriving a
+        # terminal decision; otherwise a valid V3 run can only ever observe
+        # an absent evaluation and is blocked before Quality is reachable.
+        lifecycle_blocks = await self._evidence_issuer.lifecycle_blocks(
+            job,
+            tuple(run_receipts),
+        )
+        for block in lifecycle_blocks[:2]:
+            if self._clock.now() >= job.deadline_at:
+                return self._seal_nonready(
+                    coordinator,
+                    job,
+                    creation_job.creation_job_id,
+                    validation=package,
+                    evaluation=coordinator.evaluation_for_job(job.job_id),
+                    evidence=evidence,
+                )
+            self._record_lifecycle_block(coordinator, job, block)
+
+        if isinstance(job, AgentFactoryJobV3):
+            # Gateway accepts evaluation/feedback only after REAL_CASE_EVIDENCE
+            # exists.  The runtime derives both from the immutable normal runs.
+            await self._evidence_issuer.workflow_review(
+                job,
+                candidate,
+                tuple(run_receipts),
+            )
+            workflow_artifacts = coordinator.workflow_artifacts(job.job_id)
+            evaluations = tuple(
+                item for item in workflow_artifacts if isinstance(item, TeamEvaluationV1)
+            )
+            feedback_items = tuple(
+                item for item in workflow_artifacts if isinstance(item, FactoryFeedbackV1)
+            )
+            if len(evaluations) != 1 or len(feedback_items) != 1:
+                raise RuntimeError("V3 workflow review did not materialize one evaluation and feedback")
+            quality = lifecycle_blocks[2]
+            lifecycle_blocks = (
+                lifecycle_blocks[0],
+                lifecycle_blocks[1],
+                quality.model_copy(
+                    update={
+                        "artifact_refs": (
+                            evaluations[0].artifact_ref,
+                            feedback_items[0].artifact_ref,
+                        )
+                    }
+                ),
+            )
+
+        for block in lifecycle_blocks[2:]:
+            if self._clock.now() >= job.deadline_at:
+                return self._seal_nonready(
+                    coordinator,
+                    job,
+                    creation_job.creation_job_id,
+                    validation=package,
+                    evaluation=coordinator.evaluation_for_job(job.job_id),
+                    evidence=evidence,
+                )
+            self._record_lifecycle_block(coordinator, job, block)
 
         evaluation = coordinator.evaluation_for_job(job.job_id)
         provisional = derive_terminal_decision(
@@ -1762,11 +1909,17 @@ class CapabilityFactoryEntrypoint:
                 evaluation=evaluation,
                 evidence=evidence,
             )
-        lifecycle_blocks = await self._evidence_issuer.lifecycle_blocks(
-            job,
-            tuple(run_receipts),
-        )
-        for block in lifecycle_blocks:
+        workflow_evaluation_ref: ArtifactRef | None = None
+        feedback_ref: ArtifactRef | None = None
+        if isinstance(job, AgentFactoryJobV3):
+            projection = coordinator.projection(job.job_id)
+            workflow_evaluation_ref = projection.workflow_evaluation_ref
+            feedback_ref = projection.feedback_ref
+            if workflow_evaluation_ref is None or feedback_ref is None:
+                raise RuntimeError("V3 promotion lacks materialized workflow review")
+        else:
+            old_evidence = tuple(_legacy_e2e(item) for item in run_receipts)
+            release_decision = evaluate_factory_release(job, old_evidence, evaluation)
             if self._clock.now() >= job.deadline_at:
                 return self._seal_nonready(
                     coordinator,
@@ -1776,25 +1929,30 @@ class CapabilityFactoryEntrypoint:
                     evaluation=evaluation,
                     evidence=evidence,
                 )
-            coordinator.record(block)
-        old_evidence = tuple(_legacy_e2e(item) for item in run_receipts)
-        release_decision = evaluate_factory_release(job, old_evidence, evaluation)
-        if self._clock.now() >= job.deadline_at:
-            return self._seal_nonready(
-                coordinator,
-                job,
-                creation_job.creation_job_id,
-                validation=package,
-                evaluation=evaluation,
-                evidence=evidence,
+            self._gateway.record_factory_release_decision(
+                FactoryReleaseDecisionSubmission(
+                    decision=release_decision,
+                    e2e_evidence=old_evidence,
+                )
             )
-        self._gateway.record_factory_release_decision(
-            FactoryReleaseDecisionSubmission(
-                decision=release_decision,
-                e2e_evidence=old_evidence,
-            )
+        existing_promotions = tuple(
+            block
+            for block in self._repository.blocks(job.job_id)
+            if block.phase is FactoryPhase.CAPABILITY_PROMOTED
         )
-        promotion = _promotion_block(job, package, evaluation, self._clock.now())
+        if existing_promotions:
+            if len(existing_promotions) != 1:
+                raise RuntimeError("factory promotion evidence is ambiguous")
+            promotion = existing_promotions[0]
+        else:
+            promotion = _promotion_block(
+                job,
+                package,
+                evaluation,
+                self._clock.now(),
+                workflow_evaluation_ref=workflow_evaluation_ref,
+                feedback_ref=feedback_ref,
+            )
         if self._clock.now() >= job.deadline_at:
             return self._seal_nonready(
                 coordinator,
@@ -1804,7 +1962,8 @@ class CapabilityFactoryEntrypoint:
                 evaluation=evaluation,
                 evidence=evidence,
             )
-        coordinator.record(promotion)
+        if not existing_promotions:
+            coordinator.record(promotion)
         terminal = derive_terminal_decision(
             job,
             coordinator.projection(job.job_id),
@@ -1864,7 +2023,16 @@ class CapabilityFactoryEntrypoint:
         authority: CapabilityCatalogRecord,
     ) -> CapabilityExecutionCompleted | CapabilityExecutionRetryPending:
         self._require_effect_budget(job, "runtime plan preparation")
+        ensure_runtime_package = getattr(self._gateway, "ensure_runtime_package", None)
+        if callable(ensure_runtime_package):
+            ensure_runtime_package(authority)
         plan = await self._runtime.prepare(job, authority)
+        ensure_runtime_batch = getattr(self._gateway, "ensure_runtime_batch", None)
+        if callable(ensure_runtime_batch):
+            # The production Gateway adapter appends this immutable root block
+            # before accepting a command that names the batch.  Lightweight
+            # offline ports intentionally have no batch ledger.
+            ensure_runtime_batch(job)
         if (
             plan.command.correlation_id != job.correlation_id
             or plan.grant.command_id != plan.command.event_id
@@ -2320,6 +2488,11 @@ class CapabilityFactoryEntrypoint:
             or stored.dependency_graph_ref != proposed.dependency_graph_ref
         ):
             raise CapabilityFactoryInputMutation("factory input bytes changed on resume")
+        if isinstance(proposed, AgentFactoryJobV3):
+            if not isinstance(stored, AgentFactoryJobV3):
+                raise CapabilityFactoryInputMutation("factory job schema changed on resume")
+            if stored.execution_policy != proposed.execution_policy:
+                raise CapabilityFactoryInputMutation("factory execution policy changed on resume")
         return stored
 
     async def _read_candidate(
@@ -2364,6 +2537,47 @@ class CapabilityFactoryEntrypoint:
             execution=None,
         )
 
+    def _lease_workspace_ref(self, job: AgentFactoryJobV2) -> str:
+        return self._workspace_ref or f"workspace://capability-factory/{job.job_id}"
+
+    def _record_lifecycle_block(
+        self,
+        coordinator: FactoryCoordinator,
+        job: AgentFactoryJobV2,
+        block: FactoryEvidenceBlock,
+    ) -> None:
+        """Persist each V3 role lease only when its evidence block is next."""
+
+        if isinstance(job, AgentFactoryJobV3) and block.phase is FactoryPhase.BUILD_PASSED:
+            # The V3 evidence runtime records the sandbox-attested Build block
+            # before it can legally obtain a paid tester lease.  The legacy
+            # four-run lifecycle payload still contains an aggregate Build
+            # block, but it must not overwrite or duplicate that pre-effect
+            # Captain transition.
+            prior = tuple(
+                item
+                for item in self._repository.blocks(job.job_id)
+                if item.phase is FactoryPhase.BUILD_PASSED
+                and item.attempt == block.attempt
+                and item.role is FactoryRole.TOOL_INTEGRATOR
+            )
+            if prior:
+                if len(prior) != 1 or prior[0].lease_id != block.lease_id:
+                    raise ValueError("V3 Build lifecycle evidence is ambiguous")
+                return
+        if isinstance(job, AgentFactoryJobV3) and block.role is not None:
+            lease = issue_factory_lease(
+                job=job,
+                role=block.role,
+                attempt=block.attempt,
+                workspace_ref=self._lease_workspace_ref(job),
+                now=job.occurred_at,
+            )
+            if lease.lease_id != block.lease_id:
+                raise ValueError("release evidence lease is outside Captain authority")
+            self._repository.record_lease(lease)
+        coordinator.record(block)
+
     def _build_creation_job(
         self,
         job: AgentFactoryJobV2,
@@ -2371,12 +2585,14 @@ class CapabilityFactoryEntrypoint:
         compiled: CompiledFactorySpecification,
         creation_key: str,
         released_skill: ReleasedSkillRefV1,
+        architect_lease_id: str,
     ) -> CreationJobV1:
         del compiled
         return _creation_job(
             job,
             creation_key=creation_key,
             released_skill=released_skill,
+            architect_lease_id=architect_lease_id,
         )
 
 
@@ -2385,6 +2601,7 @@ def _creation_job(
     *,
     creation_key: str,
     released_skill: ReleasedSkillRefV1,
+    architect_lease_id: str,
 ) -> CreationJobV1:
     idempotency_key = hashlib.sha256(
         f"{job.job_id}:{creation_key}:1".encode("utf-8")
@@ -2405,8 +2622,35 @@ def _creation_job(
             "released_skill": released_skill.model_dump(mode="json"),
             "public_assertion_ids": job.acceptance_assertion_ids,
             "deadline_at": job.deadline_at,
+            "architect_lease_id": architect_lease_id,
         }
     )
+
+
+def _upgrade_job_to_v3(
+    job: AgentFactoryJobV2,
+    execution_policy: FactoryExecutionPolicyV1,
+) -> AgentFactoryJobV3:
+    """Attach the frozen live policy before Captain persists any lifecycle state."""
+
+    if isinstance(job, AgentFactoryJobV3):
+        if job.execution_policy != execution_policy:
+            raise CapabilityFactoryConfigurationError(
+                "existing V3 factory job execution policy changed"
+            )
+        return job
+    if (job.deadline_at - job.occurred_at).total_seconds() != execution_policy.max_runtime_seconds:
+        raise CapabilityFactoryConfigurationError(
+            "live execution policy runtime must equal the Captain job deadline"
+        )
+    payload = job.model_dump(mode="json", by_alias=True)
+    payload.update(
+        {
+            "schema": "captain.agent-factory-job.v3",
+            "execution_policy": execution_policy.model_dump(mode="json", by_alias=True),
+        }
+    )
+    return AgentFactoryJobV3.model_validate(payload)
 
 
 def _captain_forge_requested(job: AgentFactoryJobV2) -> FactoryEvidenceBlock:
@@ -2490,7 +2734,33 @@ def _promotion_block(
     package: CapabilityPackageManifestV1,
     evaluation: StoredSkillEvaluation | None,
     occurred_at: datetime,
+    *,
+    workflow_evaluation_ref: ArtifactRef | None = None,
+    feedback_ref: ArtifactRef | None = None,
 ) -> FactoryEvidenceBlock:
+    if isinstance(job, AgentFactoryJobV3):
+        if workflow_evaluation_ref is None or feedback_ref is None:
+            raise RuntimeError("V3 capability promotion requires workflow review evidence")
+        return FactoryEvidenceBlock(
+            schema_name="captain.agent-factory-block.v1",
+            event_id=uuid5(job.event_id, "factory-stage:capability_promoted:1"),
+            job_id=job.job_id,
+            correlation_id=job.correlation_id,
+            causation_id=job.event_id,
+            occurred_at=occurred_at,
+            producer="captain",
+            subject_version=job.subject_version,
+            attempt=1,
+            phase=FactoryPhase.CAPABILITY_PROMOTED,
+            status=FactoryBlockStatus.SUCCEEDED,
+            artifact_refs=(package.source_ref, workflow_evaluation_ref, feedback_ref),
+            evidence_refs=(
+                *package.release_evidence_refs,
+                workflow_evaluation_ref,
+                feedback_ref,
+            ),
+            assertion_ids=tuple(item.assertion_id for item in package.assertion_outcomes),
+        )
     if evaluation is None:
         raise RuntimeError("capability promotion requires accepted evaluation evidence")
     return FactoryEvidenceBlock(
@@ -2531,16 +2801,17 @@ def _release_request(
         sha256=canonical_contract_sha256(promotion),
         media_type="application/json",
     )
-    intents = tuple(
-        sorted(
-            {
-                item.integration_intent
-                for item in package.assertion_outcomes
-                if item.integration_intent.value != "none"
-            },
-            key=lambda item: item.value,
-        )
-    )
+    intents = {
+        item.integration_intent
+        for item in package.assertion_outcomes
+        if item.integration_intent.value != "none"
+    }
+    # n8n is a declared package capability, not merely an observation of a
+    # particular holdout. A focused case may legitimately skip the workflow,
+    # while the published catalog must still preserve the sealed contract.
+    if any(artifact.kind == "n8n_workflow" for artifact in package.artifacts):
+        intents.add(IntegrationIntent.N8N)
+    intents = tuple(sorted(intents, key=lambda item: item.value))
     return CapabilityReleaseRequest(
         schema_name="captain.capability-release-request.v1",
         event_id=uuid5(job.event_id, "capability-release-request"),

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from autogen_agentchat.base import TaskResult
 from autogen_agentchat.messages import TextMessage
+from pydantic import BaseModel
 
 from agenten.agent_factory.capability_live_adapters import (
     ContentAddressedArtifactStore,
@@ -17,6 +18,7 @@ from agenten.agent_factory.input_document import parse_factory_input_bytes
 from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
 from agenten.agent_factory.production_holdout_policy import (
     CanonicalInputHoldoutPolicy,
+    _observation_from_content,
 )
 from agenten.agent_factory.team_execution import build_private_holdout_task_envelope
 from agenten.agent_runtime.contracts import ArtifactRef
@@ -48,6 +50,49 @@ def _result(payload: object, *, source: str = "quality_warden") -> TaskResult:
         messages=[TextMessage(source=source, content=json.dumps(payload))],
         stop_reason="TERMINATE",
     )
+
+
+def test_structured_terminal_observation_normalizes_assertion_list() -> None:
+    class Assertion(BaseModel):
+        assertion_id: str
+        passed: bool
+        observable: str
+
+    class Recovery(BaseModel):
+        stop_condition_sha256: str
+
+    class Observation(BaseModel):
+        schema: str
+        assertions: list[Assertion]
+        recovery: Recovery
+        termination: str
+
+    parsed = _observation_from_content(
+        Observation(
+            schema="captain.factory-observation.v1",
+            assertions=[
+                Assertion(
+                    assertion_id="assert-123456789abc",
+                    passed=True,
+                    observable="exact observed output",
+                )
+            ],
+            recovery=Recovery(stop_condition_sha256="a" * 64),
+            termination="TERMINATE",
+        )
+    )
+
+    assert parsed == {
+        "schema": "captain.factory-observation.v1",
+        "assertions": {
+            "assert-123456789abc": {
+                "passed": True,
+                "observable": "exact observed output",
+            }
+        },
+        "recovery": {"stop_condition_sha256": "a" * 64},
+        "termination": "TERMINATE",
+    }
 
 
 @pytest.mark.asyncio
@@ -94,12 +139,12 @@ async def test_policy_reconstructs_holdout_and_accepts_only_observed_expected_va
     assert receipt.evaluator_version.startswith("1+")
     assert await policy.read(reference) == holdout_bodies.get(reference.uri).encode()
     assert artifacts.binding(
-        "holdout-policy", f"{compiled.source_ref.sha256}/v3"
+        "holdout-policy", f"{compiled.source_ref.sha256}/v3/{compiled.compilation_digest}"
     ) is not None
 
 
 @pytest.mark.asyncio
-async def test_task_envelope_drives_a_real_task_result_without_embedding_answers(
+async def test_task_envelope_drives_a_real_task_result_with_private_assertion_contract(
     tmp_path: Path,
 ) -> None:
     source, compiled, holdout_bodies = _compiled()
@@ -118,13 +163,16 @@ async def test_task_envelope_drives_a_real_task_result_without_embedding_answers
     required = envelope["required_final_output"]
 
     assert required["assertion_ids"] == list(compiled.assertion_ids)
-    assert "observable_expected" not in required["assertion_shape"]
-    assert all(
-        assertion.observable_expected not in json.dumps(required)
+    assert "observable_expected" not in required["assertions"]["item_shape"]
+    assert required["assertions"]["format"] == "array"
+    assert envelope["private_case"]["assertion_expectations"] == {
+        assertion.assertion_id: assertion.observable_expected
         for assertion in compiled.assertions
-    )
+    }
+    assert "termination" not in required
+    assert "copy observable byte-for-byte" in envelope["instructions"]
+    assert "Captain-authorized observed evidence" in envelope["instructions"]
     observation = {
-        "schema": required["schema"],
         "assertions": {
             assertion.assertion_id: {
                 "passed": True,
@@ -133,6 +181,7 @@ async def test_task_envelope_drives_a_real_task_result_without_embedding_answers
             for assertion in compiled.assertions
         },
         "recovery": required["recovery"],
+        "termination": "TERMINATE",
     }
     task_result = TaskResult(
         messages=[

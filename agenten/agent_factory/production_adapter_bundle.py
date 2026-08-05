@@ -41,6 +41,12 @@ from agenten.agent_factory.capability_live_adapters import (
 from agenten.agent_factory.factory_live_prepared_dispatch import (
     FactoryLivePreparedDispatch,
 )
+from agenten.agent_factory.execution_policy import (
+    FactoryExecutionMode,
+    FactoryExecutionPolicyV1,
+    FactoryLiveCapability,
+    FactorySandboxMode,
+)
 from agenten.agent_factory.factory_live_runner import (
     FactoryLiveEffectOutcomeV1,
     FactoryLiveEffectRequestV1,
@@ -58,6 +64,7 @@ from agenten.agent_factory.input_document import load_factory_input
 from agenten.agent_factory.claim_aware_capability_runtime import (
     ClaimAwareCapabilityRuntime,
     ContentAddressedCapabilityEffectStore,
+    capability_runtime_batch_id,
 )
 from agenten.agent_factory.state_machine import FactoryAction
 from agenten.agent_factory.skill_evaluation import (
@@ -66,6 +73,10 @@ from agenten.agent_factory.skill_evaluation import (
     ReleasedHermesSkill,
     ToolGapMarker,
     ToolImplementationOption,
+)
+
+from agenten.agent_factory.skill_workflow_contracts import (
+    FACTORY_WORKFLOW_CAPABILITY,
 )
 from agenten.agent_factory.skill_store import reject_sensitive_data
 import httpx
@@ -87,8 +98,14 @@ from agenten.agent_runtime.runtime_entrypoint import (
 from agenten.delivery.minibook_client import MinibookClient
 from agenten.delivery.projector import MinibookProjector
 from agenten.delivery.projection_cursor import ProjectionCursorStore
+from agenten.validation.contracts import AcceptanceAssertion, AssertionKind, WorkBatch
 from gateway.capability_catalog import GatewayCapabilityCatalog
 from gateway.factory_live_runtime import FactoryLiveExternalRuntimeGraph
+
+
+# Codex JSON mode includes structured tool/MCP events.  Eight MiB is sufficient
+# for a bounded documentation-heavy run while still rejecting unbounded output.
+MAX_RUNTIME_CLI_EVIDENCE_BYTES = 8 * 1024 * 1024
 from gateway.factory_repository import GatewayFactoryRepository
 from gateway.registry_feed import factory_promotion_projection, runtime_result_projection
 from gateway.production_store import LazyGatewayStore
@@ -143,22 +160,38 @@ def _resolved_executable(environ: Mapping[str, str], name: str, default: str) ->
     return resolved
 
 
-async def _bounded_process(arguments: tuple[str, ...], *, timeout: int) -> bytes:
+async def _bounded_process(
+    arguments: tuple[str, ...],
+    *,
+    timeout: int,
+    stdin: bytes | None = None,
+) -> bytes:
     process = await asyncio.create_subprocess_exec(
         *arguments,
-        stdin=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, _stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        stdout, _stderr = await asyncio.wait_for(
+            process.communicate(stdin),
+            timeout=timeout,
+        )
     except TimeoutError:
         process.kill()
         await process.wait()
         raise RuntimeError("runtime CLI exceeded its Captain wall-clock limit") from None
     if process.returncode != 0:
+        safe_stderr = "".join(
+            character
+            if character.isalnum() or character in " _.,:;()/-"
+            else "?"
+            for character in _stderr.decode("utf-8", errors="replace")
+        )[:240]
+        if os.environ.get("CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS") == "1" and safe_stderr:
+            raise RuntimeError(f"runtime CLI failed: {safe_stderr}")
         raise RuntimeError("runtime CLI failed")
-    if len(stdout) > 1_048_576:
+    if len(stdout) > MAX_RUNTIME_CLI_EVIDENCE_BYTES:
         raise RuntimeError("runtime CLI returned too much evidence")
     return stdout
 
@@ -170,6 +203,40 @@ def _first_json_object(content: bytes) -> object:
         raise ValueError("runtime CLI returned no JSON object")
     value, _ = json.JSONDecoder().raw_decode(text[start:])
     return value
+
+
+def _json_line_events(content: bytes) -> tuple[dict[str, object], ...]:
+    """Read the bounded line-delimited event stream emitted by ``codex exec``."""
+
+    events: list[dict[str, object]] = []
+    for line in content.decode("utf-8").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return tuple(events)
+
+
+def _codex_provider_session_id(events: tuple[dict[str, object], ...]) -> str:
+    """Derive a durable session identity from the provider's thread event.
+
+    The agent-produced result is not authoritative for session identity.  Codex
+    emits exactly one ``thread.started`` event for a one-shot ``exec`` run;
+    binding that event makes recovery evidence refer to the real provider run.
+    """
+
+    thread_ids = {
+        event["thread_id"]
+        for event in events
+        if event.get("type") == "thread.started"
+        and isinstance(event.get("thread_id"), str)
+        and event["thread_id"]
+    }
+    if len(thread_ids) != 1:
+        raise ValueError("Codex runtime did not yield one durable provider thread")
+    return f"codex-thread:{next(iter(thread_ids))}"
 
 
 class StrictHermesCliPlanner:
@@ -261,26 +328,29 @@ class StrictCodexCliExecution:
                 self._executable,
                 "exec",
                 "--json",
-                json.dumps(envelope, sort_keys=True, separators=(",", ":")),
+                "-",
             ),
             timeout=command.payload.limits.wall_seconds,
+            stdin=json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8"),
         )
+        events = _json_line_events(stdout)
         candidates: list[object] = []
-        for line in stdout.decode("utf-8").splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(event, dict) and event.get("schema") == "captain.agent-runtime-result.v1":
+        for event in events:
+            if event.get("schema") == "captain.agent-runtime-result.v1":
                 candidates.append(event)
-            item = event.get("item") if isinstance(event, dict) else None
+            item = event.get("item")
             if isinstance(item, dict):
                 text = item.get("text") or item.get("content")
                 if isinstance(text, str) and "captain.agent-runtime-result.v1" in text:
                     candidates.append(_first_json_object(text.encode("utf-8")))
         if len(candidates) != 1:
             raise ValueError("Codex runtime returned no unique typed result")
-        result = AgentRuntimeResult.model_validate(candidates[0])
+        candidate = candidates[0]
+        if not isinstance(candidate, dict):
+            raise ValueError("Codex runtime result is not a JSON object")
+        result_payload = dict(candidate)
+        result_payload["session_id"] = _codex_provider_session_id(events)
+        result = AgentRuntimeResult.model_validate(result_payload)
         if (
             result.command_id != command.event_id
             or result.correlation_id != command.correlation_id
@@ -564,14 +634,82 @@ def _required_from_mapping(environ: Mapping[str, str], name: str) -> str:
 class GatewayCapabilityFactoryPort:
     """Package-C adapter preserving GatewayStore claim/fence authority."""
 
-    def __init__(self, store: GatewayStore) -> None:
+    def __init__(
+        self,
+        store: GatewayStore,
+        artifacts: ContentAddressedArtifactStore | None = None,
+    ) -> None:
         self._store = store
+        self._artifacts = artifacts
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._store, name)
 
     def record_runtime_result(self, result: Any, **claim: Any) -> object:
         return self._store.record_runtime_result(result, **claim)
+
+    def ensure_runtime_batch(self, job: AgentFactoryJobV2) -> None:
+        """Materialize the exact released batch before admitting its runtime command."""
+
+        batch = WorkBatch(
+            batch_id=capability_runtime_batch_id(job),
+            title="Released capability execution",
+            goal="Execute the Captain-published capability exactly once.",
+            subtask_ids=["capability-execution"],
+            target="captain",
+            runtime="codex-cli",
+            runtime_version="v1",
+            interface_schema="captain.agent-runtime-command.v1",
+            capability_tags=["code-builder"],
+            constraints=[
+                "published capability catalog authority is required",
+                "durable provider-effect idempotency is required",
+            ],
+            acceptance_criteria=[
+                AcceptanceAssertion(
+                    assertion_id="runtime-execution-succeeded",
+                    kind=AssertionKind.STATUS_EQUALS,
+                    path="status",
+                    expected="succeeded",
+                    description="The released capability records one successful runtime result.",
+                )
+            ],
+        )
+        self._store.append(
+            _GatewayBlockWrite(
+                block_type="work_batch",
+                data=batch.model_dump(mode="json"),
+                status="pending",
+                parent_index=None,
+                metadata={"source": "capability-factory"},
+            ),
+            claim_token=None,
+        )
+
+    def ensure_runtime_package(self, authority: Any) -> None:
+        """Hydrate the Gateway-retained manifest into the shared runtime CAS."""
+
+        if self._artifacts is None:
+            raise ValueError("runtime package CAS is unavailable")
+        package = self._store.capability_package(
+            authority.capability_id,
+            authority.capability_version,
+        )
+        if package is None:
+            raise ValueError("published capability package is unavailable")
+        content = json.dumps(
+            package.model_dump(mode="json", by_alias=True),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        reference = self._artifacts.put(
+            content,
+            "application/json",
+            namespace="capability-package",
+        )
+        if reference.sha256 != authority.package_ref.sha256:
+            raise ValueError("published capability package digest changed")
 
     def projection_events(self, correlation_id: UUID) -> tuple[Any, ...]:
         cursor = -1
@@ -592,6 +730,15 @@ class GatewayCapabilityFactoryPort:
                     projected.append(event)
             if not has_more:
                 return tuple(projected)
+
+
+@dataclass(frozen=True)
+class _GatewayBlockWrite:
+    block_type: str
+    data: dict[str, Any]
+    status: str
+    parent_index: int | None
+    metadata: dict[str, Any]
 
 
 class _UtcClock:
@@ -768,7 +915,13 @@ class ProductionHermesCreationAnalysis:
                 "this analysis must not claim that validation. Return exactly one JSON "
                 "object matching "
                 "response_schema. Declare every missing tool as TODO_TOOL.v1; use [] only "
-                "when your actual analysis finds no gaps. Do not include credentials."
+                "when your actual analysis finds no gaps. When an integration has a required "
+                "n8n requirement and n8n.workflow.execute is ready, its external provider "
+                "credential is owned by the approved n8n path: classify the integration as "
+                "buildable and do not emit a gap for its credential alias. Never reproduce a "
+                "credential alias, endpoint, token-like word, or secret-like field name in "
+                "any JSON value, input_contract, output_contract, or evidence; use neutral "
+                "terms such as provider_configuration and approved_integration_path instead."
             ),
             "artifact_paths": artifact_paths,
             "provided_capabilities": [
@@ -897,7 +1050,7 @@ class ProductionHermesCreationAnalysis:
             schema="captain.released-hermes-skill.v1",
             skill_id=creation_job.released_skill.skill_id,
             version=creation_job.released_skill.version,
-            capability="autogen.agent-factory",
+            capability=FACTORY_WORKFLOW_CAPABILITY,
             content_ref=ArtifactRef.model_validate(
                 creation_job.released_skill.content_ref.model_dump(mode="json")
             ),
@@ -1045,6 +1198,7 @@ class ProductionCapabilityFactoryEntrypoint(CapabilityFactoryEntrypoint):
         compiled: Any,
         creation_key: str,
         released_skill: ReleasedSkillRefV1,
+        architect_lease_id: str,
     ) -> Any:
         input_ref = self._production_artifacts.put(
             self._production_artifacts.read_sha256(job.input_ref.sha256),
@@ -1093,6 +1247,7 @@ class ProductionCapabilityFactoryEntrypoint(CapabilityFactoryEntrypoint):
             compiled=compiled,
             creation_key=creation_key,
             released_skill=released_skill,
+            architect_lease_id=architect_lease_id,
         )
 
     async def run(
@@ -1151,6 +1306,29 @@ def _required_environment(name: str) -> str:
     return value
 
 
+def _production_execution_policy(*, runtime_seconds: int) -> FactoryExecutionPolicyV1:
+    """Build the exact V3 policy before the first Captain lifecycle write."""
+
+    try:
+        return FactoryExecutionPolicyV1(
+            schema_name="captain.factory-execution-policy.v1",
+            mode=FactoryExecutionMode.RELEASE,
+            live_execution=True,
+            max_cost_usd=_required_environment("CAPTAIN_FACTORY_MAX_COST_USD"),
+            max_runtime_seconds=runtime_seconds,
+            required_live_runs=3,
+            allowed_models=(_required_environment("CAPTAIN_FACTORY_MODEL"),),
+            live_capabilities=(
+                FactoryLiveCapability.MODEL_INVOKE,
+                FactoryLiveCapability.CAPTAIN_TEST_DATABASE,
+                FactoryLiveCapability.DOCKER_RUN,
+            ),
+            sandbox_mode=FactorySandboxMode.ISOLATED_DANGER_FULL_ACCESS,
+        )
+    except (TypeError, ValueError, InvalidOperation) as exc:
+        raise _todo("configuration:CAPTAIN_FACTORY_EXECUTION_POLICY") from exc
+
+
 def _released_skill(
     root: Path,
     artifacts: ContentAddressedArtifactStore,
@@ -1177,7 +1355,10 @@ def _released_skill(
         raise ValueError("released skill CAS binding changed")
     return ReleasedSkillRefV1(
         skill_id="captain-agent-factory-loop",
-        version=1,
+        # Version 1 was published before the executable SKILL.md existed.
+        # The content-addressed registry is immutable per (skill_id, version),
+        # therefore the complete released workflow must advance its version.
+        version=2,
         content_ref=ForgeArtifactRef.model_validate(stored.model_dump(mode="json")),
         content_sha256=digest,
     )
@@ -1215,6 +1396,7 @@ def build_capability_factory_entrypoint(config: Any) -> CapabilityFactoryEntrypo
         raise _todo("configuration:CAPTAIN_FACTORY_RUNTIME_SECONDS") from exc
     if hermes_timeout < 1:
         raise _todo("configuration:CAPTAIN_FACTORY_RUNTIME_SECONDS")
+    execution_policy = _production_execution_policy(runtime_seconds=hermes_timeout)
     hermes_creation_analysis = ProductionHermesCreationAnalysis(
         artifacts=content,
         hermes=HermesCliFactory(
@@ -1235,14 +1417,25 @@ def build_capability_factory_entrypoint(config: Any) -> CapabilityFactoryEntrypo
         ),
         released_skill_path=released_skill_path,
         max_cost_per_call_usd=_required_environment(
-            "CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD"
+            "CAPTAIN_FACTORY_HERMES_MAX_COST_PER_CALL_USD"
         ),
         timeout_seconds=hermes_timeout,
     )
     store = LazyGatewayStore(dsn)
-    gateway = GatewayCapabilityFactoryPort(store)
+    gateway = GatewayCapabilityFactoryPort(store, content)
     minibook_api_key = _required_environment("MINIBOOK_API_KEY")
-    capability_http = httpx.AsyncClient(timeout=30.0)
+    # Minibook polls cheaply, but one authenticated Runtime evidence request
+    # performs the controlled recovery and three provider-backed executions.
+    # Its read budget must therefore cover the Captain-authorized runtime,
+    # rather than silently cutting the request off at httpx's former 30s.
+    capability_http = httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            connect=30.0,
+            read=float(hermes_timeout + 60),
+            write=60.0,
+            pool=30.0,
+        )
+    )
     runtime_artifacts = ContentAddressedRuntimeArtifactPort(artifact_root)
     codex = StrictCodexCliExecution(
         _resolved_executable(os.environ, "CODEX_EXECUTABLE", "codex"),
@@ -1286,6 +1479,8 @@ def build_capability_factory_entrypoint(config: Any) -> CapabilityFactoryEntrypo
             owner_id="capability-factory-production",
         ),
         clock=_UtcClock(),
+        execution_policy=execution_policy,
+        workspace_ref=_required_environment("CAPTAIN_FACTORY_WORKSPACE_REF"),
     )
 
 

@@ -139,6 +139,8 @@ class CreationJobV1(_FrozenContract):
     released_skill: ReleasedSkillRefV1
     public_assertion_ids: tuple[str, ...] = Field(min_length=1)
     deadline_at: datetime
+    # Opaque Captain authority only; Minibook must never mint this identity.
+    architect_lease_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
 
     @field_validator("deadline_at")
     @classmethod
@@ -167,7 +169,7 @@ class CreationProgressV1(_FrozenContract):
     creation_job_id: UUID
     subject_version: int = Field(ge=1, strict=True)
     attempt: int = Field(ge=1, le=5, strict=True)
-    status: Literal["queued", "running", "blocked", "failed", "cancelled", "succeeded"]
+    status: Literal["queued", "running", "awaiting_tool_integrator", "blocked", "failed", "cancelled", "succeeded"]
     checkpoint: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
     version: int = Field(ge=1, strict=True)
 
@@ -255,6 +257,14 @@ class FactoryEvidenceBlockV1(_FrozenContract):
         for reference in (*self.artifact_refs, *self.evidence_refs):
             _require_content_address(reference)
         return self
+
+
+class CreationResumeGrantV1(_FrozenContract):
+    schema_name: Literal["minibook.creation-resume-grant.v1"] = Field(
+        default="minibook.creation-resume-grant.v1", alias="schema", serialization_alias="schema"
+    )
+    creation_job_id: UUID
+    tool_integrator_lease_id: str = Field(pattern=IDENTIFIER_PATTERN)
 
 
 class CreationPreparationEvidenceV1(_FrozenContract):

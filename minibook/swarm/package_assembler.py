@@ -90,6 +90,7 @@ class PackageAssembler:
         hermes_skill_usage_receipt: bytes | None,
         hermes_tool_gaps: bytes | None = None,
         released_skill: tuple[str, bytes] | None = None,
+        integration_keys: tuple[str, ...] = (),
     ) -> Path:
         """Repackage only observed legacy/Hermes bytes into Package C.
 
@@ -195,12 +196,16 @@ class PackageAssembler:
                     self._copy_observed_tree(candidate, staged / metadata)
             if (source / "project.yml").is_file():
                 shutil.copy2(source / "project.yml", staged / "project.yml")
+            integration_contracts = self._materialize_canonical_integrations(
+                staged, integration_keys
+            )
 
             archive_path = temporary_root / "candidate.zip"
             assembled = self.assemble(
                 staged,
                 archive_path,
                 startup_command=("python", "autogen/main.py"),
+                integration_contracts=integration_contracts,
                 capability_id=capability_id,
                 capability_version=capability_version,
             )
@@ -212,6 +217,94 @@ class PackageAssembler:
                 }
             self._materialize_immutable(destination.resolve(), expected)
         return destination.resolve()
+
+    @staticmethod
+    def _materialize_canonical_integrations(
+        source: Path,
+        integration_keys: tuple[str, ...],
+    ) -> tuple[dict[str, object], ...]:
+        """Seal input-derived n8n templates without importing provider credentials."""
+
+        if len(integration_keys) != len(set(integration_keys)):
+            raise PackageAssemblyError("canonical integration keys must be unique")
+        contracts: list[dict[str, object]] = []
+        for key in sorted(integration_keys):
+            if key != _identifier(key):
+                raise PackageAssemblyError("canonical integration key is invalid")
+            workflow = f"n8n/{key}.json"
+            input_schema = f"adapters/schemas/{key}.input.json"
+            output_schema = f"adapters/schemas/{key}.output.json"
+            for relative, payload in (
+                (
+                    workflow,
+                    {
+                        "name": f"Captain Factory {key}",
+                        "nodes": [
+                            {
+                                "id": "captain-input",
+                                "name": "Captain Input",
+                                "type": "n8n-nodes-base.webhook",
+                                "typeVersion": 2,
+                                "position": [0, 0],
+                                "parameters": {},
+                            },
+                            {
+                                "id": "captain-result",
+                                "name": "Captain Result",
+                                "type": "n8n-nodes-base.set",
+                                "typeVersion": 3.4,
+                                "position": [240, 0],
+                                "parameters": {"assignments": {"assignments": []}},
+                            },
+                        ],
+                        "connections": {},
+                        "settings": {},
+                    },
+                ),
+                (
+                    input_schema,
+                    {
+                        "title": f"Captain Factory {key} input",
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["correlation_id", "input"],
+                        "properties": {
+                            "correlation_id": {"type": "string"},
+                            "input": {"type": "object"},
+                        },
+                    },
+                ),
+                (
+                    output_schema,
+                    {
+                        "title": f"Captain Factory {key} output",
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["status"],
+                        "properties": {
+                            "status": {"type": "string"},
+                            "result": {"type": "object"},
+                        },
+                    },
+                ),
+            ):
+                target = source / Path(*PurePosixPath(relative).parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(_canonical_json(payload))
+            contracts.append(
+                {
+                    "workflow": workflow,
+                    "input_schema": input_schema,
+                    "output_schema": output_schema,
+                    "idempotency": "correlation_id",
+                    "timeout": 60,
+                    "retry": "bounded",
+                    "duplicate": "reject",
+                    "failure": "fail_closed",
+                    "compensation": "none",
+                }
+            )
+        return tuple(contracts)
 
     @staticmethod
     def _copy_observed_tree(source: Path, destination: Path) -> None:
@@ -303,22 +396,23 @@ class PackageAssembler:
             raise PackageAssemblyError(
                 "candidate source collides with Captain-generated package metadata"
             )
-        descriptor_digest: str | None = None
+        generated = self._candidate_execution_files(
+            source,
+            files,
+            startup_command=startup_command,
+            integration_contracts=contracts,
+        )
+        files.update(generated)
+        files["runtime/capability-runtime.json"] = _canonical_json({"schema": "captain.capability-runtime.v1", "startup_command": list(startup_command), "entrypoint": "autogen/main.py", "environment": "captain-managed"})
+        files["runtime/requirements.txt"] = b"autogen-agentchat>=0.4\n"
+        descriptor_digest = hashlib.sha256(
+            generated["adapters/factory-candidate.json"]
+        ).hexdigest()
+        directories.update({"adapters/", "adapters/prompts/", "runtime/"})
+        required = {"autogen/", "skills/", "tests/", "evidence/", "runtime/", "RUNBOOK.md"}
+        required.add("adapters/")
         if contracts:
-            generated = self._candidate_execution_files(
-                source,
-                files,
-                startup_command=startup_command,
-                integration_contracts=contracts,
-            )
-            files.update(generated)
-            descriptor_digest = hashlib.sha256(
-                generated["adapters/factory-candidate.json"]
-            ).hexdigest()
-            directories.update({"adapters/", "adapters/prompts/"})
-        required = {"autogen/", "skills/", "tests/", "evidence/", "RUNBOOK.md"}
-        if contracts:
-            required.update({"n8n/", "adapters/"})
+            required.add("n8n/")
         present = directories | set(files)
         if not required.issubset(present):
             raise PackageAssemblyError("candidate package is missing required layout")
@@ -440,6 +534,21 @@ class PackageAssembler:
         integration_contracts: tuple[dict[str, object], ...],
     ) -> dict[str, bytes]:
         agents = self._exported_agents(source)
+        if not agents:
+            # Legacy code-only exports do not carry agent.yml files.  Seal a
+            # deterministic runtime adapter instead of inventing an n8n tool
+            # or claiming a model-authored agent specification.
+            agents = (
+                {
+                    "name": "captain_generated_runtime",
+                    "system_message": (
+                        "Execute the sealed AutoGen entrypoint and return only "
+                        "the result produced by the packaged team."
+                    ),
+                    "tools": (),
+                    "handoffs": (),
+                },
+            )
         tool_records = tuple(
             self._tool_record(contract, files) for contract in integration_contracts
         )
@@ -450,11 +559,16 @@ class PackageAssembler:
             prompt_path = f"adapters/prompts/{agent['name']}.md"
             prompt = (str(agent["system_message"]).rstrip() + "\n").encode("utf-8")
             prompts[prompt_path] = prompt
-            tools = tuple(str(item) for item in agent["tools"])
-            if set(tools) - allowed_tools:
-                raise PackageAssemblyError(
-                    "exported agent references a tool outside integration contracts"
-                )
+            declared_tools = tuple(str(item) for item in agent["tools"])
+            # The V3 runtime grants only typed n8n tools.  Local generated
+            # helpers remain sealed in autogen/tools.py and are exercised by
+            # the package tests; only exact integration-contract matches gain
+            # a Captain-issued n8n capability lease.
+            tools = (
+                tuple(tool for tool in declared_tools if tool in allowed_tools)
+                if integration_contracts
+                else ()
+            )
             manifest_agents.append(
                 {
                     "name": agent["name"],
@@ -467,6 +581,22 @@ class PackageAssembler:
         if any(set(item["handoffs"]) - names for item in manifest_agents):
             raise PackageAssemblyError("exported agent handoff names are not closed")
         pattern = self._conversation_pattern(source, manifest_agents)
+        if pattern == "swarm":
+            self._bound_swarm_handoffs(manifest_agents)
+            for agent in manifest_agents:
+                if agent["handoffs"]:
+                    continue
+                prompt_path = f"adapters/prompts/{agent['name']}.md"
+                terminal_prompt = (
+                    prompts[prompt_path].decode("utf-8").rstrip()
+                    + "\n\nCaptain terminal role: Do not hand off to another agent. "
+                    "Return exactly one parseable captain.factory-observation.v1 JSON object: "
+                    "include every required assertion exactly once in an assertions array with assertion_id, passed, and observable, recovery with "
+                    "stop_condition_sha256, and termination set to TERMINATE. Do not emit Markdown "
+                    "or any text outside that JSON object.\n"
+                ).encode("utf-8")
+                prompts[prompt_path] = terminal_prompt
+                agent["system_prompt_ref"] = _reference(terminal_prompt, prompt_path)
         execution_manifest = {
             "schema": "autogen-team.v1",
             "name": _identifier(source.name),
@@ -513,16 +643,32 @@ class PackageAssembler:
             "real_case_command": list(startup_command),
             "timeout_seconds": min(
                 300,
-                max(1, max(int(item["timeout"]) for item in tool_records)),
+                max(
+                    1,
+                    max((int(item["timeout"]) for item in tool_records), default=300),
+                ),
             ),
         }
         generated["adapters/factory-candidate.json"] = _canonical_json(descriptor)
         return generated
 
+    @staticmethod
+    def _bound_swarm_handoffs(agents: list[dict[str, object]]) -> None:
+        """Seal a generated swarm as a forward-only graph with a final agent."""
+
+        order = {str(agent["name"]): index for index, agent in enumerate(agents)}
+        for agent in agents:
+            agent_name = str(agent["name"])
+            agent["handoffs"] = [
+                target
+                for target in agent["handoffs"]
+                if order[str(target)] > order[agent_name]
+            ]
+
     def _exported_agents(self, source: Path) -> tuple[dict[str, object], ...]:
         root = source / "agents"
         records: list[dict[str, object]] = []
-        for path in sorted(root.glob("*/agent.yml")) if root.is_dir() else ():
+        for path in sorted(root.rglob("agent.yml")) if root.is_dir() else ():
             try:
                 payload = yaml.safe_load(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, yaml.YAMLError) as exc:
@@ -534,8 +680,16 @@ class PackageAssembler:
             if not isinstance(prompt, str) or not prompt.strip():
                 raise PackageAssemblyError("exported agent lacks a system prompt")
             raw_tools = payload.get("domain_tools", payload.get("tools", ()))
-            if not isinstance(raw_tools, list) or any(not isinstance(item, str) for item in raw_tools):
+            if not isinstance(raw_tools, list):
                 raise PackageAssemblyError("exported agent tools must be named strings")
+            tools: list[str] = []
+            for item in raw_tools:
+                if isinstance(item, str):
+                    tools.append(item)
+                elif isinstance(item, Mapping) and isinstance(item.get("name"), str):
+                    tools.append(item["name"])
+                else:
+                    raise PackageAssemblyError("exported agent tools must be named strings")
             raw_handoffs = payload.get("handoffs", ())
             if not isinstance(raw_handoffs, list) or any(
                 not isinstance(item, str) for item in raw_handoffs
@@ -545,11 +699,11 @@ class PackageAssembler:
                 {
                     "name": name,
                     "system_message": prompt,
-                    "tools": tuple(raw_tools),
+                    "tools": tuple(tools),
                     "handoffs": tuple(_identifier(item) for item in raw_handoffs),
                 }
             )
-        if not records or len({item["name"] for item in records}) != len(records):
+        if len({item["name"] for item in records}) != len(records):
             raise PackageAssemblyError("candidate export requires unique agent.yml files")
         return tuple(records)
 
@@ -647,7 +801,7 @@ def _canonical_json(value: object) -> bytes:
 def _reference(content: bytes, path: str) -> dict[str, str]:
     digest = hashlib.sha256(content).hexdigest()
     return {
-        "uri": f"artifact://capability-factory/package-file/{digest}",
+        "uri": f"artifact://capability-factory/candidate-file/{digest}",
         "sha256": digest,
         "media_type": _media_type(path),
     }
@@ -678,6 +832,8 @@ def _kind(path: str) -> str:
         return "n8n_workflow"
     if path.startswith("adapters/"):
         return "local_adapter"
+    if path.startswith("runtime/"):
+        return "runtime_config"
     if path.startswith("skills/"):
         return "skill"
     if path.startswith("tests/"):

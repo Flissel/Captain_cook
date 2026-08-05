@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -16,6 +16,8 @@ from agenten.agent_factory.capability_v3_evidence_bridge import (
     PackageCV3CapabilityEvidenceBackend,
 )
 from agenten.agent_factory.production_evidence_composition import (
+    FACTORY_SKILL_RELEASED_AT,
+    DirectoryReleasedSkillSource,
     GatewayCapabilityV3Authority,
     ProductionV3EvidenceConfigurationError,
     ProductionV3EvidenceExternalPorts,
@@ -23,6 +25,11 @@ from agenten.agent_factory.production_evidence_composition import (
     load_production_v3_evidence_settings,
 )
 from agenten.agent_factory.team_execution import TeamExecutionCandidateAdapter
+from agenten.agent_factory.skill_workflow_contracts import (
+    FactorySkillStep,
+    released_skill_capability_matches_job,
+)
+from gateway.factory_repository import GatewayFactoryRepository
 
 
 NOW = datetime(2026, 7, 21, 18, 0, tzinfo=timezone.utc)
@@ -120,6 +127,54 @@ def test_builder_composes_gateway_cas_team_execution_and_recovery_without_effect
     ports.model_client_for.assert_not_called()
     ports.candidate_provider.assert_not_called()
     ports.candidate_attestation.assert_not_called()
+
+
+def test_gateway_v3_authority_reuses_repository_lease_replay_guard() -> None:
+    store = Mock(name="gateway_store")
+    authority = GatewayCapabilityV3Authority(store)
+    lease = Mock(name="lease")
+
+    with patch.object(GatewayFactoryRepository, "record_lease") as record_lease:
+        authority.record_lease(lease)
+
+    record_lease.assert_called_once_with(lease)
+    store.record_factory_lease.assert_not_called()
+
+
+def test_released_skill_metadata_is_stable_across_distinct_factory_jobs() -> None:
+    source = DirectoryReleasedSkillSource(
+        Path(__file__).parents[2] / "agenten" / "agent_factory" / "skills"
+    )
+    step = next(iter(FactorySkillStep))
+    first = SimpleNamespace(
+        required_capability="enterprise_sales_pipeline_briefing_team",
+        occurred_at=NOW,
+    )
+    second = SimpleNamespace(
+        required_capability="enterprise_sales_pipeline_briefing_team",
+        occurred_at=datetime(2026, 7, 22, 9, 0, tzinfo=timezone.utc),
+    )
+
+    assert source.released_for(first, step).released_at == FACTORY_SKILL_RELEASED_AT
+    assert source.released_for(second, step).released_at == FACTORY_SKILL_RELEASED_AT
+    released = source.released_for(first, FactorySkillStep.EXECUTE_TEAM)
+    assert released.version == 2
+    assert released.capability == "factory_workflow"
+    assert released.content_ref.uri == "artifact://released-skills/captain-factory-execute-team/v2"
+    assert released.content_ref.media_type == "application/json"
+
+
+def test_generic_factory_workflow_skill_is_compatible_with_a_specific_job() -> None:
+    assert released_skill_capability_matches_job(
+        "factory_workflow", "enterprise_sales_pipeline_briefing_team"
+    )
+    assert released_skill_capability_matches_job(
+        "enterprise_sales_pipeline_briefing_team",
+        "enterprise_sales_pipeline_briefing_team",
+    )
+    assert not released_skill_capability_matches_job(
+        "unrelated_workflow", "enterprise_sales_pipeline_briefing_team"
+    )
 
 
 def test_builder_fails_closed_when_external_provider_ports_are_absent(

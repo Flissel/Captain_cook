@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
+import inspect
 import json
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -54,6 +55,8 @@ from agenten.agent_factory.team_execution import (
     HostAutoGenTeamRunner,
     ResolvedFactoryHoldoutCase,
     TeamExecutionService,
+    _FactoryActivityCeilingTermination,
+    _provider_failure_label,
     compose_live_team_execution,
 )
 from agenten.agent_runtime.contracts import (
@@ -72,14 +75,81 @@ from agenten.agent_runtime.contracts import (
 from agenten.targets.n8n import N8nExecutionEvidence
 from agenten.agent_runtime.capabilities import PROFILE_CAPABILITIES
 from agenten.llm.model_client import build_replay_model_client
-from autogen_core.models import ModelFamily, ModelInfo, UserMessage
+from autogen_core.models import FunctionExecutionResult, ModelFamily, ModelInfo, UserMessage
 from autogen_core import CancellationToken
 from autogen_core.tools import FunctionTool
+from autogen_agentchat.messages import ToolCallExecutionEvent
 from autogen_ext.models.replay import ReplayChatCompletionClient
 from autogen_agentchat.teams import Swarm
 
 
 NOW = datetime(2026, 7, 21, 13, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_activity_ceiling_excludes_internal_swarm_handoff_tools() -> None:
+    termination = _FactoryActivityCeilingTermination(
+        max_handoffs=4,
+        max_tool_calls=1,
+    )
+    internal_handoff = ToolCallExecutionEvent(
+        source="triage",
+        content=[
+            FunctionExecutionResult(
+                content="handoff",
+                name="transfer_to_resolver",
+                call_id="handoff-1",
+            )
+        ],
+    )
+    executable_tool = ToolCallExecutionEvent(
+        source="resolver",
+        content=[
+            FunctionExecutionResult(
+                content="ok",
+                name="support_triage",
+                call_id="tool-1",
+            )
+        ],
+    )
+
+    assert await termination([internal_handoff]) is None
+    stop = await termination([executable_tool])
+
+    assert stop is not None
+    assert stop.content == "max_tool_calls"
+
+
+def test_provider_failure_label_redacts_openai_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS", "1")
+
+    label = _provider_failure_label(
+        RuntimeError("Error code: 400 - provider response body omitted")
+    )
+
+    assert label == "RuntimeError:openai_status:400"
+
+
+def test_provider_failure_label_includes_only_safe_openai_error_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ProviderError(RuntimeError):
+        code = "invalid_value"
+        param = "messages.2.role"
+
+    monkeypatch.setenv("CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS", "1")
+
+    label = _provider_failure_label(ProviderError("Error code: 400 - sensitive provider body"))
+
+    assert label == "ProviderError:openai_status:400:code:invalid_value:param:messages.2.role"
+    assert "sensitive" not in label
+
+
+def test_host_runner_binds_outcome_version_to_job_authority() -> None:
+    source = inspect.getsource(HostAutoGenTeamRunner.run)
+
+    assert "capability_version=job.subject_version" in source
+    assert "team_version=job.subject_version" in source
 
 
 def _policy_digest(job: AgentFactoryJobV3) -> str:
@@ -1237,7 +1307,22 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
         invocation=invocation,
         attempt=1,
         delegate=ReplayChatCompletionClient(
-            ["SENSITIVE-AGENT-OUTPUT TERMINATE"],
+            [
+                json.dumps(
+                    {
+                        "schema": "captain.factory-observation.v1",
+                        "assertions": [
+                            {
+                                "assertion_id": "assert-000000000000",
+                                "passed": True,
+                                "observable": "deterministic replay output",
+                            }
+                        ],
+                        "recovery": {"stop_condition_sha256": "a" * 64},
+                        "termination": "TERMINATE",
+                    }
+                )
+            ],
             model_info=ModelInfo(
                 vision=False,
                 function_calling=True,

@@ -81,6 +81,24 @@ class GatewayFactoryRepository(FactoryRepository):
         receipt = self._translate(lambda: self._store.record_factory_block(block))
         return not receipt.replayed
 
+    def record_lease(self, lease: FactoryLease) -> bool:
+        existing = self._translate(lambda: self._store.factory_job(lease.job_id).leases)
+        for recorded in existing:
+            if recorded.lease_id == lease.lease_id:
+                recorded_identity = recorded.model_dump(
+                    mode="json", exclude={"issued_at", "expires_at"}
+                )
+                proposed_identity = lease.model_dump(
+                    mode="json", exclude={"issued_at", "expires_at"}
+                )
+                if recorded_identity != proposed_identity:
+                    raise FactoryRepositoryError(
+                        "lease_id already exists with different content"
+                    )
+                return False
+        receipt = self._translate(lambda: self._store.record_factory_lease(lease))
+        return not receipt.replayed
+
     def blocks(self, job_id: UUID) -> tuple[FactoryEvidenceBlock, ...]:
         return self._translate(lambda: self._store.factory_job(job_id).blocks)
 

@@ -13,6 +13,7 @@ from .contracts import (
     CreationCompletionEvidenceV1,
     CreationEvidenceReceiptV1,
     CreationJobV1,
+    CreationResumeGrantV1,
     CreationPreparationEvidenceV1,
     FactoryEvidenceBlockV1,
 )
@@ -54,6 +55,8 @@ def create_creation_router(
     def submit(job: CreationJobV1):
         if store is None:
             raise HTTPException(503, "Creation jobs are not configured")
+        if job.architect_lease_id is None:
+            raise HTTPException(422, "Creation job requires a Captain architect lease")
         try:
             receipt = store.submit(job)
         except CreationConflictError as exc:
@@ -104,6 +107,31 @@ def create_creation_router(
                 "Creation preparation evidence is not available",
                 exc,
             )
+
+    @router.get("/api/v1/creation-jobs/{job_id}/architect-block", response_model=FactoryEvidenceBlockV1)
+    def architect_block(job_id: UUID) -> FactoryEvidenceBlockV1:
+        if store is None:
+            raise HTTPException(503, "Creation jobs are not configured")
+        try:
+            return store.architect(job_id)
+        except CreationNotFoundError as exc:
+            _raise_pending_or_missing(store, job_id, "Creation architect evidence is not available", exc)
+
+    @router.post("/api/v1/creation-jobs/{job_id}/resume")
+    def resume(job_id: UUID, grant: CreationResumeGrantV1):
+        if store is None:
+            raise HTTPException(503, "Creation jobs are not configured")
+        if grant.creation_job_id != job_id:
+            raise HTTPException(409, "Resume grant path identity changed")
+        try:
+            replayed = store.resume(grant)
+        except CreationNotFoundError as exc:
+            raise HTTPException(404, "Creation job not found") from exc
+        except CreationConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if not replayed and schedule is not None:
+            schedule(job_id)
+        return JSONResponse({"creation_job_id": str(job_id), "replayed": replayed}, status_code=200 if replayed else 202)
 
     @router.get("/api/v1/creation-jobs/{job_id}")
     def status(job_id: UUID):

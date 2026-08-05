@@ -69,6 +69,7 @@ class PackageArtifact(_FrozenContract):
         "autogen_source",
         "n8n_workflow",
         "local_adapter",
+        "runtime_config",
         "skill",
         "test",
         "evidence",
@@ -329,6 +330,10 @@ class CapabilityPackageManifestV1(_FrozenContract):
             item.path.startswith("adapters/") for item in self.artifacts
         ):
             raise ValueError("declared local adapters require the adapters/ package root")
+        if any(item.kind == "runtime_config" for item in self.artifacts) and not any(
+            item.path.startswith("runtime/") for item in self.artifacts
+        ):
+            raise ValueError("declared runtime configuration requires the runtime/ package root")
 
         artifacts_by_path = {item.path: item.reference for item in self.artifacts}
         if artifacts_by_path["team-manifest.json"] != self.team_manifest_ref:
@@ -520,6 +525,10 @@ def _require_closed_package_artifacts(
         item.path.startswith("adapters/") for item in artifacts
     ):
         raise ValueError("declared local adapters require the adapters/ package root")
+    if any(item.kind == "runtime_config" for item in artifacts) and not any(
+        item.path.startswith("runtime/") for item in artifacts
+    ):
+        raise ValueError("declared runtime configuration requires the runtime/ package root")
     artifacts_by_path = {item.path: item.reference for item in artifacts}
     if artifacts_by_path["team-manifest.json"] != team_manifest_ref:
         raise ValueError("team_manifest_ref must match team-manifest.json")

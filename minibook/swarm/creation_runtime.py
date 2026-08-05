@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass
@@ -106,7 +107,17 @@ class BackgroundCreationRuntime:
             return
         self._loop = asyncio.get_running_loop()
         self._stopping = False
-        for job_id in self.store.resumable_job_ids():
+        configured = os.environ.get("MINIBOOK_CREATION_RESUME_JOB_IDS", "").strip()
+        if configured:
+            try:
+                requested = tuple(UUID(value.strip()) for value in configured.split(",") if value.strip())
+            except ValueError as exc:
+                raise RuntimeError("MINIBOOK_CREATION_RESUME_JOB_IDS is invalid") from exc
+            resumable = set(self.store.resumable_job_ids())
+            job_ids = tuple(job_id for job_id in requested if job_id in resumable)
+        else:
+            job_ids = self.store.resumable_job_ids()
+        for job_id in job_ids:
             self._spawn(job_id)
 
     def schedule(self, job_id: UUID) -> None:
@@ -132,12 +143,26 @@ class BackgroundCreationRuntime:
 
     async def _run(self, job_id: UUID) -> None:
         job = self.store.job(job_id)
+        if job.architect_lease_id is None:
+            raise ValueError("legacy creation job has no Captain architect lease")
         try:
             async with self.pipeline_factory.open(job) as pipeline:
+                pause = "architect" not in self.store.completed_steps(job_id)
                 result = await CreationRunner(self.store, pipeline).run_slice(
                     job_id,
                     persist_result=False,
+                    pause_after_architect=pause,
                 )
+                if result is None:
+                    architect_builder = getattr(pipeline, "architect_evidence", None)
+                    if not callable(architect_builder):
+                        raise ValueError("creation pipeline cannot produce architect evidence")
+                    self.store.record_architect(
+                        job_id,
+                        architect_builder(job, self.store.snapshot(job_id)),
+                    )
+                    self.store.pause_for_tool_integrator(job_id)
+                    return
                 preparation_builder = getattr(pipeline, "preparation_evidence", None)
                 completion_builder = getattr(pipeline, "completion_evidence", None)
                 if (
@@ -265,6 +290,12 @@ class ProductionSwarmPipelineFactory:
                     task,
                     interactive=False,
                 )
+                # Package-C candidates are long-lived services.  Their
+                # bounded startup contract is the Minibook validation; the
+                # later Captain runtime records the provider-backed case.
+                # Keep this distinct from input-file generation, which also
+                # changes how the legacy swarm creates its source files.
+                pipeline.captain_package_contract_mode = True
                 self._install_package_c_export(pipeline, job)
                 snapshotter = ExportArtifactSnapshotter(self.artifacts)
 
@@ -281,6 +312,103 @@ class ProductionSwarmPipelineFactory:
         legacy_export = getattr(pipeline, "step_export", None)
         if not callable(legacy_export):
             return
+
+        # The legacy swarm's final three agents are UI/GitHub facing: they
+        # wait for mentions that a Captain-owned, non-interactive factory run
+        # intentionally never produces.  Creation has already performed its
+        # code, build, execution, output-evaluation, TODO, and toolforge
+        # stages.  Continue from that verified local output rather than
+        # waiting for an interactive export hand-off or creating a repository.
+        if getattr(pipeline, "interactive", True) is False:
+            legacy_output_evaluation = getattr(pipeline, "step_output_eval", None)
+
+            async def direct_factory_trigger(
+                *_args: object, **_kwargs: object
+            ) -> dict[str, dict[str, str]]:
+                """Provide the Captain-owned hand-off for non-interactive stages."""
+
+                del _args, _kwargs
+                return {"post": {"content": "Captain factory quality evaluation"}}
+
+            if callable(legacy_output_evaluation):
+
+                async def evaluate_without_ui(
+                    session: object, *args: object, **kwargs: object
+                ) -> Any:
+                    """Run the existing evaluator without waiting for a UI mention."""
+
+                    original_poll = getattr(pipeline, "poll_mention", None)
+                    if callable(original_poll):
+                        pipeline.poll_mention = direct_factory_trigger
+                    try:
+                        return await legacy_output_evaluation(session, *args, **kwargs)
+                    finally:
+                        if callable(original_poll):
+                            pipeline.poll_mention = original_poll
+
+                pipeline.step_output_eval = evaluate_without_ui
+
+            async def verify_feedback(
+                session: object, *args: object, **kwargs: object
+            ) -> dict[str, str]:
+                """Repeat a failed quality evaluation without a UI hand-off.
+
+                A factory run has no human mention for FeedbackAgent, but a
+                failed output evaluation is not permission to skip quality.
+                The second evaluation executes the generated team again using
+                the same bounded task and retains its *observed* result.  The
+                temporary trigger only replaces the Minibook UI transport;
+                the Docker execution and model evaluation remain real.
+                """
+                del args, kwargs
+                evaluation = getattr(pipeline, "output_eval", None)
+                rerun = getattr(pipeline, "step_output_eval", None)
+                if (
+                    isinstance(evaluation, dict)
+                    and evaluation.get("status") != "PASS"
+                    and callable(rerun)
+                ):
+                    test_task = evaluation.get("test_task")
+                    await rerun(
+                        session,
+                        test_task_override=test_task
+                        if isinstance(test_task, str)
+                        else None,
+                    )
+                pipeline.completed_steps.add("FeedbackAgent")
+                observed = getattr(pipeline, "output_eval", None)
+                return {
+                    "status": "verified"
+                    if isinstance(observed, dict) and observed.get("status") == "PASS"
+                    else "failed",
+                    "reason": "factory_non_interactive_quality_retry",
+                }
+
+            async def skip_evaluation_report(_session: object) -> dict[str, str]:
+                pipeline.completed_steps.add("EvalReporterAgent")
+                return {"status": "skipped", "reason": "factory_non_interactive"}
+
+            async def export_local_candidate(_session: object) -> dict[str, str]:
+                output_path = getattr(pipeline, "output_path", None)
+                source = Path(str(output_path or "")).resolve()
+                if source.is_dir():
+                    pipeline.export_result = {
+                        "status": "SUCCESS",
+                        "path": str(source),
+                        "repo_url": "local-factory-candidate",
+                    }
+                else:
+                    pipeline.export_result = {
+                        "status": "FAIL",
+                        "reason": "local factory output path is unavailable",
+                    }
+                pipeline.completed_steps.add("ExportAgent")
+                return dict(pipeline.export_result)
+
+            pipeline.step_feedback_loop = verify_feedback
+            pipeline.step_eval_reporter = skip_evaluation_report
+            legacy_export = export_local_candidate
+            pipeline.step_export = export_local_candidate
 
         async def export_package_c(session: object) -> Any:
             output = await legacy_export(session)
@@ -319,6 +447,25 @@ class ProductionSwarmPipelineFactory:
                     ),
                 }
                 return output
+            # Preserve the legacy export's exact missing-evidence reporting:
+            # if Hermes did not provide its bytes, PackageAssembler must surface
+            # that original contract gap before looking for optional integration
+            # expansion. A real Captain run always supplies both sealed bytes.
+            if all(
+                isinstance(evidence.get(name), bytes)
+                for name in ("skill_usage_receipt", "tool_gaps")
+            ):
+                integration_keys = self._compiled_integration_keys(job)
+                if integration_keys is None:
+                    pipeline.package_contract_gap = {
+                        "gap_id": "legacy-swarm-package-c-export",
+                        "required_outputs": (
+                            "compiled integration graph for canonical n8n artifacts",
+                        ),
+                    }
+                    return output
+            else:
+                integration_keys = ()
             try:
                 skill = self.artifacts.read(job.released_skill.content_ref)
             except ValueError:
@@ -339,6 +486,7 @@ class ProductionSwarmPipelineFactory:
                     hermes_skill_usage_receipt=evidence.get("skill_usage_receipt"),
                     hermes_tool_gaps=evidence.get("tool_gaps"),
                     released_skill=released_skill,
+                    integration_keys=integration_keys,
                 )
             except LegacyPackageContractGap as exc:
                 pipeline.package_contract_gap = {
@@ -369,6 +517,29 @@ class ProductionSwarmPipelineFactory:
             return None
         value = payload.get("capability_key") if isinstance(payload, dict) else None
         return value if isinstance(value, str) and value else None
+
+    def _compiled_integration_keys(self, job: CreationJobV1) -> tuple[str, ...] | None:
+        """Recover only public integration identifiers from Captain's sealed graph."""
+
+        try:
+            payload = json.loads(self.artifacts.read(job.dependency_graph_ref))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        nodes = payload.get("nodes") if isinstance(payload, dict) else None
+        if not isinstance(nodes, list):
+            return None
+        keys: set[str] = set()
+        for node in nodes:
+            if not isinstance(node, dict) or node.get("kind") != "integration_decision":
+                continue
+            values = node.get("integration_keys")
+            if not isinstance(values, list) or len(values) != 1:
+                return None
+            key = values[0]
+            if not isinstance(key, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", key) is None:
+                return None
+            keys.add(key)
+        return tuple(sorted(keys))
 
 
 @dataclass(frozen=True)

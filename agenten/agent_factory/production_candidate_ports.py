@@ -127,9 +127,11 @@ class FactoryCandidateExecutionDescriptorV1(_FrozenContract):
     )
     candidate_id: str
     team_manifest: FactoryCandidateArtifact
-    workflow_artifacts: tuple[FactoryCandidateArtifact, ...] = Field(min_length=1)
-    tool_schema_artifacts: tuple[FactoryCandidateArtifact, ...] = Field(min_length=2)
-    n8n_tools: tuple[TypedN8nTool, ...] = Field(min_length=1)
+    # A code-only team must not invent an n8n workflow just to satisfy this
+    # descriptor. n8n grants remain mandatory whenever tools are declared.
+    workflow_artifacts: tuple[FactoryCandidateArtifact, ...] = ()
+    tool_schema_artifacts: tuple[FactoryCandidateArtifact, ...] = ()
+    n8n_tools: tuple[TypedN8nTool, ...] = ()
     build_command: tuple[str, ...] = Field(min_length=1)
     real_case_command: tuple[str, ...] = Field(min_length=1)
     timeout_seconds: int = Field(ge=1, le=300, strict=True)
@@ -361,7 +363,8 @@ class DockerCapabilityCandidateAttestor:
             or result.process_tree_termination_capable is not True
         ):
             raise ProductionCandidatePortError(
-                "candidate sandbox did not pass with the required isolation"
+                "candidate sandbox did not pass with the required isolation "
+                f"(status={result.status}; failure_stage={result.failure_stage})"
             )
         return result
 

@@ -34,6 +34,19 @@ def factory_promotion_projection(
 ) -> MinibookProjectionEvent:
     """Build the strict public view of one committed Factory promotion."""
 
+    raw_subject = UUID(str(block["job_id"]))
+    if raw_subject.version == 4:
+        subject = raw_subject
+    else:
+        digest = bytearray(
+            hashlib.sha256(
+                f"captain-factory-subject:{raw_subject}".encode("utf-8")
+            ).digest()[:16]
+        )
+        digest[6] = (digest[6] & 0x0F) | 0x40
+        digest[8] = (digest[8] & 0x3F) | 0x80
+        subject = UUID(bytes=bytes(digest))
+
     return MinibookProjectionEvent.model_validate(
         {
             "schema": "captain.minibook-projection.v2",
@@ -42,7 +55,7 @@ def factory_promotion_projection(
             "causation_id": job.get("event_id"),
             "occurred_at": block["occurred_at"],
             "producer": "captain-gateway",
-            "subject_id": f"subject:{block['job_id']}",
+            "subject_id": f"subject:{subject}",
             "subject_version": block["subject_version"],
             "event_type": "capability.promoted",
             "payload": {

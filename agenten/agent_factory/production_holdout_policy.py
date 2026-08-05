@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from autogen_agentchat.base import TaskResult
+from pydantic import BaseModel
 
 from agenten.agent_factory.capability_live_adapters import (
     ContentAddressedArtifactStore,
@@ -104,7 +105,11 @@ class CanonicalInputHoldoutPolicy:
         )
         artifacts.bind(
             "holdout-policy",
-            f"{document.input_ref.sha256}/v{subject_version}",
+            # The same source/version can be recompiled after Captain changes
+            # its private-contract compiler.  Bind the immutable policy to the
+            # compilation digest as well; an older policy must remain readable
+            # rather than making a later live run overwrite it.
+            f"{document.input_ref.sha256}/v{subject_version}/{compiled.compilation_digest}",
             self._policy_ref,
         )
 
@@ -221,7 +226,11 @@ def _last_agent_observation(result: TaskResult) -> dict[str, object] | None:
 
 
 def _observation_from_content(content: object) -> dict[str, object] | None:
-    if isinstance(content, Mapping):
+    if isinstance(content, BaseModel):
+        candidate = content.model_dump()
+        if candidate.get("schema_name") == "captain.factory-observation.v1":
+            candidate["schema"] = candidate["schema_name"]
+    elif isinstance(content, Mapping):
         candidate = dict(content)
     elif isinstance(content, str):
         stripped = content.strip()
@@ -237,6 +246,42 @@ def _observation_from_content(content: object) -> dict[str, object] | None:
         candidate = raw
     else:
         return None
+    if candidate.get("schema") != "captain.factory-observation.v1":
+        # The terminal model may omit the redundant schema discriminator even
+        # when it emitted the full required observation body. Normalize only
+        # this exact, otherwise complete compatibility shape before Captain
+        # evaluates every assertion against its own private oracle.
+        if (
+            "schema" not in candidate
+            and candidate.get("termination") == "TERMINATE"
+            and isinstance(candidate.get("assertions"), Mapping)
+            and isinstance(candidate.get("recovery"), Mapping)
+        ):
+            candidate["schema"] = "captain.factory-observation.v1"
+        else:
+            return None
+    assertions = candidate.get("assertions")
+    if isinstance(assertions, list):
+        normalized: dict[str, dict[str, object]] = {}
+        for item in assertions:
+            if not isinstance(item, Mapping):
+                return None
+            assertion_id = item.get("assertion_id")
+            passed = item.get("passed")
+            observable = item.get("observable")
+            if (
+                not isinstance(assertion_id, str)
+                or not assertion_id
+                or assertion_id in normalized
+                or not isinstance(passed, bool)
+                or not isinstance(observable, str)
+            ):
+                return None
+            normalized[assertion_id] = {
+                "passed": passed,
+                "observable": observable,
+            }
+        candidate["assertions"] = normalized
     if candidate.get("schema") != "captain.factory-observation.v1":
         return None
     return candidate

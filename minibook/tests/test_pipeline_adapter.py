@@ -29,6 +29,27 @@ def job() -> CreationJobV1:
     return CreationJobV1.model_validate_json(FIXTURE.read_text(encoding="utf-8"))
 
 
+def seeded_job(artifacts: ContentAddressedCreationArtifacts) -> CreationJobV1:
+    """Give export tests one real shared-CAS released-skill artifact."""
+
+    creation = job()
+    reference = artifacts.put(
+        b'{"schema":"captain.released-factory-workflow.v1"}',
+        "application/json",
+        namespace="released-skill",
+    )
+    return creation.model_copy(
+        update={
+            "released_skill": creation.released_skill.model_copy(
+                update={
+                    "content_ref": reference,
+                    "content_sha256": reference.sha256,
+                }
+            )
+        }
+    )
+
+
 def test_pipeline_step_order_freezes_existing_conditional_flow() -> None:
     assert PIPELINE_STEP_ORDER == (
         SwarmStep.MANAGER,
@@ -47,6 +68,15 @@ def test_pipeline_step_order_freezes_existing_conditional_flow() -> None:
         SwarmStep.EVALUATION_REPORT,
         SwarmStep.EXPORT,
     )
+
+
+def test_export_snapshotter_keeps_all_sealed_adapter_metadata() -> None:
+    assert ExportArtifactSnapshotter._artifact_kind(
+        "adapters/factory-candidate.json"
+    ) == "local_adapter"
+    assert ExportArtifactSnapshotter._artifact_kind(
+        "adapters/prompts/runtime.md"
+    ) == "local_adapter"
 
 
 class FakePipeline:
@@ -87,8 +117,7 @@ def test_known_documentation_failure_has_typed_code() -> None:
     assert failure.code == "documentation_unavailable"
 
 
-def _hermes_receipt() -> dict[str, object]:
-    creation = job()
+def _hermes_receipt(creation: CreationJobV1) -> dict[str, object]:
     return {
         "schema": "hermes.skill-usage-receipt.v1",
         "receipt_id": "90000000-0000-4000-8000-000000000001",
@@ -102,7 +131,7 @@ def _hermes_receipt() -> dict[str, object]:
             "schema": "captain.released-hermes-skill.v1",
             "skill_id": creation.released_skill.skill_id,
             "version": creation.released_skill.version,
-            "capability": "autogen.agent-factory",
+            "capability": "factory_workflow",
             "content_ref": creation.released_skill.content_ref.model_dump(mode="json"),
             "content_sha256": creation.released_skill.content_sha256,
             "status": "released",
@@ -138,12 +167,19 @@ class ExportPipeline:
         return dict(self.export_result)
 
 
-def _export_tree(path: Path, *, with_receipt: bool) -> None:
+def _export_tree(
+    path: Path, *, with_receipt: bool, creation: CreationJobV1 | None = None
+) -> None:
+    creation = creation or job()
     (path / "src").mkdir(parents=True)
     (path / "src/main.py").write_text("print('ready')\n", encoding="utf-8")
     (path / "project.yml").write_text("name: ready\n", encoding="utf-8")
     (path / "autogen").mkdir()
     (path / "autogen/team.py").write_text("TEAM_READY = True\n", encoding="utf-8")
+    (path / "adapters").mkdir()
+    (path / "adapters/factory-candidate.json").write_text(
+        '{"schema":"captain.factory-candidate-descriptor.v1"}', encoding="utf-8"
+    )
     (path / "skills/factory").mkdir(parents=True)
     (path / "skills/factory/SKILL.md").write_text("# Factory skill\n", encoding="utf-8")
     (path / "tests").mkdir()
@@ -155,7 +191,7 @@ def _export_tree(path: Path, *, with_receipt: bool) -> None:
         json.dumps(
             {
                 "schema": "minibook.creation-assertions.v1",
-                "assertion_ids": list(job().public_assertion_ids),
+                "assertion_ids": list(creation.public_assertion_ids),
             },
             sort_keys=True,
         ),
@@ -184,27 +220,28 @@ def _export_tree(path: Path, *, with_receipt: bool) -> None:
     )
     if with_receipt:
         (path / "evidence/hermes-skill-usage-receipt.json").write_text(
-            json.dumps(_hermes_receipt(), sort_keys=True), encoding="utf-8"
+            json.dumps(_hermes_receipt(creation), sort_keys=True), encoding="utf-8"
         )
 
 
 @pytest.mark.asyncio
 async def test_export_snapshot_uses_real_content_and_hermes_receipt(tmp_path: Path) -> None:
     export = tmp_path / "export"
-    _export_tree(export, with_receipt=True)
-    pipeline = ExportPipeline(export)
     artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
+    creation = seeded_job(artifacts)
+    _export_tree(export, with_receipt=True, creation=creation)
+    pipeline = ExportPipeline(export)
     adapter = SwarmPipelineAdapter(
         lambda prior: pipeline,
         session=object(),
         snapshotter=ExportArtifactSnapshotter(artifacts),
     )
-    prior = SwarmSnapshot(creation_job_id=job().creation_job_id)
+    prior = SwarmSnapshot(creation_job_id=creation.creation_job_id)
 
     outcome = await adapter.run_step(
-        job(), SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
+        creation, SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
     )
-    result = adapter.assemble_result(job(), outcome.snapshot)
+    result = adapter.assemble_result(creation, outcome.snapshot)
 
     assert result.status == "succeeded"
     assert result.package_manifest_ref is not None
@@ -212,9 +249,10 @@ async def test_export_snapshot_uses_real_content_and_hermes_receipt(tmp_path: Pa
     candidate = ForgeCapabilityPackageCandidateV1.model_validate_json(
         artifacts.read(result.package_manifest_ref)
     )
-    assert candidate.factory_job_id == job().factory_job_id
-    assert candidate.creation_job_id == job().creation_job_id
+    assert candidate.factory_job_id == creation.factory_job_id
+    assert candidate.creation_job_id == creation.creation_job_id
     assert candidate.capability_id == "requested-team"
+    assert any(item.path == "adapters/factory-candidate.json" for item in candidate.artifacts)
     assert candidate.skill_usage_receipt_ref == CaptainArtifactRef.model_validate(
         result.skill_usage_receipt_ref.model_dump(mode="json")
     )
@@ -235,20 +273,21 @@ async def test_export_snapshot_uses_real_content_and_hermes_receipt(tmp_path: Pa
 @pytest.mark.asyncio
 async def test_export_without_hermes_receipt_is_required_todo_tool(tmp_path: Path) -> None:
     export = tmp_path / "export"
-    _export_tree(export, with_receipt=False)
-    pipeline = ExportPipeline(export)
     artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
+    creation = seeded_job(artifacts)
+    _export_tree(export, with_receipt=False, creation=creation)
+    pipeline = ExportPipeline(export)
     adapter = SwarmPipelineAdapter(
         lambda prior: pipeline,
         session=object(),
         snapshotter=ExportArtifactSnapshotter(artifacts),
     )
-    prior = SwarmSnapshot(creation_job_id=job().creation_job_id)
+    prior = SwarmSnapshot(creation_job_id=creation.creation_job_id)
 
     outcome = await adapter.run_step(
-        job(), SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
+        creation, SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
     )
-    result = adapter.assemble_result(job(), outcome.snapshot)
+    result = adapter.assemble_result(creation, outcome.snapshot)
 
     assert result.status == "blocked"
     assert result.failure is not None and result.failure.code == "tool_unresolved"
@@ -266,7 +305,9 @@ async def test_export_without_hermes_receipt_is_required_todo_tool(tmp_path: Pat
 @pytest.mark.asyncio
 async def test_export_blocks_receipt_for_another_factory_job(tmp_path: Path) -> None:
     export = tmp_path / "export"
-    _export_tree(export, with_receipt=True)
+    artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
+    creation = seeded_job(artifacts)
+    _export_tree(export, with_receipt=True, creation=creation)
     receipt_path = export / "evidence/hermes-skill-usage-receipt.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     receipt["job_id"] = "90000000-0000-4000-8000-000000000099"
@@ -276,15 +317,15 @@ async def test_export_blocks_receipt_for_another_factory_job(tmp_path: Path) -> 
         lambda prior: pipeline,
         session=object(),
         snapshotter=ExportArtifactSnapshotter(
-            ContentAddressedCreationArtifacts(tmp_path / "artifacts")
-        ),
-    )
-    prior = SwarmSnapshot(creation_job_id=job().creation_job_id)
+        artifacts
+    ),
+)
+    prior = SwarmSnapshot(creation_job_id=creation.creation_job_id)
 
     outcome = await adapter.run_step(
-        job(), SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
+        creation, SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
     )
-    result = adapter.assemble_result(job(), outcome.snapshot)
+    result = adapter.assemble_result(creation, outcome.snapshot)
 
     assert result.status == "blocked"
     assert result.tool_gaps[0].gap_id == "forge-capability-candidate-contract"
@@ -295,17 +336,18 @@ async def test_export_effect_receipt_replays_structured_snapshot_without_dispatc
     tmp_path: Path,
 ) -> None:
     export = tmp_path / "export"
-    _export_tree(export, with_receipt=False)
     artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
+    creation = seeded_job(artifacts)
+    _export_tree(export, with_receipt=False, creation=creation)
     first_pipeline = ExportPipeline(export)
     first = SwarmPipelineAdapter(
         lambda prior: first_pipeline,
         session=object(),
         snapshotter=ExportArtifactSnapshotter(artifacts),
     )
-    prior = SwarmSnapshot(creation_job_id=job().creation_job_id)
+    prior = SwarmSnapshot(creation_job_id=creation.creation_job_id)
     first_outcome = await first.run_step(
-        job(), SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
+        creation, SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
     )
     assert first_outcome.effect_receipt is not None
 
@@ -319,13 +361,13 @@ async def test_export_effect_receipt_replays_structured_snapshot_without_dispatc
         snapshotter=ExportArtifactSnapshotter(artifacts),
     )
     replayed = await replay.run_step(
-        job(),
+        creation,
         SwarmStep.EXPORT.value,
         prior.model_dump(),
         "effect",
         first_outcome.effect_receipt,
     )
-    result = replay.assemble_result(job(), replayed.snapshot)
+    result = replay.assemble_result(creation, replayed.snapshot)
 
     assert result.status == "blocked"
     assert result.tool_gaps[0].gap_id == "hermes-skill-usage-receipt"
