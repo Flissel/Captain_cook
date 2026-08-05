@@ -12,7 +12,9 @@ credential metadata and issues execution authority only after a safe probe.
 
 - Captain owns requirements, readiness, leases, validation, audit, and release.
 - n8n owns encrypted credential values and provider-side authentication.
-- Credential creation and rotation stay in the n8n UI.
+- Credential values stay in n8n's encrypted store. The self-hosted Captain
+  deployment may provision its controlled demo OAuth credential through n8n's
+  official CLI import; interactive third-party credentials stay in the n8n UI.
 - Agents receive typed tool capabilities, never secrets or credential values.
 - Minibook receives redacted readiness projections only.
 - Required unresolved credentials block execution and promotion fail-closed.
@@ -46,7 +48,7 @@ credential metadata and issues execution authority only after a safe probe.
 - [x] Prove the independent Minibook v2 HTTP projection, restart, idempotent
   replay, drift rebuild, and redaction canaries against a Captain-compatible
   local feed.
-- [ ] Prove one real API-key/Bearer integration and one OAuth integration.
+- [x] Prove one real API-key/Bearer integration and one OAuth integration.
 - [ ] Run clean-checkout, architecture, security-audit, and live evidence gates.
 
 The fail-closed portal live harness is now
@@ -55,21 +57,25 @@ The fail-closed portal live harness is now
 every case skips before network access. Its current verified-local and blocked
 live status, including the exact operator commands, is recorded in
 `docs/superpowers/plans/2026-08-05-self-service-integration-portal-live-evidence-gaps.md`.
-The unchecked provider and clean-checkout items above remain unchecked until
-that gate records real provider-backed evidence; configured URLs or metadata
-discovery do not satisfy them.
+The clean-checkout item remains open until one correlation-bound aggregate
+gate records three provider traces, restart, Minibook rebuild and the accepted
+release decision; configured URLs or metadata discovery do not satisfy it.
 
 On 2026-08-05 WSL and Docker recovered without deleting or reconfiguring any
 Captain or VibeMind volume. Captain MariaDB's isolated `captain_test` compose
 service passed the authenticated Gateway API restart/replay, rotation, and
 revoke acceptance cases. Captain-n8n `/healthz`, authenticated workflow read,
 and native MCP `list_credentials` each returned HTTP 200; the production
-adapter correctly parsed the MCP SSE response. The local Captain-n8n instance
-currently has zero `httpBearerAuth` and zero `oAuth2Api` credential metadata
-entries, so the provider E2E gates remain explicitly blocked rather than
-simulated. The separate Minibook live gate passes against a temporary local
-Minibook HTTP service and a Captain-compatible v2 feed; it is not a claim that
-a provider-backed Gateway promotion has already reached Minibook.
+adapter correctly parsed the MCP SSE response. The local Captain-n8n project
+now contains one project-bound `httpBearerAuth` credential and one
+project-bound `oAuth2Api` client-credentials credential. Both executed real
+n8n workflows through Captain and reached the Mini-PC provider; the OAuth
+result contains a provider-bound token-exchange receipt. A controlled Gateway
+restart changed the boot ID while the prior provider audit remained exactly
+one invocation and one completion. The separate Minibook live gate passes HTTP
+projection, duplicate replay, drift rebuild and redaction canaries. These are
+live component/E2E facts, but not yet the single aggregate release claim for
+one correlation ID.
 
 ## Acceptance sequence
 

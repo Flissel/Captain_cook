@@ -49,24 +49,27 @@ This is verified-local safety evidence, not provider evidence.
   separation, redirect behavior, response-size bounds, malformed bodies,
   strict DTO rejection and configured-canary rejection.
 
-### Configured, not verified live
+### Verified live on 2026-08-05
 
-- Local environment inspection considered variable names only. No complete
-  `CAPTAIN_PORTAL_LIVE_*` group was present.
-- Therefore the new gate made no Portal, Supabase, Gitea, n8n, OAuth, provider,
-  restart-control, evidence or Minibook request.
-- Existing portal routes provide ticketing, metadata discovery/selection,
-  rotation and revoke. That remains lifecycle surface, not credential proof.
+- Real Bearer and OAuth2 client-credentials runs traversed Supabase login,
+  Captain Gateway, native n8n credential discovery, immutable n8n verification
+  workflows and the Mini-PC provider. Both returned `status=passed`; OAuth
+  includes a durable provider-bound exchange ID and neither emitted secrets.
+- The OAuth credential was imported idempotently into the exact Captain n8n
+  project through `n8n import:credentials --input=/dev/stdin`; its stable ID is
+  retained only in the ignored credential environment.
+- A controlled Gateway restart changed the boot ID. The same pre-restart run
+  afterwards retained exactly one invocation, one completion and one trace.
+- The Minibook HTTP gate passed projection, duplicate replay, drift repair and
+  redaction canaries. MariaDB-backed finalization, rebuild, rotation/revoke and
+  fencing tests passed against isolated `captain_test`.
 
 ### Blocked live
 
-The current checkout does not implement the mandatory correlation-bound,
-redacted provider-audit, provider-control, restart-control and aggregated
-release-evidence endpoints. Those endpoints must prove:
+The correlation-bound provider-audit, provider-control, restart-control and
+aggregate-evidence endpoints are implemented. The remaining live closure must
+combine the proven components into one run and prove:
 
-- a harmless provider-backed Bearer verification probe;
-- OAuth consent, exact callback completion and provider-backed verification;
-- controlled Portal/Gateway restart and resume;
 - three complete provider traces for one correlation ID;
 - the digest-pinned Gitea release used by those traces;
 - the accepted Gateway decision and execution reference;
@@ -134,10 +137,10 @@ disposable value exists. Absent prerequisites remain skipped, not passed.
 
 ## Single next operator action
 
-Engineering must first implement the redacted audit/control/restart/evidence
-seams above with dedicated capabilities and health endpoints. Only then should
-an operator provision the disposable two-organization job, Bearer credential
-and sandbox OAuth client and supply the complete gitignored live group.
+Run one disposable, correlation-bound aggregate scenario using the existing
+Bearer and OAuth credentials: three provider traces, controlled restart
+receipt, Minibook acknowledgement/rebuild receipt, then fail-closed
+finalization and read-only evidence query.
 
 ## Merged production goal
 
