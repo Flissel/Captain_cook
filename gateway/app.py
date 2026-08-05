@@ -434,6 +434,16 @@ def create_app(
             receipt,
         )
 
+    @app.get("/v1/control/restarts/health")
+    async def restart_control_health(
+        _: PortalControlRole = Depends(require_restart_control),
+    ) -> dict[str, str]:
+        return {
+            "status": "ok",
+            "service_version": "captain.portal-restart-control.v1",
+            "boot_id": portal_control_boot_id,
+        }
+
     @app.post("/v1/control/portal-runs/{run_id}/decisions")
     async def finalize_portal_live_run(
         run_id: str,

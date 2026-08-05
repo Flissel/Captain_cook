@@ -324,6 +324,14 @@ def test_restart_receipt_is_setup_fenced_and_replay_safe() -> None:
         with TestClient(
             create_app(gateway_store=store, settings=settings, mirror=NullMirror())
         ) as client:
+            restart_health_denied = client.get(
+                "/v1/control/restarts/health",
+                headers={"Authorization": "Bearer evidence-token"},
+            )
+            restart_health = client.get(
+                "/v1/control/restarts/health",
+                headers={"Authorization": "Bearer restart-token"},
+            )
             denied = client.post(
                 f"/v1/control/restarts/{receipt.restart_id}/receipts",
                 headers={"Authorization": "Bearer evidence-token"},
@@ -335,6 +343,9 @@ def test_restart_receipt_is_setup_fenced_and_replay_safe() -> None:
                 json=receipt.model_dump(mode="json"),
             )
         assert denied.status_code == 401
+        assert restart_health_denied.status_code == 401
+        assert restart_health.status_code == 200
+        assert set(restart_health.json()) == {"status", "service_version", "boot_id"}
         assert accepted.status_code == 200
         assert accepted.json() == receipt.model_dump(mode="json")
     finally:
