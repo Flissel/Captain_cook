@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
+from http.client import HTTPException as HttpClientError
 from time import monotonic
 from threading import Lock
 from typing import Protocol
@@ -47,14 +48,20 @@ class CachingJwksKeyResolver:
         self,
         *,
         ttl_seconds: int = 300,
+        refresh_cooldown_seconds: int = 1,
         clock: Callable[[], float] = monotonic,
     ) -> None:
         if ttl_seconds < 1:
             raise ValueError("JWKS cache TTL must be positive")
+        if refresh_cooldown_seconds < 1:
+            raise ValueError("JWKS refresh cooldown must be positive")
         self._ttl_seconds = ttl_seconds
+        self._refresh_cooldown_seconds = refresh_cooldown_seconds
         self._clock = clock
         self._keys: dict[str, tuple[float, object]] = {}
         self._lock = Lock()
+        self._refresh_lock = Lock()
+        self._next_refresh_at = 0.0
 
     def get_key(self, *, kid: str, jwks_url: str) -> object:
         with self._lock:
@@ -62,7 +69,20 @@ class CachingJwksKeyResolver:
             now = self._clock()
             if cached is not None and cached[0] > now:
                 return cached[1]
+            if now < self._next_refresh_at:
+                raise PortalTokenVerificationError()
 
+        if not self._refresh_lock.acquire(blocking=False):
+            raise PortalTokenVerificationError()
+        try:
+            with self._lock:
+                cached = self._keys.get(kid)
+                now = self._clock()
+                if cached is not None and cached[0] > now:
+                    return cached[1]
+                if now < self._next_refresh_at:
+                    raise PortalTokenVerificationError()
+                self._next_refresh_at = now + self._refresh_cooldown_seconds
             try:
                 request = UrlRequest(jwks_url, headers={"Accept": "application/json"})
                 with urlopen(request, timeout=5.0) as response:  # noqa: S310 - configured JWKS URL
@@ -72,6 +92,7 @@ class CachingJwksKeyResolver:
                 decoded = json.loads(body.decode("utf-8"))
                 key = self._select_key(decoded, kid)
             except (
+                HttpClientError,
                 OSError,
                 UnicodeDecodeError,
                 json.JSONDecodeError,
@@ -80,8 +101,11 @@ class CachingJwksKeyResolver:
             ):
                 raise PortalTokenVerificationError() from None
 
-            self._keys[kid] = (now + self._ttl_seconds, key)
+            with self._lock:
+                self._keys[kid] = (now + self._ttl_seconds, key)
             return key
+        finally:
+            self._refresh_lock.release()
 
     @staticmethod
     def _select_key(document: object, kid: str) -> object:

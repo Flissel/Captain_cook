@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from http.client import IncompleteRead
 import json
-from threading import Lock
+from threading import Event, Lock, Thread
 
 import jwt
 import pytest
@@ -58,6 +59,12 @@ class JwksResponse:
     def read(self, limit: int = -1) -> bytes:
         self.read_limits.append(limit)
         return self._body if limit < 0 else self._body[:limit]
+
+
+class InterruptedJwksResponse(JwksResponse):
+    def read(self, limit: int = -1) -> bytes:
+        del limit
+        raise IncompleteRead(b"partial", 10)
 
 
 def configured_settings() -> GatewaySettings:
@@ -214,6 +221,95 @@ def test_jwks_resolver_caps_response_before_json_parsing(
         CachingJwksKeyResolver().get_key(kid=KID, jwks_url=JWKS_URL)
 
     assert response.read_limits == [1_048_577]
+
+
+def test_cached_valid_key_does_not_wait_for_an_unknown_kid_refresh(
+    private_key: RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+    resolver = CachingJwksKeyResolver(clock=lambda: now[0])
+    document = jwks_document(private_key)
+    refresh_started = Event()
+    release_refresh = Event()
+    valid_completed = Event()
+    calls = 0
+
+    def fetch(*_: object, **__: object) -> JwksResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            refresh_started.set()
+            assert release_refresh.wait(timeout=2)
+        return JwksResponse(document)
+
+    monkeypatch.setattr(portal_auth_module, "urlopen", fetch)
+    cached_key = resolver.get_key(kid=KID, jwks_url=JWKS_URL)
+    now[0] = 1.0
+
+    def read_unknown_key() -> None:
+        with pytest.raises(PortalTokenVerificationError):
+            resolver.get_key(kid="unknown-key", jwks_url=JWKS_URL)
+
+    def read_cached_key() -> None:
+        assert resolver.get_key(kid=KID, jwks_url=JWKS_URL) is cached_key
+        valid_completed.set()
+
+    unknown = Thread(target=read_unknown_key)
+    unknown.start()
+    assert refresh_started.wait(timeout=1)
+    valid = Thread(target=read_cached_key)
+    valid.start()
+    try:
+        assert valid_completed.wait(timeout=0.2)
+    finally:
+        release_refresh.set()
+    unknown.join(timeout=1)
+    valid.join(timeout=1)
+    assert not unknown.is_alive()
+    assert not valid.is_alive()
+
+
+def test_unknown_kid_refresh_is_throttled_between_bounded_attempts(
+    private_key: RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+    resolver = CachingJwksKeyResolver(
+        clock=lambda: now[0],
+        refresh_cooldown_seconds=10,
+    )
+    calls = 0
+
+    def fetch(*_: object, **__: object) -> JwksResponse:
+        nonlocal calls
+        calls += 1
+        return JwksResponse(jwks_document(private_key))
+
+    monkeypatch.setattr(portal_auth_module, "urlopen", fetch)
+
+    with pytest.raises(PortalTokenVerificationError):
+        resolver.get_key(kid="unknown-key", jwks_url=JWKS_URL)
+    with pytest.raises(PortalTokenVerificationError):
+        resolver.get_key(kid="unknown-key", jwks_url=JWKS_URL)
+    assert calls == 1
+    now[0] = 10.0
+    with pytest.raises(PortalTokenVerificationError):
+        resolver.get_key(kid="unknown-key", jwks_url=JWKS_URL)
+    assert calls == 2
+
+
+def test_incomplete_jwks_body_read_is_normalized_to_portal_identity_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        portal_auth_module,
+        "urlopen",
+        lambda *_args, **_kwargs: InterruptedJwksResponse(b""),
+    )
+
+    with pytest.raises(PortalTokenVerificationError):
+        CachingJwksKeyResolver().get_key(kid=KID, jwks_url=JWKS_URL)
 
 
 def test_configured_organization_claim_maps_to_the_portal_principal(
