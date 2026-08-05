@@ -280,6 +280,22 @@ class GatewayStore:
         self._ensure_schema()
         self._portal_tickets = PortalTicketStore(storage)
 
+    def configure_portal_sources(
+        self,
+        *,
+        credential_source: PortalCredentialMetadataSource,
+        verification_source: PortalCredentialVerificationSource,
+    ) -> None:
+        """Install the complete production pair exactly once during boot."""
+
+        if (
+            self._portal_credential_source is not None
+            or self._portal_verification_source is not None
+        ):
+            raise RuntimeError("portal sources are already configured")
+        self._portal_credential_source = credential_source
+        self._portal_verification_source = verification_source
+
     def _ensure_schema(self) -> None:
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:

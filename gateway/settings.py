@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import secrets
 from collections.abc import Mapping
 from typing import Literal
@@ -16,6 +17,11 @@ from pydantic import (
     ValidationError,
     field_validator,
     model_validator,
+)
+
+from agenten.agent_factory.gitea_template_contracts import (
+    GiteaTemplateReleaseV1,
+    validate_safe_https_url,
 )
 
 
@@ -43,6 +49,11 @@ class GatewaySettings(BaseModel):
     portal_provider_control_token: SecretStr | None = None
     portal_evidence_token: SecretStr | None = None
     portal_restart_control_token: SecretStr | None = None
+    portal_n8n_adapters_enabled: bool = False
+    portal_n8n_api_key: SecretStr | None = None
+    portal_n8n_mcp_token: SecretStr | None = None
+    portal_gitea_origin: str | None = None
+    portal_verification_releases: tuple[GiteaTemplateReleaseV1, ...] = ()
 
     @field_validator(
         "ledger_dsn",
@@ -139,6 +150,40 @@ class GatewaySettings(BaseModel):
                 raise ValueError("portal control tokens must not be blank")
             if len(values) != len(set(values)):
                 raise ValueError("portal control tokens must be distinct")
+        if self.portal_n8n_adapters_enabled:
+            adapter_values = (
+                self.portal_n8n_api_key,
+                self.portal_n8n_mcp_token,
+                self.portal_gitea_origin,
+                self.portal_verification_releases,
+            )
+            if any(value is None or value == () for value in adapter_values):
+                raise ValueError("portal n8n adapter configuration is incomplete")
+            assert self.portal_n8n_api_key is not None
+            assert self.portal_n8n_mcp_token is not None
+            assert self.portal_gitea_origin is not None
+            if (
+                not self.portal_n8n_api_key.get_secret_value().strip()
+                or not self.portal_n8n_mcp_token.get_secret_value().strip()
+            ):
+                raise ValueError("portal n8n adapter secrets must not be blank")
+            validate_safe_https_url(
+                self.portal_gitea_origin,
+                label="portal Gitea origin",
+            )
+            if urlsplit(self.portal_gitea_origin).path not in {"", "/"}:
+                raise ValueError("portal Gitea origin must not contain a path")
+            digests = tuple(
+                release.sha256 for release in self.portal_verification_releases
+            )
+            if len(digests) != len(set(digests)):
+                raise ValueError("portal verification release digests must be unique")
+            origin = self.portal_gitea_origin.rstrip("/") + "/"
+            if any(
+                not release.contents_url.startswith(origin)
+                for release in self.portal_verification_releases
+            ):
+                raise ValueError("portal verification releases must use the Gitea origin")
         return self
 
     @property
@@ -162,6 +207,10 @@ class GatewaySettings(BaseModel):
                 self.portal_restart_control_token,
             )
         )
+
+    @property
+    def portal_n8n_adapters_configured(self) -> bool:
+        return self.portal_n8n_adapters_enabled
 
     @classmethod
     def from_env(
@@ -193,6 +242,30 @@ class GatewaySettings(BaseModel):
         if approval_raw.lower() not in {"true", "false"}:
             raise GatewayConfigurationError("invalid gateway configuration")
         approval_enabled = approval_raw.lower() == "true"
+
+        portal_n8n_raw = source.get(
+            "CAPTAIN_PORTAL_N8N_ADAPTERS_ENABLED",
+            "false",
+        )
+        if portal_n8n_raw.lower() not in {"true", "false"}:
+            raise GatewayConfigurationError("invalid gateway configuration")
+        portal_n8n_enabled = portal_n8n_raw.lower() == "true"
+        releases: tuple[GiteaTemplateReleaseV1, ...] = ()
+        if portal_n8n_enabled:
+            releases_raw = source.get(
+                "CAPTAIN_PORTAL_VERIFICATION_RELEASES_JSON",
+                "",
+            )
+            try:
+                decoded_releases = json.loads(releases_raw)
+                if not isinstance(decoded_releases, list):
+                    raise ValueError
+                releases = tuple(
+                    GiteaTemplateReleaseV1.model_validate(item)
+                    for item in decoded_releases
+                )
+            except (json.JSONDecodeError, TypeError, ValueError, ValidationError):
+                raise GatewayConfigurationError("invalid gateway configuration") from None
 
         port_raw = source.get("GATEWAY_PORT", "8090")
         try:
@@ -240,6 +313,23 @@ class GatewaySettings(BaseModel):
                     if source.get("PORTAL_RESTART_CONTROL_TOKEN") is not None
                     else None
                 ),
+                portal_n8n_adapters_enabled=portal_n8n_enabled,
+                portal_n8n_api_key=(
+                    SecretStr(source["CAPTAIN_N8N_API_KEY"])
+                    if portal_n8n_enabled and source.get("CAPTAIN_N8N_API_KEY") is not None
+                    else None
+                ),
+                portal_n8n_mcp_token=(
+                    SecretStr(source["CAPTAIN_N8N_MCP_TOKEN"])
+                    if portal_n8n_enabled and source.get("CAPTAIN_N8N_MCP_TOKEN") is not None
+                    else None
+                ),
+                portal_gitea_origin=(
+                    source.get("CAPTAIN_PORTAL_GITEA_ORIGIN")
+                    if portal_n8n_enabled
+                    else None
+                ),
+                portal_verification_releases=releases,
             )
         except ValidationError:
             raise GatewayConfigurationError("invalid gateway configuration") from None

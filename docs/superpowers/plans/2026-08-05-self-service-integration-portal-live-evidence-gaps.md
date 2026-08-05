@@ -150,13 +150,13 @@ they are not a separate follow-up project:
   active Captain Tool Integrator lease.
 - [x] Materialize exactly one type-matching credential ID/name placeholder and
   keep verified template bytes process-local.
-- [ ] Enable the concrete adapters in the default Gateway composition only by
+- [x] Enable the concrete adapters in the default Gateway composition only by
   explicit, complete, fail-closed configuration.
-- [ ] Persist provider probe start/completion and Gitea release bindings through
+- [x] Persist provider probe start/completion and Gitea release bindings through
   Captain's sole-writer Gateway.
-- [ ] Add separately authorized provider-control, restart-control, finalization,
+- [x] Add separately authorized provider-control, restart-control, finalization,
   and read-only aggregate-evidence routes.
-- [ ] Persist Minibook integration-setup acknowledgement and rebuild convergence
+- [x] Persist Minibook integration-setup acknowledgement and rebuild convergence
   for the same run, job, and correlation.
 - [ ] Run the isolated Bearer and OAuth paths, controlled restart/resume,
   rotation/revoke, and three distinct provider traces before any live claim.

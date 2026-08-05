@@ -75,6 +75,7 @@ from gateway.portal_control_auth import (
     require_provider_control,
     require_restart_control,
 )
+from gateway.portal_n8n_composition import build_portal_n8n_adapter_bundle
 from gateway.portal_contracts import (
     PortalPrincipalV1,
     PortalSetupActionRequestV1,
@@ -272,17 +273,38 @@ def create_app(
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
-    store: GatewayStore | None = gateway_store or (
-        GatewayStore(
-            storage,
-            claim_ttl=timedelta(seconds=settings.claim_ttl_seconds),
+    def configured_store(
+        target_storage: MariaDBStorage,
+        configured: GatewaySettings | None,
+    ) -> GatewayStore:
+        created = GatewayStore(
+            target_storage,
+            claim_ttl=(
+                timedelta(seconds=configured.claim_ttl_seconds)
+                if configured is not None
+                else timedelta(minutes=90)
+            ),
             portal_credential_source=portal_credential_source,
             portal_verification_source=portal_verification_source,
         )
-        if storage and settings
-        else GatewayStore(storage)
-        if storage
-        else None
+        if (
+            configured is not None
+            and configured.portal_n8n_adapters_configured
+            and portal_credential_source is None
+            and portal_verification_source is None
+        ):
+            bundle = build_portal_n8n_adapter_bundle(
+                reader=created,
+                settings=configured,
+            )
+            created.configure_portal_sources(
+                credential_source=bundle.credential_source,
+                verification_source=bundle.verification_source,
+            )
+        return created
+
+    store: GatewayStore | None = gateway_store or (
+        configured_store(storage, settings) if storage else None
     )
     portal_clock = portal_clock or (lambda: datetime.now(timezone.utc))
     portal_control_boot_id = str(uuid4())
@@ -348,12 +370,7 @@ def create_app(
                 if store is None:
                     configured = load_gateway_settings(app)
                     dsn = configured.ledger_dsn.get_secret_value()
-                    store = GatewayStore(
-                        MariaDBStorage(dsn),
-                        claim_ttl=timedelta(seconds=configured.claim_ttl_seconds),
-                        portal_credential_source=portal_credential_source,
-                        portal_verification_source=portal_verification_source,
-                    )
+                    store = configured_store(MariaDBStorage(dsn), configured)
         return store
 
     @app.get("/healthz")
