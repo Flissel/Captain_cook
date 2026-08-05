@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 _REPOSITORY_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 _PINNED_REVISION = r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
 _SHA256 = r"^[0-9a-f]{64}$"
 
@@ -48,6 +49,20 @@ class GiteaTemplateReleaseV1(BaseModel):
     contents_url: str = Field(min_length=1, max_length=2048)
     sha256: str = Field(pattern=_SHA256)
 
+    @field_validator(
+        "repository",
+        "revision",
+        "path",
+        "contents_url",
+        "sha256",
+        mode="before",
+    )
+    @classmethod
+    def reject_c0_control_characters(cls, value: object) -> object:
+        if isinstance(value, str) and any(ord(character) < 32 for character in value):
+            raise ValueError("release metadata must not contain C0 control characters")
+        return value
+
     @field_validator("repository")
     @classmethod
     def require_owner_and_repository(cls, value: str) -> str:
@@ -67,7 +82,10 @@ class GiteaTemplateReleaseV1(BaseModel):
             value != value.strip()
             or value.startswith("/")
             or "\\" in value
-            or any(component in {"", ".", ".."} for component in components)
+            or any(
+                component in {"", ".", ".."} or not _PATH_COMPONENT.fullmatch(component)
+                for component in components
+            )
         ):
             raise ValueError("template path must be a safe relative path")
         return value

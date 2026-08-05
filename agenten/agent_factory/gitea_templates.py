@@ -46,6 +46,7 @@ class GiteaTemplateClient:
         if not 0 < max_response_bytes <= 10_485_760:
             raise ValueError("template response size limit must be between 1 and 10485760 bytes")
         self._origin = _origin_key(origin_parts)
+        self._origin_url = origin.rstrip("/")
         self._http = http
         self._timeout = httpx.Timeout(timeout_seconds)
         self._max_response_bytes = max_response_bytes
@@ -58,6 +59,12 @@ class GiteaTemplateClient:
 
         if _origin_key(urlsplit(release.contents_url)) != self._origin:
             raise GiteaTemplateError("template URL does not match configured Gitea origin")
+        canonical_url = (
+            f"{self._origin_url}/{release.repository}/raw/commit/"
+            f"{release.revision}/{release.path}"
+        )
+        if release.contents_url != canonical_url:
+            raise GiteaTemplateError("template URL does not match release metadata")
 
         try:
             async with self._http.stream(

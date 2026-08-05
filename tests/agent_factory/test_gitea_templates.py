@@ -87,6 +87,51 @@ def test_release_rejects_unsafe_or_mutable_metadata(field: str, value: str) -> N
         _release(**{field: value})
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repository", "captain/temp\x00lates"),
+        ("revision", REVISION[:20] + "\x1f" + REVISION[21:]),
+        ("path", "teams/renewal\x07.json"),
+        (
+            "contents_url",
+            f"{ORIGIN}/captain/templates/raw/commit/{REVISION}/teams/renew\x00al.json",
+        ),
+        ("sha256", BODY_SHA256[:20] + "\x0b" + BODY_SHA256[21:]),
+    ],
+)
+def test_release_rejects_c0_control_characters(field: str, value: str) -> None:
+    with pytest.raises(ValidationError, match="control"):
+        _release(**{field: value})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repository", "other/templates"),
+        ("revision", "f" * 40),
+        ("path", "teams/claims.json"),
+    ],
+)
+async def test_fetch_verified_template_binds_metadata_to_exact_raw_url(
+    field: str,
+    value: str,
+) -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=BODY, request=request)
+
+    async with _client(httpx.MockTransport(handler)) as client:
+        with pytest.raises(GiteaTemplateError, match="release metadata"):
+            await client.fetch_verified_template(_release(**{field: value}))
+
+    assert calls == 0
+
+
 @pytest.mark.asyncio
 async def test_fetch_verified_template_rejects_foreign_origin_before_network() -> None:
     calls = 0
@@ -158,6 +203,22 @@ async def test_fetch_verified_template_normalizes_timeout() -> None:
 async def test_fetch_verified_template_rejects_response_over_size_limit() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"12345", request=request)
+
+    async with _client(httpx.MockTransport(handler), max_response_bytes=4) as client:
+        with pytest.raises(GiteaTemplateError, match="template response exceeded size limit"):
+            await client.fetch_verified_template(_release())
+
+
+class _ChunkedStream(httpx.AsyncByteStream):
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b"123"
+        yield b"45"
+
+
+@pytest.mark.asyncio
+async def test_fetch_verified_template_rejects_chunked_response_over_size_limit() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_ChunkedStream(), request=request)
 
     async with _client(httpx.MockTransport(handler), max_response_bytes=4) as client:
         with pytest.raises(GiteaTemplateError, match="template response exceeded size limit"):
