@@ -57,6 +57,19 @@ async def test_fetch_verified_template_returns_digest_only_artifact_reference() 
 
 
 @pytest.mark.asyncio
+async def test_fetch_verified_payload_keeps_verified_bytes_out_of_repr() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=BODY, request=request)
+
+    async with _client(httpx.MockTransport(handler)) as client:
+        result = await client.fetch_verified_payload(_release())
+
+    assert result.ref.sha256 == BODY_SHA256
+    assert result.content == BODY
+    assert BODY.decode() not in repr(result)
+
+
+@pytest.mark.asyncio
 async def test_fetch_verified_template_rejects_changed_bytes() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"changed", request=request)

@@ -181,7 +181,11 @@ class PortalCredentialMetadataSource(Protocol):
 
     def list_credentials(
         self,
+        *,
         requirement: IntegrationCredentialRequirementV1,
+        job_id: UUID,
+        correlation_id: UUID,
+        now: datetime,
     ) -> tuple[N8nCredentialMetadataV1, ...]: ...
 
 
@@ -193,6 +197,7 @@ class PortalCredentialVerificationSource(Protocol):
         *,
         requirement: IntegrationCredentialRequirementV1,
         credential: N8nCredentialMetadataV1,
+        job_id: UUID,
         correlation_id: UUID,
         expected_content_sha256: str,
         expected_revision: int,
@@ -817,7 +822,12 @@ class GatewayStore:
         if self._portal_credential_source is None:
             raise HTTPException(status_code=503, detail="credential discovery unavailable")
         target = persisted.submission.plan.connections[target_index]
-        credentials = self._portal_credential_source.list_credentials(target.requirement)
+        credentials = self._portal_credential_source.list_credentials(
+            requirement=target.requirement,
+            job_id=job_id,
+            correlation_id=persisted.submission.correlation_id,
+            now=now.astimezone(timezone.utc),
+        )
         replacement = self._resolve_portal_connection(
             target.requirement,
             credentials=credentials,
@@ -915,6 +925,7 @@ class GatewayStore:
             returned = self._portal_verification_source.verify_credential(
                 requirement=target.requirement,
                 credential=selected,
+                job_id=job_id,
                 correlation_id=persisted.submission.correlation_id,
                 expected_content_sha256=persisted.content_sha256,
                 expected_revision=persisted.submission.revision,

@@ -90,6 +90,11 @@ class CredentialVerificationReceiptV1(_FrozenContract):
     project_id: str | None = Field(default=None, pattern=_CREDENTIAL_ID_PATTERN)
     status: Literal["passed", "failed"]
     occurred_at: datetime
+    template_ref: ArtifactRef | None = None
+    template_content_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     workflow_ref: ArtifactRef
     workflow_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     execution_ref: ArtifactRef
@@ -114,6 +119,13 @@ class CredentialVerificationReceiptV1(_FrozenContract):
     def require_digest_and_expiry_binding(self) -> "CredentialVerificationReceiptV1":
         if self.workflow_content_sha256 != self.workflow_ref.sha256:
             raise ValueError("verification receipt workflow digest mismatch")
+        if (self.template_ref is None) != (self.template_content_sha256 is None):
+            raise ValueError("verification receipt template reference is incomplete")
+        if (
+            self.template_ref is not None
+            and self.template_content_sha256 != self.template_ref.sha256
+        ):
+            raise ValueError("verification receipt template digest mismatch")
         if self.valid_until is not None and self.valid_until <= self.occurred_at:
             raise ValueError("verification receipt validity must end after verification")
         return self
@@ -156,9 +168,14 @@ class IntegrationConnectionV1(_FrozenContract):
                 raise ValueError("expired connection requires an expiring passed receipt")
         if receipt is not None and selected is not None:
             expected_workflow = self.requirement.verification_workflow_sha256
+            released_template_sha256 = (
+                receipt.template_content_sha256
+                if receipt.template_content_sha256 is not None
+                else receipt.workflow_content_sha256
+            )
             if (
                 expected_workflow is None
-                or receipt.workflow_content_sha256 != expected_workflow
+                or released_template_sha256 != expected_workflow
             ):
                 raise ValueError(
                     "verification receipt does not match Captain verification workflow"

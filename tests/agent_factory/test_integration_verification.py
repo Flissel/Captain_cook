@@ -9,6 +9,7 @@ from agenten.agent_factory.integration_setup import (
     N8nCredentialMetadataV1,
 )
 from agenten.agent_factory.integration_verification import seal_provider_verification
+from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.targets.n8n import (
     N8nDeployment,
     N8nExecutionEvidence,
@@ -94,6 +95,33 @@ def test_matching_provider_execution_seals_secret_free_gateway_receipt() -> None
     rendered = receipt.model_dump_json()
     for forbidden in ("token", "password", "authorization", "client_secret"):
         assert forbidden not in rendered.lower()
+
+
+def test_bound_workflow_keeps_release_and_deployment_digests_distinct() -> None:
+    template_ref = ArtifactRef(
+        uri="artifact://gitea/" + "a" * 64,
+        sha256="a" * 64,
+        media_type="application/json",
+    )
+    bound_artifact = artifact().model_copy(update={"artifact_digest": "b" * 64})
+    bound_deployment = deployment().model_copy(update={"artifact_digest": "b" * 64})
+    bound_execution = evidence().model_copy(update={"artifact_digest": "b" * 64})
+
+    receipt = seal_provider_verification(
+        requirement=requirement(),
+        credential=credential(),
+        template_ref=template_ref,
+        workflow_artifact=bound_artifact,
+        deployment=bound_deployment,
+        execution=bound_execution,
+        expected_correlation_id=CORRELATION_ID,
+        occurred_at=NOW,
+    )
+
+    assert receipt.template_ref == template_ref
+    assert receipt.template_content_sha256 == "a" * 64
+    assert receipt.workflow_ref.sha256 == "b" * 64
+    assert receipt.workflow_content_sha256 == "b" * 64
 
 
 @pytest.mark.parametrize(

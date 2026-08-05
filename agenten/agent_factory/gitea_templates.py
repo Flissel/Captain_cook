@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from urllib.parse import SplitResult, urlsplit
 
 import httpx
@@ -16,6 +17,14 @@ from agenten.agent_runtime.contracts import ArtifactRef
 
 class GiteaTemplateError(RuntimeError):
     """A normalized template retrieval failure without provider diagnostics."""
+
+
+@dataclass(frozen=True, repr=False)
+class VerifiedTemplatePayload:
+    """Verified bytes kept process-local; repr never exposes workflow content."""
+
+    ref: ArtifactRef
+    content: bytes
 
 
 def _origin_key(parts: SplitResult) -> tuple[str, str, int]:
@@ -56,6 +65,14 @@ class GiteaTemplateClient:
         release: GiteaTemplateReleaseV1,
     ) -> ArtifactRef:
         """Return a reference only after exact response bytes match the release."""
+
+        return (await self.fetch_verified_payload(release)).ref
+
+    async def fetch_verified_payload(
+        self,
+        release: GiteaTemplateReleaseV1,
+    ) -> VerifiedTemplatePayload:
+        """Return exact verified bytes for an in-process workflow materializer."""
 
         if _origin_key(urlsplit(release.contents_url)) != self._origin:
             raise GiteaTemplateError("template URL does not match configured Gitea origin")
@@ -101,8 +118,11 @@ class GiteaTemplateClient:
         digest = hashlib.sha256(body).hexdigest()
         if digest != release.sha256:
             raise GiteaTemplateError("template digest mismatch")
-        return ArtifactRef(
-            uri=f"artifact://gitea/{digest}",
-            sha256=digest,
-            media_type="application/octet-stream",
+        return VerifiedTemplatePayload(
+            ref=ArtifactRef(
+                uri=f"artifact://gitea/{digest}",
+                sha256=digest,
+                media_type="application/octet-stream",
+            ),
+            content=bytes(body),
         )

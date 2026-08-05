@@ -23,6 +23,7 @@ def seal_provider_verification(
     *,
     requirement: IntegrationCredentialRequirementV1,
     credential: N8nCredentialMetadataV1,
+    template_ref: ArtifactRef | None = None,
     workflow_artifact: SealedArtifact,
     deployment: N8nDeployment,
     execution: N8nExecutionEvidence,
@@ -39,10 +40,14 @@ def seal_provider_verification(
         raise ValueError("credential metadata does not match setup requirement")
     if deployment.artifact_digest != workflow_artifact.artifact_digest:
         raise ValueError("workflow deployment does not match sealed artifact")
+    released_template_ref = template_ref or ArtifactRef(
+        uri=f"artifact://n8n-workflow/{workflow_artifact.artifact_digest}",
+        sha256=workflow_artifact.artifact_digest,
+        media_type="application/json",
+    )
     if (
         requirement.verification_workflow_sha256 is None
-        or workflow_artifact.artifact_digest
-        != requirement.verification_workflow_sha256
+        or released_template_ref.sha256 != requirement.verification_workflow_sha256
     ):
         raise ValueError("workflow does not match Captain verification workflow release")
     if (
@@ -71,6 +76,8 @@ def seal_provider_verification(
         project_id=credential.project_id,
         status="passed",
         occurred_at=occurred_at,
+        template_ref=template_ref,
+        template_content_sha256=(None if template_ref is None else template_ref.sha256),
         workflow_ref=ArtifactRef(
             uri=f"artifact://n8n-workflow/{workflow_digest}",
             sha256=workflow_digest,

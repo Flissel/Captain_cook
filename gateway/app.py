@@ -14,6 +14,7 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from blockchain.mariadb_storage import MariaDBStorage
 from agenten.agent_runtime.contracts import (
@@ -477,7 +478,8 @@ def create_app(
         request: PortalSetupTicketUseV1,
         principal: PortalPrincipalV1 = Depends(require_portal_principal),
     ) -> IntegrationSetupSurfaceV1:
-        persisted = get_store().portal_discover(
+        persisted = await run_in_threadpool(
+            get_store().portal_discover,
             job_id=job_id,
             principal=principal,
             request=request,
@@ -513,7 +515,8 @@ def create_app(
         request: PortalSetupTicketUseV1,
         principal: PortalPrincipalV1 = Depends(require_portal_principal),
     ) -> IntegrationSetupSurfaceV1:
-        persisted = get_store().portal_verify(
+        persisted = await run_in_threadpool(
+            get_store().portal_verify,
             job_id=job_id,
             principal=principal,
             request=request,

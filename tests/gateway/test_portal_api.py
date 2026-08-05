@@ -58,8 +58,8 @@ class NullMirror:
 
 
 class StaticCredentialSource:
-    def list_credentials(self, requirement):
-        del requirement
+    def list_credentials(self, *, requirement, job_id, correlation_id, now):
+        del requirement, job_id, correlation_id, now
         return (
             N8nCredentialMetadataV1(
                 credential_id="credential-1",

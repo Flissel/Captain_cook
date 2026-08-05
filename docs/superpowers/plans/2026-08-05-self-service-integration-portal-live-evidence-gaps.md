@@ -138,3 +138,25 @@ Engineering must first implement the redacted audit/control/restart/evidence
 seams above with dedicated capabilities and health endpoints. Only then should
 an operator provision the disposable two-organization job, Bearer credential
 and sandbox OAuth client and supply the complete gitignored live group.
+
+## Merged production goal
+
+The active integration-control-plane goal also owns these implementation gates;
+they are not a separate follow-up project:
+
+- [x] Keep the immutable Gitea template digest distinct from the canonical,
+  credential-ID-bound n8n deployment digest.
+- [x] Resolve n8n discovery and verification authority only from an exact,
+  active Captain Tool Integrator lease.
+- [x] Materialize exactly one type-matching credential ID/name placeholder and
+  keep verified template bytes process-local.
+- [ ] Enable the concrete adapters in the default Gateway composition only by
+  explicit, complete, fail-closed configuration.
+- [ ] Persist provider probe start/completion and Gitea release bindings through
+  Captain's sole-writer Gateway.
+- [ ] Add separately authorized provider-control, restart-control, finalization,
+  and read-only aggregate-evidence routes.
+- [ ] Persist Minibook integration-setup acknowledgement and rebuild convergence
+  for the same run, job, and correlation.
+- [ ] Run the isolated Bearer and OAuth paths, controlled restart/resume,
+  rotation/revoke, and three distinct provider traces before any live claim.
