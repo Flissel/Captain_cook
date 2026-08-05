@@ -143,6 +143,9 @@ def _run(
     fake_hermes = _fake_command(tmp_path, "hermes", FAKE_HERMES)
     fake_git = _fake_command(tmp_path, "git", FAKE_GIT)
     env = dict(os.environ)
+    for name in tuple(env):
+        if name.startswith("COV_CORE_") or name == "COVERAGE_PROCESS_START":
+            env.pop(name)
     env["FAKE_CODEX_STATE"] = str(tmp_path / "state")
     env["FAKE_N8N_MCP_URL"] = mcp_url
     env["FAKE_OFFICIAL_SKILLS"] = json.dumps(sorted(OFFICIAL_SKILLS))
