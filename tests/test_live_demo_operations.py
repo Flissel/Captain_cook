@@ -216,6 +216,7 @@ def test_live_demo_services_can_restart_only_the_verified_portal_gateway() -> No
         "function ", 1
     )[0]
     assert "Get-ManagedListenerIdentity" in restart_function
+    assert "Get-ManagedListenerIdentityForConfigurationReplacement" in restart_function
     assert "taskkill.exe" in restart_function
     assert "Start-Gateway $Values" in restart_function
 

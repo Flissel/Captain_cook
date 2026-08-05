@@ -361,10 +361,18 @@ function Stop-ManagedGateway([string]$PidPath=$gatewayPid) {
 function Restart-Gateway($Values, [string]$PidPath=$gatewayPid) {
     $gatewayPort = [Uri]$Values['CAPTAIN_GATEWAY_URL'] | Select-Object -ExpandProperty Port
     $configurationSha256 = Get-GatewayConfigurationSha256 $Values
-    $managed = Get-ManagedListenerIdentity `
-        -Path $PidPath `
-        -Port $gatewayPort `
-        -ConfigurationSha256 $configurationSha256
+    try {
+        $managed = Get-ManagedListenerIdentity `
+            -Path $PidPath `
+            -Port $gatewayPort `
+            -ConfigurationSha256 $configurationSha256
+    }
+    catch {
+        $managed = Get-ManagedListenerIdentityForConfigurationReplacement `
+            -Path $PidPath `
+            -Port $gatewayPort `
+            -ReplacementConfigurationSha256 $configurationSha256
+    }
     & taskkill.exe /PID $managed.Id /T /F *> $null
     if ($LASTEXITCODE -ne 0) {
         throw 'Verified managed Gateway process tree could not be stopped for restart.'
