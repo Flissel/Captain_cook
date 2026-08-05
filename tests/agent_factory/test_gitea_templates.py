@@ -233,3 +233,13 @@ async def test_client_rejects_unsafe_configured_origin() -> None:
             GiteaTemplateClient(origin="https://user:secret@gitea.internal.example", http=http)
     finally:
         await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_c0_control_character_in_configured_origin() -> None:
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
+    try:
+        with pytest.raises(ValueError, match="Gitea origin"):
+            GiteaTemplateClient(origin="https://gitea.internal\x00.example", http=http)
+    finally:
+        await http.aclose()

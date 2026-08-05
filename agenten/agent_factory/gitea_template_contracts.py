@@ -17,6 +17,8 @@ _SHA256 = r"^[0-9a-f]{64}$"
 def validate_safe_https_url(value: str, *, label: str) -> str:
     """Reject URL forms that can hide credentials or change request semantics."""
 
+    if any(ord(character) < 32 for character in value):
+        raise ValueError(f"{label} must not contain C0 control characters")
     if value != value.strip():
         raise ValueError(f"{label} must be a canonical HTTPS URL")
     parts = urlsplit(value)
