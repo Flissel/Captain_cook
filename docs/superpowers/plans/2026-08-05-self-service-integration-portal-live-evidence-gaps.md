@@ -28,6 +28,10 @@ This is verified-local safety evidence, not provider evidence.
 - Portal and Captain control origins must differ. Factory tenant binding uses
   only the dedicated Captain control origin/capability, never the browser
   portal proxy.
+- Every protected health, audit, control and evidence URL must share the exact
+  origin of the capability that authorizes it. No protected capability origin
+  may equal the browser portal origin. Malformed ports are normalized to a
+  fail-closed configuration error before client construction.
 - Public and protected health references plus a correlation-bound provider
   audit are checked before any live mutation.
 - Cross-tenant denial requires the same redacted provider invocation count
@@ -37,6 +41,10 @@ This is verified-local safety evidence, not provider evidence.
   provider traces; OAuth consent/callback references; digest-pinned Gitea,
   Gateway decision/execution and Minibook projection/rebuild evidence; then
   monotonic rotation and revoke revisions.
+- The three requested provider traces must have distinct IDs and exactly match
+  the requested kind, alias and credential ID. Aggregated release evidence
+  must contain exactly those traces, and the OAuth trace must carry both
+  consent and callback references.
 - Deterministic non-live tests cover opt-in/partial groups, unsafe URLs, origin
   separation, redirect behavior, response-size bounds, malformed bodies,
   strict DTO rejection and configured-canary rejection.

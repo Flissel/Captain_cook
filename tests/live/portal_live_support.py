@@ -135,7 +135,38 @@ class PortalLiveConfig:
         allow_loopback = os.environ.get(LOOPBACK_NAME) == "1"
         for name in _URL_ENVIRONMENT:
             _validate_safe_url(values[name], name=name, allow_loopback=allow_loopback)
-        if _origin(values["CAPTAIN_PORTAL_LIVE_BASE_URL"]) == _origin(
+        portal_origin = _origin(values["CAPTAIN_PORTAL_LIVE_BASE_URL"])
+        protected_groups = (
+            (
+                _origin(values["CAPTAIN_PORTAL_LIVE_CAPTAIN_CONTROL_BASE_URL"]),
+                ("CAPTAIN_PORTAL_LIVE_CAPTAIN_CONTROL_HEALTH_URL",),
+            ),
+            (
+                _origin(values["CAPTAIN_PORTAL_LIVE_PROVIDER_CONTROL_URL"]),
+                (
+                    "CAPTAIN_PORTAL_LIVE_PROVIDER_AUDIT_URL",
+                    "CAPTAIN_PORTAL_LIVE_PROVIDER_CONTROL_HEALTH_URL",
+                ),
+            ),
+            (
+                _origin(values["CAPTAIN_PORTAL_LIVE_RESTART_CONTROL_URL"]),
+                ("CAPTAIN_PORTAL_LIVE_RESTART_CONTROL_HEALTH_URL",),
+            ),
+            (
+                _origin(values["CAPTAIN_PORTAL_LIVE_EVIDENCE_URL"]),
+                ("CAPTAIN_PORTAL_LIVE_EVIDENCE_HEALTH_URL",),
+            ),
+        )
+        for capability_origin, member_names in protected_groups:
+            if any(_origin(values[name]) != capability_origin for name in member_names):
+                raise PortalLiveConfigurationError(
+                    "protected URL must share its capability origin"
+                )
+            if capability_origin == portal_origin:
+                raise PortalLiveConfigurationError(
+                    "protected origin must be distinct from the browser portal origin"
+                )
+        if portal_origin == _origin(
             values["CAPTAIN_PORTAL_LIVE_CAPTAIN_CONTROL_BASE_URL"]
         ):
             raise PortalLiveConfigurationError(
@@ -666,7 +697,11 @@ def _origin(value: str) -> tuple[str, str | None, int | None]:
 
 
 def _validate_safe_url(value: str, *, name: str, allow_loopback: bool) -> None:
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+        parsed.port
+    except ValueError:
+        raise PortalLiveConfigurationError(f"{name} must be a safe HTTPS URL") from None
     loopback = parsed.hostname in {"127.0.0.1", "::1", "localhost"}
     allowed_scheme = parsed.scheme == "https" or (
         allow_loopback and loopback and parsed.scheme == "http"

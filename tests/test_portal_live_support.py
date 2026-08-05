@@ -39,7 +39,7 @@ def complete_environment() -> dict[str, str]:
         "CAPTAIN_PORTAL_LIVE_GITEA_HEALTH_URL": "https://gitea.example.test/api/healthz",
         "CAPTAIN_PORTAL_LIVE_SUPABASE_HEALTH_URL": "https://supabase.example.test/auth/v1/health",
         "CAPTAIN_PORTAL_LIVE_MINIBOOK_HEALTH_URL": "https://minibook.example.test/health",
-        "CAPTAIN_PORTAL_LIVE_PROVIDER_AUDIT_URL": "https://audit.example.test/v1/provider-audit",
+        "CAPTAIN_PORTAL_LIVE_PROVIDER_AUDIT_URL": "https://provider-control.example.test/v1/provider-audit",
         "CAPTAIN_PORTAL_LIVE_PROVIDER_CONTROL_URL": "https://provider-control.example.test/v1/probes",
         "CAPTAIN_PORTAL_LIVE_PROVIDER_CONTROL_HEALTH_URL": "https://provider-control.example.test/health",
         "CAPTAIN_PORTAL_LIVE_PROVIDER_CONTROL_TOKEN": "provider-control-value",
@@ -110,8 +110,94 @@ def test_portal_and_captain_control_origins_must_be_distinct(
     environment["CAPTAIN_PORTAL_LIVE_CAPTAIN_CONTROL_BASE_URL"] = environment[
         "CAPTAIN_PORTAL_LIVE_BASE_URL"
     ]
+    environment["CAPTAIN_PORTAL_LIVE_CAPTAIN_CONTROL_HEALTH_URL"] = (
+        "https://portal.example.test/health"
+    )
     install_environment(monkeypatch, environment)
     with pytest.raises(PortalLiveConfigurationError, match="distinct"):
+        PortalLiveConfig.from_environment()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        (
+            "CAPTAIN_PORTAL_LIVE_CAPTAIN_CONTROL_HEALTH_URL",
+            "https://other.example.test/health",
+        ),
+        (
+            "CAPTAIN_PORTAL_LIVE_PROVIDER_AUDIT_URL",
+            "https://other.example.test/v1/audit",
+        ),
+        (
+            "CAPTAIN_PORTAL_LIVE_PROVIDER_CONTROL_HEALTH_URL",
+            "https://other.example.test/health",
+        ),
+        (
+            "CAPTAIN_PORTAL_LIVE_RESTART_CONTROL_HEALTH_URL",
+            "https://other.example.test/health",
+        ),
+        (
+            "CAPTAIN_PORTAL_LIVE_EVIDENCE_HEALTH_URL",
+            "https://other.example.test/health",
+        ),
+    ),
+)
+def test_protected_urls_must_share_their_capability_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    environment = complete_environment()
+    environment[name] = value
+    install_environment(monkeypatch, environment)
+    with pytest.raises(PortalLiveConfigurationError, match="capability origin"):
+        PortalLiveConfig.from_environment()
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "CAPTAIN_PORTAL_LIVE_PROVIDER_AUDIT_URL",
+        "CAPTAIN_PORTAL_LIVE_RESTART_CONTROL_URL",
+        "CAPTAIN_PORTAL_LIVE_EVIDENCE_URL",
+    ),
+)
+def test_protected_origins_cannot_equal_browser_portal_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    environment = complete_environment()
+    environment[name] = "https://portal.example.test/protected"
+    if name == "CAPTAIN_PORTAL_LIVE_PROVIDER_AUDIT_URL":
+        environment["CAPTAIN_PORTAL_LIVE_PROVIDER_CONTROL_URL"] = (
+            "https://portal.example.test/provider"
+        )
+        environment["CAPTAIN_PORTAL_LIVE_PROVIDER_CONTROL_HEALTH_URL"] = (
+            "https://portal.example.test/health"
+        )
+    elif name == "CAPTAIN_PORTAL_LIVE_RESTART_CONTROL_URL":
+        environment["CAPTAIN_PORTAL_LIVE_RESTART_CONTROL_HEALTH_URL"] = (
+            "https://portal.example.test/health"
+        )
+    else:
+        environment["CAPTAIN_PORTAL_LIVE_EVIDENCE_HEALTH_URL"] = (
+            "https://portal.example.test/health"
+        )
+    install_environment(monkeypatch, environment)
+    with pytest.raises(PortalLiveConfigurationError, match="browser portal"):
+        PortalLiveConfig.from_environment()
+
+
+def test_malformed_port_is_normalized_to_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = complete_environment()
+    environment["CAPTAIN_PORTAL_LIVE_EVIDENCE_URL"] = (
+        "https://evidence.example.test:not-a-port/v1/evidence"
+    )
+    install_environment(monkeypatch, environment)
+    with pytest.raises(PortalLiveConfigurationError, match="EVIDENCE_URL"):
         PortalLiveConfig.from_environment()
 
 

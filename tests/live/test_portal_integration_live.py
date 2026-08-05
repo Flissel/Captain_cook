@@ -206,6 +206,28 @@ def test_ticket_lifecycle_provider_traces_restart_and_release_evidence(
         live_portal.provider_probe("bearer"),
     )
     assert all(trace.correlation_id == live_config.correlation_id for trace in traces)
+    expected_trace_bindings = (
+        (
+            "bearer",
+            live_config.bearer_alias,
+            live_config.bearer_credential_id,
+        ),
+        (
+            "oauth",
+            live_config.oauth_alias,
+            live_config.oauth_credential_id,
+        ),
+        (
+            "bearer",
+            live_config.bearer_alias,
+            live_config.bearer_credential_id,
+        ),
+    )
+    assert tuple(
+        (trace.integration_kind, trace.credential_alias, trace.credential_id)
+        for trace in traces
+    ) == expected_trace_bindings
+    assert len({trace.trace_id for trace in traces}) == 3
     oauth_trace = traces[1]
     assert oauth_trace.consent_ref is not None
     assert oauth_trace.callback_ref is not None
@@ -216,8 +238,9 @@ def test_ticket_lifecycle_provider_traces_restart_and_release_evidence(
         trace.correlation_id == live_config.correlation_id
         for trace in release.provider_traces
     )
-    trace_ids = {trace.trace_id for trace in release.provider_traces}
-    assert {trace.trace_id for trace in traces}.issubset(trace_ids)
+    release_traces = {trace.trace_id: trace for trace in release.provider_traces}
+    requested_traces = {trace.trace_id: trace for trace in traces}
+    assert release_traces == requested_traces
     assert release.gitea_sha256
     assert release.gateway_decision_ref
     assert release.gateway_execution_ref
