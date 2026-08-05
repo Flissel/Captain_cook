@@ -376,6 +376,32 @@ def test_configured_organization_claim_maps_to_the_portal_principal(
     assert response.json() == {"subject_id": "user-1", "organization_id": "tenant-7"}
 
 
+def test_nested_supabase_app_metadata_organization_maps_to_principal(
+    private_key: RSAPrivateKey,
+    verifier: PyJwtPortalVerifier,
+) -> None:
+    settings = configured_settings().model_copy(
+        update={"portal_organization_claim": "app_metadata.organization_id"}
+    )
+
+    response = portal_client(settings, verifier).get(
+        "/portal",
+        headers=bearer(
+            token(
+                private_key,
+                _remove=("organization_id",),
+                app_metadata={"organization_id": "org-captain-demo"},
+            )
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "subject_id": "user-1",
+        "organization_id": "org-captain-demo",
+    }
+
+
 @pytest.mark.parametrize(
     "replacement",
     (

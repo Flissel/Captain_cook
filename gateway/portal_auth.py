@@ -164,10 +164,14 @@ class PyJwtPortalVerifier:
                 algorithms=[algorithm],
                 audience=audience,
                 issuer=issuer,
-                options={"require": ["exp", "sub", settings.portal_organization_claim]},
+                options={"require": ["exp", "sub"]},
             )
             subject_id = claims.get("sub")
-            organization_id = claims.get(settings.portal_organization_claim)
+            organization_id: object = claims
+            for segment in settings.portal_organization_claim.split("."):
+                if not isinstance(organization_id, Mapping):
+                    raise PortalTokenVerificationError()
+                organization_id = organization_id.get(segment)
             if not isinstance(subject_id, str) or not subject_id.strip():
                 raise PortalTokenVerificationError()
             if not isinstance(organization_id, str) or not organization_id.strip():

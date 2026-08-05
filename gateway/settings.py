@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import secrets
 from collections.abc import Mapping
 from typing import Literal
@@ -111,8 +112,11 @@ class GatewaySettings(BaseModel):
     @field_validator("portal_organization_claim")
     @classmethod
     def _portal_organization_claim_must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("portal organization claim must not be blank")
+        if not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*",
+            value,
+        ):
+            raise ValueError("portal organization claim must be a safe claim path")
         return value
 
     @model_validator(mode="after")

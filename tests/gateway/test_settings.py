@@ -46,6 +46,14 @@ def test_portal_settings_are_optional_only_as_a_complete_group() -> None:
         )
 
 
+def test_portal_organization_claim_accepts_nested_supabase_metadata_path() -> None:
+    configured = GatewaySettings.from_env(
+        valid_environment(PORTAL_ORGANIZATION_CLAIM="app_metadata.organization_id")
+    )
+
+    assert configured.portal_organization_claim == "app_metadata.organization_id"
+
+
 @pytest.mark.parametrize(
     "jwks_url",
     (
