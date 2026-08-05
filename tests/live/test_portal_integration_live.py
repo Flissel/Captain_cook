@@ -238,6 +238,8 @@ def test_ticket_lifecycle_provider_traces_restart_and_release_evidence(
         trace.correlation_id == live_config.correlation_id
         for trace in release.provider_traces
     )
+    assert len(release.provider_traces) == 3
+    assert len({trace.trace_id for trace in release.provider_traces}) == 3
     release_traces = {trace.trace_id: trace for trace in release.provider_traces}
     requested_traces = {trace.trace_id: trace for trace in traces}
     assert release_traces == requested_traces

@@ -201,6 +201,37 @@ def test_malformed_port_is_normalized_to_configuration_error(
         PortalLiveConfig.from_environment()
 
 
+def test_explicit_https_default_port_matches_implicit_capability_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = complete_environment()
+    environment["CAPTAIN_PORTAL_LIVE_CAPTAIN_CONTROL_HEALTH_URL"] = (
+        "https://captain.example.test:443/health"
+    )
+    install_environment(monkeypatch, environment)
+    assert PortalLiveConfig.from_environment().captain_control_health_url.endswith(
+        ":443/health"
+    )
+
+
+def test_explicit_default_port_cannot_bypass_browser_origin_separation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = complete_environment()
+    environment["CAPTAIN_PORTAL_LIVE_PROVIDER_AUDIT_URL"] = (
+        "https://portal.example.test:443/audit"
+    )
+    environment["CAPTAIN_PORTAL_LIVE_PROVIDER_CONTROL_URL"] = (
+        "https://portal.example.test:443/control"
+    )
+    environment["CAPTAIN_PORTAL_LIVE_PROVIDER_CONTROL_HEALTH_URL"] = (
+        "https://portal.example.test:443/health"
+    )
+    install_environment(monkeypatch, environment)
+    with pytest.raises(PortalLiveConfigurationError, match="browser portal"):
+        PortalLiveConfig.from_environment()
+
+
 def config(monkeypatch: pytest.MonkeyPatch) -> PortalLiveConfig:
     install_environment(monkeypatch, complete_environment())
     return PortalLiveConfig.from_environment()
@@ -331,3 +362,46 @@ def test_factory_binding_uses_only_the_distinct_captain_control_origin(
         "https://captain.example.test/v1/factory/integration-setups/"
         "10000000-0000-0000-0000-000000000001/portal-tenant-binding"
     ]
+
+
+def test_release_evidence_rejects_duplicate_trace_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace = {
+        "trace_id": "30000000-0000-0000-0000-000000000003",
+        "correlation_id": "20000000-0000-0000-0000-000000000002",
+        "credential_alias": "CRM_BEARER",
+        "credential_id": "credential-bearer",
+        "integration_kind": "bearer",
+        "status": "passed",
+        "occurred_at": "2026-08-05T12:00:00Z",
+        "execution_ref": "execution://trace-3",
+        "consent_ref": None,
+        "callback_ref": None,
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "correlation_id": "20000000-0000-0000-0000-000000000002",
+                "revision": 4,
+                "status": "accepted",
+                "provider_traces": [trace, trace, trace],
+                "gitea_sha256": "a" * 64,
+                "gateway_decision_ref": "decision://accepted",
+                "gateway_execution_ref": "execution://gateway",
+                "minibook_projection_ref": "minibook://projection",
+                "minibook_rebuild_ref": "minibook://rebuild",
+            },
+        )
+
+    client = PortalLiveClient(
+        config(monkeypatch),
+        auxiliary_transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(PortalLiveResponseError, match="schema"):
+            client.release_evidence()
+    finally:
+        client.close()

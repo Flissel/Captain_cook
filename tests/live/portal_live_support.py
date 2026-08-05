@@ -6,12 +6,19 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import os
-from typing import Literal, Mapping, TypeVar
+from typing import Literal, Mapping, Self, TypeVar
 from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 
 OPT_IN_NAME = "CAPTAIN_PORTAL_LIVE_E2E"
@@ -352,12 +359,22 @@ class ReleaseEvidence(_WireModel):
     correlation_id: UUID
     revision: int = Field(ge=1)
     status: Literal["accepted"]
-    provider_traces: tuple[ProviderTraceEvidence, ...] = Field(min_length=3)
+    provider_traces: tuple[ProviderTraceEvidence, ...] = Field(
+        min_length=3,
+        max_length=3,
+    )
     gitea_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     gateway_decision_ref: str = Field(pattern=EVIDENCE_REFERENCE_PATTERN)
     gateway_execution_ref: str = Field(pattern=EVIDENCE_REFERENCE_PATTERN)
     minibook_projection_ref: str = Field(pattern=EVIDENCE_REFERENCE_PATTERN)
     minibook_rebuild_ref: str = Field(pattern=EVIDENCE_REFERENCE_PATTERN)
+
+    @model_validator(mode="after")
+    def require_unique_trace_ids(self) -> Self:
+        trace_ids = tuple(trace.trace_id for trace in self.provider_traces)
+        if len(set(trace_ids)) != 3:
+            raise ValueError("release evidence trace IDs must be unique")
+        return self
 
 
 WireModel = TypeVar("WireModel", bound=_WireModel)
@@ -693,7 +710,10 @@ class PortalLiveClient:
 
 def _origin(value: str) -> tuple[str, str | None, int | None]:
     parsed = urlsplit(value)
-    return parsed.scheme, parsed.hostname, parsed.port
+    port = parsed.port
+    if port is None:
+        port = {"https": 443, "http": 80}.get(parsed.scheme)
+    return parsed.scheme, parsed.hostname, port
 
 
 def _validate_safe_url(value: str, *, name: str, allow_loopback: bool) -> None:
