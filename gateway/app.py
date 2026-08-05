@@ -72,6 +72,7 @@ from gateway.portal_contracts import (
     PortalSetupTicketIssueV1,
     PortalSetupTicketUseV1,
     PortalSetupTicketV1,
+    PortalTenantBindingV1,
 )
 from gateway.registry_feed import mirror_captain_projection
 from gateway.registry_feed import (
@@ -437,6 +438,23 @@ def create_app(
             action=request.action,
             now=portal_clock(),
         )
+
+    @app.post(
+        "/v1/factory/integration-setups/{job_id}/portal-tenant-binding",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def provision_portal_tenant_binding(
+        job_id: UUID,
+        binding: PortalTenantBindingV1,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> PortalTenantBindingV1:
+        if binding.job_id != job_id:
+            raise HTTPException(status_code=409, detail="portal binding job_id must match route")
+        created = get_store().provision_portal_tenant(binding)
+        if not created:
+            response.status_code = status.HTTP_200_OK
+        return binding
 
     @app.get("/v1/portal/integration-setups/{job_id}")
     async def get_portal_integration_setup(

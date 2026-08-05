@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from gateway.portal_contracts import (
     PortalPrincipalV1,
+    PortalTenantBindingV1,
     PortalSetupSelectionRequestV1,
     PortalSetupTicketIssueV1,
     PortalSetupTicketUseV1,
@@ -15,6 +16,16 @@ from gateway.portal_contracts import (
     PortalSetupTicketRequestV1,
     PortalSetupTicketV1,
 )
+
+
+def test_portal_tenant_binding_is_strict_and_secret_free() -> None:
+    binding = PortalTenantBindingV1(job_id=JOB_ID, organization_id="org-a")
+
+    assert binding.organization_id == "org-a"
+    with pytest.raises(ValidationError):
+        PortalTenantBindingV1.model_validate(
+            {"job_id": str(JOB_ID), "organization_id": "org-a", "api_key": "no"}
+        )
 
 
 def test_portal_operation_requests_reject_secret_shaped_fields() -> None:

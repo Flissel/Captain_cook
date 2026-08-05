@@ -13,7 +13,7 @@ from gateway.app import create_app
 from gateway.portal_auth import PortalTokenVerifier
 from gateway.portal_contracts import PortalPrincipalV1, PortalSetupTicketV1
 from gateway.settings import GatewaySettings
-from tests.gateway.test_integration_setup_api import setup_payload
+from tests.gateway.test_integration_setup_api import ready_setup_payload, setup_payload
 from tests.agent_factory.test_state_machine import job
 from gateway.integration_setup_contracts import (
     IntegrationSetupSubmissionV1,
@@ -72,6 +72,17 @@ class FakePortalGatewayStore:
         self.owner = "org-a"
         self.used: list[tuple[str, str]] = []
         self.ticket_principal: PortalPrincipalV1 | None = None
+
+    def provision_portal_tenant(self, binding):
+        if binding.job_id != JOB_ID:
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=404, detail="integration setup not found")
+        if self.owner != binding.organization_id:
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=409, detail="portal tenant binding conflict")
+        return False
 
     def portal_integration_setup(self, job_id: UUID, organization_id: str):
         if job_id != JOB_ID or organization_id != self.owner:
@@ -150,6 +161,26 @@ def test_org_b_cannot_read_org_a_setup_or_issue_org_a_ticket() -> None:
 
     assert read.status_code == 404
     assert issued.status_code == 404
+
+
+def test_tenant_binding_route_is_captain_only_and_idempotent() -> None:
+    store = FakePortalGatewayStore()
+    principal = PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+    payload = {"job_id": str(JOB_ID), "organization_id": "org-a"}
+    with client_for(principal, store) as client:
+        portal_attempt = client.post(
+            f"/v1/factory/integration-setups/{JOB_ID}/portal-tenant-binding",
+            headers=auth(),
+            json=payload,
+        )
+        replay = client.post(
+            f"/v1/factory/integration-setups/{JOB_ID}/portal-tenant-binding",
+            headers={"Authorization": "Bearer captain"},
+            json=payload,
+        )
+
+    assert portal_attempt.status_code == 401
+    assert replay.status_code == 200
 
 
 def test_org_b_cannot_consume_org_a_ticket() -> None:
@@ -293,6 +324,31 @@ def test_real_gateway_portal_flow_is_tenant_scoped_and_digest_fenced() -> None:
                 headers={"Authorization": "Bearer captain"},
                 json=setup_payload(factory_job),
             ).status_code == 201
+            application.state.portal_token_verifier = StaticVerifier(
+                PortalPrincipalV1(subject_id="user-b", organization_id="org-b")
+            )
+            unbound_attempt = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/tickets",
+                headers=auth(),
+                json={"credential_alias": "CRM_PRIMARY", "action": "discover"},
+            )
+            assert PortalTicketStore(storage).organization_owns_setup(JOB_ID, "org-b") is False
+            application.state.portal_token_verifier = StaticVerifier(org_a)
+            provisioned = client.post(
+                f"/v1/factory/integration-setups/{JOB_ID}/portal-tenant-binding",
+                headers={"Authorization": "Bearer captain"},
+                json={"job_id": str(JOB_ID), "organization_id": "org-a"},
+            )
+            provisioned_replay = client.post(
+                f"/v1/factory/integration-setups/{JOB_ID}/portal-tenant-binding",
+                headers={"Authorization": "Bearer captain"},
+                json={"job_id": str(JOB_ID), "organization_id": "org-a"},
+            )
+            conflicting_binding = client.post(
+                f"/v1/factory/integration-setups/{JOB_ID}/portal-tenant-binding",
+                headers={"Authorization": "Bearer captain"},
+                json={"job_id": str(JOB_ID), "organization_id": "org-b"},
+            )
             issued = client.post(
                 f"/v1/portal/integration-setups/{JOB_ID}/tickets",
                 headers=auth(),
@@ -316,6 +372,66 @@ def test_real_gateway_portal_flow_is_tenant_scoped_and_digest_fenced() -> None:
                     "credential_alias": "CRM_PRIMARY",
                 },
             )
+            select_ticket = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/tickets",
+                headers=auth(),
+                json={"credential_alias": "CRM_PRIMARY", "action": "select"},
+            ).json()
+            wrong_action = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/actions",
+                headers=auth(),
+                json={
+                    "ticket_id": select_ticket["ticket_id"],
+                    "ticket": select_ticket["ticket"],
+                    "credential_alias": "CRM_PRIMARY",
+                    "action": "revoked",
+                },
+            )
+            selected = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/select",
+                headers=auth(),
+                json={
+                    "ticket_id": select_ticket["ticket_id"],
+                    "ticket": select_ticket["ticket"],
+                    "credential_alias": "CRM_PRIMARY",
+                    "credential_id": "credential-1",
+                },
+            )
+            selected_replay = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/select",
+                headers=auth(),
+                json={
+                    "ticket_id": select_ticket["ticket_id"],
+                    "ticket": select_ticket["ticket"],
+                    "credential_alias": "CRM_PRIMARY",
+                    "credential_id": "credential-1",
+                },
+            )
+            revoke_ticket = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/tickets",
+                headers=auth(),
+                json={"credential_alias": "CRM_PRIMARY", "action": "revoked"},
+            ).json()
+            revoked = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/actions",
+                headers=auth(),
+                json={
+                    "ticket_id": revoke_ticket["ticket_id"],
+                    "ticket": revoke_ticket["ticket"],
+                    "credential_alias": "CRM_PRIMARY",
+                    "action": "revoked",
+                },
+            )
+            revoked_replay = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/actions",
+                headers=auth(),
+                json={
+                    "ticket_id": revoke_ticket["ticket_id"],
+                    "ticket": revoke_ticket["ticket"],
+                    "credential_alias": "CRM_PRIMARY",
+                    "action": "revoked",
+                },
+            )
             application.state.portal_token_verifier = StaticVerifier(
                 PortalPrincipalV1(subject_id="user-b", organization_id="org-b")
             )
@@ -324,11 +440,106 @@ def test_real_gateway_portal_flow_is_tenant_scoped_and_digest_fenced() -> None:
             )
 
         assert issued.status_code == 201
+        assert unbound_attempt.status_code == 404
+        assert provisioned.status_code == 201
+        assert provisioned_replay.status_code == 200
+        assert conflicting_binding.status_code == 409
+        assert PortalTicketStore(storage).organization_owns_setup(JOB_ID, "org-a") is True
+        assert PortalTicketStore(storage).organization_owns_setup(JOB_ID, "org-b") is False
         assert discovered.status_code == 200
         assert discovered.json()["overall_status"] == "selection_required"
         assert discovered.json()["revision"] == 2
         assert replay.status_code == 403
+        assert wrong_action.status_code == 403
+        assert selected.status_code == 200
+        assert selected.json()["overall_status"] == "verification_required"
+        assert selected_replay.status_code == 403
+        assert revoked.status_code == 200
+        assert revoked.json()["overall_status"] == "revoked"
+        assert revoked_replay.status_code == 403
         assert cross_read.status_code == 404
+    finally:
+        with storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM portal_setup_tickets")
+                cursor.execute("DELETE FROM portal_setup_bindings")
+        storage.clear()
+
+
+@pytest.mark.skipif(not TEST_DSN, reason="TEST_MARIADB_DSN is not configured")
+def test_real_gateway_rotation_ticket_is_action_bound_and_single_use() -> None:
+    assert TEST_DSN is not None
+    assert_isolated_test_database(TEST_DSN)
+    storage = MariaDBStorage(TEST_DSN)
+    from gateway.portal_store import PortalTicketStore
+
+    PortalTicketStore(storage)
+    with storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM portal_setup_tickets")
+            cursor.execute("DELETE FROM portal_setup_bindings")
+    storage.clear()
+    configured = settings().model_copy(update={"ledger_dsn": SecretStr(TEST_DSN)})
+    application = create_app(
+        storage=storage,
+        mirror=NullMirror(),
+        settings=configured,
+        portal_clock=lambda: NOW,
+    )
+    application.state.portal_token_verifier = StaticVerifier(
+        PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+    )
+    factory_job = job().model_copy(update={"job_id": JOB_ID})
+
+    try:
+        with TestClient(application) as client:
+            assert client.post(
+                "/v1/factory/jobs",
+                headers={"Authorization": "Bearer captain"},
+                json=factory_job.model_dump(mode="json", by_alias=True),
+            ).status_code == 202
+            assert client.post(
+                "/v1/factory/integration-setups",
+                headers={"Authorization": "Bearer captain"},
+                json=ready_setup_payload(factory_job),
+            ).status_code == 201
+            assert client.post(
+                f"/v1/factory/integration-setups/{JOB_ID}/portal-tenant-binding",
+                headers={"Authorization": "Bearer captain"},
+                json={"job_id": str(JOB_ID), "organization_id": "org-a"},
+            ).status_code == 201
+            ticket = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/tickets",
+                headers=auth(),
+                json={
+                    "credential_alias": "CRM_API_KEY",
+                    "action": "rotation_requested",
+                },
+            ).json()
+            rotated = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/actions",
+                headers=auth(),
+                json={
+                    "ticket_id": ticket["ticket_id"],
+                    "ticket": ticket["ticket"],
+                    "credential_alias": "CRM_API_KEY",
+                    "action": "rotation_requested",
+                },
+            )
+            replay = client.post(
+                f"/v1/portal/integration-setups/{JOB_ID}/actions",
+                headers=auth(),
+                json={
+                    "ticket_id": ticket["ticket_id"],
+                    "ticket": ticket["ticket"],
+                    "credential_alias": "CRM_API_KEY",
+                    "action": "rotation_requested",
+                },
+            )
+
+        assert rotated.status_code == 200
+        assert rotated.json()["overall_status"] == "verification_required"
+        assert replay.status_code == 403
     finally:
         with storage.transaction() as connection:
             with connection.cursor() as cursor:

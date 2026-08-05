@@ -64,8 +64,8 @@ class PortalTicketStore:
                     """
                 )
 
-    def bind_or_require_organization(self, job_id: UUID, organization_id: str) -> None:
-        """Bind an unclaimed setup once, then fail closed for every other tenant."""
+    def provision_organization(self, job_id: UUID, organization_id: str) -> bool:
+        """Captain-only seam: create one immutable setup tenant binding."""
 
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
@@ -74,6 +74,7 @@ class PortalTicketStore:
                        (job_id, organization_id) VALUES (%s, %s)""",
                     (str(job_id), organization_id),
                 )
+                created = cursor.rowcount == 1
                 cursor.execute(
                     """SELECT organization_id FROM portal_setup_bindings
                        WHERE job_id = %s FOR UPDATE""",
@@ -81,7 +82,14 @@ class PortalTicketStore:
                 )
                 row = cursor.fetchone()
                 if row is None or str(row["organization_id"]) != organization_id:
-                    raise LookupError("portal integration setup not found")
+                    raise ValueError("portal tenant binding conflict")
+                return created
+
+    def require_organization(self, job_id: UUID, organization_id: str) -> None:
+        """Require an existing exact binding without creating or changing it."""
+
+        if not self.organization_owns_setup(job_id, organization_id):
+            raise LookupError("portal integration setup not found")
 
     def organization_owns_setup(self, job_id: UUID, organization_id: str) -> bool:
         with self.storage.transaction() as connection:
@@ -106,7 +114,7 @@ class PortalTicketStore:
         now = _utc(now)
         if lifetime <= timedelta(0) or lifetime > timedelta(minutes=10):
             raise ValueError("portal ticket lifetime must be at most ten minutes")
-        self.bind_or_require_organization(job_id, principal.organization_id)
+        self.require_organization(job_id, principal.organization_id)
         raw_ticket = secrets.token_urlsafe(32)
         token_sha256 = hashlib.sha256(raw_ticket.encode("utf-8")).hexdigest()
         ticket_id = uuid4()

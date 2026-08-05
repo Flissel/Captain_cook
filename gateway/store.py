@@ -143,6 +143,7 @@ from gateway.portal_contracts import (
     PortalSetupSelectionRequestV1,
     PortalSetupTicketUseV1,
     PortalSetupTicketV1,
+    PortalTenantBindingV1,
     PortalTicketAction,
 )
 from gateway.portal_store import PortalTicketStore
@@ -695,6 +696,18 @@ class GatewayStore:
         if not self._portal_tickets.organization_owns_setup(job_id, organization_id):
             raise HTTPException(status_code=404, detail="integration setup not found")
         return self.integration_setup(job_id)
+
+    def provision_portal_tenant(self, binding: PortalTenantBindingV1) -> bool:
+        """Provision immutable portal ownership after Captain validates the setup."""
+
+        self.integration_setup(binding.job_id)
+        try:
+            return self._portal_tickets.provision_organization(
+                binding.job_id,
+                binding.organization_id,
+            )
+        except ValueError:
+            raise HTTPException(status_code=409, detail="portal tenant binding conflict") from None
 
     def issue_portal_ticket(
         self,

@@ -44,6 +44,8 @@ def storage() -> Iterator[MariaDBStorage]:
 
 def test_ticket_is_hashed_expires_and_can_only_be_used_once(storage: MariaDBStorage) -> None:
     store = PortalTicketStore(storage)
+    assert store.provision_organization(JOB_ID, "org-a") is True
+    assert store.provision_organization(JOB_ID, "org-a") is False
     ticket = store.issue(
         job_id=JOB_ID,
         principal=ORG_A,
@@ -84,6 +86,7 @@ def test_ticket_is_hashed_expires_and_can_only_be_used_once(storage: MariaDBStor
 
 def test_cross_tenant_and_expired_ticket_fail_with_fixed_error(storage: MariaDBStorage) -> None:
     store = PortalTicketStore(storage)
+    store.provision_organization(JOB_ID, "org-a")
     ticket = store.issue(
         job_id=JOB_ID,
         principal=ORG_A,
@@ -110,6 +113,7 @@ def test_cross_tenant_and_expired_ticket_fail_with_fixed_error(storage: MariaDBS
 
 def test_concurrent_consumers_cannot_both_use_one_ticket(storage: MariaDBStorage) -> None:
     store = PortalTicketStore(storage)
+    store.provision_organization(JOB_ID, "org-a")
     ticket = store.issue(
         job_id=JOB_ID,
         principal=ORG_A,
@@ -137,3 +141,70 @@ def test_concurrent_consumers_cannot_both_use_one_ticket(storage: MariaDBStorage
         results = tuple(executor.map(lambda _: consume(), range(2)))
 
     assert sorted(results) == ["accepted", "denied"]
+
+
+def test_portal_identity_cannot_create_or_rebind_tenant_binding(storage: MariaDBStorage) -> None:
+    store = PortalTicketStore(storage)
+
+    with pytest.raises(LookupError, match="portal integration setup not found"):
+        store.issue(
+            job_id=JOB_ID,
+            principal=ORG_B,
+            credential_alias="CRM_PRIMARY",
+            action="discover",
+            now=NOW,
+        )
+    assert store.organization_owns_setup(JOB_ID, "org-b") is False
+
+    store.provision_organization(JOB_ID, "org-a")
+    with pytest.raises(ValueError, match="portal tenant binding conflict"):
+        store.provision_organization(JOB_ID, "org-b")
+    assert store.organization_owns_setup(JOB_ID, "org-a") is True
+    assert store.organization_owns_setup(JOB_ID, "org-b") is False
+
+
+@pytest.mark.parametrize("action", ["select", "rotation_requested", "revoked"])
+def test_ticket_action_is_bound_and_single_use_for_every_mutating_action(
+    storage: MariaDBStorage,
+    action: str,
+) -> None:
+    store = PortalTicketStore(storage)
+    store.provision_organization(JOB_ID, "org-a")
+    ticket = store.issue(
+        job_id=JOB_ID,
+        principal=ORG_A,
+        credential_alias="CRM_PRIMARY",
+        action=action,
+        now=NOW,
+    )
+    wrong_action = "revoked" if action != "revoked" else "rotation_requested"
+
+    with pytest.raises(PermissionError, match="^invalid portal setup ticket$"):
+        store.consume(
+            job_id=JOB_ID,
+            principal=ORG_A,
+            ticket_id=ticket.ticket_id,
+            raw_ticket=ticket.ticket,
+            credential_alias="CRM_PRIMARY",
+            action=wrong_action,
+            now=NOW + timedelta(minutes=1),
+        )
+    store.consume(
+        job_id=JOB_ID,
+        principal=ORG_A,
+        ticket_id=ticket.ticket_id,
+        raw_ticket=ticket.ticket,
+        credential_alias="CRM_PRIMARY",
+        action=action,
+        now=NOW + timedelta(minutes=1),
+    )
+    with pytest.raises(PermissionError, match="^invalid portal setup ticket$"):
+        store.consume(
+            job_id=JOB_ID,
+            principal=ORG_A,
+            ticket_id=ticket.ticket_id,
+            raw_ticket=ticket.ticket,
+            credential_alias="CRM_PRIMARY",
+            action=action,
+            now=NOW + timedelta(minutes=1),
+        )

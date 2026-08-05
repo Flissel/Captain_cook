@@ -27,6 +27,13 @@ class PortalPrincipalV1(_FrozenContract):
     organization_id: str = Field(pattern=IDENTIFIER_PATTERN)
 
 
+class PortalTenantBindingV1(_FrozenContract):
+    """Captain-provisioned ownership of one integration setup."""
+
+    job_id: UUID
+    organization_id: str = Field(pattern=IDENTIFIER_PATTERN)
+
+
 class PortalSetupTicketRequestV1(_FrozenContract):
     """The tenant-bound request Captain validates before issuing a ticket."""
 
