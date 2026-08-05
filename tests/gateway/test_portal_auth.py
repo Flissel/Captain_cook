@@ -137,7 +137,7 @@ def token(private_key: RSAPrivateKey, **overrides: object) -> str:
         "iss": ISSUER,
         "aud": AUDIENCE,
         "iat": NOW,
-        "exp": NOW + timedelta(minutes=5),
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
     }
     remove = overrides.pop("_remove", ())
     assert isinstance(remove, tuple)
@@ -187,7 +187,7 @@ def test_valid_supabase_es256_token_maps_subject_and_organization() -> None:
         "iss": ISSUER,
         "aud": AUDIENCE,
         "iat": NOW,
-        "exp": NOW + timedelta(minutes=5),
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
     }
     supplied = jwt.encode(
         claims,
