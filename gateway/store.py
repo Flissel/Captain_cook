@@ -36,7 +36,10 @@ from agenten.agent_factory.contracts import (
     FactoryRole,
     parse_factory_job,
 )
-from agenten.delivery.minibook_events import MinibookProjectionAcknowledgementV1
+from agenten.delivery.minibook_events import (
+    MinibookProjectionAcknowledgementV1,
+    MinibookProjectionRebuildReceiptV1,
+)
 from agenten.agent_factory.execution_budget import (
     BudgetExhausted,
     FactoryBudgetProjection,
@@ -529,6 +532,22 @@ class GatewayStore:
                         block_index BIGINT NOT NULL UNIQUE,
                         payload JSON NOT NULL,
                         CONSTRAINT fk_portal_restart_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS minibook_projection_rebuild_receipts (
+                        rebuild_id CHAR(36) NOT NULL PRIMARY KEY,
+                        run_id VARCHAR(128) NOT NULL,
+                        job_id CHAR(36) NOT NULL,
+                        correlation_id CHAR(36) NOT NULL,
+                        projection_event_id CHAR(36) NOT NULL,
+                        acknowledgement_id CHAR(36) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        CONSTRAINT fk_minibook_rebuild_block
                             FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
                     ) ENGINE=InnoDB
                     """
@@ -4358,6 +4377,116 @@ class GatewayStore:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return self.append_delivery_event(mirror)
+
+    def record_minibook_projection_rebuild_receipt(
+        self,
+        receipt: MinibookProjectionRebuildReceiptV1,
+    ) -> MinibookProjectionRebuildReceiptV1:
+        canonical = receipt.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM minibook_projection_rebuild_receipts "
+                    "WHERE rebuild_id = %s FOR UPDATE",
+                    (str(receipt.rebuild_id),),
+                )
+                replay = cursor.fetchone()
+                if replay is not None:
+                    stored = MinibookProjectionRebuildReceiptV1.model_validate(
+                        self._decode_json(replay["payload"])
+                    )
+                    if stored != receipt:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Minibook rebuild receipt already exists with different content",
+                        )
+                    return stored
+                cursor.execute(
+                    """SELECT payload, content_sha256, revision, event_id
+                       FROM factory_integration_setup_events
+                       WHERE job_id = %s ORDER BY revision DESC LIMIT 1 FOR UPDATE""",
+                    (str(receipt.job_id),),
+                )
+                setup_row = cursor.fetchone()
+                if setup_row is None:
+                    raise HTTPException(status_code=409, detail="integration setup is unavailable")
+                setup = IntegrationSetupSubmissionV1.model_validate(
+                    self._decode_json(setup_row["payload"])
+                )
+                if (
+                    setup.correlation_id != receipt.correlation_id
+                    or int(setup_row["revision"]) != receipt.setup_revision
+                    or str(setup_row["content_sha256"]) != receipt.setup_content_sha256
+                    or UUID(str(setup_row["event_id"])) != receipt.projection_event_id
+                ):
+                    raise HTTPException(status_code=409, detail="Minibook rebuild setup fence mismatch")
+                cursor.execute(
+                    """SELECT data FROM blocks
+                       WHERE block_type = 'delivery_event'
+                         AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.event_id')) = %s
+                       LIMIT 1 FOR UPDATE""",
+                    (str(receipt.acknowledgement_id),),
+                )
+                ack_row = cursor.fetchone()
+                if ack_row is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="integration setup projection acknowledgement is unavailable",
+                    )
+                acknowledgement = DeliveryEventEnvelope.model_validate(
+                    self._decode_json(ack_row["data"])
+                )
+                if (
+                    acknowledgement.event_type != "registry_mirror"
+                    or acknowledgement.trace.job_id != receipt.job_id
+                    or acknowledgement.trace.correlation_id != receipt.correlation_id
+                    or acknowledgement.trace.run_id
+                    != f"integration-setup:{receipt.setup_revision}"
+                    or acknowledgement.trace.trace_id
+                    != f"minibook-projection:{receipt.projection_event_id}"
+                    or acknowledgement.occurred_at >= receipt.occurred_at
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="integration setup projection acknowledgement mismatch",
+                    )
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(receipt.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job is unavailable")
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="minibook_projection_rebuild_completed",
+                    data=canonical,
+                    status="converged",
+                    parent_index=job_block["index"],
+                    metadata={"schema": receipt.schema_name},
+                )
+                self._insert(cursor, block)
+                cursor.execute(
+                    """INSERT INTO minibook_projection_rebuild_receipts
+                       (rebuild_id, run_id, job_id, correlation_id,
+                        projection_event_id, acknowledgement_id, block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        str(receipt.rebuild_id),
+                        receipt.run_id,
+                        str(receipt.job_id),
+                        str(receipt.correlation_id),
+                        str(receipt.projection_event_id),
+                        str(receipt.acknowledgement_id),
+                        index,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+        return receipt
 
     def integration_setup_source(
         self,

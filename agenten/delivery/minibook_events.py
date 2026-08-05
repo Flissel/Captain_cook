@@ -133,6 +133,38 @@ class MinibookProjectionAcknowledgementV1(BaseModel):
             raise ValueError("acknowledgement_id does not match canonical projection")
         return self
 
+
+class MinibookProjectionRebuildReceiptV1(BaseModel):
+    """Captain-owned proof that a full Minibook replay converged."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    schema_name: Literal["captain.minibook-projection-rebuild-receipt.v1"] = Field(
+        default="captain.minibook-projection-rebuild-receipt.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    rebuild_id: UUID
+    run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    job_id: UUID
+    correlation_id: UUID
+    projection_event_id: UUID
+    acknowledgement_id: UUID
+    setup_revision: int = Field(ge=1, strict=True)
+    setup_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    feed_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    event_ids_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_project_id: Literal["captain-runtime-projection-v2"]
+    outcome: Literal["converged"]
+    occurred_at: AwareDatetime
+
+    @field_validator("occurred_at")
+    @classmethod
+    def require_rebuild_at_utc(cls, value: AwareDatetime) -> AwareDatetime:
+        if value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("rebuild receipt timestamp must be UTC")
+        return value.astimezone(timezone.utc)
+
 _EVENT_CATALOG: dict[
     ProjectionEventType,
     tuple[ProjectionView, ProjectionTemplateId, ProjectionStatusId],

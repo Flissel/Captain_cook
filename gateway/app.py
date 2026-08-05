@@ -30,7 +30,10 @@ from agenten.agent_factory.execution_budget import (
     FactoryBudgetReservationV1,
     FactoryBudgetWriteReceipt,
 )
-from agenten.delivery.minibook_events import MinibookProjectionAcknowledgementV1
+from agenten.delivery.minibook_events import (
+    MinibookProjectionAcknowledgementV1,
+    MinibookProjectionRebuildReceiptV1,
+)
 from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkSummaryV1
 from agenten.agent_factory.skill_workflow_contracts import TeamEvaluationV1
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
@@ -851,6 +854,16 @@ def create_app(
         if result.replayed:
             response.status_code = status.HTTP_200_OK
         return result
+
+    @app.post("/api/v1/projections/minibook/rebuild-receipts")
+    async def record_minibook_projection_rebuild(
+        receipt: MinibookProjectionRebuildReceiptV1,
+        _: GatewayRole = Depends(require_captain),
+    ) -> MinibookProjectionRebuildReceiptV1:
+        return await run_in_threadpool(
+            get_store().record_minibook_projection_rebuild_receipt,
+            receipt,
+        )
 
     @app.post("/v1/runtime/commands", status_code=status.HTTP_202_ACCEPTED)
     async def accept_runtime_command(
