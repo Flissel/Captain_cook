@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { createPortalApi, PortalPublicError, type PortalApi } from "./api";
-import { portalPublicConfig } from "./config";
 import { IntegrationCard } from "./components/IntegrationCard";
 import { SetupStatus } from "./components/SetupStatus";
 import { portalSupabase } from "./supabase";
@@ -30,7 +29,10 @@ function SignIn() {
     if (pending) return;
     setPending(true);
     setMessage(null);
-    const { error } = await portalSupabase().auth.signInWithOtp({ email });
+    const { error } = await portalSupabase().auth.signInWithOtp({
+      email,
+      options: { shouldCreateUser: false },
+    });
     setMessage(error ? "Sign-in could not be started." : "Check your inbox for your sign-in link.");
     setPending(false);
   }
@@ -179,7 +181,7 @@ function PortalDashboard({ api }: { api: PortalApi }) {
 
 export default function App() {
   const [signedIn, setSignedIn] = useState<boolean | null>(null);
-  const api = useMemo(() => createPortalApi(portalPublicConfig().portalApiBaseUrl), []);
+  const api = useMemo(() => createPortalApi(), []);
 
   useEffect(() => {
     let active = true;

@@ -12,8 +12,11 @@ type TicketAction = "discover" | "select" | "rotation_requested" | "revoked";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/;
+const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
+const CREDENTIAL_ALIAS_PATTERN = /^[A-Z][A-Z0-9_]*$/;
+const NON_WHITESPACE_PATTERN = /^\S+$/;
 const CREDENTIAL_TYPE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,127}$/;
+const PORTAL_API_PREFIX = "/v1/portal";
 
 export class PortalPublicError extends Error {
   constructor(message: string) {
@@ -39,15 +42,20 @@ function exact(value: unknown, keys: readonly string[]): Record<string, unknown>
   return candidate;
 }
 
-function stringValue(value: unknown, pattern?: RegExp): string {
-  if (typeof value !== "string" || value.length === 0 || (pattern && !pattern.test(value))) {
+function stringValue(value: unknown, pattern?: RegExp, maximumLength?: number): string {
+  if (
+    typeof value !== "string" ||
+    [...value].length === 0 ||
+    (maximumLength !== undefined && [...value].length > maximumLength) ||
+    (pattern && !pattern.test(value))
+  ) {
     throw new Error("invalid string");
   }
   return value;
 }
 
-function nullableString(value: unknown): string | null {
-  return value === null ? null : stringValue(value);
+function nullableString(value: unknown, pattern?: RegExp, maximumLength?: number): string | null {
+  return value === null ? null : stringValue(value, pattern, maximumLength);
 }
 
 function statusValue(value: unknown): IntegrationSetupStatus {
@@ -63,7 +71,9 @@ function safeHttpUrl(value: unknown): string {
   if (
     (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
     parsed.username !== "" ||
-    parsed.password !== ""
+    parsed.password !== "" ||
+    parsed.search !== "" ||
+    parsed.hash !== ""
   ) {
     throw new Error("unsafe URL");
   }
@@ -83,11 +93,11 @@ function parseCredential(value: unknown): CredentialMetadata {
     throw new Error("invalid credential schema");
   }
   return {
-    credentialId: stringValue(item.credential_id),
-    credentialName: stringValue(item.credential_name),
+    credentialId: stringValue(item.credential_id, NON_WHITESPACE_PATTERN, 256),
+    credentialName: stringValue(item.credential_name, undefined, 256),
     credentialType: stringValue(item.credential_type, CREDENTIAL_TYPE_PATTERN),
-    projectId: nullableString(item.project_id),
-    projectName: nullableString(item.project_name),
+    projectId: nullableString(item.project_id, NON_WHITESPACE_PATTERN, 256),
+    projectName: nullableString(item.project_name, undefined, 256),
   };
 }
 
@@ -106,10 +116,10 @@ function parseAction(value: unknown): IntegrationSetupAction {
     throw new Error("invalid integration action");
   }
   return {
-    integrationKey: stringValue(item.integration_key, IDENTIFIER_PATTERN),
-    credentialAlias: stringValue(item.credential_alias),
+    integrationKey: stringValue(item.integration_key, IDENTIFIER_PATTERN, 128),
+    credentialAlias: stringValue(item.credential_alias, CREDENTIAL_ALIAS_PATTERN, 128),
     credentialType: stringValue(item.credential_type, CREDENTIAL_TYPE_PATTERN),
-    setupLabel: stringValue(item.setup_label),
+    setupLabel: stringValue(item.setup_label, undefined, 128),
     required: item.required,
     status: statusValue(item.status),
     candidateCredentials: item.candidate_credentials.map(parseCredential),
@@ -147,9 +157,9 @@ function parseTicket(value: unknown): PortalSetupTicket {
   }
   return {
     ticketId: stringValue(item.ticket_id, UUID_PATTERN),
-    ticket: stringValue(item.ticket),
+    ticket: stringValue(item.ticket, undefined, 256),
     jobId: stringValue(item.job_id, UUID_PATTERN),
-    credentialAlias: stringValue(item.credential_alias),
+    credentialAlias: stringValue(item.credential_alias, IDENTIFIER_PATTERN, 128),
     expiresAt,
   };
 }
@@ -163,20 +173,6 @@ function publicStatusError(status: number): PortalPublicError {
     503: "The integration service is temporarily unavailable.",
   };
   return new PortalPublicError(messages[status] ?? "The integration request could not be completed.");
-}
-
-function normalizeBaseUrl(value: string): string {
-  const parsed = new URL(value);
-  if (
-    (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
-    parsed.username !== "" ||
-    parsed.password !== "" ||
-    parsed.search !== "" ||
-    parsed.hash !== ""
-  ) {
-    throw new Error("invalid portal API URL");
-  }
-  return value.replace(/\/$/, "");
 }
 
 async function rawRequest(
@@ -216,9 +212,9 @@ export interface PortalApi {
   revokeCredential(jobId: string, alias: string, accessToken: string): Promise<PortalSetupSurface>;
 }
 
-export function createPortalApi(baseUrl: string, fetcher: Fetcher = fetch): PortalApi {
-  const base = normalizeBaseUrl(baseUrl);
-  const setupPath = (jobId: string) => `${base}/v1/portal/integration-setups/${encodeURIComponent(jobId)}`;
+export function createPortalApi(fetcher: Fetcher = fetch): PortalApi {
+  const setupPath = (jobId: string) =>
+    `${PORTAL_API_PREFIX}/integration-setups/${encodeURIComponent(jobId)}`;
 
   const surfaceRequest = async (
     url: string,
@@ -290,8 +286,5 @@ export function createPortalApi(baseUrl: string, fetcher: Fetcher = fetch): Port
 }
 
 export function getSetupSurface(jobId: string, accessToken: string): Promise<PortalSetupSurface> {
-  return createPortalApi(import.meta.env.VITE_CAPTAIN_PORTAL_API_BASE_URL).getSetupSurface(
-    jobId,
-    accessToken,
-  );
+  return createPortalApi().getSetupSurface(jobId, accessToken);
 }
