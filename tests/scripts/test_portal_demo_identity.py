@@ -41,6 +41,27 @@ services:
         provision.extract_compose_value(compose, "MISSING")
 
 
+def test_extract_secret_accepts_repeated_identical_compose_values_only() -> None:
+    provision = _load_module()
+    repeated = """\
+services:
+  auth:
+    environment:
+      ANON_KEY: public-demo-key
+  studio:
+    environment:
+        ANON_KEY: public-demo-key
+"""
+    divergent = repeated.replace(
+        "        ANON_KEY: public-demo-key",
+        "        ANON_KEY: foreign-key",
+    )
+
+    assert provision.extract_compose_value(repeated, "ANON_KEY") == "public-demo-key"
+    with pytest.raises(ValueError, match="expected one literal ANON_KEY"):
+        provision.extract_compose_value(divergent, "ANON_KEY")
+
+
 def test_validate_session_requires_es256_and_nested_organization() -> None:
     provision = _load_module()
     token = ".".join(

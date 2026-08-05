@@ -27,11 +27,16 @@ class _NoRedirect(HTTPRedirectHandler):
 
 def extract_compose_value(compose: str, key: str) -> str:
     matches = re.findall(
-        rf"^\s{{6}}{re.escape(key)}:\s*([^\s#]+)\s*$",
+        rf"^\s+{re.escape(key)}:\s*([^\s#]+)\s*$",
         compose,
         re.MULTILINE,
     )
-    if len(matches) != 1 or not matches[0] or matches[0].startswith("${"):
+    distinct = set(matches)
+    if (
+        len(distinct) != 1
+        or not matches[0]
+        or matches[0].startswith("${")
+    ):
         raise ValueError(f"expected one literal {key} mapping")
     return matches[0]
 
