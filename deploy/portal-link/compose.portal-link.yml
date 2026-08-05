@@ -1,6 +1,7 @@
 services:
   captain-portal-link:
     image: nginx:1.27-alpine
+    profiles: ["captain"]
     network_mode: host
     read_only: true
     tmpfs:
@@ -26,6 +27,7 @@ services:
 
   mini-pc-portal-link:
     image: nginx:1.27-alpine
+    profiles: ["mini-pc"]
     network_mode: host
     read_only: true
     tmpfs:
