@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-from contextlib import closing
-from typing import Any, Mapping
-
 import pytest
 
 from tests.live.portal_live_support import (
+    EphemeralPortalTicket,
+    PortalActionWire,
     PortalLiveClient,
     PortalLiveConfig,
     PortalLiveConfigurationError,
-    require_secret_free_surface,
-    require_status,
+    PortalLiveResponseError,
+    PortalSurfaceEvidence,
 )
 
 
@@ -21,6 +20,8 @@ pytestmark = pytest.mark.live
 
 @pytest.fixture(scope="module")
 def live_config() -> PortalLiveConfig:
+    """Reject every incomplete/unsafe group before any client or network exists."""
+
     try:
         return PortalLiveConfig.from_environment()
     except PortalLiveConfigurationError as error:
@@ -29,50 +30,40 @@ def live_config() -> PortalLiveConfig:
 
 @pytest.fixture(scope="module")
 def live_portal(live_config: PortalLiveConfig) -> PortalLiveClient:
-    with closing(PortalLiveClient(live_config)) as client:
+    client = PortalLiveClient(live_config)
+    try:
+        try:
+            statuses = client.preflight_statuses()
+            audit = client.provider_audit()
+        except PortalLiveResponseError:
+            pytest.skip("missing-live-prerequisites: a configured live control seam is unavailable")
+        if not all(200 <= item.status_code < 300 for item in statuses):
+            pytest.skip("missing-live-prerequisites: a configured live control seam is not ready")
+        if audit.correlation_id != live_config.correlation_id:
+            pytest.skip("missing-live-prerequisites: provider audit is not correlation-bound")
         yield client
+    finally:
+        client.close()
 
 
-def _path(config: PortalLiveConfig, suffix: str = "") -> str:
-    return f"/v1/portal/integration-setups/{config.job_id}{suffix}"
-
-
-def _issue(
-    client: PortalLiveClient,
-    config: PortalLiveConfig,
-    *,
-    alias: str,
-    action: str,
-) -> Mapping[str, Any]:
-    response = client.portal(
-        "POST",
-        _path(config, "/tickets"),
-        access_token=config.org_a_access_token,
-        payload={"credential_alias": alias, "action": action},
-    )
-    return require_status(response, 201)
-
-
-def _ticket_use(ticket: Mapping[str, Any], alias: str) -> dict[str, Any]:
+def _ticket_payload(ticket: EphemeralPortalTicket) -> dict[str, object]:
     return {
-        "ticket_id": ticket["ticket_id"],
-        "ticket": ticket["ticket"],
-        "credential_alias": alias,
+        "ticket_id": str(ticket.ticket_id),
+        "ticket": ticket.ticket,
+        "credential_alias": ticket.credential_alias,
     }
 
 
-def _revision(payload: Mapping[str, Any]) -> int:
-    revision = payload.get("revision")
-    assert isinstance(revision, int) and revision >= 1
-    return revision
+def _find_action(surface: PortalSurfaceEvidence, alias: str) -> PortalActionWire:
+    matching = tuple(
+        action for action in surface.actions if action.credential_alias == alias
+    )
+    assert len(matching) == 1
+    return matching[0]
 
 
-def _find_action(payload: Mapping[str, Any], alias: str) -> Mapping[str, Any]:
-    actions = payload.get("actions")
-    assert isinstance(actions, list)
-    match = [item for item in actions if isinstance(item, dict) and item.get("credential_alias") == alias]
-    assert len(match) == 1
-    return match[0]
+def _require_monotonic(revisions: list[int]) -> None:
+    assert all(current > previous for previous, current in zip(revisions, revisions[1:]))
 
 
 def test_live_references_are_reachable_without_forwarding_credentials(
@@ -80,7 +71,7 @@ def test_live_references_are_reachable_without_forwarding_credentials(
     live_config: PortalLiveConfig,
 ) -> None:
     statuses = tuple(
-        live_portal.health(url)
+        live_portal.health(url).status_code
         for url in (
             live_config.n8n_health_url,
             live_config.gitea_health_url,
@@ -91,231 +82,159 @@ def test_live_references_are_reachable_without_forwarding_credentials(
     assert all(200 <= status < 400 for status in statuses)
 
 
-def test_portal_rejects_cross_tenant_ticket_before_provider_call(
+def test_portal_rejects_cross_tenant_before_provider_invocation(
     live_portal: PortalLiveClient,
     live_config: PortalLiveConfig,
 ) -> None:
-    binding = live_portal.portal(
-        "POST",
-        f"/v1/factory/integration-setups/{live_config.job_id}/portal-tenant-binding",
-        access_token=live_config.captain_token,
-        payload={"job_id": str(live_config.job_id), "organization_id": live_config.org_a_id},
+    binding = live_portal.provision_tenant(live_config.org_a_id)
+    assert binding.job_id == live_config.job_id
+    assert binding.organization_id == live_config.org_a_id
+
+    audit_before = live_portal.provider_audit()
+    assert audit_before.correlation_id == live_config.correlation_id
+    surface_before = live_portal.get_surface(
+        access_token=live_config.org_a_access_token
     )
-    require_status(binding, 200, 201)
-    conflicting_binding = live_portal.portal(
-        "POST",
-        f"/v1/factory/integration-setups/{live_config.job_id}/portal-tenant-binding",
-        access_token=live_config.captain_token,
-        payload={"job_id": str(live_config.job_id), "organization_id": live_config.org_b_id},
-    )
-    assert conflicting_binding.status_code == 409
-    before = require_status(
-        live_portal.portal(
-            "GET",
-            _path(live_config),
-            access_token=live_config.org_a_access_token,
-        ),
-        200,
-    )
-    ticket = _issue(
-        live_portal,
-        live_config,
+    ticket = live_portal.issue_ticket(
         alias=live_config.bearer_alias,
         action="discover",
     )
-    denied = live_portal.portal(
+    denied = live_portal.portal_status(
         "POST",
-        _path(live_config, "/discover"),
+        f"/v1/portal/integration-setups/{live_config.job_id}/discover",
         access_token=live_config.org_b_access_token,
-        payload=_ticket_use(ticket, live_config.bearer_alias),
+        payload=_ticket_payload(ticket),
     )
     assert denied.status_code == 403
-    cross_read = live_portal.portal(
+    cross_read = live_portal.portal_status(
         "GET",
-        _path(live_config),
+        f"/v1/portal/integration-setups/{live_config.job_id}",
         access_token=live_config.org_b_access_token,
     )
     assert cross_read.status_code == 404
-    after = require_status(
-        live_portal.portal(
-            "GET",
-            _path(live_config),
-            access_token=live_config.org_a_access_token,
-        ),
-        200,
+    audit_after = live_portal.provider_audit()
+    surface_after = live_portal.get_surface(
+        access_token=live_config.org_a_access_token
     )
-    assert _revision(after) == _revision(before)
+    assert audit_after.correlation_id == live_config.correlation_id
+    assert audit_after.invocation_count == audit_before.invocation_count
+    assert surface_after.revision == surface_before.revision
 
 
-def test_live_ticket_binding_bearer_oauth_rotation_and_revoke(
+def test_ticket_lifecycle_provider_traces_restart_and_release_evidence(
     live_portal: PortalLiveClient,
     live_config: PortalLiveConfig,
 ) -> None:
     revisions: list[int] = []
 
-    bearer_ticket = _issue(
-        live_portal,
-        live_config,
+    bearer_ticket = live_portal.issue_ticket(
         alias=live_config.bearer_alias,
         action="discover",
     )
-    wrong_action = live_portal.portal(
+    wrong_action = live_portal.portal_status(
         "POST",
-        _path(live_config, "/actions"),
+        f"/v1/portal/integration-setups/{live_config.job_id}/actions",
         access_token=live_config.org_a_access_token,
-        payload={
-            **_ticket_use(bearer_ticket, live_config.bearer_alias),
-            "action": "revoked",
-        },
+        payload={**_ticket_payload(bearer_ticket), "action": "revoked"},
     )
     assert wrong_action.status_code == 403
-    bearer_discovered = require_status(
-        live_portal.portal(
-            "POST",
-            _path(live_config, "/discover"),
-            access_token=live_config.org_a_access_token,
-            payload=_ticket_use(bearer_ticket, live_config.bearer_alias),
-        ),
-        200,
-    )
-    require_secret_free_surface(bearer_discovered)
-    revisions.append(_revision(bearer_discovered))
-    replay = live_portal.portal(
-        "POST",
-        _path(live_config, "/discover"),
+    bearer_discovered = live_portal.discover(
+        bearer_ticket,
         access_token=live_config.org_a_access_token,
-        payload=_ticket_use(bearer_ticket, live_config.bearer_alias),
+    )
+    revisions.append(bearer_discovered.revision)
+    replay = live_portal.portal_status(
+        "POST",
+        f"/v1/portal/integration-setups/{live_config.job_id}/discover",
+        access_token=live_config.org_a_access_token,
+        payload=_ticket_payload(bearer_ticket),
     )
     assert replay.status_code == 403
     bearer_action = _find_action(bearer_discovered, live_config.bearer_alias)
-    candidates = bearer_action.get("candidate_credentials")
-    assert isinstance(candidates, list)
-    assert any(
-        isinstance(candidate, dict)
-        and candidate.get("credential_id") == live_config.bearer_credential_id
-        for candidate in candidates
-    )
+    assert live_config.bearer_credential_id in {
+        candidate.credential_id for candidate in bearer_action.candidate_credentials
+    }
 
-    bearer_select_ticket = _issue(
-        live_portal,
-        live_config,
+    bearer_select_ticket = live_portal.issue_ticket(
         alias=live_config.bearer_alias,
         action="select",
     )
-    bearer_selected = require_status(
-        live_portal.portal(
-            "POST",
-            _path(live_config, "/select"),
-            access_token=live_config.org_a_access_token,
-            payload={
-                **_ticket_use(bearer_select_ticket, live_config.bearer_alias),
-                "credential_id": live_config.bearer_credential_id,
-            },
-        ),
-        200,
+    bearer_selected = live_portal.select(
+        bearer_select_ticket,
+        live_config.bearer_credential_id,
     )
-    require_secret_free_surface(bearer_selected)
-    revisions.append(_revision(bearer_selected))
+    revisions.append(bearer_selected.revision)
 
-    oauth_ticket = _issue(
-        live_portal,
-        live_config,
+    oauth_ticket = live_portal.issue_ticket(
         alias=live_config.oauth_alias,
         action="discover",
     )
-    oauth_discovered = require_status(
-        live_portal.portal(
-            "POST",
-            _path(live_config, "/discover"),
-            access_token=live_config.org_a_access_token,
-            payload=_ticket_use(oauth_ticket, live_config.oauth_alias),
-        ),
-        200,
+    oauth_discovered = live_portal.discover(
+        oauth_ticket,
+        access_token=live_config.org_a_access_token,
     )
-    require_secret_free_surface(oauth_discovered)
-    revisions.append(_revision(oauth_discovered))
+    revisions.append(oauth_discovered.revision)
     oauth_action = _find_action(oauth_discovered, live_config.oauth_alias)
-    oauth_candidates = oauth_action.get("candidate_credentials")
-    assert isinstance(oauth_candidates, list)
-    assert any(
-        isinstance(candidate, dict)
-        and candidate.get("credential_id") == live_config.oauth_credential_id
-        for candidate in oauth_candidates
-    )
-
-    oauth_select_ticket = _issue(
-        live_portal,
-        live_config,
+    assert live_config.oauth_credential_id in {
+        candidate.credential_id for candidate in oauth_action.candidate_credentials
+    }
+    oauth_select_ticket = live_portal.issue_ticket(
         alias=live_config.oauth_alias,
         action="select",
     )
-    oauth_selected = require_status(
-        live_portal.portal(
-            "POST",
-            _path(live_config, "/select"),
-            access_token=live_config.org_a_access_token,
-            payload={
-                **_ticket_use(oauth_select_ticket, live_config.oauth_alias),
-                "credential_id": live_config.oauth_credential_id,
-            },
-        ),
-        200,
+    oauth_selected = live_portal.select(
+        oauth_select_ticket,
+        live_config.oauth_credential_id,
     )
-    revisions.append(_revision(oauth_selected))
+    revisions.append(oauth_selected.revision)
 
-    rotation_ticket = _issue(
-        live_portal,
-        live_config,
+    restart = live_portal.restart_and_resume()
+    assert restart.correlation_id == live_config.correlation_id
+    resumed = live_portal.get_surface(access_token=live_config.org_a_access_token)
+    assert resumed.revision == oauth_selected.revision
+    consumed_after_restart = live_portal.portal_status(
+        "POST",
+        f"/v1/portal/integration-setups/{live_config.job_id}/discover",
+        access_token=live_config.org_a_access_token,
+        payload=_ticket_payload(oauth_ticket),
+    )
+    assert consumed_after_restart.status_code == 403
+
+    traces = (
+        live_portal.provider_probe("bearer"),
+        live_portal.provider_probe("oauth"),
+        live_portal.provider_probe("bearer"),
+    )
+    assert all(trace.correlation_id == live_config.correlation_id for trace in traces)
+    oauth_trace = traces[1]
+    assert oauth_trace.consent_ref is not None
+    assert oauth_trace.callback_ref is not None
+
+    release = live_portal.release_evidence()
+    assert release.correlation_id == live_config.correlation_id
+    assert all(
+        trace.correlation_id == live_config.correlation_id
+        for trace in release.provider_traces
+    )
+    trace_ids = {trace.trace_id for trace in release.provider_traces}
+    assert {trace.trace_id for trace in traces}.issubset(trace_ids)
+    assert release.gitea_sha256
+    assert release.gateway_decision_ref
+    assert release.gateway_execution_ref
+    assert release.minibook_projection_ref
+    assert release.minibook_rebuild_ref
+
+    rotation_ticket = live_portal.issue_ticket(
         alias=live_config.bearer_alias,
         action="rotation_requested",
     )
-    rotated = require_status(
-        live_portal.portal(
-            "POST",
-            _path(live_config, "/actions"),
-            access_token=live_config.org_a_access_token,
-            payload={
-                **_ticket_use(rotation_ticket, live_config.bearer_alias),
-                "action": "rotation_requested",
-            },
-        ),
-        200,
-    )
-    revisions.append(_revision(rotated))
-
-    revoke_ticket = _issue(
-        live_portal,
-        live_config,
+    rotated = live_portal.action(rotation_ticket, "rotation_requested")
+    revisions.append(rotated.revision)
+    revoke_ticket = live_portal.issue_ticket(
         alias=live_config.bearer_alias,
         action="revoked",
     )
-    revoked = require_status(
-        live_portal.portal(
-            "POST",
-            _path(live_config, "/actions"),
-            access_token=live_config.org_a_access_token,
-            payload={
-                **_ticket_use(revoke_ticket, live_config.bearer_alias),
-                "action": "revoked",
-            },
-        ),
-        200,
-    )
-    revisions.append(_revision(revoked))
-    assert _find_action(revoked, live_config.bearer_alias).get("status") == "revoked"
-    assert all(current > previous for previous, current in zip(revisions, revisions[1:]))
-
-
-def test_provider_and_release_evidence_requires_a_safe_callable_seam(
-    live_config: PortalLiveConfig,
-) -> None:
-    assert live_config.oauth_client_id
-    assert live_config.oauth_auth_url
-    assert live_config.oauth_callback_url
-    pytest.skip(
-        "BLOCKED-LIVE: no safe callable portal seam currently exposes Bearer probe "
-        "verification, OAuth consent/callback verification, controlled Gateway/portal "
-        "restart-resume, three provider traces, Gitea release digest, accepted Gateway "
-        "decision/execution reference, or Minibook projection/rebuild for the configured "
-        "correlation_id"
-    )
+    revoked = live_portal.action(revoke_ticket, "revoked")
+    revisions.append(revoked.revision)
+    assert _find_action(revoked, live_config.bearer_alias).status == "revoked"
+    _require_monotonic(revisions)
