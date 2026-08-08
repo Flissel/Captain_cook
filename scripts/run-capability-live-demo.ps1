@@ -13,7 +13,7 @@ param(
 
     [string]$PythonExecutable = (Join-Path (Split-Path -Parent $PSScriptRoot) '.venv\Scripts\python.exe'),
 
-    [string]$EntrypointPath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'agenten\agent_factory\capability_live_entrypoint.py'),
+    [string]$EntrypointModule = 'agenten.agent_factory.capability_live_entrypoint',
 
     [string]$EvidencePath,
 
@@ -80,9 +80,34 @@ function Resolve-ProviderBudget {
 $repository = [System.IO.Path]::GetFullPath(
     (Resolve-Path -LiteralPath $RepositoryRoot -ErrorAction Stop).Path
 ).TrimEnd('\', '/')
-$entrypoint = Resolve-ExistingLeaf -Path $EntrypointPath -Description 'Capability live entrypoint'
-Assert-RepositoryOwnedPath -Path $entrypoint -Repository $repository -Description 'Capability live entrypoint'
+$moduleRoot = [System.IO.Path]::GetFullPath(
+    (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot) -ErrorAction Stop).Path
+).TrimEnd('\', '/')
+if ($EntrypointModule -notmatch '^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$') {
+    throw 'Capability live entrypoint module is invalid'
+}
+$entrypointRelative = $EntrypointModule.Replace('.', [System.IO.Path]::DirectorySeparatorChar) + '.py'
+$entrypoint = Resolve-ExistingLeaf `
+    -Path (Join-Path $moduleRoot $entrypointRelative) `
+    -Description 'Capability live entrypoint module'
+Assert-RepositoryOwnedPath `
+    -Path $entrypoint `
+    -Repository $moduleRoot `
+    -Description 'Capability live entrypoint module'
 $python = Resolve-ExistingLeaf -Path $PythonExecutable -Description 'Python executable'
+
+function Invoke-CapabilityLiveEntrypoint {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+    Push-Location -LiteralPath $moduleRoot
+    try {
+        & $python -m $EntrypointModule @Arguments *> $null
+        return $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+}
 
 if ([string]::IsNullOrWhiteSpace($EvidencePath)) {
     $EvidencePath = Join-Path $repository '.captain-cook\live-demo\current\final-evidence.json'
@@ -92,9 +117,11 @@ Assert-RepositoryOwnedPath -Path $evidence -Repository $repository -Description 
 
 if ($Action -eq 'verify') {
     $existingEvidence = Resolve-ExistingLeaf -Path $evidence -Description 'Capability live evidence'
-    & $python $entrypoint --evidence-path $existingEvidence --verify-only *> $null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Capability live evidence verification failed with exit code $LASTEXITCODE"
+    $exitCode = Invoke-CapabilityLiveEntrypoint -Arguments @(
+        '--evidence-path', $existingEvidence, '--verify-only'
+    )
+    if ($exitCode -ne 0) {
+        throw "Capability live evidence verification failed with exit code $exitCode"
     }
     [ordered]@{
         schema = 'captain.capability-live-wrapper-result.v1'
@@ -173,7 +200,6 @@ if (-not [string]::IsNullOrWhiteSpace($RecordingWindowTitle)) {
 
 try {
     $arguments = @(
-        $entrypoint,
         '--repository-root', $repository,
         '--input', $inputs[0], '--pattern', $inputDefinitions[0].pattern,
         '--input', $inputs[1], '--pattern', $inputDefinitions[1].pattern,
@@ -181,13 +207,15 @@ try {
         '--max-cost-usd', $MaxCostUsd,
         '--evidence-path', $evidence
     )
-    & $python @arguments *> $null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Capability live entrypoint failed with exit code $LASTEXITCODE"
+    $exitCode = Invoke-CapabilityLiveEntrypoint -Arguments $arguments
+    if ($exitCode -ne 0) {
+        throw "Capability live entrypoint failed with exit code $exitCode"
     }
-    & $python $entrypoint --evidence-path $evidence --verify-only *> $null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Capability live evidence verification failed with exit code $LASTEXITCODE"
+    $verifyExitCode = Invoke-CapabilityLiveEntrypoint -Arguments @(
+        '--evidence-path', $evidence, '--verify-only'
+    )
+    if ($verifyExitCode -ne 0) {
+        throw "Capability live evidence verification failed with exit code $verifyExitCode"
     }
 }
 finally {

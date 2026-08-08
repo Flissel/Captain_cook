@@ -314,6 +314,22 @@ class CapabilityLiveBudgetPort(Protocol):
     ) -> CapabilityLiveReservation: ...
 
 
+class CapabilityLiveReservationAuthority:
+    """Bind the runner's three local reservations before any provider effect.
+
+    The durable run plan is the reservation ledger for this suite.  This
+    adapter does not mint a provider receipt or change the runner-selected
+    identity; it only rejects malformed requests and returns the exact frozen
+    envelope that will be persisted before stage one starts.
+    """
+
+    def reserve(
+        self,
+        request: CapabilityLiveReservationRequest,
+    ) -> CapabilityLiveReservation:
+        return CapabilityLiveReservation.model_validate(request.model_dump())
+
+
 class CapabilityLivePipelinePort(Protocol):
     """Delegate every domain decision to current authoritative compositions."""
 
@@ -900,6 +916,7 @@ __all__ = [
     "CapabilityLiveInput",
     "CapabilityLivePipelinePort",
     "CapabilityLiveReservation",
+    "CapabilityLiveReservationAuthority",
     "CapabilityLiveReservationRequest",
     "CapabilityLiveRestartEvidence",
     "CapabilityLiveRestartRequest",

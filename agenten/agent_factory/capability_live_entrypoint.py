@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from collections.abc import Callable, Sequence
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -214,11 +215,8 @@ def main(
                 "live execution requires repository, three inputs, patterns, and budget"
             )
         maximum = _positive_decimal(arguments.max_cost_usd)
-        if runner_factory is None:
-            raise CapabilityLiveEntrypointError(
-                "a current Gateway capability-live runner binding is required"
-            )
-        runner = runner_factory(arguments.repository_root.resolve(strict=True))
+        selected_factory = runner_factory or _compose_current_gateway_runner
+        runner = selected_factory(arguments.repository_root.resolve(strict=True))
         evidence = asyncio.run(
             run_capability_live_demo(
                 runner=runner,
@@ -282,8 +280,42 @@ def _positive_decimal(value: object) -> Decimal:
     return parsed
 
 
+def _compose_current_gateway_runner(repository_root: Path) -> CapabilityLiveRunnerPort:
+    """Reach the production Gateway composition and preserve its fail-closed gap."""
+
+    from gateway.agent_factory_live_composition import (
+        GatewayCapabilityLiveCompositionError,
+        compose_gateway_capability_live_runner,
+    )
+
+    try:
+        return compose_gateway_capability_live_runner(
+            repository_root=repository_root,
+        )
+    except GatewayCapabilityLiveCompositionError as exc:
+        raise CapabilityLiveEntrypointError(str(exc)) from exc
+
+
+def _cli_main() -> int:
+    try:
+        return main()
+    except CapabilityLiveEntrypointError:
+        print(
+            json.dumps(
+                {
+                    "schema": "captain.capability-live-entrypoint-error.v1",
+                    "status": "configuration_blocked",
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_cli_main())
 
 
 __all__ = [

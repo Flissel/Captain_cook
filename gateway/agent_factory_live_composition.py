@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Protocol, cast
@@ -13,6 +13,11 @@ from uuid import UUID
 from autogen_core.models import ChatCompletionClient
 
 from agenten.agent_factory.business_benchmark import BusinessBenchmarkEvaluator
+from agenten.agent_factory.capability_live_runner import (
+    CapabilityLiveReservationAuthority,
+    CapabilityLiveRunner,
+    FilesystemCapabilityLiveCheckpointStore,
+)
 from agenten.agent_factory.business_decision_tool import (
     TOOL_NAME as BUSINESS_DECISION_TOOL,
     captain_business_decision,
@@ -93,6 +98,13 @@ from agenten.agent_factory.team_execution import (
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
+from gateway.capability_live_pipeline import (
+    CapabilityBusinessBenchmarkPort,
+    CapabilityFactoryPort,
+    CapabilityProjectionPort,
+    GatewayCapabilityLivePipeline,
+    PromotedCapabilityExecutionPort,
+)
 from gateway.factory_repository import GatewayFactoryBudgetLedger, GatewayFactoryRepository
 from gateway.store import GatewayStore
 
@@ -110,6 +122,10 @@ class ForgeCandidateBindingPort(Protocol):
         """Return the current candidate reference recorded by Gateway."""
 
         ...
+
+
+class GatewayCapabilityLiveCompositionError(RuntimeError):
+    """The standalone live runner lacks one concrete current-authority port."""
 
 
 class FactoryLiveTeamExecutionPortsProvider(Protocol):
@@ -633,14 +649,119 @@ def _positive_decimal_environment(
     return value
 
 
+def compose_gateway_capability_live_runner(
+    *,
+    repository_root: Path,
+    factory: CapabilityFactoryPort | None = None,
+    benchmark: CapabilityBusinessBenchmarkPort | None = None,
+    execution: PromotedCapabilityExecutionPort | None = None,
+    projection: CapabilityProjectionPort | None = None,
+    factory_composition: AgentFactoryLiveComposition | None = None,
+    factory_provisioning: object | None = None,
+    minibook_effects: object | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> CapabilityLiveRunner:
+    """Compose Task 6 from either a tested port set or current authorities.
+
+    ``factory_composition`` binds the current Captain Factory workflow,
+    benchmark, recorded release execution, and Minibook acknowledgement seams
+    as one production graph.  The provisioner and projection effects remain
+    explicit because neither can be manufactured from a repository path.
+    """
+
+    root = repository_root.resolve(strict=True)
+    if not root.is_dir():
+        raise GatewayCapabilityLiveCompositionError(
+            "capability live repository root is unavailable"
+        )
+    selected_clock = clock or (lambda: datetime.now(timezone.utc))
+    concrete = (factory_composition, factory_provisioning, minibook_effects)
+    generic = (factory, benchmark, execution, projection)
+    if any(item is not None for item in concrete):
+        if any(item is not None for item in generic):
+            raise GatewayCapabilityLiveCompositionError(
+                "capability live composition cannot mix generic and current authorities"
+            )
+        if any(item is None for item in concrete):
+            raise GatewayCapabilityLiveCompositionError(
+                "current capability live composition requires Factory, provisioning, and Minibook effects"
+            )
+        from gateway.capability_live_current_adapters import (
+            GatewayCapabilityBusinessBenchmarkAdapter,
+            GatewayMinibookCapabilityProjectionAdapter,
+            RecordedFactoryCapabilityExecutionAdapter,
+        )
+        from gateway.capability_live_factory_adapter import CurrentCapabilityFactoryAdapter
+
+        assert factory_composition is not None
+        assert factory_provisioning is not None
+        assert minibook_effects is not None
+        factory = CurrentCapabilityFactoryAdapter(
+            composition=factory_composition,
+            provisioning=cast(object, factory_provisioning),
+            clock=selected_clock,
+        )
+        benchmark = GatewayCapabilityBusinessBenchmarkAdapter(
+            composition=cast(object, factory_composition),
+            bindings=factory,
+        )
+        execution = RecordedFactoryCapabilityExecutionAdapter(
+            composition=cast(object, factory_composition),
+        )
+        projection = GatewayMinibookCapabilityProjectionAdapter(
+            composition=cast(object, factory_composition),
+            effects=cast(object, minibook_effects),
+        )
+    missing = (
+        (
+            factory,
+            "generic capability Factory provisioning port is unavailable",
+        ),
+        (
+            benchmark,
+            "generic capability business benchmark input port is unavailable",
+        ),
+        (
+            execution,
+            "promoted capability execution port is unavailable",
+        ),
+        (
+            projection,
+            "capability Minibook projection port is unavailable",
+        ),
+    )
+    for authority, message in missing:
+        if authority is None:
+            raise GatewayCapabilityLiveCompositionError(message)
+    assert factory is not None
+    assert benchmark is not None
+    assert execution is not None
+    assert projection is not None
+    return CapabilityLiveRunner(
+        pipeline=GatewayCapabilityLivePipeline(
+            factory=factory,
+            benchmark=benchmark,
+            execution=execution,
+            projection=projection,
+        ),
+        budget=CapabilityLiveReservationAuthority(),
+        checkpoints=FilesystemCapabilityLiveCheckpointStore(
+            root / ".captain-cook" / "live-demo" / "checkpoints"
+        ),
+        clock=selected_clock,
+    )
+
+
 __all__ = [
     "AgentFactoryLiveComposition",
     "CaptainImprovementAuthorityRequired",
     "FactoryLiveTeamExecutionPortsProvider",
     "ForgeCandidateBindingPort",
     "GatewayTechnicalTeamExecutionPortsProvider",
+    "GatewayCapabilityLiveCompositionError",
     "GatewayBoundBusinessBenchmarkInputPort",
     "ProductionFactoryTeamExecutionPort",
     "compose_agent_factory_live",
+    "compose_gateway_capability_live_runner",
     "select_technical_business_holdout",
 ]

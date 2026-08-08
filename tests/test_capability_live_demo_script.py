@@ -6,8 +6,18 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from decimal import Decimal
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
+
+from agenten.agent_factory.capability_live_runner import (
+    CapabilityLiveCapabilityEvidence,
+    CapabilityLiveDemoEvidence,
+    CapabilityLiveReservation,
+    CapabilityLiveRestartEvidence,
+)
+from agenten.agent_runtime.contracts import ArtifactRef
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,8 +29,84 @@ INPUTS = (
 )
 
 
+def _authority_ref(namespace: str, value: str) -> ArtifactRef:
+    digest = uuid5(NAMESPACE_URL, f"{namespace}:{value}").hex * 2
+    return ArtifactRef(
+        uri=f"artifact://{namespace}/{digest}",
+        sha256=digest,
+        media_type="application/json",
+    )
+
+
+def _write_valid_real_entrypoint_evidence(path: Path) -> None:
+    run_id = UUID("82000000-0000-0000-0000-000000000062")
+    patterns = ("sequential", "selector_group_chat", "swarm")
+    input_ids = ("sequential-n8n", "selector-review", "swarm-api-gap")
+    allocations = (Decimal("0.33"), Decimal("0.33"), Decimal("0.34"))
+    reservations = tuple(
+        CapabilityLiveReservation(
+            reservation_id=uuid5(run_id, f"reservation:{input_id}"),
+            run_id=run_id,
+            input_id=input_id,
+            maximum_cost_usd=allocation,
+        )
+        for input_id, allocation in zip(input_ids, allocations, strict=True)
+    )
+    capabilities = tuple(
+        CapabilityLiveCapabilityEvidence(
+            input_id=input_id,
+            conversation_pattern=pattern,
+            correlation_id=uuid5(run_id, f"correlation:{input_id}"),
+            capability_id=f"capability-{input_id}",
+            capability_version=1,
+            controlled_recovery_id=(
+                uuid5(run_id, f"recovery:{input_id}") if index == 0 else None
+            ),
+            normal_trace_ids=tuple(
+                uuid5(run_id, f"trace:{input_id}:{trace}")
+                for trace in range(1, 4)
+            ),
+            release_authority_id=uuid5(run_id, f"release:{input_id}"),
+            execution_authority_id=uuid5(run_id, f"execution:{input_id}"),
+            execution_command_id=uuid5(run_id, f"command:{input_id}"),
+            execution_result_id=uuid5(run_id, f"result:{input_id}"),
+            projection_event_id=uuid5(run_id, f"projection:{input_id}"),
+            projection_readback_id=uuid5(run_id, f"readback:{input_id}"),
+            suite_ref=_authority_ref("benchmark-suite", input_id),
+            hermes_result_ref=_authority_ref("hermes-result", input_id),
+            booked_cost_usd=allocation,
+            checkpoint_refs=(_authority_ref("checkpoint", input_id),),
+        )
+        for index, (input_id, pattern, allocation) in enumerate(
+            zip(input_ids, patterns, allocations, strict=True)
+        )
+    )
+    first = capabilities[0]
+    evidence = CapabilityLiveDemoEvidence(
+        run_id=run_id,
+        maximum_cost_usd=Decimal("1.00"),
+        booked_cost_usd=Decimal("1.00"),
+        reservations=reservations,
+        capabilities=capabilities,
+        restart=CapabilityLiveRestartEvidence(
+            correlation_id=first.correlation_id,
+            capability_id=first.capability_id,
+            capability_version=first.capability_version,
+            execution_command_id=first.execution_command_id,
+            execution_result_id=first.execution_result_id,
+            projection_event_id=first.projection_event_id,
+            projection_readback_id=first.projection_readback_id,
+        ),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        evidence.model_dump_json(by_alias=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 @pytest.fixture
-def demo_repository(tmp_path: Path) -> tuple[Path, Path, Path]:
+def demo_repository(tmp_path: Path) -> tuple[Path, Path, str]:
     repository = tmp_path / "repository"
     scripts = repository / "scripts"
     scripts.mkdir(parents=True)
@@ -67,14 +153,14 @@ else:
 """.strip(),
         encoding="utf-8",
     )
-    return repository, copied, entrypoint
+    return repository, copied, "agenten.agent_factory.fake_entrypoint"
 
 
 def _invoke(
-    demo_repository: tuple[Path, Path, Path],
+    demo_repository: tuple[Path, Path, str],
     *arguments: str,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
-    repository, script, entrypoint = demo_repository
+    repository, script, entrypoint_module = demo_repository
     call_log = repository / ".captain-cook" / "test-calls.jsonl"
     environment = os.environ.copy()
     environment["CAPTAIN_TEST_CALL_LOG"] = str(call_log)
@@ -89,8 +175,8 @@ def _invoke(
             str(repository),
             "-PythonExecutable",
             sys.executable,
-            "-EntrypointPath",
-            str(entrypoint),
+            "-EntrypointModule",
+            entrypoint_module,
         ],
         cwd=repository,
         env=environment,
@@ -114,7 +200,7 @@ def _invoke(
     ],
 )
 def test_paid_authorization_and_three_reservations_fail_before_entrypoint(
-    demo_repository: tuple[Path, Path, Path],
+    demo_repository: tuple[Path, Path, str],
     arguments: tuple[str, ...],
 ) -> None:
     result, call_log = _invoke(demo_repository, *arguments)
@@ -124,7 +210,7 @@ def test_paid_authorization_and_three_reservations_fail_before_entrypoint(
 
 
 def test_wrapper_selects_exact_repository_inputs_runs_and_revalidates_evidence(
-    demo_repository: tuple[Path, Path, Path],
+    demo_repository: tuple[Path, Path, str],
 ) -> None:
     repository, _, _ = demo_repository
 
@@ -152,7 +238,7 @@ def test_wrapper_selects_exact_repository_inputs_runs_and_revalidates_evidence(
 
 
 def test_missing_canonical_input_stops_before_entrypoint(
-    demo_repository: tuple[Path, Path, Path],
+    demo_repository: tuple[Path, Path, str],
 ) -> None:
     repository, _, _ = demo_repository
     (repository / INPUTS[1]).unlink()
@@ -170,7 +256,7 @@ def test_missing_canonical_input_stops_before_entrypoint(
 
 
 def test_recording_requires_ffmpeg_before_entrypoint(
-    demo_repository: tuple[Path, Path, Path],
+    demo_repository: tuple[Path, Path, str],
 ) -> None:
     result, call_log = _invoke(
         demo_repository,
@@ -190,7 +276,7 @@ def test_recording_requires_ffmpeg_before_entrypoint(
 
 
 def test_recording_rejects_zero_exact_named_windows_before_entrypoint(
-    demo_repository: tuple[Path, Path, Path],
+    demo_repository: tuple[Path, Path, str],
 ) -> None:
     ffmpeg_probe = shutil.which("where.exe") or shutil.which("where")
     assert ffmpeg_probe is not None
@@ -210,3 +296,81 @@ def test_recording_rejects_zero_exact_named_windows_before_entrypoint(
     assert result.returncode != 0
     assert "exactly one named window" in (result.stdout + result.stderr)
     assert not call_log.exists()
+
+
+def test_real_wrapper_imports_the_real_entrypoint_as_a_repository_module(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    evidence = repository / ".captain-cook/live-demo/current/final-evidence.json"
+    _write_valid_real_entrypoint_evidence(evidence)
+
+    result = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(SCRIPT),
+            "verify",
+            "-RepositoryRoot",
+            str(repository),
+            "-PythonExecutable",
+            sys.executable,
+            "-EntrypointModule",
+            "agenten.agent_factory.capability_live_entrypoint",
+            "-EvidencePath",
+            str(evidence),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ready_to_use" in result.stdout
+    assert "ModuleNotFoundError" not in result.stdout + result.stderr
+
+
+def test_real_wrapper_reaches_production_composition_and_fails_before_provider(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    for relative in INPUTS:
+        path = repository / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# {path.parent.name}\n", encoding="utf-8")
+    evidence = repository / ".captain-cook/live-demo/current/final-evidence.json"
+
+    result = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(SCRIPT),
+            "start",
+            "-ConfirmProviderCost",
+            "-MaxCostUsd",
+            "1.00",
+            "-RepositoryRoot",
+            str(repository),
+            "-PythonExecutable",
+            sys.executable,
+            "-EntrypointModule",
+            "agenten.agent_factory.capability_live_entrypoint",
+            "-EvidencePath",
+            str(evidence),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "entrypoint failed with exit code 2" in result.stdout + result.stderr
+    assert "ModuleNotFoundError" not in result.stdout + result.stderr
+    assert not evidence.exists()
