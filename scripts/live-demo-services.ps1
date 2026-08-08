@@ -5,7 +5,10 @@ param(
     [ValidateSet("start", "status", "portal-start", "gateway-restart", "benchmark-start", "benchmark-restart", "health", "stop")]
     [string]$Action,
     [switch]$RecoverDemoCredentials,
-    [string]$CredentialSourceEnv
+    [string]$CredentialSourceEnv,
+    [string]$MinibookCommand = (Join-Path $PSScriptRoot 'minibook-demo.ps1'),
+    [scriptblock]$CaptainStartProbe,
+    [scriptblock]$StatusProbe
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -442,19 +445,26 @@ function Assert-RuntimeConfiguration($Values) {
     if ($LASTEXITCODE -ne 0) { throw 'Production Runtime configuration is unavailable; no services were started.' }
 }
 function Invoke-StartServices([switch]$RecoverDemoCredentials, [string]$SourceEnv) {
-    $values = Initialize-LocalEnvironment
-    Set-ProcessEnvironment $values
-    Assert-RuntimeConfiguration $values
-    Initialize-CaptainN8n $values -Recover:$RecoverDemoCredentials -SourceEnv $SourceEnv
-    docker compose --project-name $project --env-file $rootEnv --file $testCompose up -d --wait mariadb-test
-    if ($LASTEXITCODE -ne 0) { throw 'Isolated captain_test MariaDB failed to start.' }
-    Start-Gateway $values
-    Start-CaptainN8nBroker $values
-    Start-Runtime $values
-    docker compose --env-file $rootEnv up -d --wait mailpit
-    if ($LASTEXITCODE -ne 0) { throw 'Captain Mailpit failed to start.' }
-    & (Join-Path $PSScriptRoot 'minibook-demo.ps1') bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials
-    Invoke-Health
+    if ($null -ne $CaptainStartProbe) {
+        $values = [ordered]@{}
+        & $CaptainStartProbe $values
+    } else {
+        $values = Initialize-LocalEnvironment
+        Set-ProcessEnvironment $values
+        Assert-RuntimeConfiguration $values
+        Initialize-CaptainN8n $values -Recover:$RecoverDemoCredentials -SourceEnv $SourceEnv
+        docker compose --project-name $project --env-file $rootEnv --file $testCompose up -d --wait mariadb-test
+        if ($LASTEXITCODE -ne 0) { throw 'Isolated captain_test MariaDB failed to start.' }
+        Start-Gateway $values
+        Start-CaptainN8nBroker $values
+        Start-Runtime $values
+        docker compose --env-file $rootEnv up -d --wait mailpit
+        if ($LASTEXITCODE -ne 0) { throw 'Captain Mailpit failed to start.' }
+    }
+    $global:LASTEXITCODE = 0
+    & $MinibookCommand start
+    if ($LASTEXITCODE -ne 0) { throw 'Minibook start failed.' }
+    if ($null -ne $StatusProbe) { & $StatusProbe } else { Invoke-Health }
 }
 function Invoke-PortalStart([switch]$RecoverDemoCredentials, [string]$SourceEnv) {
     $values = Initialize-LocalEnvironment
@@ -511,7 +521,7 @@ function Invoke-Health {
     if (-not $values.Contains('CAPTAIN_RUNTIME_URL')) { throw 'Runtime URL is not configured.' }
     if (-not (Get-ManagedRuntimeProcess)) { throw 'Managed Runtime process is not running.' }
     if ((Invoke-WebRequest "$($values['CAPTAIN_RUNTIME_URL'])/health" -UseBasicParsing -TimeoutSec 3).StatusCode -ne 200) { throw 'Runtime health check failed.' }
-    & (Join-Path $PSScriptRoot 'minibook-demo.ps1') status
+    & $MinibookCommand status
     & (Join-Path $PSScriptRoot 'demo-preflight.ps1') -EnvFile $rootEnv
     $summary = [ordered]@{schema='captain.live-demo-services.v1';checked_at=(Get-Date).ToUniversalTime().ToString('o');status='ready';secrets='redacted';database='captain_test';services=@('gateway','runtime','minibook','captain-n8n-rest','captain-n8n-mcp','mailpit')}
     New-Item -ItemType Directory -Force (Split-Path $evidence -Parent) | Out-Null

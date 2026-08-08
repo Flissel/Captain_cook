@@ -303,6 +303,54 @@ def test_minibook_demo_initializes_projection_key_after_valid_identity(
     assert projection_key not in output
 
 
+def test_service_start_never_bootstraps_minibook(tmp_path: Path) -> None:
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    service_script = script_dir / "live-demo-services.ps1"
+    minibook_child = script_dir / "minibook-demo.ps1"
+    shutil.copy2(SERVICES, service_script)
+    shutil.copy2(MANAGED_PROCESS, script_dir / "managed-process-identity.ps1")
+    minibook_child.write_text(
+        "\n".join(
+            (
+                "param([string]$Action)",
+                "if ($Action -eq 'bootstrap') { Write-Output 'bootstrap-called'; exit 7 }",
+                "if ($Action -ne 'start') { throw 'unexpected Minibook action' }",
+                "Write-Output ('minibook-child action=' + $Action)",
+            )
+        ),
+        encoding="utf-8",
+    )
+    harness = tmp_path / "run-service-start.ps1"
+    harness.write_text(
+        "\n".join(
+            (
+                "$ErrorActionPreference = 'Stop'",
+                f"& '{service_script.as_posix()}' start `",
+                f"  -MinibookCommand '{minibook_child.as_posix()}' `",
+                "  -CaptainStartProbe { param($values) Write-Output 'captain-start-probe' } `",
+                "  -StatusProbe { Write-Output 'status-probe' }",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "captain-start-probe" in output
+    assert "minibook-child action=start" in output
+    assert "bootstrap-called" not in output
+
+
 def test_live_demo_services_only_operates_captain_resources() -> None:
     source = SERVICES.read_text(encoding="utf-8")
     assert "$global:LASTEXITCODE = 0" in source
@@ -369,7 +417,8 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "docker stop" in source
     assert "com.docker.compose.project=captain-n8n-builder" in source
     assert "application/json, text/event-stream" in PREFLIGHT.read_text(encoding="utf-8")
-    assert "bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials" in source
+    assert "& $MinibookCommand start" in source
+    assert "bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials" not in source
     assert "OPENAI" not in source.upper()
     assert source.index("Initialize-CaptainN8n $values") < source.index("mariadb-test")
     lowered = source.lower()

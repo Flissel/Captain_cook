@@ -21,6 +21,7 @@ def _write_child(path: Path, name: str) -> None:
                 ")",
                 "$ErrorActionPreference = 'Stop'",
                 f"if ($env:LIVE_DEMO_FAIL_CHILD -eq ('{name}:' + $Action)) {{ throw 'forced {name} failure' }}",
+                f"if ($env:LIVE_DEMO_EXIT_CHILD -eq ('{name}:' + $Action)) {{ exit 7 }}",
                 "if ($Action -notin @('start', 'status')) { throw 'unexpected action' }",
                 f"Write-Output ('child-called {name} action=' + $Action + ' identity={name}-stable-id endpoint=http://127.0.0.1/{'7011' if name == 'service' else '7012'} status=ready')",
             ]
@@ -177,3 +178,20 @@ def test_child_failure_never_prints_green_summary(
 
     assert result.returncode != 0
     assert "[ready] Live demo infrastructure is healthy" not in result.stdout
+
+
+def test_child_exit_code_stops_before_later_children_and_summary(
+    start_script: Path, child_commands: tuple[Path, Path, Path]
+) -> None:
+    result = invoke_start_script(
+        start_script,
+        child_commands,
+        env={"LIVE_DEMO_EXIT_CHILD": "service:status"},
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "child-called service action=start" in output
+    assert "child-called service action=status" not in output
+    assert "child-called minibook" not in output
+    assert "[ready] Live demo infrastructure is healthy" not in output
