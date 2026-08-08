@@ -211,3 +211,24 @@ def test_cross_contract_binding_rejects_identity_drift() -> None:
     response = FactoryActionResponseV1.model_validate(json.loads((FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8")) | {"request_id": "00000000-0000-0000-0000-000000000699"})
     with pytest.raises(ValueError, match="identity drift"):
         validate_action_response_binding(request, response)
+
+
+def test_metadata_uses_token_secret_detection_without_rejecting_long_prose() -> None:
+    payload = json.loads((FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8"))
+    prose = "This is a display-safe explanation with ordinary words and spaces. " * 4
+    assert FactoryActionResponseV1.model_validate(payload | {"answer_metadata": {"note": prose}}).answer_metadata["note"] == prose
+    with pytest.raises(ValidationError, match="secret-like"):
+        FactoryActionResponseV1.model_validate(payload | {"answer_metadata": {"note": "Y7pL2vQ9xN4mR8sT6uW3aB5cD1eF0gHk"}})
+    with pytest.raises(ValidationError, match="secret-like"):
+        FactoryActionResponseV1.model_validate(payload | {"answer_metadata": {"note": "a" * 64}})
+    assert FactoryActionResponseV1.model_validate(payload | {"answer_metadata": {"sha256": "a" * 64}}).answer_metadata["sha256"] == "a" * 64
+    assert FactoryActionResponseV1.model_validate(payload | {"answer_metadata": {"run_id": "2f1d8c50-4a7a-4d94-91fb-77a1ed58ba23"}}).answer_metadata["run_id"]
+
+
+def test_assignment_rejects_pathful_executables() -> None:
+    payload = json.loads((FIXTURES / "hermes_factory_assignment.v2.json").read_text(encoding="utf-8"))
+    for command in (["tools/python.exe", "-m", "pytest"], ["tools\\python.exe", "-m", "pytest"], ["./python", "-m", "pytest"], ["tools/pytest.cmd"]):
+        with pytest.raises(ValidationError, match="allowed command"):
+            FactoryBuildAssignmentV2.model_validate(payload | {"allowed_commands": [command]})
+    with pytest.raises(ValidationError, match="allowed command"):
+        FactoryBuildAssignmentV2.model_validate(payload | {"allowed_commands": [["python", "-m", "pytest", "."]]})

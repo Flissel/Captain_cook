@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from math import log2
 import re
 from datetime import datetime, timezone
 from typing import Literal
@@ -500,9 +501,9 @@ class FactoryBuildAssignmentV2(_FrozenContract):
         if any(x.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", x) or ".." in x.replace("\\", "/").split("/") for x in self.allowed_output_roots): raise ValueError("output roots must be relative")
         for command in self.allowed_commands:
             if not command or any(not x.strip() for x in command): raise ValueError("allowed command must contain nonblank argv")
-            executable = re.sub(r"(?i)\.(exe|cmd|bat)$", "", command[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]).lower()
-            allowed = (executable == "python" and len(command) >= 3 and command[1:3] in (("-m", "pytest"), ("-m", "compileall"))) or executable == "pytest"
-            if not allowed or any(re.search(r"[|&;*?`$<>]", x) or x.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", x) or ".." in x.replace("\\", "/").split("/") for x in command): raise ValueError("allowed command has unsafe argv")
+            executable = command[0]
+            allowed = (executable in {"python", "python.exe", "python3", "python3.exe"} and len(command) >= 3 and command[1:3] in (("-m", "pytest"), ("-m", "compileall"))) or executable in {"pytest", "pytest.exe"}
+            if not allowed or any(re.search(r"[|&;*?`$<>]", x) or x.startswith(("/", "\\", ".")) or re.match(r"^[A-Za-z]:", x) or any(part in {".", ".."} for part in x.replace("\\", "/").split("/")) for x in command): raise ValueError("allowed command has unsafe argv")
         if self.lease_ref.media_type != "application/json": raise ValueError("lease ref must be application/json")
         if self.deadline_at.tzinfo is None or self.deadline_at.utcoffset() != timezone.utc.utcoffset(self.deadline_at): raise ValueError("deadline_at must be UTC")
         return self
@@ -535,17 +536,30 @@ class CreationResultV2(_FrozenContract):
         return self
 
 
-def _reject_secret_like_content(value: object) -> object:
+def _is_explicit_digest_key(key: str | None) -> bool:
+    return key is not None and bool(re.fullmatch(r"(?:[a-z0-9]+_)*(?:sha256|digest)(?:_[a-z0-9]+)*", key.casefold()))
+
+
+def _is_opaque_secret_token(value: str, key: str | None) -> bool:
+    if re.fullmatch(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}", value): return False
+    if key is not None and (key.casefold() == "id" or key.casefold().endswith("_id")) and re.fullmatch(IDENTIFIER_PATTERN, value): return False
+    if re.fullmatch(r"[0-9a-fA-F]{32,}", value): return not _is_explicit_digest_key(key)
+    if not re.fullmatch(r"[A-Za-z0-9_+/-]{32,}={0,2}", value): return False
+    entropy = -sum((value.count(character) / len(value)) * log2(value.count(character) / len(value)) for character in set(value))
+    return entropy >= 3.5
+
+
+def _reject_secret_like_content(value: object, *, key: str | None = None) -> object:
     forbidden = r"(?i)(api.?key|authorization|password|secret|token|prompt|holdout|provider.?response|credential|private.?key)"
     if isinstance(value, dict):
         for key, item in value.items():
             if str(key) != "credential_alias" and re.search(forbidden, str(key)): raise ValueError("secret-like metadata is forbidden")
-            _reject_secret_like_content(item)
+            _reject_secret_like_content(item, key=str(key))
     elif isinstance(value, (list, tuple)):
-        for item in value: _reject_secret_like_content(item)
+        for item in value: _reject_secret_like_content(item, key=key)
     elif isinstance(value, str):
         if value.startswith("credential://") or re.search(r"(?i)(bearer\s+|basic\s+[A-Za-z0-9+/=]+|(?:api[_ -]?key|password|secret|token|credential)\s*=|private.?key|system.?prompt|provider.?response|holdout|\bsk_(?:live|test)_[A-Za-z0-9_-]+|\bsk-proj-[A-Za-z0-9_-]+|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bgh[pours]_[A-Za-z0-9_-]+|\bxox[a-z]-[A-Za-z0-9-]+|\bAIza[A-Za-z0-9_-]+)", value) or re.fullmatch(r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}", value): raise ValueError("secret-like metadata is forbidden")
-        if len(value) > 128 and not re.fullmatch(SHA256_PATTERN, value) and not re.fullmatch(IDENTIFIER_PATTERN, value) and not re.fullmatch(r"https?://[^\s]+", value): raise ValueError("secret-like metadata is forbidden")
+        if _is_opaque_secret_token(value, key): raise ValueError("secret-like metadata is forbidden")
     return value
 
 
