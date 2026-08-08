@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import sys
@@ -11,7 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType, ModuleType
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, BinaryIO, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -70,15 +71,20 @@ def _sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _read_required_file(path: Path, *, description: str) -> bytes:
+def _canonical_repository_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _normalize_requested_path(value: str | Path, *, repository_root: Path) -> Path:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = repository_root / candidate
     try:
-        if not path.is_file():
-            raise RuntimeAdapterManifestError(f"{description} file is missing")
-        return path.read_bytes()
-    except RuntimeAdapterManifestError:
-        raise
+        return Path(os.path.abspath(candidate))
     except OSError:
-        raise RuntimeAdapterManifestError(f"{description} file could not be read") from None
+        raise RuntimeAdapterManifestError(
+            "runtime adapter path could not be normalized"
+        ) from None
 
 
 def _require_sha256(value: str, *, description: str) -> str:
@@ -89,30 +95,138 @@ def _require_sha256(value: str, *, description: str) -> str:
     return value
 
 
-def _resolve_scoped_path(
-    value: str | Path,
+def _require_authorized_path(
+    path: Path,
     *,
     repository_root: Path,
     description: str,
 ) -> Path:
-    candidate = Path(value)
-    if not candidate.is_absolute():
-        candidate = repository_root / candidate
-    try:
-        resolved = candidate.resolve(strict=False)
-    except OSError:
-        raise RuntimeAdapterManifestError(f"{description} path could not be resolved") from None
-    runtime_root = (repository_root / ".captain-cook" / "runtime-adapters").resolve(
-        strict=False
-    )
+    runtime_root = repository_root / ".captain-cook" / "runtime-adapters"
     if not (
-        resolved.is_relative_to(repository_root)
-        or resolved.is_relative_to(runtime_root)
+        path.is_relative_to(repository_root)
+        or path.is_relative_to(runtime_root)
     ):
         raise RuntimeAdapterManifestError(
             f"{description} path is outside the allowed repository/runtime roots"
         )
-    return resolved
+    return path
+
+
+def _windows_final_path_for_open_file(stream: BinaryIO) -> Path:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    get_final_path = ctypes.WinDLL(
+        "kernel32",
+        use_last_error=True,
+    ).GetFinalPathNameByHandleW
+    get_final_path.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    )
+    get_final_path.restype = wintypes.DWORD
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_final_path(
+        msvcrt.get_osfhandle(stream.fileno()),
+        buffer,
+        len(buffer),
+        0,
+    )
+    if length == 0 or length >= len(buffer):
+        raise RuntimeAdapterManifestError(
+            "runtime adapter file final path could not be verified"
+        )
+    value = buffer.value
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value)
+
+
+def _final_path_for_open_file(
+    stream: BinaryIO,
+    *,
+    requested_path: Path,
+) -> Path:
+    if os.name == "nt":
+        return _windows_final_path_for_open_file(stream)
+    proc_path = Path("/proc/self/fd") / str(stream.fileno())
+    try:
+        final_path = os.readlink(proc_path)
+    except OSError:
+        raise RuntimeAdapterManifestError(
+            "runtime adapter file final path could not be verified"
+        ) from None
+    if final_path.endswith(" (deleted)"):
+        raise RuntimeAdapterManifestError(
+            "runtime adapter file final path could not be verified"
+        )
+    del requested_path
+    return Path(final_path)
+
+
+def _read_authorized_file(
+    value: str | Path,
+    *,
+    repository_root: Path,
+    description: str,
+) -> tuple[Path, bytes]:
+    requested_path = _normalize_requested_path(
+        value,
+        repository_root=repository_root,
+    )
+    _require_authorized_path(
+        requested_path,
+        repository_root=repository_root,
+        description=description,
+    )
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+    if os.name != "nt":
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(requested_path, flags)
+    except FileNotFoundError:
+        raise RuntimeAdapterManifestError(f"{description} file is missing") from None
+    except OSError:
+        raise RuntimeAdapterManifestError(
+            f"{description} file could not be opened"
+        ) from None
+
+    try:
+        stream = os.fdopen(descriptor, "rb", closefd=True)
+    except Exception:
+        os.close(descriptor)
+        raise RuntimeAdapterManifestError(
+            f"{description} file could not be opened"
+        ) from None
+    with stream:
+        try:
+            final_path = _final_path_for_open_file(
+                stream,
+                requested_path=requested_path,
+            )
+        except RuntimeAdapterManifestError:
+            raise
+        except Exception:
+            raise RuntimeAdapterManifestError(
+                f"{description} final path could not be verified"
+            ) from None
+        _require_authorized_path(
+            final_path,
+            repository_root=repository_root,
+            description=description,
+        )
+        try:
+            content = stream.read()
+        except OSError:
+            raise RuntimeAdapterManifestError(
+                f"{description} file could not be read"
+            ) from None
+    return final_path, content
 
 
 def _parse_manifest(content: bytes) -> RuntimeAdapterManifest:
@@ -149,16 +263,38 @@ def _validate_binding(value: object) -> RuntimeAdapterBinding:
         raise RuntimeAdapterManifestError(
             "runtime adapter factory returned an invalid binding"
         )
-    required_ports = (
-        ("HermesPlannerPort", value.hermes, HermesPlannerPort),
-        ("CodexExecutionPort", value.codex, CodexExecutionPort),
-        ("ArtifactPort", value.artifacts, ArtifactPort),
+    required_methods = (
+        ("HermesPlannerPort", value.hermes, "plan", 2),
+        ("HermesPlannerPort", value.hermes, "design_agent", 2),
+        ("CodexExecutionPort", value.codex, "start", 2),
+        ("CodexExecutionPort", value.codex, "resume", 2),
+        ("CodexExecutionPort", value.codex, "status", 2),
+        ("CodexExecutionPort", value.codex, "cancel", 2),
+        ("CodexExecutionPort", value.codex, "heartbeat", 2),
+        ("ArtifactPort", value.artifacts, "require", 1),
     )
-    for name, adapter, port in required_ports:
-        if not isinstance(adapter, port):
+    for port_name, adapter, method_name, argument_count in required_methods:
+        qualified_name = f"{port_name}.{method_name}"
+        try:
+            method = getattr(adapter, method_name)
+        except Exception:
             raise RuntimeAdapterManifestError(
-                f"runtime adapter binding does not implement {name}"
+                f"runtime adapter binding does not implement {qualified_name}"
+            ) from None
+        if not callable(method):
+            raise RuntimeAdapterManifestError(
+                f"runtime adapter binding {qualified_name} must be callable"
             )
+        if not inspect.iscoroutinefunction(method):
+            raise RuntimeAdapterManifestError(
+                f"runtime adapter binding {qualified_name} must be async"
+            )
+        try:
+            inspect.signature(method).bind(*([object()] * argument_count))
+        except (TypeError, ValueError):
+            raise RuntimeAdapterManifestError(
+                f"runtime adapter binding {qualified_name} has an invalid signature"
+            ) from None
     return value
 
 
@@ -171,19 +307,14 @@ def load_runtime_adapters(
 ) -> RuntimeAdapterBinding:
     """Validate exact manifest/module bytes, then invoke and verify their factory."""
 
-    requested_manifest = Path(manifest_path)
-    if repository_root is None:
-        requested_manifest = requested_manifest.resolve(strict=False)
-        root = requested_manifest.parent
-    else:
-        root = repository_root.resolve(strict=False)
-    resolved_manifest = _resolve_scoped_path(
-        requested_manifest,
-        repository_root=root,
-        description="runtime adapter manifest",
+    root = (
+        _canonical_repository_root()
+        if repository_root is None
+        else repository_root.resolve(strict=False)
     )
-    manifest_content = _read_required_file(
-        resolved_manifest,
+    _, manifest_content = _read_authorized_file(
+        manifest_path,
+        repository_root=root,
         description="runtime adapter manifest",
     )
     expected_manifest_digest = _require_sha256(
@@ -194,13 +325,9 @@ def load_runtime_adapters(
         raise RuntimeAdapterManifestError("runtime adapter manifest digest mismatch")
 
     manifest = _parse_manifest(manifest_content)
-    module_path = _resolve_scoped_path(
+    module_path, module_content = _read_authorized_file(
         manifest.module_path,
         repository_root=root,
-        description="runtime adapter module",
-    )
-    module_content = _read_required_file(
-        module_path,
         description="runtime adapter module",
     )
     if not hmac.compare_digest(_sha256(module_content), manifest.module_sha256):
