@@ -76,7 +76,13 @@ from agenten.agent_factory.skill_workflow_contracts import (
     TeamExecutionEvidenceV1,
 )
 from agenten.agent_factory.forge_contracts import FactoryBuildAssignmentV1
-from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
+from agenten.agent_runtime.contracts import (
+    AgentRuntimeCommand,
+    ArtifactRef,
+    CapabilityGrant,
+    HermesPlanResult,
+    IntegrationIntent,
+)
 
 if TYPE_CHECKING:
     from agenten.agent_factory.candidate_evaluation import FactoryCandidateEvaluationResult
@@ -355,6 +361,84 @@ class HermesCliFactory(HermesFactoryPort):
     @property
     def observed_cost_usd(self) -> Decimal:
         return self._observed_cost_usd
+
+    def validate_runtime_skill(
+        self,
+        *,
+        skill_name: str,
+        released_skill_sha256: str,
+    ) -> None:
+        """Require exact local bytes for Captain's released runtime skill."""
+
+        if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", skill_name) is None:
+            raise FactoryDispatchError("released runtime skill name is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", released_skill_sha256) is None:
+            raise FactoryDispatchError("released runtime skill digest is invalid")
+        root = self._settings.skill_root.resolve()
+        directory = (root / skill_name).resolve()
+        try:
+            directory.relative_to(root)
+        except ValueError as exc:
+            raise FactoryDispatchError(
+                "released runtime skill directory is outside its root"
+            ) from exc
+        if not directory.is_dir() or not (directory / "SKILL.md").is_file():
+            raise FactoryDispatchError("released runtime skill directory is missing")
+        if _skill_directory_digest(directory) != released_skill_sha256:
+            raise FactoryDispatchError(
+                "released runtime skill digest does not match Captain's release"
+            )
+
+    async def runtime_plan(
+        self,
+        command: AgentRuntimeCommand,
+        grant: CapabilityGrant,
+        prompt: str,
+        *,
+        skill_name: str,
+        released_skill_sha256: str,
+    ) -> HermesPlanResult:
+        """Invoke current Hermes CLI handling and accept only the runtime plan."""
+
+        self.validate_runtime_skill(
+            skill_name=skill_name,
+            released_skill_sha256=released_skill_sha256,
+        )
+        if (
+            grant.command_id != command.event_id
+            or grant.profile != command.payload.capability_profile
+            or grant.workspace_ref
+            != (command.payload.workspace_ref or grant.workspace_ref)
+        ):
+            raise FactoryDispatchError("Hermes runtime grant does not match command")
+        envelope = {
+            "instruction": (
+                "Return exactly one captain.hermes-plan-result.v1 JSON object. "
+                "Use only opaque artifact/workspace references and never reproduce "
+                "the prompt, provider response, credentials, endpoints, or local paths."
+            ),
+            "command": command.model_dump(mode="json", by_alias=True),
+            "grant": grant.model_dump(mode="json", by_alias=True),
+            "prompt": prompt,
+        }
+        stdout = await self._run_skill_prompt(
+            _canonical_json(envelope),
+            max_seconds=float(command.payload.limits.wall_seconds),
+            skill_name=skill_name,
+        )
+        try:
+            result = HermesPlanResult.model_validate(_parse_evidence_payload(stdout))
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise FactoryDispatchError(
+                "Hermes must return exactly one typed runtime plan"
+            ) from exc
+        if (
+            result.correlation_id != command.correlation_id
+            or result.project_id != command.payload.project_id
+            or result.subject_version != command.subject_version
+        ):
+            raise FactoryDispatchError("Hermes runtime plan changed Captain authority")
+        return result
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
         if request.role is None or request.lease is None:
