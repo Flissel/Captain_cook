@@ -20,18 +20,29 @@ def run_minibook_harness(
     env: dict[str, str],
     command: str,
     identity_status: int = 200,
+    health_results: tuple[bool, ...] = (True,),
+    expect_ephemeral_projection: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     script_dir = tmp_path / "scripts"
     script_dir.mkdir()
     demo_script = script_dir / "minibook-demo.ps1"
     shutil.copy2(MINIBOOK, demo_script)
 
+    health_values = ", ".join("$true" if result else "$false" for result in health_results)
+    expected_ephemeral = "$true" if expect_ephemeral_projection else "$false"
+    start_probe_argument = (
+        " -ServiceStartProbe $serviceStartProbe"
+        if health_results != (True,)
+        else ""
+    )
     harness = tmp_path / "run-minibook.ps1"
     harness.write_text(
         "\n".join(
             (
                 "$ErrorActionPreference = 'Stop'",
-                "$healthProbe = { param([string]$url) Write-Host \"PROBE health $url\"; $true }",
+                "$healthResults = [Collections.Generic.Queue[bool]]::new()",
+                f"foreach ($healthResult in @({health_values})) {{ [void]$healthResults.Enqueue($healthResult) }}",
+                "$healthProbe = { param([string]$url) $healthy = if ($healthResults.Count -gt 1) { $healthResults.Dequeue() } else { $healthResults.Peek() }; Write-Host \"PROBE health $url\"; $healthy }.GetNewClosure()",
                 (
                     "$identityProbe = { param([string]$url, [string]$apiKey) "
                     "Write-Host \"PROBE identity $url\"; "
@@ -39,11 +50,19 @@ def run_minibook_harness(
                     "@{ name = 'captain-demo-service' } }"
                 ),
                 "$agentRegistrationProbe = { param([string]$url) Write-Host 'PROBE agent-registration'; throw 'agent registration must not be called' }",
+                "$serviceStartProbe = {",
+                "  param([string]$python, [string]$workingDirectory, [string]$projectionApiKey)",
+                "  if ([string]::IsNullOrWhiteSpace($projectionApiKey)) { throw 'empty ephemeral projection key' }",
+                "  $envFile = Join-Path (Get-Location) '.env'",
+                f"  if ({expected_ephemeral} -and (Get-Content $envFile -Raw) -match '(?m)^CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY=') {{ throw 'projection key persisted before identity' }}",
+                "  Write-Host 'PROBE start projection-present'",
+                "  Get-Process -Id $PID",
+                "}",
                 "try {",
                 (
                     f"  & '{demo_script.as_posix()}' {command} "
                     "-HealthProbe $healthProbe -IdentityProbe $identityProbe "
-                    "-AgentRegistrationProbe $agentRegistrationProbe"
+                    f"-AgentRegistrationProbe $agentRegistrationProbe{start_probe_argument}"
                 ),
                 "  exit 0",
                 "} catch {",
@@ -193,15 +212,58 @@ def test_minibook_demo_rejects_invalid_identity_before_creating_projection_key(
         env={"MINIBOOK_BACKEND_URL": "http://127.0.0.1:4456"},
         command="bootstrap",
         identity_status=401,
+        health_results=(False, True),
+        expect_ephemeral_projection=True,
     )
     output = result.stdout + result.stderr
 
     assert result.returncode != 0
     assert "fixture-service-key-only" not in output
     assert "PROBE health http://127.0.0.1:4456/health" in output
+    assert "PROBE start projection-present" in output
     assert "PROBE identity http://127.0.0.1:4456/api/v1/agents/me" in output
     assert "PROBE agent-registration" not in output
     assert env_file.read_bytes() == credential_bytes
+
+
+def test_minibook_demo_starts_with_ephemeral_projection_key_before_persisting(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / ".env"
+    credential_bytes = b"CAPTAIN_DEMO_MINIBOOK_API_KEY=fixture-valid-service-key\r\n"
+    env_file.write_bytes(credential_bytes)
+
+    result = run_minibook_harness(
+        tmp_path,
+        env={"MINIBOOK_BACKEND_URL": "http://127.0.0.1:4456"},
+        command="bootstrap",
+        health_results=(False, True),
+        expect_ephemeral_projection=True,
+    )
+    output = result.stdout + result.stderr
+    saved_credentials = env_file.read_text(encoding="utf-8")
+    projection_lines = [
+        line
+        for line in saved_credentials.splitlines()
+        if line.startswith("CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY=")
+    ]
+    health_probe = "PROBE health http://127.0.0.1:4456/health"
+
+    assert result.returncode == 0, output
+    assert "fixture-valid-service-key" not in output
+    assert output.index(health_probe) < output.index("PROBE start projection-present")
+    assert output.index("PROBE start projection-present") < output.index(
+        health_probe, output.index(health_probe) + 1
+    )
+    assert output.index(health_probe, output.index(health_probe) + 1) < output.index(
+        "PROBE identity http://127.0.0.1:4456/api/v1/agents/me"
+    )
+    assert "PROBE agent-registration" not in output
+    assert "CAPTAIN_DEMO_MINIBOOK_API_KEY=fixture-valid-service-key" in saved_credentials
+    assert len(projection_lines) == 1
+    projection_key = projection_lines[0].split("=", 1)[1]
+    assert len(projection_key) == 64
+    assert projection_key not in output
 
 
 def test_minibook_demo_initializes_projection_key_after_valid_identity(

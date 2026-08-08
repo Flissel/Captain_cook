@@ -7,7 +7,8 @@ param(
     [switch]$RecoverDemoCredentials,
     [scriptblock]$HealthProbe,
     [scriptblock]$IdentityProbe,
-    [scriptblock]$AgentRegistrationProbe
+    [scriptblock]$AgentRegistrationProbe,
+    [scriptblock]$ServiceStartProbe
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -71,6 +72,12 @@ if ($null -eq $AgentRegistrationProbe) {
         Invoke-RestMethod $RegistrationUrl -Method Post -ContentType 'application/json' -Body (@{name=$Name}|ConvertTo-Json) -TimeoutSec 5
     }
 }
+if ($null -eq $ServiceStartProbe) {
+    $ServiceStartProbe = {
+        param([string]$PythonPath, [string]$WorkingDirectory, [string]$ProjectionApiKey)
+        Start-Process $PythonPath -ArgumentList 'run.py' -WorkingDirectory $WorkingDirectory -WindowStyle Hidden -PassThru
+    }
+}
 
 function Read-Env {
     $values = [ordered]@{}
@@ -114,7 +121,7 @@ function Start-Service($values) {
     $env:MINIBOOK_PROJECTION_API_KEY = $projectionApiKey
     New-Item -ItemType Directory -Force $stateDir | Out-Null
     $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python.exe -CommandType Application).Source }
-    $process = Start-Process $python -ArgumentList 'run.py' -WorkingDirectory (Join-Path $root 'minibook') -WindowStyle Hidden -PassThru
+    $process = & $ServiceStartProbe $python (Join-Path $root 'minibook') $projectionApiKey
     $identity = @{ pid=$process.Id; started_at=$process.StartTime.ToUniversalTime().ToString('o'); executable=$process.Path }
     [IO.File]::WriteAllText($pidFile, ($identity | ConvertTo-Json -Compress))
     foreach ($attempt in 1..60) { if (Test-Health) { Write-Host '[ready] Minibook local instance'; return }; Start-Sleep -Milliseconds 500 }
@@ -135,29 +142,32 @@ function Recover-ServiceCredential($values) {
     Save-Env $values
     Write-Host '[ready] Minibook demo service credential recovered locally (credential redacted)'
 }
-function Initialize-ProjectionCredential($values) {
+function Initialize-ProjectionCredential($values, [switch]$Persist) {
     $projectionApiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY']
     if ([string]::IsNullOrWhiteSpace($projectionApiKey)) {
         $projectionApiKey = [Convert]::ToHexString(
             [Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
         ).ToLowerInvariant()
         $values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY'] = $projectionApiKey
-        Save-Env $values
+        if ($Persist) { Save-Env $values }
+        return $true
     }
+    return $false
 }
 function Bootstrap-Service {
     $values = Read-Env
     $apiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_API_KEY']
     if ($apiKey) {
+        $projectionKeyWasMissing = Initialize-ProjectionCredential $values
         Start-Service $values
         try {
             $me = & $IdentityProbe "$baseUrl/api/v1/agents/me" $apiKey
             if ($me.name -ne $serviceName) { throw 'Configured Minibook key belongs to another identity.' }
         } catch { throw 'Configured CAPTAIN_DEMO_MINIBOOK_API_KEY is invalid; refusing to replace it.' }
-        Initialize-ProjectionCredential $values
+        if ($projectionKeyWasMissing) { Save-Env $values }
         Write-Host '[ready] Minibook demo service account reused (credential redacted)'; return
     }
-    Initialize-ProjectionCredential $values
+    $null = Initialize-ProjectionCredential $values -Persist
     Start-Service $values
     try {
         $created = & $AgentRegistrationProbe "$baseUrl/api/v1/agents" $serviceName
