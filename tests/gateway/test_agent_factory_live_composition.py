@@ -24,6 +24,7 @@ from agenten.agent_factory.orchestration import FactoryDispatcher
 from agenten.agent_factory.production_dispatch_runner import (
     ProductionFactoryDispatchRunner,
 )
+from agenten.agent_factory.service import FactoryCoordinator
 from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
 from gateway.agent_factory_live_composition import (
     CaptainImprovementAuthorityRequired,
@@ -101,6 +102,7 @@ def test_composes_real_factory_runner_without_provider_effects(tmp_path: Path) -
     )
 
     assert isinstance(composition.repository, GatewayFactoryRepository)
+    assert isinstance(composition.coordinator, FactoryCoordinator)
     assert isinstance(composition.lease_issuer, GatewayNextActionLeaseIssuer)
     assert isinstance(composition.hermes, HermesCliFactory)
     assert isinstance(composition.team_execution, ProductionFactoryTeamExecutionPort)

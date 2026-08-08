@@ -460,6 +460,7 @@ class AgentFactoryLiveComposition:
     """Inspectable graph; Captain-only transitions remain outside ``run``."""
 
     repository: GatewayFactoryRepository
+    coordinator: FactoryCoordinator
     lease_issuer: GatewayNextActionLeaseIssuer
     hermes: HermesCliFactory
     team_execution: ProductionFactoryTeamExecutionPort
@@ -469,6 +470,11 @@ class AgentFactoryLiveComposition:
     runner: ProductionFactoryDispatchRunner
     improvement_authority: FactoryImprovementAuthorizationPort
     runtime_retry_authority: FactoryRuntimeRetryAuthorizationPort | None
+
+    def projection(self, job_id: UUID) -> FactoryProjection:
+        """Expose Captain's derived state without recreating lifecycle decisions."""
+
+        return self.coordinator.projection(job_id)
 
     async def run(
         self,
@@ -593,6 +599,7 @@ def compose_agent_factory_live(
     )
     return AgentFactoryLiveComposition(
         repository=repository,
+        coordinator=coordinator,
         lease_issuer=lease_issuer,
         hermes=hermes,
         team_execution=team_execution,
