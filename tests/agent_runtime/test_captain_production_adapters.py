@@ -653,6 +653,56 @@ async def test_verified_operator_cancel_is_cancelled_despite_non_130_child_exit(
 
 
 @pytest.mark.asyncio
+async def test_verified_cancel_wins_when_child_result_arrives_before_cancel_returns(
+    tmp_path: Path,
+) -> None:
+    class ResultBeforeCancelOutcomeRunner(StreamingRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.result_ready = asyncio.Event()
+
+        async def run(self, invocation, observer):
+            result = await super().run(invocation, observer)
+            self.result_ready.set()
+            return result
+
+        async def cancel(self, session_id: str) -> str:
+            assert session_id == self.invocations[-1].session_id
+            self.cancel_calls += 1
+            self.exit_code = 17
+            self.release.set()
+            await self.result_ready.wait()
+            return "verified_cancelled"
+
+    runner = ResultBeforeCancelOutcomeRunner()
+    runner.block = True
+    adapter, execution, artifacts = _codex_adapter(tmp_path, runner)
+    prompt_ref = artifacts.put(b"result before verified cancel", "text/markdown")
+    original = _command(prompt_ref)
+    active = asyncio.create_task(adapter.start(original, _grant(original)))
+    await runner.started.wait()
+    cancel = _command(
+        prompt_ref,
+        operation="codex.cancel",
+        correlation_id=original.correlation_id,
+        causation_id=original.event_id,
+    )
+
+    cancelled, terminal = await asyncio.gather(
+        adapter.cancel(cancel, _grant(cancel)),
+        active,
+    )
+    evidence = execution.terminal_evidence(original.event_id)
+
+    assert cancelled.status is RuntimeStatus.CANCELLED
+    assert terminal.status is RuntimeStatus.CANCELLED
+    assert evidence is not None
+    assert evidence.exit_code == 130
+    assert evidence.process_cleanup_status == "verified_cancelled"
+    assert runner.cancel_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_cancelled_attempt_does_not_cancel_successful_resume_or_status(
     tmp_path: Path,
 ) -> None:

@@ -173,6 +173,12 @@ class _EventSummary:
         return canonical
 
 
+@dataclass
+class _RuntimeCodexAttempt:
+    cancellation_attempted: bool = False
+    operator_cancel_outcome: RuntimeCodexCancelOutcome | None = None
+
+
 class RuntimeCodexExecution:
     """Single-flight runtime state and immutable terminal recovery."""
 
@@ -182,9 +188,14 @@ class RuntimeCodexExecution:
         self._terminal: dict[UUID, RuntimeCodexTerminalEvidenceV1] = {}
         self._identity_index: dict[tuple[UUID, str, str, str, str], UUID] = {}
         self._sessions: dict[UUID, str] = {}
-        self._active: dict[UUID, tuple[str, asyncio.Task[RuntimeCodexTerminalEvidenceV1]]] = {}
-        self._cancelled: set[UUID] = set()
-        self._cancel_outcomes: dict[UUID, RuntimeCodexCancelOutcome] = {}
+        self._active: dict[
+            UUID,
+            tuple[
+                str,
+                asyncio.Task[RuntimeCodexTerminalEvidenceV1],
+                _RuntimeCodexAttempt,
+            ],
+        ] = {}
         self._lock = asyncio.Lock()
         self._owner_id = uuid4().hex
 
@@ -310,10 +321,12 @@ class RuntimeCodexExecution:
                     raise FactoryDispatchError("Codex cancellation target is unavailable")
                 return terminal
             task = active[1]
-            if command_id not in self._cancelled:
-                outcome = await self._runner.cancel(self._sessions[command_id])
-                self._cancel_outcomes[command_id] = outcome
-                self._cancelled.add(command_id)
+            attempt = active[2]
+            if not attempt.cancellation_attempted:
+                attempt.cancellation_attempted = True
+                attempt.operator_cancel_outcome = await self._runner.cancel(
+                    self._sessions[command_id]
+                )
         return await asyncio.shield(task)
 
     def terminal_evidence(self, command_id: UUID) -> RuntimeCodexTerminalEvidenceV1 | None:
@@ -360,8 +373,6 @@ class RuntimeCodexExecution:
         async with self._lock:
             if replace_checkpoint and invocation.command_id not in self._active:
                 self._terminal.pop(invocation.command_id, None)
-                self._cancelled.discard(invocation.command_id)
-                self._cancel_outcomes.pop(invocation.command_id, None)
             existing = self._terminal.get(invocation.command_id)
             if existing is None and not replace_checkpoint:
                 existing = self._load_checkpoint(invocation.command_id)
@@ -381,12 +392,19 @@ class RuntimeCodexExecution:
                     task = None
                 else:
                     self._sessions[invocation.command_id] = invocation.session_id
+                    attempt = _RuntimeCodexAttempt()
                     task = asyncio.create_task(
-                        self._run(invocation, observer, replace_checkpoint=replace_checkpoint)
+                        self._run(
+                            invocation,
+                            observer,
+                            attempt=attempt,
+                            replace_checkpoint=replace_checkpoint,
+                        )
                     )
                     self._active[invocation.command_id] = (
                         invocation.command_identity_sha256,
                         task,
+                        attempt,
                     )
         if task is None:
             return await self._wait_for_claim_owner(invocation)
@@ -517,6 +535,7 @@ class RuntimeCodexExecution:
         invocation: RuntimeCodexInvocation,
         observer: RuntimeCodexObserver,
         *,
+        attempt: _RuntimeCodexAttempt,
         replace_checkpoint: bool,
     ) -> RuntimeCodexTerminalEvidenceV1:
         summary = _EventSummary()
@@ -531,64 +550,73 @@ class RuntimeCodexExecution:
         try:
             result = await self._runner.run(invocation, observe)
         except Exception as exc:
-            cleanup: RuntimeCodexProcessCleanupStatus = "not_required"
-            if invocation.command_id not in self._cancelled:
-                try:
-                    outcome = await self._runner.cancel(invocation.session_id)
-                except Exception:
-                    outcome = "requested_unverified"
-                if outcome == "verified_cancelled":
-                    cleanup = "verified_cancelled"
-                elif outcome == "requested_unverified":
-                    cleanup = "unresolved"
-                self._cancelled.add(invocation.command_id)
-            result = RuntimeCodexProcessResult(
-                exit_code=70,
-                terminal_status="failed",
-                process_cleanup_status=cleanup,
-                elapsed_ms=0,
-                session_id=summary.session_id or invocation.session_id,
-                event_count=summary.count,
-                event_types=tuple(sorted(summary.types)),
-                last_event_sha256=summary.last_sha256,
-                failure_kind=(
-                    "observer_failed"
-                    if isinstance(exc, _RuntimeObserverFailed)
-                    else "output_read_failed"
-                ),
+            failure = exc
+            result = None
+        else:
+            failure = None
+        async with self._lock:
+            if result is None:
+                cleanup: RuntimeCodexProcessCleanupStatus = "not_required"
+                if not attempt.cancellation_attempted:
+                    attempt.cancellation_attempted = True
+                    try:
+                        outcome = await self._runner.cancel(invocation.session_id)
+                    except Exception:
+                        outcome = "requested_unverified"
+                    if outcome == "verified_cancelled":
+                        cleanup = "verified_cancelled"
+                    elif outcome == "requested_unverified":
+                        cleanup = "unresolved"
+                result = RuntimeCodexProcessResult(
+                    exit_code=70,
+                    terminal_status="failed",
+                    process_cleanup_status=cleanup,
+                    elapsed_ms=0,
+                    session_id=summary.session_id or invocation.session_id,
+                    event_count=summary.count,
+                    event_types=tuple(sorted(summary.types)),
+                    last_event_sha256=summary.last_sha256,
+                    failure_kind=(
+                        "observer_failed"
+                        if isinstance(failure, _RuntimeObserverFailed)
+                        else "output_read_failed"
+                    ),
+                )
+            if attempt.operator_cancel_outcome == "verified_cancelled":
+                result = RuntimeCodexProcessResult(
+                    exit_code=130,
+                    terminal_status="cancelled",
+                    process_cleanup_status="verified_cancelled",
+                    elapsed_ms=result.elapsed_ms,
+                    session_id=result.session_id,
+                    event_count=result.event_count,
+                    event_types=result.event_types,
+                    last_event_sha256=result.last_event_sha256,
+                )
+            if (
+                result.event_count != summary.count
+                or result.event_types != tuple(sorted(summary.types))
+                or result.last_event_sha256 != summary.last_sha256
+            ):
+                result = RuntimeCodexProcessResult(
+                    exit_code=70,
+                    terminal_status="failed",
+                    process_cleanup_status=result.process_cleanup_status,
+                    elapsed_ms=result.elapsed_ms,
+                    session_id=result.session_id,
+                    event_count=summary.count,
+                    event_types=tuple(sorted(summary.types)),
+                    last_event_sha256=summary.last_sha256,
+                    failure_kind="stream_mismatch",
+                )
+            evidence = self._terminal_evidence(
+                invocation,
+                result,
+                replace_checkpoint=replace_checkpoint,
             )
-        cancel_outcome = self._cancel_outcomes.get(invocation.command_id)
-        if cancel_outcome == "verified_cancelled":
-            result = RuntimeCodexProcessResult(
-                exit_code=130,
-                terminal_status="cancelled",
-                process_cleanup_status="verified_cancelled",
-                elapsed_ms=result.elapsed_ms,
-                session_id=result.session_id,
-                event_count=result.event_count,
-                event_types=result.event_types,
-                last_event_sha256=result.last_event_sha256,
-            )
-        if (
-            result.event_count != summary.count
-            or result.event_types != tuple(sorted(summary.types))
-            or result.last_event_sha256 != summary.last_sha256
-        ):
-            result = RuntimeCodexProcessResult(
-                exit_code=70,
-                terminal_status="failed",
-                process_cleanup_status=result.process_cleanup_status,
-                elapsed_ms=result.elapsed_ms,
-                session_id=result.session_id,
-                event_count=summary.count,
-                event_types=tuple(sorted(summary.types)),
-                last_event_sha256=summary.last_sha256,
-                failure_kind="stream_mismatch",
-            )
-        evidence = self._terminal_evidence(invocation, result, replace_checkpoint=replace_checkpoint)
-        self._sessions[invocation.command_id] = result.session_id
-        self._terminal[invocation.command_id] = evidence
-        return evidence
+            self._sessions[invocation.command_id] = result.session_id
+            self._terminal[invocation.command_id] = evidence
+            return evidence
 
     def _terminal_evidence(
         self,
