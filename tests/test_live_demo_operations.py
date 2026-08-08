@@ -150,6 +150,9 @@ def test_runtime_dependencies_install_hermes_streamable_http_transport() -> None
 
 
 def test_minibook_demo_prefers_configured_backend_url(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(
+        "CAPTAIN_DEMO_MINIBOOK_API_KEY=fixture-status-key\n", encoding="utf-8"
+    )
     result = run_minibook_harness(
         tmp_path,
         env={"MINIBOOK_BACKEND_URL": "http://127.0.0.1:4456"},
@@ -165,6 +168,9 @@ def test_minibook_demo_reads_port_from_local_configuration(tmp_path: Path) -> No
     config = tmp_path / "minibook" / "config.yaml"
     config.parent.mkdir()
     config.write_text("port: 3556\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "CAPTAIN_DEMO_MINIBOOK_API_KEY=fixture-status-key\n", encoding="utf-8"
+    )
 
     result = run_minibook_harness(tmp_path, env={}, command="status")
 
@@ -300,7 +306,7 @@ def test_minibook_demo_initializes_projection_key_after_valid_identity(
 def test_live_demo_services_only_operates_captain_resources() -> None:
     source = SERVICES.read_text(encoding="utf-8")
     assert "$global:LASTEXITCODE = 0" in source
-    assert 'ValidateSet("start", "portal-start", "gateway-restart", "benchmark-start"' in source
+    assert 'ValidateSet("start", "status", "portal-start", "gateway-restart", "benchmark-start"' in source
     assert "captain-n8n.ps1" in source
     assert "minibook-demo.ps1" in source
     assert "docker compose" in source

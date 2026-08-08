@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position=0)]
-    [ValidateSet("start", "portal-start", "gateway-restart", "benchmark-start", "benchmark-restart", "health", "stop")]
+    [ValidateSet("start", "status", "portal-start", "gateway-restart", "benchmark-start", "benchmark-restart", "health", "stop")]
     [string]$Action,
     [switch]$RecoverDemoCredentials,
     [string]$CredentialSourceEnv
@@ -538,6 +538,7 @@ try {
             Stop-ManagedGateway -PidPath $benchmarkGatewayPid
             Invoke-BenchmarkStart -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv
         }
+        status { Invoke-Health }
         health { Invoke-Health }
         stop {
             & (Join-Path $PSScriptRoot 'minibook-demo.ps1') stop

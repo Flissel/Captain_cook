@@ -112,6 +112,18 @@ function Save-Env($values) {
 function Test-Health {
     try { [bool](& $HealthProbe "$baseUrl/health") } catch { $false }
 }
+function Test-Identity($values) {
+    $apiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_API_KEY']
+    if ([string]::IsNullOrWhiteSpace($apiKey)) {
+        throw 'Minibook demo credential is unavailable; use the explicit recovery workflow.'
+    }
+    try {
+        $me = & $IdentityProbe "$baseUrl/api/v1/agents/me" $apiKey
+        if ($me.name -ne $serviceName) { throw 'Configured Minibook key belongs to another identity.' }
+    } catch {
+        throw 'Configured CAPTAIN_DEMO_MINIBOOK_API_KEY is invalid; refusing to replace it.'
+    }
+}
 function Start-Service($values) {
     if (Test-Health) { Write-Host '[ready] Minibook local instance'; return }
     $projectionApiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY']
@@ -196,6 +208,10 @@ function Stop-Service {
 switch ($Action) {
     start { Start-Service (Read-Env) }
     bootstrap { Bootstrap-Service }
-    status { if (-not (Test-Health)) { throw 'Minibook is not healthy.' }; Write-Host '[ready] Minibook healthy' }
+    status {
+        if (-not (Test-Health)) { throw 'Minibook is not healthy.' }
+        Test-Identity (Read-Env)
+        Write-Host '[ready] Minibook healthy and identity validated'
+    }
     stop { Stop-Service }
 }
