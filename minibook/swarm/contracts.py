@@ -495,10 +495,10 @@ class FactoryBuildAssignmentV2(_FrozenContract):
     allowed_output_roots: tuple[str, ...] = Field(min_length=1); allowed_commands: tuple[tuple[str, ...], ...] = Field(min_length=1); limits: FactoryBuildLimitsV1; lease_ref: ArtifactRef; deadline_at: datetime
     @model_validator(mode="after")
     def safety(self) -> "FactoryBuildAssignmentV2":
-        if len(self.required_agent_ids) != len(set(self.required_agent_ids)): raise ValueError("required agent ids must be unique")
+        if len(self.required_agent_ids) != len(set(self.required_agent_ids)) or any(not re.fullmatch(IDENTIFIER_PATTERN, x) for x in self.required_agent_ids): raise ValueError("required agent ids must be unique and valid")
         agents = set(self.required_agent_ids)
         if any(x.from_agent_id not in agents or x.to_agent_id not in agents for x in self.ordered_handoffs): raise ValueError("handoff agents must be required agents")
-        if any(x.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", x) or ".." in x.replace("\\", "/").split("/") for x in self.allowed_output_roots): raise ValueError("output roots must be relative")
+        if any(not x or x == "." or x.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", x) or any(part in {".", ".."} for part in x.replace("\\", "/").split("/")) for x in self.allowed_output_roots): raise ValueError("output roots must be relative")
         for command in self.allowed_commands:
             if not command or any(not x.strip() for x in command): raise ValueError("allowed command must contain nonblank argv")
             executable = command[0]
@@ -575,6 +575,11 @@ class FactoryActionRequestV1(_FrozenContract):
         try: _reject_secret_like_content(value)
         except ValueError as error: raise ValueError("display-safe request text is required") from error
         return value
+    @field_validator("deadline_at")
+    @classmethod
+    def deadline(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value): raise ValueError("deadline_at must be UTC")
+        return value
     @model_validator(mode="after")
     def checkpoint(self) -> "FactoryActionRequestV1":
         if self.safe_checkpoint_sha256 != self.safe_checkpoint_ref.sha256: raise ValueError("safe checkpoint digest must match ref")
@@ -595,6 +600,11 @@ class FactoryActionResponseV1(_FrozenContract):
     def credential(cls, value: str | None) -> str | None:
         if value is not None and not re.fullmatch(r"credential://[A-Za-z0-9._/-]+", value): raise ValueError("credential_ref must use credential:// URI")
         return value
+    @field_validator("answered_at")
+    @classmethod
+    def answered(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value): raise ValueError("answered_at must be UTC")
+        return value
     @field_validator("answer_metadata")
     @classmethod
     def metadata(cls, value: dict[str, object]) -> dict[str, object]:
@@ -608,3 +618,5 @@ def validate_build_effect_binding(assignment: FactoryBuildAssignmentV2, effect: 
 
 def validate_action_response_binding(request: FactoryActionRequestV1, response: FactoryActionResponseV1) -> None:
     if request.request_id != response.request_id or request.expected_subject_version != response.expected_subject_version: raise ValueError("action response identity drift")
+    if response.decision not in request.allowed_decisions: raise ValueError("action response decision is not allowed")
+    if response.approved_scope != request.required_scope: raise ValueError("action response scope does not match request scope")

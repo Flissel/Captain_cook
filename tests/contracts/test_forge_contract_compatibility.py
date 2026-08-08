@@ -251,3 +251,39 @@ def test_assignment_rejects_relative_command_components(contract: type) -> None:
     for command in (["pytest", "--pythonpath", "x"], ["python", "-m", "compileall", "output", "-q"]):
         with pytest.raises(ValidationError, match="allowed command"):
             contract.model_validate(payload | {"allowed_commands": [command]})
+
+
+@pytest.mark.parametrize("contract", (CaptainFactoryBuildAssignmentV2, FactoryBuildAssignmentV2))
+def test_assignment_rejects_invalid_agents_unbounded_roots_and_non_utc_deadlines(contract: type) -> None:
+    payload = json.loads((FIXTURES / "hermes_factory_assignment.v2.json").read_text(encoding="utf-8"))
+    for override in ({"required_agent_ids": ["bad agent"]}, {"allowed_output_roots": [""]}, {"allowed_output_roots": ["."]}, {"deadline_at": "2026-08-09T12:00:00"}):
+        with pytest.raises(ValidationError):
+            contract.model_validate(payload | override)
+
+
+@pytest.mark.parametrize(
+    ("request_type", "response_type", "validator"),
+    ((CaptainFactoryActionRequestV1, CaptainFactoryActionResponseV1, captain_validate_action_response_binding), (FactoryActionRequestV1, FactoryActionResponseV1, validate_action_response_binding)),
+)
+def test_action_response_binding_enforces_decision_and_scope(request_type: type, response_type: type, validator: object) -> None:
+    request_payload = json.loads((FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8")) | {"allowed_decisions": ["deny"]}
+    response_payload = json.loads((FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8"))
+    request = request_type.model_validate(request_payload)
+    with pytest.raises(ValueError, match="decision"):
+        validator(request, response_type.model_validate(response_payload))  # type: ignore[operator]
+    with pytest.raises(ValueError, match="scope"):
+        validator(request_type.model_validate(request_payload | {"allowed_decisions": ["approve"]}), response_type.model_validate(response_payload | {"approved_scope": "n8n.crm.write"}))  # type: ignore[operator]
+
+
+@pytest.mark.parametrize("contract", (CaptainFactoryActionRequestV1, FactoryActionRequestV1))
+def test_action_request_requires_utc_deadline(contract: type) -> None:
+    payload = json.loads((FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError, match="deadline_at must be UTC"):
+        contract.model_validate(payload | {"deadline_at": "2026-08-09T12:00:00"})
+
+
+@pytest.mark.parametrize("contract", (CaptainFactoryActionResponseV1, FactoryActionResponseV1))
+def test_action_response_requires_utc_timestamp(contract: type) -> None:
+    payload = json.loads((FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError, match="answered_at must be UTC"):
+        contract.model_validate(payload | {"answered_at": "2026-08-08T12:00:00"})

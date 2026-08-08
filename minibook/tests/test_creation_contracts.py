@@ -238,3 +238,24 @@ def test_assignment_rejects_pathful_executables() -> None:
     for command in (["pytest", "--pythonpath", "x"], ["python", "-m", "compileall", "output", "-q"]):
         with pytest.raises(ValidationError, match="allowed command"):
             FactoryBuildAssignmentV2.model_validate(payload | {"allowed_commands": [command]})
+
+
+def test_assignment_rejects_invalid_agents_unbounded_roots_and_non_utc_deadlines() -> None:
+    payload = json.loads((FIXTURES / "hermes_factory_assignment.v2.json").read_text(encoding="utf-8"))
+    for override in ({"required_agent_ids": ["bad agent"]}, {"allowed_output_roots": [""]}, {"allowed_output_roots": ["."]}, {"deadline_at": "2026-08-09T12:00:00"}):
+        with pytest.raises(ValidationError):
+            FactoryBuildAssignmentV2.model_validate(payload | override)
+
+
+def test_action_response_binding_enforces_decision_scope_and_utc_timestamps() -> None:
+    request_payload = json.loads((FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8")) | {"allowed_decisions": ["deny"]}
+    response_payload = json.loads((FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8"))
+    request = FactoryActionRequestV1.model_validate(request_payload)
+    with pytest.raises(ValueError, match="decision"):
+        validate_action_response_binding(request, FactoryActionResponseV1.model_validate(response_payload))
+    with pytest.raises(ValueError, match="scope"):
+        validate_action_response_binding(FactoryActionRequestV1.model_validate(request_payload | {"allowed_decisions": ["approve"]}), FactoryActionResponseV1.model_validate(response_payload | {"approved_scope": "n8n.crm.write"}))
+    with pytest.raises(ValidationError, match="deadline_at must be UTC"):
+        FactoryActionRequestV1.model_validate(request_payload | {"deadline_at": "2026-08-09T12:00:00"})
+    with pytest.raises(ValidationError, match="answered_at must be UTC"):
+        FactoryActionResponseV1.model_validate(response_payload | {"answered_at": "2026-08-08T12:00:00"})

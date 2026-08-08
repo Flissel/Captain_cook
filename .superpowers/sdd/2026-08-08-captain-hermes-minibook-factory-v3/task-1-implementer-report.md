@@ -168,3 +168,36 @@ GREEN evidence:
 
 Both commands continued to emit the existing `RequestsDependencyWarning`; no
 test failed.
+
+## Quality Review Fix: Assignment and Action Binding Invariants
+
+Status: DONE
+
+RED evidence:
+
+- `python -m pytest tests/contracts/test_forge_contract_compatibility.py -q --no-cov`:
+  31 passed, 8 failed. Both mirrors admitted invalid assignment IDs/roots,
+  action decision and scope drift, and naive action timestamps.
+- `$env:PYTHONPATH=(Resolve-Path minibook).Path; python -m pytest
+  minibook/tests/test_creation_contracts.py -q --no-cov`: 32 passed, 2 failed
+  for assignment and action-binding bypasses.
+
+Delivered:
+
+- Assignment agent IDs must now match the shared identifier pattern. Output
+  roots reject empty values, `.`, absolute/drive paths, and any `.` or `..`
+  path component; the fixture `output` remains valid.
+- Action-response binding now requires the response decision to be requested
+  and the response scope to equal the request scope.
+- Action request deadlines and response timestamps now require UTC-aware
+  datetimes, matching the assignment deadline rule.
+
+GREEN evidence:
+
+- `python -m pytest tests/contracts/test_forge_contract_compatibility.py -q --no-cov`:
+  39 passed in 0.83s.
+- `$env:PYTHONPATH=(Resolve-Path minibook).Path; python -m pytest
+  minibook/tests/test_creation_contracts.py -q --no-cov`: 34 passed in 0.62s.
+- `git diff --check`: passed.
+
+The existing `RequestsDependencyWarning` remained non-failing.
