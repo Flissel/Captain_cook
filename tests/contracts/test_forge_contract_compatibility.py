@@ -17,6 +17,8 @@ from agenten.agent_factory.forge_contracts import (
     FactoryActionResponseV1 as CaptainFactoryActionResponseV1,
     FactoryBuildAssignmentV2 as CaptainFactoryBuildAssignmentV2,
     FactoryBuildEffectV2 as CaptainFactoryBuildEffectV2,
+    validate_action_response_binding as captain_validate_action_response_binding,
+    validate_build_effect_binding as captain_validate_build_effect_binding,
 )
 from minibook.swarm.contracts import (
     CreationJobV1,
@@ -30,6 +32,8 @@ from minibook.swarm.contracts import (
     FactoryActionResponseV1,
     FactoryBuildAssignmentV2,
     FactoryBuildEffectV2,
+    validate_action_response_binding,
+    validate_build_effect_binding,
 )
 
 
@@ -191,3 +195,33 @@ def test_action_response_rejects_neutral_secret_value_and_unsafe_scope(contract:
         contract.model_validate(payload | {"answer_metadata": {"note": "Basic dXNlcjpwYXNz"}})
     with pytest.raises(ValidationError, match="display-safe"):
         contract.model_validate(payload | {"approved_scope": "api_key=abcdef"})
+
+
+@pytest.mark.parametrize("contract", (CaptainFactoryActionResponseV1, FactoryActionResponseV1))
+def test_action_response_rejects_common_neutral_key_secret_formats(contract: type) -> None:
+    payload = json.loads((FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8"))
+    for value in ("sk_test_abcdefghijklmnopqrstuvwxyz012345", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"):
+        with pytest.raises(ValidationError, match="secret-like"):
+            contract.model_validate(payload | {"answer_metadata": {"note": value}})
+    assert contract.model_validate(payload | {"answer_metadata": {"digest": "a" * 64}}).answer_metadata["digest"] == "a" * 64
+
+
+@pytest.mark.parametrize("contract", (CaptainFactoryBuildAssignmentV2, FactoryBuildAssignmentV2))
+def test_assignment_uses_exact_command_allowlist(contract: type) -> None:
+    payload = json.loads((FIXTURES / "hermes_factory_assignment.v2.json").read_text(encoding="utf-8"))
+    for command in (["py.exe", "-c", "print(1)"], ["python3.12", "-c", "print(1)"], ["wsl.exe", "pytest"], ["python", "-m", "subprocess", "pytest"]):
+        with pytest.raises(ValidationError, match="allowed command"):
+            contract.model_validate(payload | {"allowed_commands": [command]})
+    assert contract.model_validate(payload | {"allowed_commands": [["python.exe", "-m", "pytest"]]}).assignment_id
+
+
+@pytest.mark.parametrize(
+    ("assignment_type", "effect_type", "validator"),
+    ((CaptainFactoryBuildAssignmentV2, CaptainFactoryBuildEffectV2, captain_validate_build_effect_binding), (FactoryBuildAssignmentV2, FactoryBuildEffectV2, validate_build_effect_binding)),
+)
+def test_build_effect_binding_rejects_factory_job_identity_drift(assignment_type: type, effect_type: type, validator: object) -> None:
+    assignment = assignment_type.model_validate(json.loads((FIXTURES / "hermes_factory_assignment.v2.json").read_text(encoding="utf-8")))
+    effect_payload = json.loads((FIXTURES / "hermes_factory_build_effect.v2.json").read_text(encoding="utf-8"))
+    effect = effect_type.model_validate(effect_payload | {"factory_job_id": "00000000-0000-0000-0000-000000000399"})
+    with pytest.raises(ValueError, match="identity drift"):
+        validator(assignment, effect)  # type: ignore[operator]

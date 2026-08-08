@@ -15,6 +15,8 @@ from minibook.swarm.contracts import (
     FactoryActionResponseV1,
     FactoryBuildAssignmentV2,
     FactoryBuildEffectV2,
+    validate_action_response_binding,
+    validate_build_effect_binding,
 )
 
 
@@ -180,3 +182,32 @@ def test_assignment_rejects_command_bypasses_and_v3_models_are_frozen() -> None:
     job = CreationJobV3.model_validate(json.loads((FIXTURES / "minibook_creation_job.v3.json").read_text(encoding="utf-8")))
     with pytest.raises(ValidationError, match="frozen_instance"):
         job.attempt = 2  # type: ignore[misc]
+
+
+def test_action_metadata_rejects_secret_formats_and_accepts_safe_identifiers() -> None:
+    payload = json.loads((FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8"))
+    for value in ("sk_live_abcdefghijklmnopqrstuvwxyz012345", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature", "AKIAABCDEFGHIJKLMNOP"):
+        with pytest.raises(ValidationError, match="secret-like"):
+            FactoryActionResponseV1.model_validate(payload | {"answer_metadata": {"note": value}})
+    accepted = FactoryActionResponseV1.model_validate(payload | {"answer_metadata": {"digest": "a" * 64, "run_id": "00000000-0000-0000-0000-000000000001"}})
+    assert accepted.answer_metadata["digest"] == "a" * 64
+
+
+def test_assignment_allows_only_bounded_python_commands() -> None:
+    payload = json.loads((FIXTURES / "hermes_factory_assignment.v2.json").read_text(encoding="utf-8"))
+    for command in (["py.exe", "-c", "print(1)"], ["python3.12", "-c", "print(1)"], ["wsl.exe", "pytest"], ["python", "-m", "subprocess", "pytest"]):
+        with pytest.raises(ValidationError, match="allowed command"):
+            FactoryBuildAssignmentV2.model_validate(payload | {"allowed_commands": [command]})
+    assert FactoryBuildAssignmentV2.model_validate(payload | {"allowed_commands": [["python.exe", "-m", "compileall", "output"]]}).assignment_id
+
+
+def test_cross_contract_binding_rejects_identity_drift() -> None:
+    assignment = FactoryBuildAssignmentV2.model_validate(json.loads((FIXTURES / "hermes_factory_assignment.v2.json").read_text(encoding="utf-8")))
+    effect_payload = json.loads((FIXTURES / "hermes_factory_build_effect.v2.json").read_text(encoding="utf-8"))
+    effect = FactoryBuildEffectV2.model_validate(effect_payload | {"factory_job_id": "00000000-0000-0000-0000-000000000399"})
+    with pytest.raises(ValueError, match="identity drift"):
+        validate_build_effect_binding(assignment, effect)
+    request = FactoryActionRequestV1.model_validate(json.loads((FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8")))
+    response = FactoryActionResponseV1.model_validate(json.loads((FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8")) | {"request_id": "00000000-0000-0000-0000-000000000699"})
+    with pytest.raises(ValueError, match="identity drift"):
+        validate_action_response_binding(request, response)

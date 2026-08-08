@@ -501,7 +501,8 @@ class FactoryBuildAssignmentV2(_FrozenContract):
         for command in self.allowed_commands:
             if not command or any(not x.strip() for x in command): raise ValueError("allowed command must contain nonblank argv")
             executable = re.sub(r"(?i)\.(exe|cmd|bat)$", "", command[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]).lower()
-            if executable in {"sh", "bash", "cmd", "powershell", "pwsh", "node", "perl", "ruby"} or (executable in {"python", "python3"} and not (len(command) >= 3 and command[1:3] == ("-m", "pytest"))) or any(re.search(r"[|&;*?`$<>]", x) or x.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", x) or ".." in x.replace("\\", "/").split("/") for x in command): raise ValueError("allowed command has unsafe argv")
+            allowed = (executable == "python" and len(command) >= 3 and command[1:3] in (("-m", "pytest"), ("-m", "compileall"))) or executable == "pytest"
+            if not allowed or any(re.search(r"[|&;*?`$<>]", x) or x.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", x) or ".." in x.replace("\\", "/").split("/") for x in command): raise ValueError("allowed command has unsafe argv")
         if self.lease_ref.media_type != "application/json": raise ValueError("lease ref must be application/json")
         if self.deadline_at.tzinfo is None or self.deadline_at.utcoffset() != timezone.utc.utcoffset(self.deadline_at): raise ValueError("deadline_at must be UTC")
         return self
@@ -542,7 +543,9 @@ def _reject_secret_like_content(value: object) -> object:
             _reject_secret_like_content(item)
     elif isinstance(value, (list, tuple)):
         for item in value: _reject_secret_like_content(item)
-    elif isinstance(value, str) and re.search(r"(?i)(bearer\s+|basic\s+[A-Za-z0-9+/=]+|api[_ -]?key|password=|secret=|token=|credential=|private.?key|system.?prompt|provider.?response|holdout)", value): raise ValueError("secret-like metadata is forbidden")
+    elif isinstance(value, str):
+        if value.startswith("credential://") or re.search(r"(?i)(bearer\s+|basic\s+[A-Za-z0-9+/=]+|(?:api[_ -]?key|password|secret|token|credential)\s*=|private.?key|system.?prompt|provider.?response|holdout|\bsk_(?:live|test)_[A-Za-z0-9_-]+|\bsk-proj-[A-Za-z0-9_-]+|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bgh[pours]_[A-Za-z0-9_-]+|\bxox[a-z]-[A-Za-z0-9-]+|\bAIza[A-Za-z0-9_-]+)", value) or re.fullmatch(r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}", value): raise ValueError("secret-like metadata is forbidden")
+        if len(value) > 128 and not re.fullmatch(SHA256_PATTERN, value) and not re.fullmatch(IDENTIFIER_PATTERN, value) and not re.fullmatch(r"https?://[^\s]+", value): raise ValueError("secret-like metadata is forbidden")
     return value
 
 
@@ -579,3 +582,12 @@ class FactoryActionResponseV1(_FrozenContract):
     @classmethod
     def metadata(cls, value: dict[str, object]) -> dict[str, object]:
         _reject_secret_like_content(value); return value
+
+
+def validate_build_effect_binding(assignment: FactoryBuildAssignmentV2, effect: FactoryBuildEffectV2) -> None:
+    fields = ("assignment_id", "creation_job_id", "factory_job_id", "correlation_id", "subject_version", "checkpoint_version", "attempt", "effect_key")
+    if any(getattr(assignment, field) != getattr(effect, field) for field in fields): raise ValueError("build effect identity drift")
+
+
+def validate_action_response_binding(request: FactoryActionRequestV1, response: FactoryActionResponseV1) -> None:
+    if request.request_id != response.request_id or request.expected_subject_version != response.expected_subject_version: raise ValueError("action response identity drift")
