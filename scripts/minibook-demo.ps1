@@ -137,6 +137,15 @@ function Recover-ServiceCredential($values) {
 }
 function Bootstrap-Service {
     $values = Read-Env
+    $apiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_API_KEY']
+    if ($apiKey) {
+        Start-Service $values
+        try {
+            $me = & $IdentityProbe "$baseUrl/api/v1/agents/me" $apiKey
+            if ($me.name -ne $serviceName) { throw 'Configured Minibook key belongs to another identity.' }
+            Write-Host '[ready] Minibook demo service account reused (credential redacted)'; return
+        } catch { throw 'Configured CAPTAIN_DEMO_MINIBOOK_API_KEY is invalid; refusing to replace it.' }
+    }
     $projectionApiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY']
     if ([string]::IsNullOrWhiteSpace($projectionApiKey)) {
         $projectionApiKey = [Convert]::ToHexString(
@@ -146,14 +155,6 @@ function Bootstrap-Service {
         Save-Env $values
     }
     Start-Service $values
-    $apiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_API_KEY']
-    if ($apiKey) {
-        try {
-            $me = & $IdentityProbe "$baseUrl/api/v1/agents/me" $apiKey
-            if ($me.name -ne $serviceName) { throw 'Configured Minibook key belongs to another identity.' }
-            Write-Host '[ready] Minibook demo service account reused (credential redacted)'; return
-        } catch { throw 'Configured CAPTAIN_DEMO_MINIBOOK_API_KEY is invalid; refusing to replace it.' }
-    }
     try {
         $created = & $AgentRegistrationProbe "$baseUrl/api/v1/agents" $serviceName
     } catch {

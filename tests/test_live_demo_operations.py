@@ -181,6 +181,29 @@ def test_minibook_demo_rejects_invalid_identity_without_changing_credentials(
     assert env_file.read_bytes() == credential_bytes
 
 
+def test_minibook_demo_rejects_invalid_identity_before_creating_projection_key(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / ".env"
+    credential_bytes = b"CAPTAIN_DEMO_MINIBOOK_API_KEY=fixture-service-key-only\r\n"
+    env_file.write_bytes(credential_bytes)
+
+    result = run_minibook_harness(
+        tmp_path,
+        env={"MINIBOOK_BACKEND_URL": "http://127.0.0.1:4456"},
+        command="bootstrap",
+        identity_status=401,
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert "fixture-service-key-only" not in output
+    assert "PROBE health http://127.0.0.1:4456/health" in output
+    assert "PROBE identity http://127.0.0.1:4456/api/v1/agents/me" in output
+    assert "PROBE agent-registration" not in output
+    assert env_file.read_bytes() == credential_bytes
+
+
 def test_live_demo_services_only_operates_captain_resources() -> None:
     source = SERVICES.read_text(encoding="utf-8")
     assert "$global:LASTEXITCODE = 0" in source
