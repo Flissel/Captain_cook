@@ -204,6 +204,37 @@ def test_minibook_demo_rejects_invalid_identity_before_creating_projection_key(
     assert env_file.read_bytes() == credential_bytes
 
 
+def test_minibook_demo_initializes_projection_key_after_valid_identity(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / ".env"
+    credential_bytes = b"CAPTAIN_DEMO_MINIBOOK_API_KEY=fixture-valid-service-key\r\n"
+    env_file.write_bytes(credential_bytes)
+
+    result = run_minibook_harness(
+        tmp_path,
+        env={"MINIBOOK_BACKEND_URL": "http://127.0.0.1:4456"},
+        command="bootstrap",
+    )
+    output = result.stdout + result.stderr
+    saved_credentials = env_file.read_text(encoding="utf-8")
+    projection_lines = [
+        line
+        for line in saved_credentials.splitlines()
+        if line.startswith("CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY=")
+    ]
+
+    assert result.returncode == 0, output
+    assert "fixture-valid-service-key" not in output
+    assert "PROBE identity http://127.0.0.1:4456/api/v1/agents/me" in output
+    assert "PROBE agent-registration" not in output
+    assert "CAPTAIN_DEMO_MINIBOOK_API_KEY=fixture-valid-service-key" in saved_credentials
+    assert len(projection_lines) == 1
+    projection_key = projection_lines[0].split("=", 1)[1]
+    assert len(projection_key) == 64
+    assert projection_key not in output
+
+
 def test_live_demo_services_only_operates_captain_resources() -> None:
     source = SERVICES.read_text(encoding="utf-8")
     assert "$global:LASTEXITCODE = 0" in source
