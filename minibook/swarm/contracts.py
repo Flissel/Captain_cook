@@ -437,3 +437,20 @@ class FactoryBuildAssignmentV1(_FrozenContract):
         if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
             raise ValueError("deadline_at must be UTC")
         return value
+
+
+# V3 contracts are deliberately imported from Captain's canonical contract module.
+# This keeps the wire schema byte-identical while Minibook remains a validation-only
+# projection consumer for these opt-in generation messages.
+from agenten.agent_factory.forge_contracts import (  # noqa: E402
+    AgentHandoffV1,
+    ClarificationPolicyV1,
+    CreationJobV3,
+    CreationResultV2,
+    FactoryActionRequestV1,
+    FactoryActionResponseV1,
+    FactoryBuildAssignmentV2,
+    FactoryBuildEffectV2,
+    FactoryBuildLimitsV1,
+    FactoryToolRequirementV1,
+)

@@ -438,3 +438,228 @@ class CreationJobV2(CreationJobV1):
         ):
             raise ValueError("Codex build receipt does not match creation job")
         return self
+
+
+class AgentHandoffV1(_FrozenContract):
+    from_agent_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    to_agent_id: str = Field(pattern=IDENTIFIER_PATTERN)
+
+    @model_validator(mode="after")
+    def require_distinct_agents(self) -> "AgentHandoffV1":
+        if self.from_agent_id == self.to_agent_id:
+            raise ValueError("handoff agents must be distinct")
+        return self
+
+
+class FactoryToolRequirementV1(_FrozenContract):
+    tool_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    required: bool
+
+
+class ClarificationPolicyV1(_FrozenContract):
+    allowed_request_types: tuple[Literal["clarification", "credential_required", "external_api_approval", "n8n_approval"], ...] = Field(min_length=1)
+    max_requests: int = Field(ge=0, le=10, strict=True)
+
+
+class FactoryBuildLimitsV1(_FrozenContract):
+    max_wall_clock_seconds: int = Field(ge=1, strict=True)
+    max_provider_cost_usd: float = Field(gt=0, strict=True)
+    max_retries: int = Field(ge=0, le=5, strict=True)
+    max_files: int = Field(ge=1, strict=True)
+
+
+class CreationJobV3(CreationJobV1):
+    schema_name: Literal["minibook.creation-job.v3"] = Field(default="minibook.creation-job.v3", alias="schema", serialization_alias="schema")
+    command_id: UUID
+    lease_ref: ArtifactRef
+    lease_sha256: str = Field(pattern=SHA256_PATTERN)
+    blueprint_ref: ArtifactRef
+    tool_plan_ref: ArtifactRef
+    required_agent_ids: tuple[str, ...] = Field(min_length=1)
+    ordered_handoffs: tuple[AgentHandoffV1, ...]
+    tool_requirements: tuple[FactoryToolRequirementV1, ...] = Field(min_length=1)
+    workspace_policy_ref: ArtifactRef
+    clarification_policy: ClarificationPolicyV1
+    required_output_contract: Literal["minibook.creation-result.v2"]
+
+    @field_validator("required_agent_ids")
+    @classmethod
+    def require_unique_agent_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(not re.fullmatch(IDENTIFIER_PATTERN, agent_id) for agent_id in value):
+            raise ValueError("required agent ids must be unique and valid")
+        return value
+
+    @model_validator(mode="after")
+    def require_v3_bindings(self) -> "CreationJobV3":
+        if self.lease_sha256 != self.lease_ref.sha256:
+            raise ValueError("lease digest must match lease_ref")
+        agents = set(self.required_agent_ids)
+        if any(handoff.from_agent_id not in agents or handoff.to_agent_id not in agents for handoff in self.ordered_handoffs):
+            raise ValueError("handoff agents must be required agents")
+        if len({tool.tool_id for tool in self.tool_requirements}) != len(self.tool_requirements):
+            raise ValueError("tool requirements must be unique")
+        for ref in (self.lease_ref, self.blueprint_ref, self.tool_plan_ref, self.workspace_policy_ref):
+            if ref.media_type != "application/json":
+                raise ValueError("V3 binding refs must be application/json")
+        return self
+
+
+class FactoryBuildAssignmentV2(_FrozenContract):
+    schema_name: Literal["hermes.factory-build-assignment.v2"] = Field(default="hermes.factory-build-assignment.v2", alias="schema", serialization_alias="schema")
+    assignment_id: UUID
+    creation_job_id: UUID
+    factory_job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    checkpoint_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    effect_key: str = Field(pattern=SHA256_PATTERN)
+    workspace_ref: str = Field(pattern=r"^workspace://[A-Za-z0-9._:/-]+$")
+    workspace_policy_sha256: str = Field(pattern=SHA256_PATTERN)
+    required_agent_ids: tuple[str, ...] = Field(min_length=1)
+    ordered_handoffs: tuple[AgentHandoffV1, ...]
+    tool_requirements: tuple[FactoryToolRequirementV1, ...] = Field(min_length=1)
+    allowed_output_roots: tuple[str, ...] = Field(min_length=1)
+    allowed_commands: tuple[tuple[str, ...], ...] = Field(min_length=1)
+    limits: FactoryBuildLimitsV1
+    lease_ref: ArtifactRef
+    deadline_at: datetime
+
+    @model_validator(mode="after")
+    def require_assignment_safety(self) -> "FactoryBuildAssignmentV2":
+        if len(self.required_agent_ids) != len(set(self.required_agent_ids)):
+            raise ValueError("required agent ids must be unique")
+        agents = set(self.required_agent_ids)
+        if any(h.from_agent_id not in agents or h.to_agent_id not in agents for h in self.ordered_handoffs):
+            raise ValueError("handoff agents must be required agents")
+        if any(root.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", root) or ".." in root.replace("\\", "/").split("/") for root in self.allowed_output_roots):
+            raise ValueError("output roots must be relative")
+        if self.lease_ref.media_type != "application/json":
+            raise ValueError("lease ref must be application/json")
+        if self.deadline_at.tzinfo is None or self.deadline_at.utcoffset() != timezone.utc.utcoffset(self.deadline_at):
+            raise ValueError("deadline_at must be UTC")
+        return self
+
+
+class FactoryBuildEffectV2(_FrozenContract):
+    schema_name: Literal["hermes.factory-build-effect.v2"] = Field(default="hermes.factory-build-effect.v2", alias="schema", serialization_alias="schema")
+    assignment_id: UUID
+    creation_job_id: UUID
+    factory_job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    checkpoint_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    effect_key: str = Field(pattern=SHA256_PATTERN)
+    hermes_usage_receipt_ref: ArtifactRef
+    codex_build_receipt_ref: ArtifactRef
+    codex_session_ref: ArtifactRef
+    workspace_snapshot_ref: ArtifactRef
+    source_archive_ref: ArtifactRef
+    preliminary_team_manifest_ref: ArtifactRef
+    build_evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+    test_evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+    tool_gaps: tuple[ToolGapMarkerV1, ...] = ()
+
+    @model_validator(mode="after")
+    def require_effect_media_types(self) -> "FactoryBuildEffectV2":
+        if self.workspace_snapshot_ref.media_type != "application/zip" or self.source_archive_ref.media_type != "application/zip":
+            raise ValueError("workspace snapshot and source archive must be application/zip")
+        if self.preliminary_team_manifest_ref.media_type != "application/json":
+            raise ValueError("preliminary team manifest must be application/json")
+        return self
+
+
+class CreationResultV2(_FrozenContract):
+    schema_name: Literal["minibook.creation-result.v2"] = Field(default="minibook.creation-result.v2", alias="schema", serialization_alias="schema")
+    creation_job_id: UUID
+    factory_job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    status: Literal["succeeded", "failed", "blocked", "cancelled"]
+    team_manifest_ref: ArtifactRef | None = None
+    candidate_manifest_ref: ArtifactRef | None = None
+    source_archive_ref: ArtifactRef | None = None
+    package_manifest_ref: ArtifactRef | None = None
+    hermes_usage_receipt_ref: ArtifactRef | None = None
+    codex_build_receipt_ref: ArtifactRef | None = None
+    build_evidence_refs: tuple[ArtifactRef, ...] = ()
+    real_case_evidence_refs: tuple[ArtifactRef, ...] = ()
+    cas_readback_receipt_ref: ArtifactRef | None = None
+    tool_gaps: tuple[ToolGapMarkerV1, ...] = ()
+    failure: CreationFailure | None = None
+
+    @model_validator(mode="after")
+    def require_v2_terminal_payload(self) -> "CreationResultV2":
+        if self.status == "succeeded":
+            required = (self.team_manifest_ref, self.candidate_manifest_ref, self.source_archive_ref, self.package_manifest_ref, self.hermes_usage_receipt_ref, self.codex_build_receipt_ref, self.cas_readback_receipt_ref)
+            if any(ref is None for ref in required) or not self.build_evidence_refs or not self.real_case_evidence_refs:
+                raise ValueError("successful V2 result requires all output contracts")
+            if self.failure is not None:
+                raise ValueError("successful V2 result cannot include failure")
+        elif self.failure is None:
+            raise ValueError("non-success result requires failure")
+        return self
+
+
+def _reject_secret_like_content(value: object) -> object:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if re.search(r"(?i)(api.?key|authorization|password|secret|token)", str(key)):
+                raise ValueError("secret-like metadata is forbidden")
+            _reject_secret_like_content(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_secret_like_content(item)
+    elif isinstance(value, str) and re.search(r"(?i)(bearer\\s+|api[_ -]?key|password=|secret=|token=)", value):
+        raise ValueError("secret-like metadata is forbidden")
+    return value
+
+
+class FactoryActionRequestV1(_FrozenContract):
+    schema_name: Literal["captain.factory-action-request.v1"] = Field(default="captain.factory-action-request.v1", alias="schema", serialization_alias="schema")
+    request_id: UUID
+    factory_job_id: UUID
+    creation_job_id: UUID
+    correlation_id: UUID
+    expected_subject_version: int = Field(ge=1, strict=True)
+    request_type: Literal["clarification", "credential_required", "external_api_approval", "n8n_approval"]
+    safe_checkpoint_ref: ArtifactRef
+    safe_checkpoint_sha256: str = Field(pattern=SHA256_PATTERN)
+    required_scope: str = Field(min_length=1, max_length=200)
+    allowed_decisions: tuple[Literal["approve", "deny"], ...] = Field(min_length=1)
+    message: str = Field(min_length=1, max_length=500)
+    deadline_at: datetime
+    status: Literal["pending", "answered", "expired", "consumed"]
+
+    @model_validator(mode="after")
+    def require_checkpoint_digest(self) -> "FactoryActionRequestV1":
+        if self.safe_checkpoint_sha256 != self.safe_checkpoint_ref.sha256:
+            raise ValueError("safe checkpoint digest must match ref")
+        return self
+
+
+class FactoryActionResponseV1(_FrozenContract):
+    schema_name: Literal["captain.factory-action-response.v1"] = Field(default="captain.factory-action-response.v1", alias="schema", serialization_alias="schema")
+    request_id: UUID
+    expected_subject_version: int = Field(ge=1, strict=True)
+    decision: Literal["approve", "deny"]
+    approved_scope: str = Field(min_length=1, max_length=200)
+    credential_ref: str | None = None
+    answer_metadata: dict[str, object] = Field(default_factory=dict)
+    answered_at: datetime
+    idempotency_key: str = Field(pattern=SHA256_PATTERN)
+
+    @field_validator("credential_ref")
+    @classmethod
+    def require_credential_reference(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"credential://[A-Za-z0-9._/-]+", value):
+            raise ValueError("credential_ref must use credential:// URI")
+        return value
+
+    @field_validator("answer_metadata")
+    @classmethod
+    def reject_secret_like_metadata(cls, value: dict[str, object]) -> dict[str, object]:
+        _reject_secret_like_content(value)
+        return value

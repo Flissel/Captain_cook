@@ -3,12 +3,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from agenten.agent_factory.forge_contracts import (
     CreationJobV1 as CaptainCreationJob,
     CreationPackageManifestV1 as CaptainCreationPackageManifest,
     CreationResultV1 as CaptainCreationResult,
     FactoryBuildAssignmentV1 as CaptainFactoryBuildAssignment,
     ForgeBuildSkillUsageReceiptV1 as CaptainForgeBuildSkillUsageReceipt,
+    CreationJobV3 as CaptainCreationJobV3,
+    CreationResultV2 as CaptainCreationResultV2,
+    FactoryActionRequestV1 as CaptainFactoryActionRequestV1,
+    FactoryActionResponseV1 as CaptainFactoryActionResponseV1,
+    FactoryBuildAssignmentV2 as CaptainFactoryBuildAssignmentV2,
+    FactoryBuildEffectV2 as CaptainFactoryBuildEffectV2,
 )
 from minibook.swarm.contracts import (
     CreationJobV1,
@@ -16,6 +23,12 @@ from minibook.swarm.contracts import (
     CreationResultV1,
     FactoryBuildAssignmentV1,
     ForgeBuildSkillUsageReceiptV1,
+    CreationJobV3,
+    CreationResultV2,
+    FactoryActionRequestV1,
+    FactoryActionResponseV1,
+    FactoryBuildAssignmentV2,
+    FactoryBuildEffectV2,
 )
 
 
@@ -119,3 +132,20 @@ def test_parent_and_minibook_validate_the_same_forge_build_skill_receipt() -> No
     assert parent.model_dump(mode="json", by_alias=True) == minibook.model_dump(
         mode="json", by_alias=True
     )
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "parent_type", "minibook_type"),
+    (
+        ("minibook_creation_job.v3.json", CaptainCreationJobV3, CreationJobV3),
+        ("hermes_factory_assignment.v2.json", CaptainFactoryBuildAssignmentV2, FactoryBuildAssignmentV2),
+        ("hermes_factory_build_effect.v2.json", CaptainFactoryBuildEffectV2, FactoryBuildEffectV2),
+        ("minibook_creation_result.v2.json", CaptainCreationResultV2, CreationResultV2),
+        ("factory_action_request.v1.json", CaptainFactoryActionRequestV1, FactoryActionRequestV1),
+        ("factory_action_response.v1.json", CaptainFactoryActionResponseV1, FactoryActionResponseV1),
+    ),
+)
+def test_v3_contract_fixture_is_byte_compatible(
+    fixture_name: str, parent_type: type, minibook_type: type
+) -> None:
+    _assert_byte_compatible(fixture_name, parent_type, minibook_type)
