@@ -173,3 +173,21 @@ def test_action_request_rejects_private_display_content(contract: type) -> None:
     payload = json.loads((FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8"))
     with pytest.raises(ValidationError, match="display-safe"):
         contract.model_validate(payload | {"message": "system prompt: private"})
+
+
+@pytest.mark.parametrize("contract", (CaptainCreationJobV3, CreationJobV3))
+def test_v3_job_rejects_missing_output_contract_and_lease_identity_drift(contract: type) -> None:
+    payload = json.loads((FIXTURES / "minibook_creation_job.v3.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError):
+        contract.model_validate({key: value for key, value in payload.items() if key != "required_output_contract"})
+    with pytest.raises(ValidationError, match="lease digest"):
+        contract.model_validate(payload | {"lease_ref": payload["lease_ref"] | {"sha256": "0" * 64}})
+
+
+@pytest.mark.parametrize("contract", (CaptainFactoryActionResponseV1, FactoryActionResponseV1))
+def test_action_response_rejects_neutral_secret_value_and_unsafe_scope(contract: type) -> None:
+    payload = json.loads((FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError, match="secret-like"):
+        contract.model_validate(payload | {"answer_metadata": {"note": "Basic dXNlcjpwYXNz"}})
+    with pytest.raises(ValidationError, match="display-safe"):
+        contract.model_validate(payload | {"approved_scope": "api_key=abcdef"})

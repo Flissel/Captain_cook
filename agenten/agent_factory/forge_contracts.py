@@ -537,8 +537,9 @@ class FactoryBuildAssignmentV2(_FrozenContract):
         for command in self.allowed_commands:
             if not command or any(not arg.strip() for arg in command):
                 raise ValueError("allowed command must contain nonblank argv")
-            if command[0] in {"sh", "bash", "cmd", "powershell", "pwsh"} or any(
-                re.search(r"[|&;*?`$<>]", arg) or arg.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", arg)
+            executable = re.sub(r"(?i)\.(exe|cmd|bat)$", "", command[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]).lower()
+            if executable in {"sh", "bash", "cmd", "powershell", "pwsh", "node", "perl", "ruby"} or (executable in {"python", "python3"} and command[:2] != ("python", "-m") and not (len(command) >= 3 and command[1:3] == ("-m", "pytest"))) or (executable in {"python", "python3"} and not (len(command) >= 3 and command[1:3] == ("-m", "pytest"))) or any(
+                re.search(r"[|&;*?`$<>]", arg) or arg.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", arg) or ".." in arg.replace("\\", "/").split("/")
                 for arg in command
             ):
                 raise ValueError("allowed command has unsafe argv")
@@ -624,7 +625,7 @@ def _reject_secret_like_content(value: object) -> object:
     elif isinstance(value, (list, tuple)):
         for item in value:
             _reject_secret_like_content(item)
-    elif isinstance(value, str) and re.search(r"(?i)(bearer\\s+|api[_ -]?key|password=|secret=|token=|private.?key|system.?prompt|provider.?response|holdout)", value):
+    elif isinstance(value, str) and re.search(r"(?i)(bearer\s+|basic\s+[A-Za-z0-9+/=]+|api[_ -]?key|password=|secret=|token=|credential=|private.?key|system.?prompt|provider.?response|holdout)", value):
         raise ValueError("secret-like metadata is forbidden")
     return value
 
@@ -671,6 +672,15 @@ class FactoryActionResponseV1(_FrozenContract):
     answer_metadata: dict[str, object] = Field(default_factory=dict)
     answered_at: datetime
     idempotency_key: str = Field(pattern=SHA256_PATTERN)
+
+    @field_validator("approved_scope")
+    @classmethod
+    def require_display_safe_scope(cls, value: str) -> str:
+        try:
+            _reject_secret_like_content(value)
+        except ValueError as error:
+            raise ValueError("display-safe response text is required") from error
+        return value
 
     @field_validator("credential_ref")
     @classmethod

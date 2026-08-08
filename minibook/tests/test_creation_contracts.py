@@ -152,3 +152,31 @@ def test_action_contracts_reject_private_content_and_identity_drift() -> None:
         FactoryActionRequestV1.model_validate(request | {"safe_checkpoint_sha256": "0" * 64})
     with pytest.raises(ValidationError, match="secret-like"):
         FactoryActionResponseV1.model_validate(response | {"answer_metadata": {"nested": {"provider_response": "private"}}})
+
+
+def test_v3_job_requires_output_contract_and_binds_lease_identity() -> None:
+    payload = json.loads((FIXTURES / "minibook_creation_job.v3.json").read_text(encoding="utf-8"))
+    missing = {key: value for key, value in payload.items() if key != "required_output_contract"}
+    with pytest.raises(ValidationError):
+        CreationJobV3.model_validate(missing)
+    drifted_lease = payload["lease_ref"] | {"sha256": "0" * 64}
+    with pytest.raises(ValidationError, match="lease digest"):
+        CreationJobV3.model_validate(payload | {"lease_ref": drifted_lease})
+
+
+def test_action_contracts_reject_neutral_secret_values_and_unsafe_scope() -> None:
+    payload = json.loads((FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError, match="secret-like"):
+        FactoryActionResponseV1.model_validate(payload | {"answer_metadata": {"note": "Bearer abcdefghijklmnopqrstuvwxyz0123456789"}})
+    with pytest.raises(ValidationError, match="display-safe"):
+        FactoryActionResponseV1.model_validate(payload | {"approved_scope": "token=abcdefghijk"})
+
+
+def test_assignment_rejects_command_bypasses_and_v3_models_are_frozen() -> None:
+    assignment = json.loads((FIXTURES / "hermes_factory_assignment.v2.json").read_text(encoding="utf-8"))
+    for command in (["PowerShell.exe", "-Command", "Get-ChildItem"], ["PYTHON.EXE", "-c", "print(1)"], ["python", "../tool.py"]):
+        with pytest.raises(ValidationError, match="allowed command"):
+            FactoryBuildAssignmentV2.model_validate(assignment | {"allowed_commands": [command]})
+    job = CreationJobV3.model_validate(json.loads((FIXTURES / "minibook_creation_job.v3.json").read_text(encoding="utf-8")))
+    with pytest.raises(ValidationError, match="frozen_instance"):
+        job.attempt = 2  # type: ignore[misc]

@@ -500,7 +500,8 @@ class FactoryBuildAssignmentV2(_FrozenContract):
         if any(x.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", x) or ".." in x.replace("\\", "/").split("/") for x in self.allowed_output_roots): raise ValueError("output roots must be relative")
         for command in self.allowed_commands:
             if not command or any(not x.strip() for x in command): raise ValueError("allowed command must contain nonblank argv")
-            if command[0] in {"sh", "bash", "cmd", "powershell", "pwsh"} or any(re.search(r"[|&;*?`$<>]", x) or x.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", x) for x in command): raise ValueError("allowed command has unsafe argv")
+            executable = re.sub(r"(?i)\.(exe|cmd|bat)$", "", command[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]).lower()
+            if executable in {"sh", "bash", "cmd", "powershell", "pwsh", "node", "perl", "ruby"} or (executable in {"python", "python3"} and not (len(command) >= 3 and command[1:3] == ("-m", "pytest"))) or any(re.search(r"[|&;*?`$<>]", x) or x.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", x) or ".." in x.replace("\\", "/").split("/") for x in command): raise ValueError("allowed command has unsafe argv")
         if self.lease_ref.media_type != "application/json": raise ValueError("lease ref must be application/json")
         if self.deadline_at.tzinfo is None or self.deadline_at.utcoffset() != timezone.utc.utcoffset(self.deadline_at): raise ValueError("deadline_at must be UTC")
         return self
@@ -541,7 +542,7 @@ def _reject_secret_like_content(value: object) -> object:
             _reject_secret_like_content(item)
     elif isinstance(value, (list, tuple)):
         for item in value: _reject_secret_like_content(item)
-    elif isinstance(value, str) and re.search(r"(?i)(bearer\\s+|api[_ -]?key|password=|secret=|token=|private.?key|system.?prompt|provider.?response|holdout)", value): raise ValueError("secret-like metadata is forbidden")
+    elif isinstance(value, str) and re.search(r"(?i)(bearer\s+|basic\s+[A-Za-z0-9+/=]+|api[_ -]?key|password=|secret=|token=|credential=|private.?key|system.?prompt|provider.?response|holdout)", value): raise ValueError("secret-like metadata is forbidden")
     return value
 
 
@@ -563,6 +564,12 @@ class FactoryActionRequestV1(_FrozenContract):
 class FactoryActionResponseV1(_FrozenContract):
     schema_name: Literal["captain.factory-action-response.v1"] = Field(default="captain.factory-action-response.v1", alias="schema", serialization_alias="schema")
     request_id: UUID; expected_subject_version: int = Field(ge=1, strict=True); decision: Literal["approve", "deny"]; approved_scope: str = Field(min_length=1, max_length=200); credential_ref: str | None = None; answer_metadata: dict[str, object] = Field(default_factory=dict); answered_at: datetime; idempotency_key: str = Field(pattern=SHA256_PATTERN)
+    @field_validator("approved_scope")
+    @classmethod
+    def scope(cls, value: str) -> str:
+        try: _reject_secret_like_content(value)
+        except ValueError as error: raise ValueError("display-safe response text is required") from error
+        return value
     @field_validator("credential_ref")
     @classmethod
     def credential(cls, value: str | None) -> str | None:
