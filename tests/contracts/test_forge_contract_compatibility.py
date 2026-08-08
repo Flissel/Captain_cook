@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from agenten.agent_factory.forge_contracts import (
     CreationJobV1 as CaptainCreationJob,
     CreationPackageManifestV1 as CaptainCreationPackageManifest,
@@ -149,3 +150,26 @@ def test_v3_contract_fixture_is_byte_compatible(
     fixture_name: str, parent_type: type, minibook_type: type
 ) -> None:
     _assert_byte_compatible(fixture_name, parent_type, minibook_type)
+
+
+@pytest.mark.parametrize("contract", (CaptainCreationResultV2, CreationResultV2))
+def test_v3_result_rejects_duplicate_artifact_references(contract: type) -> None:
+    payload = json.loads((FIXTURES / "minibook_creation_result.v2.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError, match="distinct"):
+        contract.model_validate(payload | {"candidate_manifest_ref": payload["team_manifest_ref"]})
+
+
+@pytest.mark.parametrize("contract", (CaptainFactoryBuildAssignmentV2, FactoryBuildAssignmentV2))
+def test_assignment_rejects_unsafe_command_and_extra_field(contract: type) -> None:
+    payload = json.loads((FIXTURES / "hermes_factory_assignment.v2.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError, match="allowed command"):
+        contract.model_validate(payload | {"allowed_commands": [["sh", "-c", "echo *"]]})
+    with pytest.raises(ValidationError):
+        contract.model_validate(payload | {"extra": "forbidden"})
+
+
+@pytest.mark.parametrize("contract", (CaptainFactoryActionRequestV1, FactoryActionRequestV1))
+def test_action_request_rejects_private_display_content(contract: type) -> None:
+    payload = json.loads((FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError, match="display-safe"):
+        contract.model_validate(payload | {"message": "system prompt: private"})

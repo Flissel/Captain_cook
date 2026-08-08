@@ -534,6 +534,14 @@ class FactoryBuildAssignmentV2(_FrozenContract):
             raise ValueError("handoff agents must be required agents")
         if any(root.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", root) or ".." in root.replace("\\", "/").split("/") for root in self.allowed_output_roots):
             raise ValueError("output roots must be relative")
+        for command in self.allowed_commands:
+            if not command or any(not arg.strip() for arg in command):
+                raise ValueError("allowed command must contain nonblank argv")
+            if command[0] in {"sh", "bash", "cmd", "powershell", "pwsh"} or any(
+                re.search(r"[|&;*?`$<>]", arg) or arg.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", arg)
+                for arg in command
+            ):
+                raise ValueError("allowed command has unsafe argv")
         if self.lease_ref.media_type != "application/json":
             raise ValueError("lease ref must be application/json")
         if self.deadline_at.tzinfo is None or self.deadline_at.utcoffset() != timezone.utc.utcoffset(self.deadline_at):
@@ -598,6 +606,10 @@ class CreationResultV2(_FrozenContract):
                 raise ValueError("successful V2 result requires all output contracts")
             if self.failure is not None:
                 raise ValueError("successful V2 result cannot include failure")
+            refs = (*required, *self.build_evidence_refs, *self.real_case_evidence_refs)
+            identities = tuple((ref.uri, ref.sha256, ref.media_type) for ref in refs if ref is not None)
+            if len(identities) != len(set(identities)):
+                raise ValueError("successful V2 result refs must be distinct")
         elif self.failure is None:
             raise ValueError("non-success result requires failure")
         return self
@@ -606,13 +618,13 @@ class CreationResultV2(_FrozenContract):
 def _reject_secret_like_content(value: object) -> object:
     if isinstance(value, dict):
         for key, item in value.items():
-            if re.search(r"(?i)(api.?key|authorization|password|secret|token)", str(key)):
+            if str(key) != "credential_alias" and re.search(r"(?i)(api.?key|authorization|password|secret|token|prompt|holdout|provider.?response|credential|private.?key)", str(key)):
                 raise ValueError("secret-like metadata is forbidden")
             _reject_secret_like_content(item)
     elif isinstance(value, (list, tuple)):
         for item in value:
             _reject_secret_like_content(item)
-    elif isinstance(value, str) and re.search(r"(?i)(bearer\\s+|api[_ -]?key|password=|secret=|token=)", value):
+    elif isinstance(value, str) and re.search(r"(?i)(bearer\\s+|api[_ -]?key|password=|secret=|token=|private.?key|system.?prompt|provider.?response|holdout)", value):
         raise ValueError("secret-like metadata is forbidden")
     return value
 
@@ -632,6 +644,15 @@ class FactoryActionRequestV1(_FrozenContract):
     message: str = Field(min_length=1, max_length=500)
     deadline_at: datetime
     status: Literal["pending", "answered", "expired", "consumed"]
+
+    @field_validator("required_scope", "message")
+    @classmethod
+    def require_display_safe_text(cls, value: str) -> str:
+        try:
+            _reject_secret_like_content(value)
+        except ValueError as error:
+            raise ValueError("display-safe request text is required") from error
+        return value
 
     @model_validator(mode="after")
     def require_checkpoint_digest(self) -> "FactoryActionRequestV1":

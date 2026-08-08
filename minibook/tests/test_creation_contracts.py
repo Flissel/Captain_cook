@@ -125,3 +125,30 @@ def test_factory_effect_rejects_bad_archive_media_type() -> None:
     bad_archive = payload["source_archive_ref"] | {"media_type": "application/json"}
     with pytest.raises(ValidationError, match="application/zip"):
         FactoryBuildEffectV2.model_validate(payload | {"source_archive_ref": bad_archive})
+
+
+def test_v3_result_rejects_duplicate_references_and_extra_fields() -> None:
+    payload = json.loads((FIXTURES / "minibook_creation_result.v2.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError, match="distinct"):
+        CreationResultV2.model_validate(payload | {"candidate_manifest_ref": payload["team_manifest_ref"]})
+    with pytest.raises(ValidationError):
+        CreationResultV2.model_validate(payload | {"unexpected": "forbidden"})
+
+
+def test_assignment_rejects_absolute_output_root_and_unsafe_command() -> None:
+    payload = json.loads((FIXTURES / "hermes_factory_assignment.v2.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError, match="output roots"):
+        FactoryBuildAssignmentV2.model_validate(payload | {"allowed_output_roots": ["C:/private"]})
+    with pytest.raises(ValidationError, match="allowed command"):
+        FactoryBuildAssignmentV2.model_validate(payload | {"allowed_commands": [["sh", "-c", "rm *"]]})
+
+
+def test_action_contracts_reject_private_content_and_identity_drift() -> None:
+    request = json.loads((FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8"))
+    response = json.loads((FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValidationError, match="display-safe"):
+        FactoryActionRequestV1.model_validate(request | {"message": "prompt: hidden system prompt"})
+    with pytest.raises(ValidationError, match="checkpoint digest"):
+        FactoryActionRequestV1.model_validate(request | {"safe_checkpoint_sha256": "0" * 64})
+    with pytest.raises(ValidationError, match="secret-like"):
+        FactoryActionResponseV1.model_validate(response | {"answer_metadata": {"nested": {"provider_response": "private"}}})

@@ -32,7 +32,7 @@
 - Create: `tests/fixtures/contracts/minibook_creation_result.v2.json`
 - Create: `tests/fixtures/contracts/factory_action_request.v1.json`
 - Create: `tests/fixtures/contracts/factory_action_response.v1.json`
-- Modify: `tests/agent_factory/test_forge_contract_compatibility.py`
+- Modify: `tests/contracts/test_forge_contract_compatibility.py`
 - Modify: `minibook/tests/test_creation_contracts.py`
 
 - [ ] **Step 1: Write failing compatibility and rejection tests.**
@@ -70,7 +70,7 @@ def test_creation_result_v2_cannot_succeed_from_receipt_only(
 Run:
 
 ```powershell
-python -m pytest tests/agent_factory/test_forge_contract_compatibility.py -q
+python -m pytest tests/contracts/test_forge_contract_compatibility.py -q
 $env:PYTHONPATH=(Resolve-Path minibook).Path
 python -m pytest minibook/tests/test_creation_contracts.py -q
 ```
@@ -176,7 +176,7 @@ Model `FactoryActionRequestV1` and `FactoryActionResponseV1` exactly as the appr
 - [ ] **Step 5: Commit.**
 
 ```powershell
-git add agenten/agent_factory/forge_contracts.py minibook/swarm/contracts.py tests/fixtures/contracts tests/agent_factory/test_forge_contract_compatibility.py minibook/tests/test_creation_contracts.py
+git add agenten/agent_factory/forge_contracts.py minibook/swarm/contracts.py tests/fixtures/contracts tests/contracts/test_forge_contract_compatibility.py minibook/tests/test_creation_contracts.py
 git commit -m "feat(factory): add strict v3 creation contracts"
 ```
 
