@@ -81,7 +81,12 @@ class CreationScheduler:
             job_id = await self._queue.get()
             try:
                 runner = self._runner_for(job_id)
-                await runner.run_slice(job_id)
+                result = await runner.run_slice(job_id)
+                # A V3 slice may persist a durable yield (for a build lease or
+                # user action).  It is deliberately not requeued here: another
+                # durable event, or startup recovery, owns the next dispatch.
+                if result is None:
+                    continue
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

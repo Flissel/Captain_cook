@@ -170,7 +170,7 @@ class CreationProgressV1(_FrozenContract):
     creation_job_id: UUID
     subject_version: int = Field(ge=1, strict=True)
     attempt: int = Field(ge=1, le=5, strict=True)
-    status: Literal["queued", "running", "blocked", "failed", "cancelled", "succeeded"]
+    status: Literal["queued", "planning", "awaiting_build", "building", "validating", "packaging", "readback", "awaiting_user_input", "running", "blocked", "failed", "cancelled", "succeeded"]
     checkpoint: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
     version: int = Field(ge=1, strict=True)
 
