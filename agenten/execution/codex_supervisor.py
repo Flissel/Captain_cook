@@ -8,7 +8,7 @@ from io import BytesIO
 import json
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,7 +73,23 @@ CodexOutputFailureKind = Literal[
     "unterminated_record",
     "journal_size_limit_exceeded",
     "journal_record_count_exceeded",
+    "observer_failed",
 ]
+
+
+CodexJsonlObserver = Callable[[dict[str, object]], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class CodexOutputJournalPolicy:
+    """Choose whether parsed JSONL is retained and optionally stream each event."""
+
+    retain_raw_records: bool = True
+    observer: CodexJsonlObserver | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.retain_raw_records, bool):
+            raise TypeError("Codex output retention policy must be boolean")
 
 
 class CodexOutputEvidenceError(RuntimeError):
@@ -163,10 +179,18 @@ class CodexJournalRecordCountLimitError(CodexOutputEvidenceError):
     failure_kind: CodexOutputFailureKind = "journal_record_count_exceeded"
 
 
+class CodexOutputObserverError(CodexOutputEvidenceError):
+    """A runtime observer rejected one parsed event; private detail is redacted."""
+
+    failure_kind: CodexOutputFailureKind = "observer_failed"
+
+
 @dataclass
 class _JournalEvidenceState:
     persisted_bytes: bytearray = field(default_factory=bytearray)
     record_count: int = 0
+    accepted_byte_count: int = 0
+    event_types: set[str] = field(default_factory=set)
 
 
 class CodexRunRequest(BaseModel):
@@ -262,6 +286,7 @@ class PowerShellCodexRunner:
         max_jsonl_record_bytes: int = DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES,
         max_journal_bytes: int = DEFAULT_MAX_CODEX_JOURNAL_BYTES,
         max_journal_records: int = DEFAULT_MAX_CODEX_JOURNAL_RECORDS,
+        output_policy: CodexOutputJournalPolicy | None = None,
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
@@ -310,6 +335,7 @@ class PowerShellCodexRunner:
         self._max_jsonl_record_bytes = max_jsonl_record_bytes
         self._max_journal_bytes = max_journal_bytes
         self._max_journal_records = max_journal_records
+        self._output_policy = output_policy or CodexOutputJournalPolicy()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic or time.monotonic
 
@@ -372,6 +398,7 @@ class PowerShellCodexRunner:
             env=child_environment,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=self._max_jsonl_record_bytes + 2,
         )
         assert process.stdout is not None
         assert process.stderr is not None
@@ -454,13 +481,23 @@ class PowerShellCodexRunner:
                 )
                 journal_bytes = bytes(journal_state.persisted_bytes)
             if evidence_failure is not None:
+                evidence_event_count = (
+                    len(journal_lines)
+                    if self._output_policy.retain_raw_records
+                    else journal_state.record_count
+                )
+                evidence_event_types = (
+                    event_types
+                    if self._output_policy.retain_raw_records
+                    else tuple(sorted(journal_state.event_types))
+                )
                 evidence_failure.bind_terminal_evidence(
                     process_cleanup_status=process_cleanup_status,
                     journal_path=self._journal_path,
                     journal_sha256=hashlib.sha256(journal_bytes).hexdigest(),
                     journal_byte_count=len(journal_bytes),
-                    event_count=len(journal_lines),
-                    event_types=event_types,
+                    event_count=evidence_event_count,
+                    event_types=evidence_event_types,
                 )
 
         if evidence_failure is not None:
@@ -545,8 +582,8 @@ class PowerShellCodexRunner:
                 if record.endswith(b"\r"):
                     record = record[:-1]
                 if record.strip():
-                    self._require_json_object(record)
-                    self._persist_jsonl_record(journal, record, state)
+                    event = self._require_json_object(record)
+                    await self._accept_jsonl_record(journal, record, event, state)
                 cursor = newline + 1
                 if cursor == len(chunk):
                     break
@@ -571,10 +608,11 @@ class PowerShellCodexRunner:
             )
         pending.extend(segment)
 
-    def _persist_jsonl_record(
+    async def _accept_jsonl_record(
         self,
         journal: BinaryIO,
         record: bytes,
+        event: dict[str, object],
         state: _JournalEvidenceState,
     ) -> None:
         serialized = record + b"\n"
@@ -582,22 +620,86 @@ class PowerShellCodexRunner:
             raise CodexJournalRecordCountLimitError(
                 "Codex JSONL journal exceeds configured record count limit"
             )
-        if len(state.persisted_bytes) + len(serialized) > self._max_journal_bytes:
+        if state.accepted_byte_count + len(serialized) > self._max_journal_bytes:
             raise CodexJournalSizeLimitError(
                 "Codex JSONL journal exceeds configured safe limit"
             )
-        try:
-            written = journal.write(serialized)
-            if written != len(serialized):
-                raise OSError
-            journal.flush()
-            os.fsync(journal.fileno())
-        except OSError:
-            raise CodexJournalPersistenceError(
-                "Codex JSONL journal persistence failed"
-            ) from None
-        state.persisted_bytes.extend(serialized)
+        observer = self._output_policy.observer
+        if observer is not None:
+            try:
+                await observer(dict(event))
+            except BaseException:
+                raise CodexOutputObserverError(
+                    "Codex JSONL observer rejected a parsed event"
+                ) from None
+        if self._output_policy.retain_raw_records:
+            try:
+                written = journal.write(serialized)
+                if written != len(serialized):
+                    raise OSError
+                journal.flush()
+                os.fsync(journal.fileno())
+            except OSError:
+                raise CodexJournalPersistenceError(
+                    "Codex JSONL journal persistence failed"
+                ) from None
+            state.persisted_bytes.extend(serialized)
+        state.accepted_byte_count += len(serialized)
         state.record_count += 1
+        state.event_types.add(canonical_codex_event_type(event.get("type")))
+
+    async def cancel(self) -> bool:
+        """Cancel this runner's exact session-owned process tree once verified."""
+
+        return await self._cancel_process("operator")
+
+    @staticmethod
+    async def inspect_process_state(
+        *,
+        pwsh_path: Path,
+        script_path: Path,
+        state_path: Path,
+        session_id: str,
+    ) -> Literal["active", "lost", "identity_mismatch", "missing", "unresolved"]:
+        """Inspect one durable session identity through the established launcher."""
+
+        if not state_path.is_file():
+            return "missing"
+        inspection = await asyncio.create_subprocess_exec(
+            str(pwsh_path),
+            "-NoProfile",
+            "-File",
+            str(script_path),
+            "-InspectStatePath",
+            str(state_path),
+            "-SessionId",
+            session_id,
+            env=PowerShellCodexRunner._cancellation_environment(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(inspection.communicate(), timeout=15)
+        except TimeoutError:
+            inspection.kill()
+            await inspection.wait()
+            return "unresolved"
+        if inspection.returncode != 0:
+            return "unresolved"
+        try:
+            result = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return "unresolved"
+        if not isinstance(result, dict):
+            return "unresolved"
+        status = result.get("status")
+        if result.get("session_id") != session_id or status not in {
+            "active",
+            "lost",
+            "identity_mismatch",
+        }:
+            return "unresolved"
+        return status
 
     def _read_bounded_journal(self, journal: BinaryIO) -> bytes:
         try:

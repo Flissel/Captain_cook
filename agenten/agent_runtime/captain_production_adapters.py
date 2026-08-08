@@ -5,18 +5,17 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
-import os
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit
 from uuid import uuid5
 
 from agenten.agent_runtime.runtime_codex import (
     RuntimeCodexExecution,
     RuntimeCodexTerminalEvidenceV1,
-    SubprocessRuntimeCodexRunner,
+    PowerShellRuntimeCodexRunner,
 )
 from agenten.agent_factory.codex_build_recovery import canonical_factory_codex_model
 from agenten.agent_factory.hermes_cli import HermesCliFactory, HermesCliSettings
@@ -29,6 +28,7 @@ from agenten.agent_runtime.contracts import (
     HermesPlanResult,
     RuntimeStatus,
 )
+from agenten.agent_runtime.confined_files import ConfinedFileError, ConfinedFileStore
 from agenten.agent_runtime.production_bootstrap import (
     RuntimeAdapterBinding,
     RuntimeAdapterContext,
@@ -52,39 +52,20 @@ class ContentAddressedArtifactAdapter:
     """Exact-byte SHA-256 storage shared by all three production adapters."""
 
     def __init__(self, root: Path) -> None:
-        self._root = root.resolve()
+        self._store = ConfinedFileStore(root)
 
     def put(self, content: bytes, media_type: str) -> ArtifactRef:
         if not isinstance(content, bytes):
             raise TypeError("runtime artifact content must be bytes")
         digest = hashlib.sha256(content).hexdigest()
-        target = self._path(digest)
-        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
-            descriptor = os.open(
-                target,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_BINARY", 0),
-                0o600,
+            self._store.write_once(
+                f"{digest[:2]}/{digest}",
+                content,
+                conflict="runtime artifact digest collision or corruption",
             )
-        except FileExistsError:
-            try:
-                existing = target.read_bytes()
-            except OSError as exc:
-                raise ValueError("runtime artifact content is unavailable") from exc
-            if existing != content or hashlib.sha256(existing).hexdigest() != digest:
-                raise ValueError("runtime artifact digest collision or corruption")
-        else:
-            try:
-                with os.fdopen(descriptor, "wb", closefd=True) as stream:
-                    stream.write(content)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-            except Exception:
-                target.unlink(missing_ok=True)
-                raise
+        except ConfinedFileError as exc:
+            raise ValueError(str(exc)) from None
         return ArtifactRef(
             uri=f"artifact://sha256/{digest}",
             sha256=digest,
@@ -101,21 +82,16 @@ class ContentAddressedArtifactAdapter:
         digest = reference.sha256
         if (
             _SHA256.fullmatch(digest) is None
-            or not reference.uri.startswith("artifact://")
-            or reference.uri.rsplit("/", 1)[-1] != digest
+            or reference.uri != f"artifact://sha256/{digest}"
         ):
             raise ValueError("runtime artifact reference is not content-addressed")
         try:
-            content = self._path(digest).read_bytes()
-        except OSError as exc:
-            raise ValueError("runtime artifact content is unavailable") from exc
+            content = self._store.read(f"{digest[:2]}/{digest}")
+        except ConfinedFileError:
+            raise ValueError("runtime artifact content is unavailable") from None
         if hashlib.sha256(content).hexdigest() != digest:
             raise ValueError("runtime artifact digest changed")
         return content
-
-    def _path(self, digest: str) -> Path:
-        return self._root / digest[:2] / digest
-
 
 class CaptainHermesPlannerAdapter:
     """Runtime planning port over the current released-skill Hermes factory."""
@@ -153,6 +129,12 @@ class CaptainHermesPlannerAdapter:
         if _SHA256.fullmatch(released_digest) is None:
             raise ValueError("Captain Hermes runtime skill release is not configured")
         skill_root = context.repository_root / "agenten" / "agent_factory" / "skills"
+        hermes_workspace = ConfinedFileStore(
+            context.repository_root
+            / ".captain-cook"
+            / "workspaces"
+            / "hermes-runtime"
+        ).root
         factory = HermesCliFactory(
             settings=HermesCliSettings(
                 executable=(
@@ -172,6 +154,7 @@ class CaptainHermesPlannerAdapter:
                     / "agent_factory"
                     / "released-skills"
                 ),
+                working_directory=hermes_workspace,
             )
         )
         factory.validate_runtime_skill(
@@ -255,9 +238,13 @@ class CaptainCodexExecutionAdapter:
             context.environ.get("CAPTAIN_CODEX_EXECUTABLE", "codex").strip()
             or "codex"
         )
-        runner = SubprocessRuntimeCodexRunner(
+        runner = PowerShellRuntimeCodexRunner(
+            repository_root=context.repository_root,
             executable=executable,
             environ=context.environ,
+            evidence_root=(
+                context.repository_root / ".captain-cook" / "runtime-codex"
+            ),
         )
         execution = RuntimeCodexExecution(
             runner=runner,
@@ -282,13 +269,14 @@ class CaptainCodexExecutionAdapter:
     ) -> AgentRuntimeResult:
         _require_grant(command, grant)
         prompt = self._prompt(command)
+        workspace = self._workspace(grant.workspace_ref)
         evidence = await self._execution.start(
             command_id=command.event_id,
             correlation_id=command.correlation_id,
             subject_id=command.subject_id,
             prompt_sha256=command.payload.prompt_ref.sha256,
             workspace_ref=grant.workspace_ref,
-            workspace=self._repository_root,
+            workspace=workspace,
             prompt=prompt,
             timeout_seconds=command.payload.limits.wall_seconds,
             observer=self._observe,
@@ -302,13 +290,14 @@ class CaptainCodexExecutionAdapter:
     ) -> AgentRuntimeResult:
         _require_grant(command, grant)
         prompt = self._prompt(command)
+        workspace = self._workspace(grant.workspace_ref)
         evidence = await self._execution.resume(
             correlation_id=command.correlation_id,
             causation_id=command.causation_id,
             subject_id=command.subject_id,
             prompt_sha256=command.payload.prompt_ref.sha256,
             workspace_ref=grant.workspace_ref,
-            workspace=self._repository_root,
+            workspace=workspace,
             prompt=prompt,
             timeout_seconds=command.payload.limits.wall_seconds,
             observer=self._observe,
@@ -321,10 +310,14 @@ class CaptainCodexExecutionAdapter:
         grant: CapabilityGrant,
     ) -> AgentRuntimeResult:
         _require_grant(command, grant)
+        workspace = self._workspace(grant.workspace_ref)
         evidence = self._execution.find_terminal(
             correlation_id=command.correlation_id,
+            causation_id=command.causation_id,
             subject_id=command.subject_id,
             prompt_sha256=command.payload.prompt_ref.sha256,
+            workspace_ref=grant.workspace_ref,
+            workspace=workspace,
         )
         return (
             self._result(command, grant, evidence)
@@ -338,11 +331,14 @@ class CaptainCodexExecutionAdapter:
         grant: CapabilityGrant,
     ) -> AgentRuntimeResult:
         _require_grant(command, grant)
+        workspace = self._workspace(grant.workspace_ref)
         evidence = await self._execution.cancel(
             correlation_id=command.correlation_id,
             causation_id=command.causation_id,
             subject_id=command.subject_id,
             prompt_sha256=command.payload.prompt_ref.sha256,
+            workspace_ref=grant.workspace_ref,
+            workspace=workspace,
         )
         return self._result(command, grant, evidence)
 
@@ -358,6 +354,25 @@ class CaptainCodexExecutionAdapter:
             return self._artifacts.read_bytes(command.payload.prompt_ref).decode("utf-8")
         except UnicodeDecodeError as exc:
             raise FactoryDispatchError("Codex runtime prompt is not UTF-8") from exc
+
+    def _workspace(self, workspace_ref: str) -> Path:
+        parsed = urlsplit(workspace_ref)
+        if parsed.scheme != "workspace" or parsed.query or parsed.fragment:
+            raise FactoryDispatchError("Codex workspace reference is invalid")
+        components = (parsed.netloc, *parsed.path.strip("/").split("/"))
+        if any(
+            re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", component) is None
+            for component in components
+        ):
+            raise FactoryDispatchError("Codex workspace reference is invalid")
+        try:
+            return ConfinedFileStore(
+                self._repository_root / ".captain-cook" / "workspaces"
+            ).require_directory(Path(*components))
+        except ConfinedFileError:
+            raise FactoryDispatchError(
+                "Codex workspace is unavailable or outside its authorized root"
+            ) from None
 
     async def _observe(self, event: dict[str, object]) -> None:
         if self._observer is None:
@@ -407,7 +422,7 @@ class CaptainCodexExecutionAdapter:
             event_id=uuid5(command.event_id, "captain.runtime-result"),
             command_id=command.event_id,
             correlation_id=command.correlation_id,
-            occurred_at=datetime.now(timezone.utc),
+            occurred_at=command.occurred_at,
             producer="agent-runtime",
             subject_id=command.subject_id,
             subject_version=command.subject_version,
@@ -430,7 +445,7 @@ class CaptainCodexExecutionAdapter:
             event_id=uuid5(command.event_id, "captain.runtime-running"),
             command_id=command.event_id,
             correlation_id=command.correlation_id,
-            occurred_at=datetime.now(timezone.utc),
+            occurred_at=command.occurred_at,
             producer="agent-runtime",
             subject_id=command.subject_id,
             subject_version=command.subject_version,

@@ -83,6 +83,7 @@ from agenten.agent_runtime.contracts import (
     HermesPlanResult,
     IntegrationIntent,
 )
+from agenten.agent_runtime.confined_files import ConfinedFileError, ConfinedFileStore
 
 if TYPE_CHECKING:
     from agenten.agent_factory.candidate_evaluation import FactoryCandidateEvaluationResult
@@ -374,20 +375,61 @@ class HermesCliFactory(HermesFactoryPort):
             raise FactoryDispatchError("released runtime skill name is invalid")
         if re.fullmatch(r"[0-9a-f]{64}", released_skill_sha256) is None:
             raise FactoryDispatchError("released runtime skill digest is invalid")
-        root = self._settings.skill_root.resolve()
-        directory = (root / skill_name).resolve()
         try:
-            directory.relative_to(root)
-        except ValueError as exc:
-            raise FactoryDispatchError(
-                "released runtime skill directory is outside its root"
-            ) from exc
-        if not directory.is_dir() or not (directory / "SKILL.md").is_file():
+            store = ConfinedFileStore(self._settings.skill_root)
+            files = store.regular_files(skill_name)
+            if Path(skill_name) / "SKILL.md" not in files:
+                raise ConfinedFileError("released runtime skill entrypoint is missing")
+            digest = _confined_skill_digest(store, skill_name, files)
+        except ConfinedFileError:
             raise FactoryDispatchError("released runtime skill directory is missing")
-        if _skill_directory_digest(directory) != released_skill_sha256:
+        if digest != released_skill_sha256:
             raise FactoryDispatchError(
                 "released runtime skill digest does not match Captain's release"
             )
+
+    def prepare_runtime_skill_snapshot(
+        self,
+        *,
+        skill_name: str,
+        released_skill_sha256: str,
+    ) -> Path:
+        """Copy validated exact skill bytes into one immutable Hermes home."""
+
+        self.validate_runtime_skill(
+            skill_name=skill_name,
+            released_skill_sha256=released_skill_sha256,
+        )
+        source = ConfinedFileStore(self._settings.skill_root)
+        files = source.regular_files(skill_name)
+        snapshot_home = (
+            self._settings.evidence_root
+            / "runtime-skill-snapshots"
+            / released_skill_sha256
+        )
+        destination = ConfinedFileStore(snapshot_home)
+        prefix = Path(skill_name)
+        try:
+            for source_relative in files:
+                inner = source_relative.relative_to(prefix)
+                destination.write_once(
+                    Path("skills") / skill_name / inner,
+                    source.read(source_relative),
+                    conflict="runtime skill snapshot conflicts with released bytes",
+                )
+            snapshot_files = destination.regular_files(Path("skills") / skill_name)
+            digest = _confined_skill_digest(
+                destination,
+                Path("skills") / skill_name,
+                snapshot_files,
+            )
+        except (ConfinedFileError, ValueError):
+            raise FactoryDispatchError(
+                "released runtime skill snapshot could not be verified"
+            ) from None
+        if digest != released_skill_sha256:
+            raise FactoryDispatchError("released runtime skill snapshot digest changed")
+        return destination.root
 
     async def runtime_plan(
         self,
@@ -401,6 +443,10 @@ class HermesCliFactory(HermesFactoryPort):
         """Invoke current Hermes CLI handling and accept only the runtime plan."""
 
         self.validate_runtime_skill(
+            skill_name=skill_name,
+            released_skill_sha256=released_skill_sha256,
+        )
+        hermes_home = self.prepare_runtime_skill_snapshot(
             skill_name=skill_name,
             released_skill_sha256=released_skill_sha256,
         )
@@ -425,6 +471,7 @@ class HermesCliFactory(HermesFactoryPort):
             _canonical_json(envelope),
             max_seconds=float(command.payload.limits.wall_seconds),
             skill_name=skill_name,
+            hermes_home=hermes_home,
         )
         try:
             result = HermesPlanResult.model_validate(_parse_evidence_payload(stdout))
@@ -1242,6 +1289,7 @@ class HermesCliFactory(HermesFactoryPort):
         skill_name: str | None = None,
         disable_tools: bool = False,
         effect_identity: str | None = None,
+        hermes_home: Path | None = None,
     ) -> bytes:
         deadline = _deadline(min(float(self._settings.timeout_seconds), max_seconds))
         maximum_cost = self._settings.maximum_total_cost_usd
@@ -1250,6 +1298,9 @@ class HermesCliFactory(HermesFactoryPort):
         command_prefix = [self._settings.executable]
         process_options: dict[str, object] = _async_process_group_options()
         environment = os.environ.copy()
+        if hermes_home is not None:
+            resolved_hermes_home = hermes_home.resolve(strict=True)
+            environment["HERMES_HOME"] = str(resolved_hermes_home)
         if self._settings.module_root is not None:
             module_root = _resolve_hermes_module_root(self._settings.module_root)
             environment["PYTHONPATH"] = str(module_root)
@@ -3044,6 +3095,26 @@ def _skill_directory_digest(directory: Path) -> str:
         manifest.append(
             {
                 "path": path.relative_to(directory).as_posix(),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "size": len(content),
+            }
+        )
+    encoded = _canonical_json(manifest).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _confined_skill_digest(
+    store: ConfinedFileStore,
+    relative_directory: str | Path,
+    files: tuple[Path, ...],
+) -> str:
+    directory = Path(relative_directory)
+    manifest: list[dict[str, object]] = []
+    for relative_path in files:
+        content = store.read(relative_path)
+        manifest.append(
+            {
+                "path": relative_path.relative_to(directory).as_posix(),
                 "sha256": hashlib.sha256(content).hexdigest(),
                 "size": len(content),
             }

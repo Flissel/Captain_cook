@@ -136,6 +136,7 @@ def _runner(
     max_jsonl_record_bytes: int | None = None,
     max_journal_bytes: int | None = None,
     max_journal_records: int | None = None,
+    output_policy: object | None = None,
 ) -> PowerShellCodexRunner:
     pwsh = shutil.which("pwsh")
     assert pwsh is not None
@@ -148,6 +149,8 @@ def _runner(
         kwargs["max_journal_bytes"] = max_journal_bytes
     if max_journal_records is not None:
         kwargs["max_journal_records"] = max_journal_records
+    if output_policy is not None:
+        kwargs["output_policy"] = output_policy
     return PowerShellCodexRunner(
         pwsh_path=Path(pwsh),
         script_path=Path("scripts/codex-session.ps1").resolve(),
@@ -169,6 +172,92 @@ def _authorized(tmp_path: Path) -> AuthorizedCodexRun:
         command=("codex", "exec", "--json", "harmless stream test"),
         environment=FrozenEnvironment({"PATH": "safe"}),
     )
+
+
+@pytest.mark.asyncio
+async def test_redacted_output_policy_streams_events_without_retaining_raw_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_text = "provider-private-body"
+    records = (
+        b'{"type":"thread.started","thread_id":"runtime-thread"}',
+        json.dumps(
+            {"type": "item.completed", "item": {"text": private_text}},
+            separators=(",", ":"),
+        ).encode(),
+    )
+    process = _CompletedProcess((b"\n".join((*records, b"")),))
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return process
+
+    observed: list[dict[str, object]] = []
+
+    async def observe(event: dict[str, object]) -> None:
+        observed.append(event)
+
+    monkeypatch.setattr(
+        codex_supervisor.asyncio, "create_subprocess_exec", create_process
+    )
+    policy_type = getattr(codex_supervisor, "CodexOutputJournalPolicy")
+    policy = policy_type(retain_raw_records=False, observer=observe)
+
+    result = await _runner(tmp_path, output_policy=policy).run(_authorized(tmp_path))
+
+    assert observed == [json.loads(record) for record in records]
+    assert result.jsonl_lines == ()
+    assert result.journal_path.read_bytes() == b""
+    assert private_text not in result.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_redacted_output_policy_observer_failure_is_typed_and_cleans_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = asyncio.StreamReader()
+    stream.feed_data(b'{"type":"turn.started","private":"secret"}\n')
+    process = _RunningProcess(stream)
+    cancellation_calls = 0
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return process
+
+    async def broken_observer(_event: dict[str, object]) -> None:
+        raise RuntimeError("private observer failure detail")
+
+    async def cancel_for_evidence_failure() -> bool:
+        nonlocal cancellation_calls
+        cancellation_calls += 1
+        process.stop()
+        return True
+
+    monkeypatch.setattr(
+        codex_supervisor.asyncio, "create_subprocess_exec", create_process
+    )
+    policy_type = getattr(codex_supervisor, "CodexOutputJournalPolicy")
+    policy = policy_type(retain_raw_records=False, observer=broken_observer)
+    runner = _runner(tmp_path, output_policy=policy)
+    monkeypatch.setattr(
+        runner,
+        "_attempt_verified_evidence_failure_cancellation",
+        cancel_for_evidence_failure,
+    )
+    error_type = getattr(codex_supervisor, "CodexOutputObserverError")
+
+    with pytest.raises(error_type) as caught:
+        await runner.run(_authorized(tmp_path))
+
+    assert cancellation_calls == 1
+    assert caught.value.failure_kind == "observer_failed"
+    assert caught.value.process_cleanup_status == "verified_cancelled"
+    assert caught.value.journal_byte_count == 0
+    assert caught.value.event_count == 0
+    assert caught.value.journal_path.read_bytes() == b""
+    assert "private observer failure detail" not in str(caught.value)
 
 
 @pytest.mark.asyncio

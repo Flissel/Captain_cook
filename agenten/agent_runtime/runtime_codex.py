@@ -1,69 +1,77 @@
-"""Redacted, resumable Codex CLI execution for Captain runtime ports."""
+"""Redacted coordination and recovery over Captain's existing Codex runner."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
-import os
 import re
-import subprocess
+import shutil
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Protocol
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from agenten.agent_factory.codex_build_execution import write_once_codex_evidence
 from agenten.agent_factory.orchestration import FactoryDispatchError
+from agenten.agent_runtime.confined_files import ConfinedFileError, ConfinedFileStore
 from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.execution.codex_policy import AuthorizedCodexRun, FrozenEnvironment
 from agenten.execution.codex_supervisor import (
-    CODEX_JSONL_READ_CHUNK_BYTES,
-    DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES,
+    CodexOutputEvidenceError,
+    CodexOutputJournalPolicy,
+    PowerShellCodexRunner,
     canonical_codex_event_type,
 )
 
 
-RuntimeCodexTerminalStatus = Literal[
-    "succeeded",
-    "failed",
-    "timed_out",
-    "cancelled",
-]
-RuntimeCodexProcessCleanupStatus = Literal[
-    "not_required",
-    "verified_cancelled",
-    "unresolved",
+RuntimeCodexTerminalStatus = Literal["succeeded", "failed", "timed_out", "cancelled"]
+RuntimeCodexProcessCleanupStatus = Literal["not_required", "verified_cancelled", "unresolved"]
+RuntimeCodexFailureKind = Literal[
+    "journal_persistence_failed",
+    "output_read_failed",
+    "invalid_json_object",
+    "record_size_limit_exceeded",
+    "unterminated_record",
+    "journal_size_limit_exceeded",
+    "journal_record_count_exceeded",
+    "observer_failed",
+    "stream_mismatch",
 ]
 
 
 @dataclass(frozen=True)
 class RuntimeCodexInvocation:
-    """Private execution input with one stable effect identity across resume."""
-
     command_id: UUID
     correlation_id: UUID
+    subject_id: str
+    prompt_sha256: str
     command_identity_sha256: str
     session_id: str
+    workspace_ref: str
+    workspace_binding_sha256: str
     workspace: Path
     prompt: str
     timeout_seconds: int
     resume: bool = False
+    prior_checkpoint_sha256: str | None = None
 
 
 @dataclass(frozen=True)
 class RuntimeCodexProcessResult:
-    """Bounded process outcome before Captain reduces it to public evidence."""
-
     exit_code: int
     terminal_status: RuntimeCodexTerminalStatus
     process_cleanup_status: RuntimeCodexProcessCleanupStatus
     elapsed_ms: int
     session_id: str
-    jsonl_events: tuple[dict[str, object], ...]
+    event_count: int
+    event_types: tuple[str, ...]
+    last_event_sha256: str | None
+    failure_kind: RuntimeCodexFailureKind | None = None
 
     def __post_init__(self) -> None:
         expected = (
@@ -77,29 +85,25 @@ class RuntimeCodexProcessResult:
         )
         if self.terminal_status != expected:
             raise ValueError("runtime Codex exit and terminal status do not match")
-        if self.elapsed_ms < 0:
-            raise ValueError("runtime Codex elapsed duration must not be negative")
+        if self.elapsed_ms < 0 or self.event_count < 0:
+            raise ValueError("runtime Codex bounded counts must not be negative")
+        if tuple(sorted(set(self.event_types))) != self.event_types:
+            raise ValueError("runtime Codex event types must be sorted and unique")
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", self.session_id) is None:
             raise ValueError("runtime Codex session identity is invalid")
 
 
 class RuntimeCodexTerminalEvidenceV1(BaseModel):
-    """Redacted terminal evidence retained independently of provider output."""
-
-    model_config = ConfigDict(
-        extra="forbid",
-        frozen=True,
-        strict=True,
-        populate_by_name=True,
-    )
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, populate_by_name=True)
 
     schema_name: Literal["captain.runtime-codex-terminal-evidence.v1"] = Field(
-        alias="schema",
-        serialization_alias="schema",
+        alias="schema", serialization_alias="schema"
     )
     command_id: UUID
     correlation_id: UUID
     command_identity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    workspace_ref: str = Field(pattern=r"^workspace://[a-z0-9][a-z0-9/-]{0,126}[a-z0-9]$")
+    workspace_binding_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     session_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
     status: RuntimeCodexTerminalStatus
     exit_code: int
@@ -108,6 +112,7 @@ class RuntimeCodexTerminalEvidenceV1(BaseModel):
     event_count: int = Field(ge=0, strict=True)
     event_types: tuple[str, ...] = ()
     process_cleanup_status: RuntimeCodexProcessCleanupStatus
+    failure_kind: RuntimeCodexFailureKind | None = None
     resumable_checkpoint: ArtifactRef | None = None
 
     @field_validator("event_types")
@@ -118,12 +123,14 @@ class RuntimeCodexTerminalEvidenceV1(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def require_timeout_checkpoint(self) -> "RuntimeCodexTerminalEvidenceV1":
+    def require_terminal_shape(self) -> "RuntimeCodexTerminalEvidenceV1":
         if self.exit_code == 124:
             if self.status != "timed_out" or self.resumable_checkpoint is None:
                 raise ValueError("runtime Codex timeout requires a resumable checkpoint")
         elif self.status == "timed_out":
             raise ValueError("runtime Codex timeout status requires exit 124")
+        if self.failure_kind is not None and self.status != "failed":
+            raise ValueError("runtime Codex failure kind requires failed status")
         return self
 
 
@@ -131,33 +138,49 @@ RuntimeCodexObserver = Callable[[dict[str, object]], Awaitable[None]]
 
 
 class RuntimeCodexProcessRunner(Protocol):
-    async def run(
-        self,
-        invocation: RuntimeCodexInvocation,
-        observer: RuntimeCodexObserver,
-    ) -> RuntimeCodexProcessResult: ...
+    async def run(self, invocation: RuntimeCodexInvocation, observer: RuntimeCodexObserver) -> RuntimeCodexProcessResult: ...
 
     async def cancel(self, session_id: str) -> None: ...
 
 
-class RuntimeCodexExecution:
-    """Small runtime execution/recovery seam over an injected process runner."""
+class _RuntimeObserverFailed(RuntimeError):
+    pass
 
-    def __init__(
-        self,
-        *,
-        runner: RuntimeCodexProcessRunner,
-        checkpoint_root: Path,
-    ) -> None:
+
+@dataclass
+class _EventSummary:
+    count: int = 0
+    types: set[str] = field(default_factory=set)
+    last_sha256: str | None = None
+    session_id: str | None = None
+
+    def observe(self, event: Mapping[str, object]) -> dict[str, object]:
+        canonical = _runtime_codex_event(event)
+        self.count += 1
+        self.types.add(canonical_codex_event_type(canonical.get("type")))
+        self.last_sha256 = hashlib.sha256(_runtime_codex_json(canonical)).hexdigest()
+        if canonical.get("type") == "thread.started":
+            candidate = canonical.get("thread_id")
+            if isinstance(candidate, str) and re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", candidate
+            ):
+                self.session_id = candidate
+        return canonical
+
+
+class RuntimeCodexExecution:
+    """Single-flight runtime state and immutable terminal recovery."""
+
+    def __init__(self, *, runner: RuntimeCodexProcessRunner, checkpoint_root: Path) -> None:
         self._runner = runner
-        self._checkpoint_root = checkpoint_root.resolve()
+        self._checkpoints = ConfinedFileStore(checkpoint_root)
         self._terminal: dict[UUID, RuntimeCodexTerminalEvidenceV1] = {}
-        self._identity_index: dict[tuple[UUID, str, str], UUID] = {}
-        self._identities: dict[UUID, str] = {}
+        self._identity_index: dict[tuple[UUID, str, str, str, str], UUID] = {}
         self._sessions: dict[UUID, str] = {}
-        self._active_events: dict[UUID, list[dict[str, object]]] = {}
+        self._active: dict[UUID, tuple[str, asyncio.Task[RuntimeCodexTerminalEvidenceV1]]] = {}
         self._cancelled: set[UUID] = set()
-        self._cancel_lock = asyncio.Lock()
+        self._lock = asyncio.Lock()
+        self._owner_id = uuid4().hex
 
     async def start(
         self,
@@ -172,29 +195,32 @@ class RuntimeCodexExecution:
         timeout_seconds: int,
         observer: RuntimeCodexObserver,
     ) -> RuntimeCodexTerminalEvidenceV1:
+        workspace_binding = _workspace_binding(workspace)
         identity = _runtime_codex_command_identity(
+            command_id=command_id,
             correlation_id=correlation_id,
             subject_id=subject_id,
             prompt_sha256=prompt_sha256,
             workspace_ref=workspace_ref,
+            workspace_binding_sha256=workspace_binding,
         )
-        key = (correlation_id, subject_id, prompt_sha256)
-        self._identity_index[key] = command_id
-        self._identities[command_id] = identity
-        session_id = f"runtime-{identity[:24]}"
-        self._sessions[command_id] = session_id
-        return await self._run(
-            RuntimeCodexInvocation(
-                command_id=command_id,
-                correlation_id=correlation_id,
-                command_identity_sha256=identity,
-                session_id=session_id,
-                workspace=workspace,
-                prompt=prompt,
-                timeout_seconds=timeout_seconds,
-            ),
-            observer=observer,
+        self._identity_index[
+            (correlation_id, subject_id, prompt_sha256, workspace_ref, workspace_binding)
+        ] = command_id
+        invocation = RuntimeCodexInvocation(
+            command_id=command_id,
+            correlation_id=correlation_id,
+            subject_id=subject_id,
+            prompt_sha256=prompt_sha256,
+            command_identity_sha256=identity,
+            session_id=f"runtime-{identity[:24]}",
+            workspace_ref=workspace_ref,
+            workspace_binding_sha256=workspace_binding,
+            workspace=workspace,
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
         )
+        return await self._single_flight(invocation, observer)
 
     async def resume(
         self,
@@ -209,41 +235,52 @@ class RuntimeCodexExecution:
         timeout_seconds: int,
         observer: RuntimeCodexObserver,
     ) -> RuntimeCodexTerminalEvidenceV1:
-        key = (correlation_id, subject_id, prompt_sha256)
+        workspace_binding = _workspace_binding(workspace)
+        key = (correlation_id, subject_id, prompt_sha256, workspace_ref, workspace_binding)
         command_id = causation_id or self._identity_index.get(key)
         if command_id is None:
             raise FactoryDispatchError("Codex resume checkpoint is unavailable")
-        prior = self._terminal.get(command_id) or self._load_checkpoint(command_id)
-        if (
-            prior is None
-            or prior.correlation_id != correlation_id
-            or prior.status not in {"timed_out", "cancelled", "failed"}
-        ):
+        prior = self.terminal_evidence(command_id)
+        if prior is None or prior.status not in {"timed_out", "cancelled", "failed"}:
             raise FactoryDispatchError("Codex resume checkpoint is not resumable")
         expected_identity = _runtime_codex_command_identity(
+            command_id=command_id,
             correlation_id=correlation_id,
             subject_id=subject_id,
             prompt_sha256=prompt_sha256,
             workspace_ref=workspace_ref,
+            workspace_binding_sha256=workspace_binding,
         )
-        if prior.command_identity_sha256 != expected_identity:
+        if (
+            prior.correlation_id != correlation_id
+            or prior.command_identity_sha256 != expected_identity
+            or prior.workspace_ref != workspace_ref
+            or prior.workspace_binding_sha256 != workspace_binding
+        ):
             raise FactoryDispatchError("Codex resume command identity changed")
-        self._sessions[command_id] = prior.session_id
-        self._identities[command_id] = expected_identity
+        self._terminal.pop(command_id, None)
         self._cancelled.discard(command_id)
-        return await self._run(
-            RuntimeCodexInvocation(
-                command_id=command_id,
-                correlation_id=correlation_id,
-                command_identity_sha256=expected_identity,
-                session_id=prior.session_id,
-                workspace=workspace,
-                prompt=prompt,
-                timeout_seconds=timeout_seconds,
-                resume=True,
+        self._identity_index[key] = command_id
+        invocation = RuntimeCodexInvocation(
+            command_id=command_id,
+            correlation_id=correlation_id,
+            subject_id=subject_id,
+            prompt_sha256=prompt_sha256,
+            command_identity_sha256=expected_identity,
+            session_id=prior.session_id,
+            workspace_ref=workspace_ref,
+            workspace_binding_sha256=workspace_binding,
+            workspace=workspace,
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+            resume=True,
+            prior_checkpoint_sha256=(
+                prior.resumable_checkpoint.sha256
+                if prior.resumable_checkpoint is not None
+                else None
             ),
-            observer=observer,
         )
+        return await self._single_flight(invocation, observer, replace_checkpoint=True)
 
     async def cancel(
         self,
@@ -252,211 +289,427 @@ class RuntimeCodexExecution:
         causation_id: UUID | None,
         subject_id: str,
         prompt_sha256: str,
+        workspace_ref: str,
+        workspace: Path,
     ) -> RuntimeCodexTerminalEvidenceV1:
-        key = (correlation_id, subject_id, prompt_sha256)
+        workspace_binding = _workspace_binding(workspace)
+        key = (correlation_id, subject_id, prompt_sha256, workspace_ref, workspace_binding)
         command_id = causation_id or self._identity_index.get(key)
-        if command_id is None or command_id not in self._sessions:
+        if command_id is None:
             raise FactoryDispatchError("Codex cancellation target is unavailable")
-        async with self._cancel_lock:
-            existing = self._terminal.get(command_id)
+        async with self._lock:
+            active = self._active.get(command_id)
+            terminal = self._terminal.get(command_id)
+            if active is None:
+                terminal = terminal or self.terminal_evidence(command_id)
+                if terminal is None:
+                    raise FactoryDispatchError("Codex cancellation target is unavailable")
+                return terminal
+            task = active[1]
             if command_id not in self._cancelled:
                 await self._runner.cancel(self._sessions[command_id])
                 self._cancelled.add(command_id)
-            if existing is not None and existing.status == "cancelled":
-                return existing
-            events = self._active_events.get(command_id, [])
-            evidence = self._terminal_evidence(
-                command_id=command_id,
-                correlation_id=correlation_id,
-                command_identity_sha256=self._identities[command_id],
-                session_id=self._sessions[command_id],
-                result=RuntimeCodexProcessResult(
-                    exit_code=130,
-                    terminal_status="cancelled",
-                    process_cleanup_status="verified_cancelled",
-                    elapsed_ms=0,
-                    session_id=self._sessions[command_id],
-                    jsonl_events=tuple(events),
-                ),
-                events=events,
-            )
-            self._terminal[command_id] = evidence
-            return evidence
+        return await asyncio.shield(task)
 
-    def terminal_evidence(
-        self,
-        command_id: UUID,
-    ) -> RuntimeCodexTerminalEvidenceV1 | None:
+    def terminal_evidence(self, command_id: UUID) -> RuntimeCodexTerminalEvidenceV1 | None:
         return self._terminal.get(command_id) or self._load_checkpoint(command_id)
 
     def find_terminal(
         self,
         *,
         correlation_id: UUID,
+        causation_id: UUID | None,
         subject_id: str,
         prompt_sha256: str,
+        workspace_ref: str,
+        workspace: Path,
     ) -> RuntimeCodexTerminalEvidenceV1 | None:
-        command_id = self._identity_index.get(
-            (correlation_id, subject_id, prompt_sha256)
+        workspace_binding = _workspace_binding(workspace)
+        command_id = causation_id or self._identity_index.get(
+            (correlation_id, subject_id, prompt_sha256, workspace_ref, workspace_binding)
         )
-        return self.terminal_evidence(command_id) if command_id is not None else None
+        if command_id is None or command_id in self._active:
+            return None
+        evidence = self.terminal_evidence(command_id)
+        if evidence is None:
+            return None
+        expected = _runtime_codex_command_identity(
+            command_id=command_id,
+            correlation_id=correlation_id,
+            subject_id=subject_id,
+            prompt_sha256=prompt_sha256,
+            workspace_ref=workspace_ref,
+            workspace_binding_sha256=workspace_binding,
+        )
+        if evidence.command_identity_sha256 != expected:
+            raise FactoryDispatchError("Codex terminal checkpoint identity changed")
+        return evidence
+
+    async def _single_flight(
+        self,
+        invocation: RuntimeCodexInvocation,
+        observer: RuntimeCodexObserver,
+        *,
+        replace_checkpoint: bool = False,
+    ) -> RuntimeCodexTerminalEvidenceV1:
+        async with self._lock:
+            existing = self._terminal.get(invocation.command_id)
+            if existing is None and not replace_checkpoint:
+                existing = self._load_checkpoint(invocation.command_id)
+            if existing is not None:
+                if existing.command_identity_sha256 != invocation.command_identity_sha256:
+                    raise FactoryDispatchError("Codex duplicate command identity conflicts")
+                self._terminal[invocation.command_id] = existing
+                return existing
+            active = self._active.get(invocation.command_id)
+            if active is not None:
+                if active[0] != invocation.command_identity_sha256:
+                    raise FactoryDispatchError("Codex active command identity conflicts")
+                task = active[1]
+            else:
+                acquired = self._claim_launch(invocation)
+                if not acquired:
+                    task = None
+                else:
+                    self._sessions[invocation.command_id] = invocation.session_id
+                    task = asyncio.create_task(
+                        self._run(invocation, observer, replace_checkpoint=replace_checkpoint)
+                    )
+                    self._active[invocation.command_id] = (
+                        invocation.command_identity_sha256,
+                        task,
+                    )
+        if task is None:
+            return await self._wait_for_claim_owner(invocation)
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                async with self._lock:
+                    current = self._active.get(invocation.command_id)
+                    if current is not None and current[1] is task:
+                        self._active.pop(invocation.command_id, None)
+
+    def _claim_launch(self, invocation: RuntimeCodexInvocation) -> bool:
+        claim_kind = self._claim_kind(invocation)
+        claimed_at = datetime.now(timezone.utc)
+        content = _runtime_codex_json(
+            {
+                "schema": "captain.runtime-codex-launch-claim.v1",
+                "command_id": str(invocation.command_id),
+                "correlation_id": str(invocation.correlation_id),
+                "command_identity_sha256": invocation.command_identity_sha256,
+                "workspace_ref": invocation.workspace_ref,
+                "workspace_binding_sha256": invocation.workspace_binding_sha256,
+                "claim_kind": claim_kind,
+                "owner_id": self._owner_id,
+                "session_id": invocation.session_id,
+                "claimed_at": claimed_at.isoformat(),
+                "deadline_at": (
+                    claimed_at + timedelta(seconds=invocation.timeout_seconds + 5)
+                ).isoformat(),
+                "process_state_ref": f"process-state://{invocation.session_id}",
+            }
+        )
+        relative = f"claims/{invocation.command_id}/{claim_kind}.json"
+        try:
+            return self._checkpoints.write_once(
+                relative,
+                content,
+                conflict="runtime Codex launch claim conflicts",
+            )
+        except ConfinedFileError as exc:
+            try:
+                existing = json.loads(self._checkpoints.read(relative))
+            except (ConfinedFileError, json.JSONDecodeError):
+                raise FactoryDispatchError(str(exc)) from None
+            if (
+                not isinstance(existing, dict)
+                or existing.get("command_identity_sha256")
+                != invocation.command_identity_sha256
+                or existing.get("workspace_ref") != invocation.workspace_ref
+                or existing.get("workspace_binding_sha256")
+                != invocation.workspace_binding_sha256
+                or existing.get("claim_kind") != claim_kind
+            ):
+                raise FactoryDispatchError(str(exc)) from None
+            return False
+
+    async def _wait_for_claim_owner(
+        self,
+        invocation: RuntimeCodexInvocation,
+    ) -> RuntimeCodexTerminalEvidenceV1:
+        deadline = asyncio.get_running_loop().time() + invocation.timeout_seconds + 5
+        inspection: str = "unavailable"
+        while asyncio.get_running_loop().time() < deadline:
+            evidence = self._load_checkpoint(invocation.command_id)
+            if evidence is not None:
+                prior_sha = invocation.prior_checkpoint_sha256
+                current_sha = (
+                    evidence.resumable_checkpoint.sha256
+                    if evidence.resumable_checkpoint is not None
+                    else None
+                )
+                if prior_sha is None or current_sha != prior_sha:
+                    if evidence.command_identity_sha256 != invocation.command_identity_sha256:
+                        raise FactoryDispatchError(
+                            "Codex durable launch claim identity changed"
+                        )
+                    self._terminal[invocation.command_id] = evidence
+                    return evidence
+            inspector = getattr(self._runner, "inspect", None)
+            if callable(inspector):
+                try:
+                    inspection = await inspector(invocation.session_id)
+                except Exception:
+                    inspection = "unresolved"
+            await asyncio.sleep(0.01)
+        self._record_orphaned_claim(invocation, inspection=inspection)
+        raise FactoryDispatchError(
+            "Codex durable launch owner did not terminalize; recovery is required"
+        )
+
+    @staticmethod
+    def _claim_kind(invocation: RuntimeCodexInvocation) -> str:
+        return (
+            f"resume/{invocation.prior_checkpoint_sha256}"
+            if invocation.resume and invocation.prior_checkpoint_sha256 is not None
+            else "start"
+        )
+
+    def _record_orphaned_claim(
+        self,
+        invocation: RuntimeCodexInvocation,
+        *,
+        inspection: str,
+    ) -> None:
+        content = _runtime_codex_json(
+            {
+                "schema": "captain.runtime-codex-orphaned-claim.v1",
+                "command_id": str(invocation.command_id),
+                "command_identity_sha256": invocation.command_identity_sha256,
+                "session_id": invocation.session_id,
+                "inspection": inspection,
+                "recovery_required": True,
+            }
+        )
+        digest = hashlib.sha256(content).hexdigest()
+        try:
+            self._checkpoints.write_once(
+                f"orphaned-claims/{invocation.command_id}/{digest}.json",
+                content,
+                conflict="runtime Codex orphan reconciliation conflicts",
+            )
+        except ConfinedFileError as exc:
+            raise FactoryDispatchError(str(exc)) from None
 
     async def _run(
         self,
         invocation: RuntimeCodexInvocation,
-        *,
         observer: RuntimeCodexObserver,
+        *,
+        replace_checkpoint: bool,
     ) -> RuntimeCodexTerminalEvidenceV1:
-        observed: list[dict[str, object]] = []
-        self._active_events[invocation.command_id] = observed
+        summary = _EventSummary()
 
         async def observe(event: dict[str, object]) -> None:
-            canonical = _runtime_codex_event(event)
-            observed.append(canonical)
-            await observer(dict(canonical))
+            canonical = summary.observe(event)
+            try:
+                await observer(dict(canonical))
+            except BaseException:
+                raise _RuntimeObserverFailed from None
 
         try:
             result = await self._runner.run(invocation, observe)
-        finally:
-            self._active_events.pop(invocation.command_id, None)
-        if tuple(observed) != result.jsonl_events:
-            raise FactoryDispatchError(
-                "Codex process result does not match streamed JSONL events"
+        except Exception as exc:
+            cleanup: RuntimeCodexProcessCleanupStatus = "verified_cancelled"
+            if invocation.command_id not in self._cancelled:
+                try:
+                    await self._runner.cancel(invocation.session_id)
+                except Exception:
+                    cleanup = "unresolved"
+                self._cancelled.add(invocation.command_id)
+            result = RuntimeCodexProcessResult(
+                exit_code=70,
+                terminal_status="failed",
+                process_cleanup_status=cleanup,
+                elapsed_ms=0,
+                session_id=summary.session_id or invocation.session_id,
+                event_count=summary.count,
+                event_types=tuple(sorted(summary.types)),
+                last_event_sha256=summary.last_sha256,
+                failure_kind=(
+                    "observer_failed"
+                    if isinstance(exc, _RuntimeObserverFailed)
+                    else "output_read_failed"
+                ),
             )
+        if (
+            result.event_count != summary.count
+            or result.event_types != tuple(sorted(summary.types))
+            or result.last_event_sha256 != summary.last_sha256
+        ):
+            result = RuntimeCodexProcessResult(
+                exit_code=70,
+                terminal_status="failed",
+                process_cleanup_status=result.process_cleanup_status,
+                elapsed_ms=result.elapsed_ms,
+                session_id=result.session_id,
+                event_count=summary.count,
+                event_types=tuple(sorted(summary.types)),
+                last_event_sha256=summary.last_sha256,
+                failure_kind="stream_mismatch",
+            )
+        evidence = self._terminal_evidence(invocation, result, replace_checkpoint=replace_checkpoint)
         self._sessions[invocation.command_id] = result.session_id
-        evidence = self._terminal_evidence(
-            command_id=invocation.command_id,
-            correlation_id=invocation.correlation_id,
-            command_identity_sha256=invocation.command_identity_sha256,
-            session_id=result.session_id,
-            result=result,
-            events=observed,
-        )
         self._terminal[invocation.command_id] = evidence
         return evidence
 
     def _terminal_evidence(
         self,
-        *,
-        command_id: UUID,
-        correlation_id: UUID,
-        command_identity_sha256: str,
-        session_id: str,
+        invocation: RuntimeCodexInvocation,
         result: RuntimeCodexProcessResult,
-        events: list[dict[str, object]],
+        *,
+        replace_checkpoint: bool,
     ) -> RuntimeCodexTerminalEvidenceV1:
-        event_types = tuple(
-            sorted(
-                {
-                    canonical_codex_event_type(event.get("type"))
-                    for event in events
-                }
-            )
-        )
-        last_event_sha256 = (
-            hashlib.sha256(_runtime_codex_json(events[-1])).hexdigest()
-            if events
-            else None
-        )
-        terminal_record = self._persist_checkpoint(
-            {
-                "schema": "captain.runtime-codex-checkpoint.v1",
-                "command_id": str(command_id),
-                "correlation_id": str(correlation_id),
-                "command_identity_sha256": command_identity_sha256,
-                "session_id": session_id,
-                "status": result.terminal_status,
-                "exit_code": result.exit_code,
-                "elapsed_ms": result.elapsed_ms,
-                "last_event_sha256": last_event_sha256,
-                "event_count": len(events),
-                "event_types": list(event_types),
-                "process_cleanup_status": result.process_cleanup_status,
-            }
-        )
-        checkpoint = (
-            terminal_record
-            if result.terminal_status in {"timed_out", "cancelled", "failed"}
-            else None
-        )
+        payload = {
+            "schema": "captain.runtime-codex-checkpoint.v1",
+            "command_id": str(invocation.command_id),
+            "correlation_id": str(invocation.correlation_id),
+            "subject_id": invocation.subject_id,
+            "prompt_sha256": invocation.prompt_sha256,
+            "command_identity_sha256": invocation.command_identity_sha256,
+            "workspace_ref": invocation.workspace_ref,
+            "workspace_binding_sha256": invocation.workspace_binding_sha256,
+            "session_id": result.session_id,
+            "status": result.terminal_status,
+            "exit_code": result.exit_code,
+            "elapsed_ms": result.elapsed_ms,
+            "last_event_sha256": result.last_event_sha256,
+            "event_count": result.event_count,
+            "event_types": list(result.event_types),
+            "process_cleanup_status": result.process_cleanup_status,
+            "failure_kind": result.failure_kind,
+        }
+        record = self._persist_checkpoint(payload)
+        checkpoint = record if result.terminal_status in {"timed_out", "cancelled", "failed"} else None
         evidence = RuntimeCodexTerminalEvidenceV1(
             schema_name="captain.runtime-codex-terminal-evidence.v1",
-            command_id=command_id,
-            correlation_id=correlation_id,
-            command_identity_sha256=command_identity_sha256,
-            session_id=session_id,
+            command_id=invocation.command_id,
+            correlation_id=invocation.correlation_id,
+            command_identity_sha256=invocation.command_identity_sha256,
+            workspace_ref=invocation.workspace_ref,
+            workspace_binding_sha256=invocation.workspace_binding_sha256,
+            session_id=result.session_id,
             status=result.terminal_status,
             exit_code=result.exit_code,
             elapsed_ms=result.elapsed_ms,
-            last_event_sha256=last_event_sha256,
-            event_count=len(events),
-            event_types=event_types,
+            last_event_sha256=result.last_event_sha256,
+            event_count=result.event_count,
+            event_types=result.event_types,
             process_cleanup_status=result.process_cleanup_status,
+            failure_kind=result.failure_kind,
             resumable_checkpoint=checkpoint,
         )
-        self._write_checkpoint_index(command_id, terminal_record)
+        self._write_checkpoint_index(invocation.command_id, record, replace=replace_checkpoint)
         return evidence
 
     def _persist_checkpoint(self, payload: Mapping[str, object]) -> ArtifactRef:
         content = _runtime_codex_json(payload)
         digest = hashlib.sha256(content).hexdigest()
-        target = self._checkpoint_root / digest[:2] / f"{digest}.json"
-        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        write_once_codex_evidence(
-            target,
-            content,
-            conflict="runtime Codex checkpoint replay conflicts",
-        )
+        try:
+            self._checkpoints.write_once(
+                f"{digest[:2]}/{digest}.json",
+                content,
+                conflict="runtime Codex checkpoint replay conflicts",
+            )
+        except ConfinedFileError as exc:
+            raise FactoryDispatchError(str(exc)) from None
         return ArtifactRef(
             uri=f"artifact://runtime-codex-checkpoint/{digest}",
             sha256=digest,
             media_type="application/json",
         )
 
-    def _write_checkpoint_index(self, command_id: UUID, reference: ArtifactRef) -> None:
-        target = self._checkpoint_root / "by-command" / f"{command_id}.json"
-        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    def _write_checkpoint_index(
+        self,
+        command_id: UUID,
+        reference: ArtifactRef,
+        *,
+        replace: bool = False,
+    ) -> None:
+        relative = f"by-command/{command_id}.json"
         content = _runtime_codex_json(reference.model_dump(mode="json"))
-        if target.exists():
+        if replace:
+            prior = self._load_checkpoint(command_id)
+            if prior is None or prior.status not in {"timed_out", "cancelled", "failed"}:
+                raise FactoryDispatchError("runtime Codex checkpoint replacement is unauthorized")
             try:
-                if target.read_bytes() == content:
-                    return
-            except OSError:
-                pass
-        temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+                prior_indexes = self._checkpoints.regular_files(
+                    f"by-resume/{command_id}"
+                )
+            except ConfinedFileError:
+                prior_indexes = ()
+            ordinal = len(prior_indexes) + 1
+            relative = f"by-resume/{command_id}/{ordinal:08d}.json"
         try:
-            write_once_codex_evidence(
-                temporary,
+            self._checkpoints.write_once(
+                relative,
                 content,
                 conflict="runtime Codex checkpoint index conflicts",
             )
-            os.replace(temporary, target)
-        finally:
-            temporary.unlink(missing_ok=True)
+        except ConfinedFileError as exc:
+            raise FactoryDispatchError(str(exc)) from None
 
-    def _load_checkpoint(
-        self,
-        command_id: UUID,
-    ) -> RuntimeCodexTerminalEvidenceV1 | None:
-        index = self._checkpoint_root / "by-command" / f"{command_id}.json"
+    def _load_checkpoint(self, command_id: UUID) -> RuntimeCodexTerminalEvidenceV1 | None:
         try:
-            reference = ArtifactRef.model_validate_json(index.read_bytes())
-            content = (
-                self._checkpoint_root
-                / reference.sha256[:2]
-                / f"{reference.sha256}.json"
-            ).read_bytes()
+            try:
+                resume_indexes = self._checkpoints.regular_files(
+                    f"by-resume/{command_id}"
+                )
+            except ConfinedFileError:
+                resume_indexes = ()
+            reference_path = (
+                resume_indexes[-1]
+                if resume_indexes
+                else Path("by-command") / f"{command_id}.json"
+            )
+            raw_reference = self._checkpoints.read(reference_path)
+        except ConfinedFileError:
+            return None
+        try:
+            reference = ArtifactRef.model_validate_json(raw_reference)
+            expected_uri = f"artifact://runtime-codex-checkpoint/{reference.sha256}"
+            if reference.uri != expected_uri:
+                raise FactoryDispatchError("runtime Codex checkpoint namespace changed")
+            content = self._checkpoints.read(
+                f"{reference.sha256[:2]}/{reference.sha256}.json"
+            )
             if hashlib.sha256(content).hexdigest() != reference.sha256:
-                raise ValueError
+                raise FactoryDispatchError("runtime Codex checkpoint digest changed")
             payload = json.loads(content)
-            if not isinstance(payload, dict):
-                raise ValueError
+            if not isinstance(payload, dict) or UUID(str(payload["command_id"])) != command_id:
+                raise FactoryDispatchError("runtime Codex checkpoint command binding changed")
+            recalculated_identity = _runtime_codex_command_identity(
+                command_id=command_id,
+                correlation_id=UUID(str(payload["correlation_id"])),
+                subject_id=str(payload["subject_id"]),
+                prompt_sha256=str(payload["prompt_sha256"]),
+                workspace_ref=str(payload["workspace_ref"]),
+                workspace_binding_sha256=str(payload["workspace_binding_sha256"]),
+            )
+            if recalculated_identity != str(payload["command_identity_sha256"]):
+                raise FactoryDispatchError(
+                    "runtime Codex checkpoint identity binding changed"
+                )
             status = str(payload["status"])
             return RuntimeCodexTerminalEvidenceV1(
                 schema_name="captain.runtime-codex-terminal-evidence.v1",
-                command_id=UUID(str(payload["command_id"])),
+                command_id=command_id,
                 correlation_id=UUID(str(payload["correlation_id"])),
                 command_identity_sha256=str(payload["command_identity_sha256"]),
+                workspace_ref=str(payload["workspace_ref"]),
+                workspace_binding_sha256=str(payload["workspace_binding_sha256"]),
                 session_id=str(payload["session_id"]),
                 status=status,
                 exit_code=int(payload["exit_code"]),
@@ -465,206 +718,207 @@ class RuntimeCodexExecution:
                 event_count=int(payload["event_count"]),
                 event_types=tuple(payload["event_types"]),
                 process_cleanup_status=str(payload["process_cleanup_status"]),
+                failure_kind=payload.get("failure_kind"),
                 resumable_checkpoint=(
-                    reference
-                    if status in {"timed_out", "cancelled", "failed"}
-                    else None
+                    reference if status in {"timed_out", "cancelled", "failed"} else None
                 ),
             )
+        except FactoryDispatchError:
+            raise
         except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
-            return None
+            raise FactoryDispatchError("runtime Codex checkpoint binding is invalid") from None
 
 
-def _runtime_codex_json(value: object) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+class PowerShellRuntimeCodexRunner:
+    """Translate runtime invocations onto the established PowerShell runner seam."""
 
-
-def _runtime_codex_event(value: Mapping[str, object]) -> dict[str, object]:
-    try:
-        encoded = _runtime_codex_json(dict(value))
-        decoded = json.loads(encoded)
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise FactoryDispatchError("Codex JSONL event is invalid") from exc
-    if not isinstance(decoded, dict):
-        raise FactoryDispatchError("Codex JSONL event is invalid")
-    return decoded
-
-
-def _runtime_codex_command_identity(
-    *,
-    correlation_id: UUID,
-    subject_id: str,
-    prompt_sha256: str,
-    workspace_ref: str,
-) -> str:
-    return hashlib.sha256(
-        _runtime_codex_json(
-            {
-                "correlation_id": str(correlation_id),
-                "subject_id": subject_id,
-                "prompt_sha256": prompt_sha256,
-                "workspace_ref": workspace_ref,
-            }
-        )
-    ).hexdigest()
-
-
-class SubprocessRuntimeCodexRunner:
-    """Stream one Codex CLI JSONL process without retaining raw public evidence."""
+    _ALLOWED_ENV = frozenset(
+        {
+            "PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+            "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "USERNAME",
+            "USERDOMAIN", "OS", "PROCESSOR_ARCHITECTURE", "LANG", "LC_ALL", "TERM",
+            "NO_COLOR", "OPENAI_API_KEY",
+        }
+    )
 
     def __init__(
         self,
         *,
+        repository_root: Path,
         executable: str,
         environ: Mapping[str, str],
+        evidence_root: Path,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
+        self._repository_root = repository_root.resolve()
         self._executable = executable
         self._environ = dict(environ)
+        self._evidence_root = evidence_root
         self._monotonic = monotonic or time.monotonic
-        self._processes: dict[str, asyncio.subprocess.Process] = {}
+        self._active: dict[str, PowerShellCodexRunner] = {}
         self._cancelled: set[str] = set()
+        self._lock = asyncio.Lock()
 
     async def run(
         self,
         invocation: RuntimeCodexInvocation,
         observer: RuntimeCodexObserver,
     ) -> RuntimeCodexProcessResult:
-        self._cancelled.discard(invocation.session_id)
-        arguments = [self._executable, "exec"]
-        if invocation.resume:
-            arguments.extend(("resume", "--json", invocation.session_id))
-        else:
-            arguments.append("--json")
-        arguments.append(invocation.prompt)
-        process_options: dict[str, object] = {}
-        if os.name == "nt":
-            process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            process_options["start_new_session"] = True
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *arguments,
-                cwd=invocation.workspace,
-                env=self._environ,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                **process_options,
-            )
-        except (FileNotFoundError, OSError) as exc:
-            raise FactoryDispatchError("Codex CLI executable is unavailable") from exc
-        self._processes[invocation.session_id] = process
-        assert process.stdout is not None
-        assert process.stderr is not None
-        events: list[dict[str, object]] = []
+        summary = _EventSummary()
+
+        async def observe(event: dict[str, object]) -> None:
+            canonical = summary.observe(event)
+            await observer(canonical)
+
+        runner = self._make_runner(invocation, observe)
+        async with self._lock:
+            if invocation.session_id in self._active:
+                raise FactoryDispatchError("Codex runtime session already has an owner")
+            self._active[invocation.session_id] = runner
+            self._cancelled.discard(invocation.session_id)
         started = self._monotonic()
-
-        async def read_stdout() -> None:
-            while True:
-                try:
-                    line = await process.stdout.readline()
-                except OSError as exc:
-                    raise FactoryDispatchError("Codex JSONL stream failed") from exc
-                if not line:
-                    return
-                if len(line) > DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES + 1:
-                    raise FactoryDispatchError("Codex JSONL record exceeds size limit")
-                try:
-                    value = json.loads(line)
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise FactoryDispatchError("Codex JSONL event is invalid") from exc
-                if not isinstance(value, dict):
-                    raise FactoryDispatchError("Codex JSONL event is invalid")
-                event = _runtime_codex_event(value)
-                events.append(event)
-                await observer(dict(event))
-
-        async def drain_stderr() -> None:
-            while await process.stderr.read(CODEX_JSONL_READ_CHUNK_BYTES):
-                pass
-
-        timed_out = False
         try:
-            await asyncio.wait_for(
-                asyncio.gather(process.wait(), read_stdout(), drain_stderr()),
-                timeout=invocation.timeout_seconds,
+            authorized = AuthorizedCodexRun(
+                workspace=invocation.workspace,
+                command=(
+                    ("codex", "exec", "resume", "--json", invocation.session_id, invocation.prompt)
+                    if invocation.resume
+                    else ("codex", "exec", "--json", invocation.prompt)
+                ),
+                environment=FrozenEnvironment(
+                    {name: value for name, value in self._environ.items() if name in self._ALLOWED_ENV}
+                ),
             )
-        except TimeoutError:
-            timed_out = True
-            await self.cancel(invocation.session_id)
-            await process.wait()
-        except BaseException:
-            await asyncio.shield(self.cancel(invocation.session_id))
-            await asyncio.shield(process.wait())
-            raise
+            result = await runner.run(authorized)
+            failure_kind: RuntimeCodexFailureKind | None = None
+        except CodexOutputEvidenceError as exc:
+            result = None
+            failure_kind = exc.failure_kind
+            cleanup = exc.process_cleanup_status or "unresolved"
         finally:
-            self._processes.pop(invocation.session_id, None)
+            async with self._lock:
+                self._active.pop(invocation.session_id, None)
         elapsed_ms = max(0, int((self._monotonic() - started) * 1000))
-        externally_cancelled = invocation.session_id in self._cancelled
-        exit_code = (
-            124
-            if timed_out
-            else 130
-            if externally_cancelled
-            else process.returncode
-        )
-        if exit_code is None:
-            raise FactoryDispatchError("Codex process has no terminal exit code")
-        status: RuntimeCodexTerminalStatus = (
-            "timed_out"
-            if exit_code == 124
-            else "cancelled"
-            if exit_code == 130
-            else "succeeded"
-            if exit_code == 0
-            else "failed"
-        )
-        session_id = invocation.session_id
-        for event in events:
-            if event.get("type") == "thread.started":
-                candidate = event.get("thread_id")
-                if isinstance(candidate, str) and re.fullmatch(
-                    r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", candidate
-                ):
-                    session_id = candidate
-                    break
+        session_id = summary.session_id or invocation.session_id
+        if result is None:
+            return RuntimeCodexProcessResult(
+                exit_code=70,
+                terminal_status="failed",
+                process_cleanup_status=cleanup,
+                elapsed_ms=elapsed_ms,
+                session_id=session_id,
+                event_count=summary.count,
+                event_types=tuple(sorted(summary.types)),
+                last_event_sha256=summary.last_sha256,
+                failure_kind=failure_kind,
+            )
         return RuntimeCodexProcessResult(
-            exit_code=exit_code,
-            terminal_status=status,
-            process_cleanup_status=(
-                "verified_cancelled"
-                if exit_code in {124, 130}
-                else "not_required"
-            ),
+            exit_code=result.exit_code,
+            terminal_status=result.terminal_status,
+            process_cleanup_status=result.process_cleanup_status,
             elapsed_ms=elapsed_ms,
             session_id=session_id,
-            jsonl_events=tuple(events),
+            event_count=summary.count,
+            event_types=tuple(sorted(summary.types)),
+            last_event_sha256=summary.last_sha256,
         )
 
     async def cancel(self, session_id: str) -> None:
-        if session_id in self._cancelled:
-            return
-        self._cancelled.add(session_id)
-        process = self._processes.get(session_id)
-        if process is None or process.returncode is not None:
-            return
-        process.terminate()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=5)
-        except TimeoutError:
-            process.kill()
-            await process.wait()
+        async with self._lock:
+            runner = self._active.get(session_id)
+            if runner is None or session_id in self._cancelled:
+                return
+            self._cancelled.add(session_id)
+        verified = await runner.cancel()
+        if not verified:
+            raise FactoryDispatchError("Codex runtime cancellation could not be verified")
+
+    async def inspect(self, session_id: str) -> str:
+        pwsh = shutil.which(self._environ.get("CAPTAIN_PWSH_EXECUTABLE", "pwsh"))
+        if pwsh is None:
+            return "unresolved"
+        return await PowerShellCodexRunner.inspect_process_state(
+            pwsh_path=Path(pwsh),
+            script_path=self._repository_root / "scripts" / "codex-session.ps1",
+            state_path=self._evidence_root / "state" / f"{session_id}.json",
+            session_id=session_id,
+        )
+
+    def _make_runner(
+        self,
+        invocation: RuntimeCodexInvocation,
+        observer: RuntimeCodexObserver,
+    ) -> PowerShellCodexRunner:
+        pwsh = shutil.which(self._environ.get("CAPTAIN_PWSH_EXECUTABLE", "pwsh"))
+        codex = shutil.which(self._executable)
+        if pwsh is None or codex is None:
+            raise FactoryDispatchError("Codex runtime executable is unavailable")
+        codex_home_value = self._environ.get("CODEX_HOME")
+        codex_home = Path(codex_home_value) if codex_home_value else Path.home() / ".codex"
+        attempt = uuid4().hex
+        return PowerShellCodexRunner(
+            pwsh_path=Path(pwsh),
+            script_path=self._repository_root / "scripts" / "codex-session.ps1",
+            codex_path=Path(codex),
+            session_id=invocation.session_id,
+            state_path=self._evidence_root / "state" / f"{invocation.session_id}.json",
+            journal_path=self._evidence_root / "journals" / f"{invocation.session_id}-{attempt}.jsonl",
+            artifact_references=(),
+            codex_home=codex_home,
+            deadline_at=datetime.now(timezone.utc) + timedelta(seconds=invocation.timeout_seconds),
+            timeout_seconds=float(invocation.timeout_seconds),
+            output_policy=CodexOutputJournalPolicy(
+                retain_raw_records=False,
+                observer=observer,
+            ),
+        )
+
+
+def _runtime_codex_json(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _runtime_codex_event(value: Mapping[str, object]) -> dict[str, object]:
+    try:
+        decoded = json.loads(_runtime_codex_json(dict(value)))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise FactoryDispatchError("Codex JSONL event is invalid") from None
+    if not isinstance(decoded, dict):
+        raise FactoryDispatchError("Codex JSONL event is invalid")
+    return decoded
+
+
+def _workspace_binding(workspace: Path) -> str:
+    return hashlib.sha256(str(workspace.resolve(strict=True)).casefold().encode("utf-8")).hexdigest()
+
+
+def _runtime_codex_command_identity(
+    *,
+    command_id: UUID,
+    correlation_id: UUID,
+    subject_id: str,
+    prompt_sha256: str,
+    workspace_ref: str,
+    workspace_binding_sha256: str,
+) -> str:
+    return hashlib.sha256(
+        _runtime_codex_json(
+            {
+                "command_id": str(command_id),
+                "correlation_id": str(correlation_id),
+                "subject_id": subject_id,
+                "prompt_sha256": prompt_sha256,
+                "workspace_ref": workspace_ref,
+                "workspace_binding_sha256": workspace_binding_sha256,
+            }
+        )
+    ).hexdigest()
+
 
 __all__ = [
+    "PowerShellRuntimeCodexRunner",
     "RuntimeCodexExecution",
     "RuntimeCodexInvocation",
     "RuntimeCodexProcessResult",
     "RuntimeCodexTerminalEvidenceV1",
-    "SubprocessRuntimeCodexRunner",
 ]
