@@ -5,11 +5,13 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
 from uuid import UUID
 
 import httpx
+import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
@@ -29,6 +31,10 @@ from agenten.agent_runtime.ports import (
     ArtifactPort,
     CodexExecutionPort,
     HermesPlannerPort,
+)
+from agenten.agent_runtime.production_bootstrap import (
+    RuntimeBootstrap,
+    load_runtime_adapters_from_env,
 )
 from agenten.agent_runtime.service import AgentRuntimeService
 from agenten.validation.contracts import WorkBatch
@@ -194,19 +200,39 @@ def compose_gateway_backed_runtime_app(
     )
 
 
-def preflight_runtime() -> None:
-    """Validate settings and fail closed while required production ports are absent."""
+def _repository_root() -> Path:
+    return Path(__file__).resolve().parents[2]
 
-    RuntimeEntrypointSettings.from_env()
-    raise RuntimeConfigurationError(
-        "production Hermes, Codex, and artifact runtime ports are unavailable"
+
+def preflight_runtime() -> RuntimeBootstrap:
+    """Validate settings and digest-bound ports before any listener starts."""
+
+    settings = RuntimeEntrypointSettings.from_env()
+    binding = load_runtime_adapters_from_env(repository_root=_repository_root())
+    return RuntimeBootstrap(
+        settings=settings,
+        binding=binding,
     )
 
 
 def main() -> None:
-    """Fail closed until production Hermes, Codex, and artifact ports are installed."""
+    """Compose and launch the authenticated runtime from verified adapters."""
 
-    preflight_runtime()
+    bootstrap = preflight_runtime()
+    client = httpx.AsyncClient()
+    app = compose_gateway_backed_runtime_app(
+        settings=bootstrap.settings,
+        client=client,
+        hermes=bootstrap.binding.hermes,
+        codex=bootstrap.binding.codex,
+        artifacts=bootstrap.binding.artifacts,
+    )
+    uvicorn.run(
+        app,
+        host=bootstrap.settings.host,
+        port=bootstrap.settings.port,
+        workers=1,
+    )
 
 
 if __name__ == "__main__":
