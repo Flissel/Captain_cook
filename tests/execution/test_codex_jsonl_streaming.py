@@ -90,6 +90,23 @@ class _ChunkedStream:
         return chunk
 
 
+class _PausedStream:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+        self._delivered = False
+        self.read_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def read(self, size: int) -> bytes:
+        self.read_started.set()
+        await self.release.wait()
+        if self._delivered:
+            return b""
+        self._delivered = True
+        assert len(self._payload) <= size
+        return self._payload
+
+
 class _MillionTinyRecordsStream:
     def __init__(self) -> None:
         self.remaining = 1_000_000
@@ -283,6 +300,172 @@ async def test_no_raw_runner_uses_no_journal_or_child_state_file_paths(
     assert "-EmitState" in launches[0]
     assert not list(tmp_path.rglob("*.jsonl"))
     assert not list(tmp_path.rglob("*state*.json"))
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_control_record_cancels_owned_process_once_identity_arrives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_record = (
+        b'CAPTAIN_PROCESS_STATE:{"session_id":"identity-race",'
+        b'"pid":42,"started_at_utc":"2026-08-08T12:00:00Z",'
+        b'"start_time_utc_ticks":123,"executable":"codex.exe"}\n'
+    )
+    stdout = _PausedStream(state_record)
+    process = _RunningProcess(stdout)
+    process_started = asyncio.Event()
+    cancellation_arguments: list[tuple[object, ...]] = []
+
+    class CancellationProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            process.stop(17)
+            return (
+                b'{"session_id":"identity-race","outcome":"cancelled",'
+                b'"cancellation_reason":"operator"}',
+                b"",
+            )
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        del kwargs
+        if "-CancelIdentity" in args:
+            cancellation_arguments.append(args)
+            return CancellationProcess()
+        process_started.set()
+        return process
+
+    monkeypatch.setattr(
+        codex_supervisor.asyncio,
+        "create_subprocess_exec",
+        create_process,
+    )
+    pwsh = shutil.which("pwsh")
+    assert pwsh is not None
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+
+    async def observe_process_state(_state: dict[str, object]) -> None:
+        return None
+
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(pwsh),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=Path(r"C:\Windows\System32\timeout.exe"),
+        session_id="identity-race",
+        state_path=None,
+        journal_path=None,
+        artifact_references=(),
+        codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
+        output_policy=codex_supervisor.CodexOutputJournalPolicy(
+            retain_raw_records=False,
+            process_state_observer=observe_process_state,
+        ),
+    )
+    run_task = asyncio.create_task(runner.run(_authorized(tmp_path)))
+    await process_started.wait()
+    await stdout.read_started.wait()
+    cancel_entered = asyncio.Event()
+
+    async def issue_cancel() -> str:
+        cancel_entered.set()
+        return await runner.cancel()
+
+    cancel_task = asyncio.create_task(issue_cancel())
+    await cancel_entered.wait()
+    try:
+        assert not cancel_task.done()
+        stdout.release.set()
+        assert await cancel_task == "verified_cancelled"
+        result = await run_task
+        assert result.exit_code == 17
+        assert result.terminal_status == "failed"
+        assert await runner.cancel() == "verified_cancelled"
+        assert len(cancellation_arguments) == 1
+        launched = cancellation_arguments[0]
+        assert launched[launched.index("-ProcessId") + 1] == "42"
+        assert launched[launched.index("-SessionId") + 1] == "identity-race"
+    finally:
+        stdout.release.set()
+        if process.alive:
+            process.stop(17)
+        await asyncio.gather(run_task, cancel_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_control_record_finishes_unverified_not_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = _PausedStream(b"")
+    process = _RunningProcess(stdout)
+    process_started = asyncio.Event()
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        process_started.set()
+        return process
+
+    monkeypatch.setattr(
+        codex_supervisor.asyncio,
+        "create_subprocess_exec",
+        create_process,
+    )
+    pwsh = shutil.which("pwsh")
+    assert pwsh is not None
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+
+    async def observe_process_state(_state: dict[str, object]) -> None:
+        pytest.fail("missing identity must not reach the state observer")
+
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(pwsh),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=Path(r"C:\Windows\System32\timeout.exe"),
+        session_id="missing-identity-race",
+        state_path=None,
+        journal_path=None,
+        artifact_references=(),
+        codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
+        output_policy=codex_supervisor.CodexOutputJournalPolicy(
+            retain_raw_records=False,
+            process_state_observer=observe_process_state,
+        ),
+    )
+    run_task = asyncio.create_task(runner.run(_authorized(tmp_path)))
+    await process_started.wait()
+    await stdout.read_started.wait()
+    cancel_entered = asyncio.Event()
+
+    async def issue_cancel() -> str:
+        cancel_entered.set()
+        return await runner.cancel()
+
+    cancel_task = asyncio.create_task(issue_cancel())
+    await cancel_entered.wait()
+    try:
+        assert not cancel_task.done()
+        stdout.release.set()
+        process.stop(17)
+        assert await cancel_task == "requested_unverified"
+        with pytest.raises(codex_supervisor.CodexOutputEvidenceError) as caught:
+            await run_task
+        assert caught.value.process_cleanup_status != "verified_cancelled"
+    finally:
+        stdout.release.set()
+        if process.alive:
+            process.stop(17)
+        await asyncio.gather(run_task, cancel_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

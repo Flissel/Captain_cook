@@ -653,6 +653,55 @@ async def test_verified_operator_cancel_is_cancelled_despite_non_130_child_exit(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_attempt_does_not_cancel_successful_resume_or_status(
+    tmp_path: Path,
+) -> None:
+    runner = StreamingRunner()
+    runner.block = True
+    adapter, execution, artifacts = _codex_adapter(tmp_path, runner)
+    prompt_ref = artifacts.put(b"cancel then resume", "text/markdown")
+    original = _command(prompt_ref)
+    active = asyncio.create_task(adapter.start(original, _grant(original)))
+    await runner.started.wait()
+    cancel = _command(
+        prompt_ref,
+        operation="codex.cancel",
+        correlation_id=original.correlation_id,
+        causation_id=original.event_id,
+    )
+    cancelled = await adapter.cancel(cancel, _grant(cancel))
+    assert (await active).status is RuntimeStatus.CANCELLED
+    prior = execution.terminal_evidence(original.event_id)
+    assert prior is not None
+    prior_json = prior.model_dump_json(by_alias=True)
+
+    runner.exit_code = 0
+    runner.started = asyncio.Event()
+    runner.release = asyncio.Event()
+    resumed = _command(
+        prompt_ref,
+        operation="codex.resume",
+        correlation_id=original.correlation_id,
+        causation_id=original.event_id,
+    )
+    resume_task = asyncio.create_task(adapter.resume(resumed, _grant(resumed)))
+    await runner.started.wait()
+    status = _command(
+        prompt_ref,
+        operation="codex.status",
+        correlation_id=original.correlation_id,
+        causation_id=original.event_id,
+    )
+
+    assert (await adapter.status(status, _grant(status))).status is RuntimeStatus.RUNNING
+    runner.release.set()
+    assert (await resume_task).status is RuntimeStatus.SUCCEEDED
+    assert (await adapter.status(status, _grant(status))).status is RuntimeStatus.SUCCEEDED
+    assert cancelled.status is RuntimeStatus.CANCELLED
+    assert prior.model_dump_json(by_alias=True) == prior_json
+
+
+@pytest.mark.asyncio
 async def test_prelaunch_failure_records_no_active_process_not_required_cleanup(
     tmp_path: Path,
 ) -> None:

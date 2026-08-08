@@ -264,8 +264,6 @@ class RuntimeCodexExecution:
             or prior.workspace_binding_sha256 != workspace_binding
         ):
             raise FactoryDispatchError("Codex resume command identity changed")
-        self._terminal.pop(command_id, None)
-        self._cancelled.discard(command_id)
         self._identity_index[key] = command_id
         invocation = RuntimeCodexInvocation(
             command_id=command_id,
@@ -360,6 +358,10 @@ class RuntimeCodexExecution:
         replace_checkpoint: bool = False,
     ) -> RuntimeCodexTerminalEvidenceV1:
         async with self._lock:
+            if replace_checkpoint and invocation.command_id not in self._active:
+                self._terminal.pop(invocation.command_id, None)
+                self._cancelled.discard(invocation.command_id)
+                self._cancel_outcomes.pop(invocation.command_id, None)
             existing = self._terminal.get(invocation.command_id)
             if existing is None and not replace_checkpoint:
                 existing = self._load_checkpoint(invocation.command_id)

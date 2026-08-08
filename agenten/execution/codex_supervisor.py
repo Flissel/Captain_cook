@@ -356,10 +356,23 @@ class PowerShellCodexRunner:
         ):
             raise ValueError("pathless Codex process state requires an observer")
         self._process_state: dict[str, object] | None = None
+        self._process_started = False
+        self._process_state_ready = asyncio.Event()
+        self._run_finished = asyncio.Event()
+        self._operator_cancel_requested = False
+        self._cancellation_lock = asyncio.Lock()
+        self._cancellation_attempted = False
+        self._cancellation_verified = False
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic or time.monotonic
 
     async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
+        try:
+            return await self._run_once(authorized)
+        finally:
+            self._run_finished.set()
+
+    async def _run_once(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
         standard_command = (
             len(authorized.command) == 4
             and authorized.command[:3] == ("codex", "exec", "--json")
@@ -423,6 +436,7 @@ class PowerShellCodexRunner:
             stderr=asyncio.subprocess.PIPE,
             limit=self._max_jsonl_record_bytes + 2,
         )
+        self._process_started = True
         assert process.stdout is not None
         assert process.stderr is not None
         timed_out = False
@@ -677,6 +691,7 @@ class PowerShellCodexRunner:
         ):
             raise CodexJsonlInvalidObjectError("Codex process state record is invalid")
         self._process_state = dict(state)
+        self._process_state_ready.set()
         observer = self._output_policy.process_state_observer
         if observer is None:
             raise CodexOutputObserverError("Codex process state observer is unavailable")
@@ -686,6 +701,8 @@ class PowerShellCodexRunner:
             raise CodexOutputObserverError(
                 "Codex process state observer rejected process identity"
             ) from None
+        if self._operator_cancel_requested:
+            await self._cancel_once("operator")
 
     def _extend_jsonl_record(
         self,
@@ -746,13 +763,27 @@ class PowerShellCodexRunner:
     async def cancel(self) -> CodexCancellationOutcome:
         """Cancel this runner's exact session-owned process tree once verified."""
 
-        if self._state_path is None and self._process_state is None:
-            return "no_active_process"
-        if self._state_path is not None and not self._state_path.is_file():
+        if self._state_path is None:
+            if self._process_state is None and not self._process_started:
+                return "no_active_process"
+            self._operator_cancel_requested = True
+            if self._process_state is None:
+                state_ready = asyncio.create_task(self._process_state_ready.wait())
+                run_finished = asyncio.create_task(self._run_finished.wait())
+                _done, pending = await asyncio.wait(
+                    (state_ready, run_finished),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for waiter in pending:
+                    waiter.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                if self._process_state is None:
+                    return "requested_unverified"
+        elif not self._state_path.is_file():
             return "no_active_process"
         return (
             "verified_cancelled"
-            if await self._cancel_process("operator")
+            if await self._cancel_once("operator")
             else "requested_unverified"
         )
 
@@ -1061,10 +1092,18 @@ class PowerShellCodexRunner:
         await asyncio.gather(process_waiter, return_exceptions=True)
 
     async def _cancel_timed_out_process(self) -> bool:
-        return await self._cancel_process("timeout")
+        return await self._cancel_once("timeout")
 
     async def _cancel_evidence_failure_process(self) -> bool:
-        return await self._cancel_process("operator")
+        return await self._cancel_once("operator")
+
+    async def _cancel_once(self, reason: Literal["operator", "timeout"]) -> bool:
+        async with self._cancellation_lock:
+            if self._cancellation_attempted:
+                return self._cancellation_verified
+            self._cancellation_attempted = True
+            self._cancellation_verified = await self._cancel_process(reason)
+            return self._cancellation_verified
 
     async def _cancel_process(self, reason: Literal["operator", "timeout"]) -> bool:
         if self._state_path is None:
