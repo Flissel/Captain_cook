@@ -1,4 +1,5 @@
 import os
+import shutil
 import socket
 import subprocess
 from pathlib import Path
@@ -11,6 +12,60 @@ SERVICES = ROOT / "scripts" / "live-demo-services.ps1"
 MINIBOOK = ROOT / "scripts" / "minibook-demo.ps1"
 BENCHMARK_COMPOSE = ROOT / "docker-compose.benchmark.yml"
 MANAGED_PROCESS = ROOT / "scripts" / "managed-process-identity.ps1"
+
+
+def run_minibook_harness(
+    tmp_path: Path,
+    *,
+    env: dict[str, str],
+    command: str,
+    identity_status: int = 200,
+) -> subprocess.CompletedProcess[str]:
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    demo_script = script_dir / "minibook-demo.ps1"
+    shutil.copy2(MINIBOOK, demo_script)
+
+    harness = tmp_path / "run-minibook.ps1"
+    harness.write_text(
+        "\n".join(
+            (
+                "$ErrorActionPreference = 'Stop'",
+                "$healthProbe = { param([string]$url) Write-Host \"PROBE health $url\"; $true }",
+                (
+                    "$identityProbe = { param([string]$url, [string]$apiKey) "
+                    "Write-Host \"PROBE identity $url\"; "
+                    f"if ({identity_status} -ne 200) {{ throw 'identity probe returned HTTP {identity_status}' }}; "
+                    "@{ name = 'captain-demo-service' } }"
+                ),
+                "$agentRegistrationProbe = { param([string]$url) Write-Host 'PROBE agent-registration'; throw 'agent registration must not be called' }",
+                "try {",
+                (
+                    f"  & '{demo_script.as_posix()}' {command} "
+                    "-HealthProbe $healthProbe -IdentityProbe $identityProbe "
+                    "-AgentRegistrationProbe $agentRegistrationProbe"
+                ),
+                "  exit 0",
+                "} catch {",
+                "  Write-Host \"FAILURE $($_.Exception.Message)\"",
+                "  exit 1",
+                "}",
+            )
+        ),
+        encoding="utf-8",
+    )
+    process_env = os.environ.copy()
+    process_env.pop("MINIBOOK_BACKEND_URL", None)
+    process_env.update(env)
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=tmp_path,
+        env=process_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
 
 
 def test_demo_preflight_contract_is_fail_closed_and_redacted() -> None:
@@ -75,24 +130,55 @@ def test_runtime_dependencies_install_hermes_streamable_http_transport() -> None
     assert "starlette==1.0.1" in requirements
 
 
-def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
-    source = MINIBOOK.read_text(encoding="utf-8")
-    assert 'ValidateSet("start", "bootstrap", "status", "stop")' in source
-    assert "CAPTAIN_DEMO_MINIBOOK_API_KEY" in source
-    assert "CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY" in source
-    assert "RandomNumberGenerator]::GetBytes(32)" in source
-    assert "$env:MINIBOOK_PROJECTION_API_KEY" in source
-    assert "/api/v1/agents/me" in source
-    assert "/api/v1/agents" in source
-    assert "captain-demo-service" in source
-    assert "[switch]$RecoverDemoCredentials" in source
-    assert "Minibook demo service credential recovered locally" in source
-    assert "SELECT api_key FROM agents WHERE name" in source
-    assert "Write-Output $apiKey" not in source
-    assert "Write-Output $projectionApiKey" not in source
-    assert "minibook-demo.pid" in source
-    assert "$baseUrl = 'http://127.0.0.1:8080'" in source
-    assert "Get-Command python.exe -CommandType Application" in source
+def test_minibook_demo_prefers_configured_backend_url(tmp_path: Path) -> None:
+    result = run_minibook_harness(
+        tmp_path,
+        env={"MINIBOOK_BACKEND_URL": "http://127.0.0.1:4456"},
+        command="status",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PROBE health http://127.0.0.1:4456/health" in result.stdout
+    assert "PROBE health http://127.0.0.1:8080/health" not in result.stdout
+
+
+def test_minibook_demo_reads_port_from_local_configuration(tmp_path: Path) -> None:
+    config = tmp_path / "minibook" / "config.yaml"
+    config.parent.mkdir()
+    config.write_text("port: 3556\n", encoding="utf-8")
+
+    result = run_minibook_harness(tmp_path, env={}, command="status")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PROBE health http://127.0.0.1:3556/health" in result.stdout
+    assert "PROBE health http://127.0.0.1:8080/health" not in result.stdout
+
+
+def test_minibook_demo_rejects_invalid_identity_without_changing_credentials(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / ".env"
+    credential_bytes = (
+        b"CAPTAIN_DEMO_MINIBOOK_API_KEY=fixture-service-key\r\n"
+        b"CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY=fixture-projection-key\r\n"
+    )
+    env_file.write_bytes(credential_bytes)
+
+    result = run_minibook_harness(
+        tmp_path,
+        env={"MINIBOOK_BACKEND_URL": "http://127.0.0.1:4456"},
+        command="bootstrap",
+        identity_status=401,
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert "fixture-service-key" not in output
+    assert "fixture-projection-key" not in output
+    assert "PROBE health http://127.0.0.1:4456/health" in output
+    assert "PROBE identity http://127.0.0.1:4456/api/v1/agents/me" in output
+    assert "PROBE agent-registration" not in output
+    assert env_file.read_bytes() == credential_bytes
 
 
 def test_live_demo_services_only_operates_captain_resources() -> None:

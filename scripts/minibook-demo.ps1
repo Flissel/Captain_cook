@@ -4,7 +4,10 @@ param(
     [Parameter(Mandatory, Position=0)]
     [ValidateSet("start", "bootstrap", "status", "stop")]
     [string]$Action,
-    [switch]$RecoverDemoCredentials
+    [switch]$RecoverDemoCredentials,
+    [scriptblock]$HealthProbe,
+    [scriptblock]$IdentityProbe,
+    [scriptblock]$AgentRegistrationProbe
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -12,8 +15,62 @@ $root = Split-Path -Parent $PSScriptRoot
 $envFile = Join-Path $root '.env'
 $stateDir = Join-Path $root '.captain-cook'
 $pidFile = Join-Path $stateDir 'minibook-demo.pid'
-$baseUrl = 'http://127.0.0.1:8080'
 $serviceName = 'captain-demo-service'
+
+function Get-MinibookConfiguredPort {
+    param([string]$ConfigPath)
+    $recovery = 'Minibook endpoint is not configured. Set MINIBOOK_BACKEND_URL or configure an integer port in minibook/config.yaml.'
+    if (-not (Test-Path $ConfigPath -PathType Leaf)) { throw $recovery }
+    foreach ($line in [IO.File]::ReadAllLines($ConfigPath)) {
+        if ($line -match '^\s*port\s*:\s*([0-9]+)\s*(?:#.*)?$') {
+            $port = [int]0
+            if ([int]::TryParse($Matches[1], [ref]$port) -and $port -ge 1 -and $port -le 65535) {
+                return $port
+            }
+            throw $recovery
+        }
+    }
+    throw $recovery
+}
+function Resolve-MinibookBaseUrl {
+    param([string]$ConfiguredUrl, [string]$ConfigPath)
+    if (-not [string]::IsNullOrWhiteSpace($ConfiguredUrl)) {
+        try {
+            $candidate = [uri]$ConfiguredUrl
+        } catch {
+            throw 'Minibook demo endpoint must be a local HTTP URL.'
+        }
+    } else {
+        $port = Get-MinibookConfiguredPort -ConfigPath $ConfigPath
+        $candidate = [uri]"http://127.0.0.1:$port"
+    }
+    if (-not $candidate.IsAbsoluteUri -or $candidate.Scheme -ne 'http' -or -not $candidate.IsLoopback) {
+        throw 'Minibook demo endpoint must be a local HTTP URL.'
+    }
+    return $candidate.AbsoluteUri.TrimEnd('/')
+}
+
+if ($Action -ne 'stop') {
+    $baseUrl = Resolve-MinibookBaseUrl -ConfiguredUrl $env:MINIBOOK_BACKEND_URL -ConfigPath (Join-Path $root 'minibook\config.yaml')
+}
+if ($null -eq $HealthProbe) {
+    $HealthProbe = {
+        param([string]$HealthUrl)
+        (Invoke-WebRequest $HealthUrl -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200
+    }
+}
+if ($null -eq $IdentityProbe) {
+    $IdentityProbe = {
+        param([string]$IdentityUrl, [string]$ApiKey)
+        Invoke-RestMethod $IdentityUrl -Headers @{Authorization="Bearer $ApiKey"} -TimeoutSec 5
+    }
+}
+if ($null -eq $AgentRegistrationProbe) {
+    $AgentRegistrationProbe = {
+        param([string]$RegistrationUrl, [string]$Name)
+        Invoke-RestMethod $RegistrationUrl -Method Post -ContentType 'application/json' -Body (@{name=$Name}|ConvertTo-Json) -TimeoutSec 5
+    }
+}
 
 function Read-Env {
     $values = [ordered]@{}
@@ -46,7 +103,7 @@ function Save-Env($values) {
     [IO.File]::WriteAllLines($envFile, $lines, [Text.UTF8Encoding]::new($false))
 }
 function Test-Health {
-    try { (Invoke-WebRequest "$baseUrl/health" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200 } catch { $false }
+    try { [bool](& $HealthProbe "$baseUrl/health") } catch { $false }
 }
 function Start-Service($values) {
     if (Test-Health) { Write-Host '[ready] Minibook local instance'; return }
@@ -71,7 +128,7 @@ function Recover-ServiceCredential($values) {
     $apiKey = (& $python -c $query $database $serviceName).Trim()
     if ([string]::IsNullOrWhiteSpace($apiKey)) { throw 'Minibook demo identity recovery was ambiguous or unavailable.' }
     try {
-        $me = Invoke-RestMethod "$baseUrl/api/v1/agents/me" -Headers @{Authorization="Bearer $apiKey"} -TimeoutSec 5
+        $me = & $IdentityProbe "$baseUrl/api/v1/agents/me" $apiKey
         if ($me.name -ne $serviceName) { throw 'Recovered Minibook key belongs to another identity.' }
     } catch { throw 'Recovered Minibook key did not validate against the local service.' }
     $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = $apiKey
@@ -92,13 +149,13 @@ function Bootstrap-Service {
     $apiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_API_KEY']
     if ($apiKey) {
         try {
-            $me = Invoke-RestMethod "$baseUrl/api/v1/agents/me" -Headers @{Authorization="Bearer $apiKey"} -TimeoutSec 5
+            $me = & $IdentityProbe "$baseUrl/api/v1/agents/me" $apiKey
             if ($me.name -ne $serviceName) { throw 'Configured Minibook key belongs to another identity.' }
             Write-Host '[ready] Minibook demo service account reused (credential redacted)'; return
         } catch { throw 'Configured CAPTAIN_DEMO_MINIBOOK_API_KEY is invalid; refusing to replace it.' }
     }
     try {
-        $created = Invoke-RestMethod "$baseUrl/api/v1/agents" -Method Post -ContentType 'application/json' -Body (@{name=$serviceName}|ConvertTo-Json) -TimeoutSec 5
+        $created = & $AgentRegistrationProbe "$baseUrl/api/v1/agents" $serviceName
     } catch {
         if ($RecoverDemoCredentials) { Recover-ServiceCredential $values; return }
         throw 'Minibook demo identity exists or registration failed; use -RecoverDemoCredentials to restore its local key.'
