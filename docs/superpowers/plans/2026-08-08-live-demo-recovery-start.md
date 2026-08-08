@@ -40,7 +40,7 @@ def test_minibook_demo_prefers_configured_backend_url(tmp_path: Path) -> None:
 Run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q tests/test_live_demo_operations.py -k "minibook_demo"
+.\.venv\Scripts\python.exe -m pytest -q --no-cov tests/test_live_demo_operations.py -k "minibook_demo"
 ```
 
 Expected: FAIL because the script still sets `$baseUrl` to port `8080` and has no injectable probe seam.
@@ -80,7 +80,7 @@ Add a behavioral test that snapshots a temporary `.env`, returns HTTP 401 from t
 Run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q tests/test_live_demo_operations.py -k "minibook_demo"
+.\.venv\Scripts\python.exe -m pytest -q --no-cov tests/test_live_demo_operations.py -k "minibook_demo"
 ```
 
 Expected: PASS.
@@ -127,7 +127,7 @@ def test_paid_demo_rejects_invalid_budget_before_children(
 Run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q tests/test_start_live_demo.py
+.\.venv\Scripts\python.exe -m pytest -q --no-cov tests/test_start_live_demo.py
 ```
 
 Expected: FAIL because `scripts/start-live-demo.ps1` does not exist.
@@ -159,7 +159,7 @@ Add only variable names and local defaults to `.env.example`, including `MINIBOO
 Run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q tests/test_start_live_demo.py tests/test_live_demo_operations.py
+.\.venv\Scripts\python.exe -m pytest -q --no-cov tests/test_start_live_demo.py tests/test_live_demo_operations.py
 ```
 
 Expected: PASS with no network or provider calls.
