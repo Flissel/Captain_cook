@@ -133,3 +133,38 @@ GREEN evidence:
 
 Both pytest commands emitted the pre-existing `RequestsDependencyWarning` from
 the local requests/urllib3 dependency combination; it did not affect results.
+
+## Review Fix: Digest Keys and Bounded Commands
+
+Status: DONE
+
+RED evidence:
+
+- `python -m pytest tests/contracts/test_forge_contract_compatibility.py -q --no-cov`:
+  27 passed, 4 failed. Both contract mirrors accepted uppercase and short
+  hexadecimal/opaque values under `sha256`, plus unbounded direct pytest and
+  compileall argv shapes.
+- `$env:PYTHONPATH=(Resolve-Path minibook).Path; python -m pytest
+  minibook/tests/test_creation_contracts.py -q --no-cov`: 30 passed, 2 failed
+  for the same digest-key and command-shape bypasses.
+
+Delivered:
+
+- Explicit digest/sha256 metadata keys now permit only exactly 64 lowercase
+  hexadecimal characters. Uppercase 64-hex, 32-hex, and opaque tokens are
+  rejected.
+- Command acceptance is now restricted to exact bounded shapes: bare
+  `pytest`/`pytest.exe`; Python `-m pytest` with no extra argv; or Python
+  `-m compileall` with exactly one declared output-root argument. Extra pytest
+  flags and compileall options are rejected.
+
+GREEN evidence:
+
+- `python -m pytest tests/contracts/test_forge_contract_compatibility.py -q --no-cov`:
+  31 passed in 0.82s.
+- `$env:PYTHONPATH=(Resolve-Path minibook).Path; python -m pytest
+  minibook/tests/test_creation_contracts.py -q --no-cov`: 32 passed in 0.51s.
+- `git diff --check`: passed.
+
+Both commands continued to emit the existing `RequestsDependencyWarning`; no
+test failed.

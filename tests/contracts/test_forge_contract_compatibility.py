@@ -237,6 +237,9 @@ def test_metadata_rejects_opaque_secret_tokens_but_allows_long_prose(contract: t
     with pytest.raises(ValidationError, match="secret-like"):
         contract.model_validate(payload | {"answer_metadata": {"note": "a" * 64}})
     assert contract.model_validate(payload | {"answer_metadata": {"sha256": "a" * 64}}).answer_metadata["sha256"] == "a" * 64
+    for value in ("A" * 64, "a" * 32, "Y7pL2vQ9xN4mR8sT6uW3aB5cD1eF0gHk"):
+        with pytest.raises(ValidationError, match="secret-like"):
+            contract.model_validate(payload | {"answer_metadata": {"sha256": value}})
     assert contract.model_validate(payload | {"answer_metadata": {"run_id": "2f1d8c50-4a7a-4d94-91fb-77a1ed58ba23"}}).answer_metadata["run_id"]
 
 
@@ -245,3 +248,6 @@ def test_assignment_rejects_relative_command_components(contract: type) -> None:
     payload = json.loads((FIXTURES / "hermes_factory_assignment.v2.json").read_text(encoding="utf-8"))
     with pytest.raises(ValidationError, match="allowed command"):
         contract.model_validate(payload | {"allowed_commands": [["python", "-m", "pytest", "."]]})
+    for command in (["pytest", "--pythonpath", "x"], ["python", "-m", "compileall", "output", "-q"]):
+        with pytest.raises(ValidationError, match="allowed command"):
+            contract.model_validate(payload | {"allowed_commands": [command]})

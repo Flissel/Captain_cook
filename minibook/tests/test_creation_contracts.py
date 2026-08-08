@@ -222,6 +222,9 @@ def test_metadata_uses_token_secret_detection_without_rejecting_long_prose() -> 
     with pytest.raises(ValidationError, match="secret-like"):
         FactoryActionResponseV1.model_validate(payload | {"answer_metadata": {"note": "a" * 64}})
     assert FactoryActionResponseV1.model_validate(payload | {"answer_metadata": {"sha256": "a" * 64}}).answer_metadata["sha256"] == "a" * 64
+    for value in ("A" * 64, "a" * 32, "Y7pL2vQ9xN4mR8sT6uW3aB5cD1eF0gHk"):
+        with pytest.raises(ValidationError, match="secret-like"):
+            FactoryActionResponseV1.model_validate(payload | {"answer_metadata": {"sha256": value}})
     assert FactoryActionResponseV1.model_validate(payload | {"answer_metadata": {"run_id": "2f1d8c50-4a7a-4d94-91fb-77a1ed58ba23"}}).answer_metadata["run_id"]
 
 
@@ -232,3 +235,6 @@ def test_assignment_rejects_pathful_executables() -> None:
             FactoryBuildAssignmentV2.model_validate(payload | {"allowed_commands": [command]})
     with pytest.raises(ValidationError, match="allowed command"):
         FactoryBuildAssignmentV2.model_validate(payload | {"allowed_commands": [["python", "-m", "pytest", "."]]})
+    for command in (["pytest", "--pythonpath", "x"], ["python", "-m", "compileall", "output", "-q"]):
+        with pytest.raises(ValidationError, match="allowed command"):
+            FactoryBuildAssignmentV2.model_validate(payload | {"allowed_commands": [command]})

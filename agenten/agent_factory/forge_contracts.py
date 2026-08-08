@@ -539,11 +539,17 @@ class FactoryBuildAssignmentV2(_FrozenContract):
             if not command or any(not arg.strip() for arg in command):
                 raise ValueError("allowed command must contain nonblank argv")
             executable = command[0]
-            allowed = (
+            python_pytest = (
                 executable in {"python", "python.exe", "python3", "python3.exe"}
-                and len(command) >= 3
-                and command[1:3] in (("-m", "pytest"), ("-m", "compileall"))
-            ) or executable in {"pytest", "pytest.exe"}
+                and command[1:] == ("-m", "pytest")
+            )
+            python_compileall = (
+                executable in {"python", "python.exe", "python3", "python3.exe"}
+                and len(command) == 4
+                and command[1:3] == ("-m", "compileall")
+                and command[3] in self.allowed_output_roots
+            )
+            allowed = python_pytest or python_compileall or (executable in {"pytest", "pytest.exe"} and len(command) == 1)
             if not allowed or any(
                 re.search(r"[|&;*?`$<>]", arg) or arg.startswith(("/", "\\", ".")) or re.match(r"^[A-Za-z]:", arg) or any(part in {".", ".."} for part in arg.replace("\\", "/").split("/"))
                 for arg in command
@@ -631,6 +637,8 @@ def _is_opaque_secret_token(value: str, key: str | None) -> bool:
         return False
     if key is not None and (key.casefold() == "id" or key.casefold().endswith("_id")) and re.fullmatch(IDENTIFIER_PATTERN, value):
         return False
+    if _is_explicit_digest_key(key):
+        return not bool(re.fullmatch(SHA256_PATTERN, value))
     if re.fullmatch(r"[0-9a-fA-F]{32,}", value):
         return not _is_explicit_digest_key(key)
     if not re.fullmatch(r"[A-Za-z0-9_+/-]{32,}={0,2}", value):
