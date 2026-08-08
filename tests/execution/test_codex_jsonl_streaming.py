@@ -213,6 +213,79 @@ async def test_redacted_output_policy_streams_events_without_retaining_raw_recor
 
 
 @pytest.mark.asyncio
+async def test_no_raw_runner_uses_no_journal_or_child_state_file_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _CompletedProcess(
+        (
+            b'CAPTAIN_PROCESS_STATE:{"session_id":"no-raw-runtime",'
+            b'"pid":42,"started_at_utc":"2026-08-08T12:00:00Z",'
+            b'"start_time_utc_ticks":123,"executable":"codex.exe"}\n'
+            b'{"type":"turn.completed"}\n',
+        )
+    )
+    launches: list[tuple[object, ...]] = []
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        del kwargs
+        launches.append(args)
+        return process
+
+    monkeypatch.setattr(
+        codex_supervisor.asyncio,
+        "create_subprocess_exec",
+        create_process,
+    )
+    pwsh = shutil.which("pwsh")
+    assert pwsh is not None
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    observed: list[dict[str, object]] = []
+    process_states: list[dict[str, object]] = []
+
+    async def observe(event: dict[str, object]) -> None:
+        observed.append(event)
+
+    async def observe_process_state(state: dict[str, object]) -> None:
+        process_states.append(state)
+
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(pwsh),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=Path(r"C:\Windows\System32\timeout.exe"),
+        session_id="no-raw-runtime",
+        state_path=None,
+        journal_path=None,
+        artifact_references=(),
+        codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
+        output_policy=codex_supervisor.CodexOutputJournalPolicy(
+            retain_raw_records=False,
+            observer=observe,
+            process_state_observer=observe_process_state,
+        ),
+    )
+
+    result = await runner.run(_authorized(tmp_path))
+
+    assert observed == [{"type": "turn.completed"}]
+    assert process_states == [
+        {
+            "session_id": "no-raw-runtime",
+            "pid": 42,
+            "started_at_utc": "2026-08-08T12:00:00Z",
+            "start_time_utc_ticks": 123,
+            "executable": "codex.exe",
+        }
+    ]
+    assert result.journal_path is None
+    assert "-EmitState" in launches[0]
+    assert not list(tmp_path.rglob("*.jsonl"))
+    assert not list(tmp_path.rglob("*state*.json"))
+
+
+@pytest.mark.asyncio
 async def test_redacted_output_policy_observer_failure_is_typed_and_cleans_process(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

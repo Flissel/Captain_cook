@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +15,7 @@ import pytest
 from agenten.agent_runtime.runtime_codex import (
     PowerShellRuntimeCodexRunner,
     RuntimeCodexExecution,
+    RuntimeCodexInvocation,
     RuntimeCodexProcessResult,
 )
 from agenten.agent_factory.hermes_cli import HermesCliFactory, HermesCliSettings
@@ -36,7 +39,10 @@ from agenten.agent_runtime.production_bootstrap import (
 )
 from agenten.agent_runtime import confined_files
 from agenten.agent_factory.orchestration import FactoryDispatchError
-from agenten.execution.codex_supervisor import CodexJsonlInvalidObjectError
+from agenten.execution.codex_supervisor import (
+    CodexJsonlInvalidObjectError,
+    CodexOutputObserverError,
+)
 
 
 NOW = datetime(2026, 8, 8, 8, 0, tzinfo=timezone.utc)
@@ -261,12 +267,13 @@ class StreamingRunner:
             ).hexdigest(),
         )
 
-    async def cancel(self, session_id: str) -> None:
+    async def cancel(self, session_id: str) -> str:
         assert self.invocations
         assert session_id == self.invocations[-1].session_id
         self.cancel_calls += 1
         self.exit_code = 130
         self.release.set()
+        return "verified_cancelled"
 
 
 def _codex_adapter(
@@ -604,6 +611,73 @@ async def test_repeated_cancel_reaches_owned_child_process_exactly_once(
     assert first.status is RuntimeStatus.CANCELLED
     assert second.status is RuntimeStatus.CANCELLED
     assert terminal.status is RuntimeStatus.CANCELLED
+    assert runner.cancel_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_verified_operator_cancel_is_cancelled_despite_non_130_child_exit(
+    tmp_path: Path,
+) -> None:
+    class Non130CancelRunner(StreamingRunner):
+        async def cancel(self, session_id: str) -> str:
+            assert session_id == self.invocations[-1].session_id
+            self.cancel_calls += 1
+            self.exit_code = 17
+            self.release.set()
+            return "verified_cancelled"
+
+    runner = Non130CancelRunner()
+    runner.block = True
+    adapter, execution, artifacts = _codex_adapter(tmp_path, runner)
+    prompt_ref = artifacts.put(b"verified operator cancel", "text/markdown")
+    original = _command(prompt_ref)
+    active = asyncio.create_task(adapter.start(original, _grant(original)))
+    await runner.started.wait()
+    cancel = _command(
+        prompt_ref,
+        operation="codex.cancel",
+        correlation_id=original.correlation_id,
+        causation_id=original.event_id,
+    )
+
+    cancelled = await adapter.cancel(cancel, _grant(cancel))
+    terminal = await active
+    evidence = execution.terminal_evidence(original.event_id)
+
+    assert cancelled.status is RuntimeStatus.CANCELLED
+    assert terminal.status is RuntimeStatus.CANCELLED
+    assert evidence is not None
+    assert evidence.exit_code == 130
+    assert evidence.process_cleanup_status == "verified_cancelled"
+    assert runner.cancel_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_prelaunch_failure_records_no_active_process_not_required_cleanup(
+    tmp_path: Path,
+) -> None:
+    class MissingExecutableRunner(StreamingRunner):
+        async def run(self, invocation: object, observer: object) -> object:
+            del invocation, observer
+            raise FileNotFoundError("private missing executable detail")
+
+        async def cancel(self, session_id: str) -> str:
+            del session_id
+            self.cancel_calls += 1
+            return "no_active_process"
+
+    runner = MissingExecutableRunner()
+    adapter, execution, artifacts = _codex_adapter(tmp_path, runner)
+    prompt_ref = artifacts.put(b"prelaunch failure", "text/markdown")
+    command = _command(prompt_ref)
+
+    result = await adapter.start(command, _grant(command))
+    evidence = execution.terminal_evidence(command.event_id)
+
+    assert result.status is RuntimeStatus.FAILED
+    assert evidence is not None
+    assert evidence.process_cleanup_status == "not_required"
+    assert evidence.failure_kind == "output_read_failed"
     assert runner.cancel_calls == 1
 
 
@@ -1000,12 +1074,9 @@ async def test_parser_failure_from_current_runner_becomes_typed_terminal_evidenc
             error = CodexJsonlInvalidObjectError(
                 "Codex JSONL record is not a valid JSON object"
             )
-            journal = tmp_path / "private-process" / "redacted.jsonl"
-            journal.parent.mkdir(parents=True)
-            journal.write_bytes(b"")
             error.bind_terminal_evidence(
                 process_cleanup_status="verified_cancelled",
-                journal_path=journal,
+                journal_path=None,
                 journal_sha256=hashlib.sha256(b"").hexdigest(),
                 journal_byte_count=0,
                 event_count=0,
@@ -1102,6 +1173,106 @@ def test_factory_returns_exact_frozen_runtime_binding(tmp_path: Path) -> None:
     assert isinstance(binding.codex._execution._runner, PowerShellRuntimeCodexRunner)
     with pytest.raises((AttributeError, TypeError)):
         binding.hermes = object()  # type: ignore[misc]
+
+
+def test_runtime_codex_rejects_reparsed_state_root_before_process_launch(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    evidence_root = tmp_path / "runtime-codex"
+    evidence_root.mkdir()
+    state_root = evidence_root / "state"
+    if os.name == "nt":
+        linked = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(state_root), str(outside)],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if linked.returncode != 0:
+            pytest.skip("directory junctions are unavailable on this host")
+    else:
+        try:
+            state_root.symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="symlink|reparse|confined"):
+        PowerShellRuntimeCodexRunner(
+            repository_root=tmp_path,
+            executable="codex",
+            environ={},
+            evidence_root=evidence_root,
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_codex_state_write_rejects_final_handle_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = tmp_path / "scripts" / "codex-session.ps1"
+    script.parent.mkdir()
+    script.write_text("# test launcher", encoding="utf-8")
+    pwsh = tmp_path / "pwsh.exe"
+    codex = tmp_path / "codex.exe"
+    pwsh.write_bytes(b"test")
+    codex.write_bytes(b"test")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    process_runner = PowerShellRuntimeCodexRunner(
+        repository_root=tmp_path,
+        executable="codex",
+        environ={"CODEX_HOME": str(codex_home)},
+        evidence_root=tmp_path / "runtime-codex",
+    )
+    monkeypatch.setattr(
+        "agenten.agent_runtime.runtime_codex.shutil.which",
+        lambda executable: str(pwsh if executable == "pwsh" else codex),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    invocation = RuntimeCodexInvocation(
+        command_id=uuid4(),
+        correlation_id=uuid4(),
+        subject_id="operator",
+        prompt_sha256="1" * 64,
+        command_identity_sha256="2" * 64,
+        session_id="final-handle",
+        workspace_ref="workspace://runtime/task",
+        workspace_binding_sha256="3" * 64,
+        workspace=workspace,
+        prompt="not persisted",
+        timeout_seconds=30,
+    )
+
+    async def observe(_event: dict[str, object]) -> None:
+        return None
+
+    runner = process_runner._make_runner(invocation, observe)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(
+        confined_files,
+        "_final_path_for_open_file",
+        lambda _stream, *, requested_path: outside / requested_path.name,
+    )
+    state = {
+        "session_id": "final-handle",
+        "pid": 42,
+        "started_at_utc": "2026-08-08T12:00:00Z",
+        "start_time_utc_ticks": 123,
+        "executable": str(codex),
+    }
+
+    with pytest.raises(CodexOutputObserverError):
+        await runner._accept_process_state(json.dumps(state).encode("utf-8"))
+
+    assert list(outside.iterdir()) == []
+    assert not list((tmp_path / "runtime-codex").rglob("*.json"))
 
 
 @pytest.mark.asyncio

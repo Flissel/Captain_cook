@@ -31,6 +31,11 @@ from agenten.execution.codex_supervisor import (
 
 RuntimeCodexTerminalStatus = Literal["succeeded", "failed", "timed_out", "cancelled"]
 RuntimeCodexProcessCleanupStatus = Literal["not_required", "verified_cancelled", "unresolved"]
+RuntimeCodexCancelOutcome = Literal[
+    "no_active_process",
+    "requested_unverified",
+    "verified_cancelled",
+]
 RuntimeCodexFailureKind = Literal[
     "journal_persistence_failed",
     "output_read_failed",
@@ -140,7 +145,7 @@ RuntimeCodexObserver = Callable[[dict[str, object]], Awaitable[None]]
 class RuntimeCodexProcessRunner(Protocol):
     async def run(self, invocation: RuntimeCodexInvocation, observer: RuntimeCodexObserver) -> RuntimeCodexProcessResult: ...
 
-    async def cancel(self, session_id: str) -> None: ...
+    async def cancel(self, session_id: str) -> RuntimeCodexCancelOutcome: ...
 
 
 class _RuntimeObserverFailed(RuntimeError):
@@ -179,6 +184,7 @@ class RuntimeCodexExecution:
         self._sessions: dict[UUID, str] = {}
         self._active: dict[UUID, tuple[str, asyncio.Task[RuntimeCodexTerminalEvidenceV1]]] = {}
         self._cancelled: set[UUID] = set()
+        self._cancel_outcomes: dict[UUID, RuntimeCodexCancelOutcome] = {}
         self._lock = asyncio.Lock()
         self._owner_id = uuid4().hex
 
@@ -307,7 +313,8 @@ class RuntimeCodexExecution:
                 return terminal
             task = active[1]
             if command_id not in self._cancelled:
-                await self._runner.cancel(self._sessions[command_id])
+                outcome = await self._runner.cancel(self._sessions[command_id])
+                self._cancel_outcomes[command_id] = outcome
                 self._cancelled.add(command_id)
         return await asyncio.shield(task)
 
@@ -522,11 +529,15 @@ class RuntimeCodexExecution:
         try:
             result = await self._runner.run(invocation, observe)
         except Exception as exc:
-            cleanup: RuntimeCodexProcessCleanupStatus = "verified_cancelled"
+            cleanup: RuntimeCodexProcessCleanupStatus = "not_required"
             if invocation.command_id not in self._cancelled:
                 try:
-                    await self._runner.cancel(invocation.session_id)
+                    outcome = await self._runner.cancel(invocation.session_id)
                 except Exception:
+                    outcome = "requested_unverified"
+                if outcome == "verified_cancelled":
+                    cleanup = "verified_cancelled"
+                elif outcome == "requested_unverified":
                     cleanup = "unresolved"
                 self._cancelled.add(invocation.command_id)
             result = RuntimeCodexProcessResult(
@@ -543,6 +554,18 @@ class RuntimeCodexExecution:
                     if isinstance(exc, _RuntimeObserverFailed)
                     else "output_read_failed"
                 ),
+            )
+        cancel_outcome = self._cancel_outcomes.get(invocation.command_id)
+        if cancel_outcome == "verified_cancelled":
+            result = RuntimeCodexProcessResult(
+                exit_code=130,
+                terminal_status="cancelled",
+                process_cleanup_status="verified_cancelled",
+                elapsed_ms=result.elapsed_ms,
+                session_id=result.session_id,
+                event_count=result.event_count,
+                event_types=result.event_types,
+                last_event_sha256=result.last_event_sha256,
             )
         if (
             result.event_count != summary.count
@@ -753,7 +776,7 @@ class PowerShellRuntimeCodexRunner:
         self._repository_root = repository_root.resolve()
         self._executable = executable
         self._environ = dict(environ)
-        self._evidence_root = evidence_root
+        self._state_store = ConfinedFileStore(evidence_root / "state")
         self._monotonic = monotonic or time.monotonic
         self._active: dict[str, PowerShellCodexRunner] = {}
         self._cancelled: set[str] = set()
@@ -823,26 +846,44 @@ class PowerShellRuntimeCodexRunner:
             last_event_sha256=summary.last_sha256,
         )
 
-    async def cancel(self, session_id: str) -> None:
+    async def cancel(self, session_id: str) -> RuntimeCodexCancelOutcome:
         async with self._lock:
             runner = self._active.get(session_id)
             if runner is None or session_id in self._cancelled:
-                return
+                return "no_active_process"
             self._cancelled.add(session_id)
-        verified = await runner.cancel()
-        if not verified:
-            raise FactoryDispatchError("Codex runtime cancellation could not be verified")
+        return await runner.cancel()
 
     async def inspect(self, session_id: str) -> str:
         pwsh = shutil.which(self._environ.get("CAPTAIN_PWSH_EXECUTABLE", "pwsh"))
         if pwsh is None:
             return "unresolved"
-        return await PowerShellCodexRunner.inspect_process_state(
-            pwsh_path=Path(pwsh),
-            script_path=self._repository_root / "scripts" / "codex-session.ps1",
-            state_path=self._evidence_root / "state" / f"{session_id}.json",
-            session_id=session_id,
-        )
+        try:
+            state_files = self._state_store.regular_files(session_id)
+        except ConfinedFileError:
+            return "missing"
+        outcomes: set[str] = set()
+        for state_file in state_files:
+            try:
+                decoded = json.loads(self._state_store.read(state_file))
+            except (ConfinedFileError, TypeError, ValueError, json.JSONDecodeError):
+                return "unresolved"
+            if not isinstance(decoded, dict):
+                return "unresolved"
+            outcome = await PowerShellCodexRunner.inspect_process_identity(
+                pwsh_path=Path(pwsh),
+                script_path=self._repository_root / "scripts" / "codex-session.ps1",
+                process_state=decoded,
+                session_id=session_id,
+            )
+            outcomes.add(outcome)
+        if "active" in outcomes:
+            return "active"
+        if "identity_mismatch" in outcomes:
+            return "identity_mismatch"
+        if "unresolved" in outcomes:
+            return "unresolved"
+        return "lost" if outcomes else "missing"
 
     def _make_runner(
         self,
@@ -856,13 +897,21 @@ class PowerShellRuntimeCodexRunner:
         codex_home_value = self._environ.get("CODEX_HOME")
         codex_home = Path(codex_home_value) if codex_home_value else Path.home() / ".codex"
         attempt = uuid4().hex
+
+        async def persist_process_state(state: dict[str, object]) -> None:
+            self._state_store.write_once(
+                f"{invocation.session_id}/{attempt}.json",
+                _runtime_codex_json(state),
+                conflict="runtime Codex process state is immutable",
+            )
+
         return PowerShellCodexRunner(
             pwsh_path=Path(pwsh),
             script_path=self._repository_root / "scripts" / "codex-session.ps1",
             codex_path=Path(codex),
             session_id=invocation.session_id,
-            state_path=self._evidence_root / "state" / f"{invocation.session_id}.json",
-            journal_path=self._evidence_root / "journals" / f"{invocation.session_id}-{attempt}.jsonl",
+            state_path=None,
+            journal_path=None,
             artifact_references=(),
             codex_home=codex_home,
             deadline_at=datetime.now(timezone.utc) + timedelta(seconds=invocation.timeout_seconds),
@@ -870,6 +919,7 @@ class PowerShellRuntimeCodexRunner:
             output_policy=CodexOutputJournalPolicy(
                 retain_raw_records=False,
                 observer=observer,
+                process_state_observer=persist_process_state,
             ),
         )
 
