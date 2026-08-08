@@ -13,6 +13,15 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $global:LASTEXITCODE = 0
+if (-not (Get-Variable -Name MinibookCommand -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:MinibookCommand = Join-Path $PSScriptRoot 'minibook-demo.ps1'
+}
+if (-not (Get-Variable -Name CaptainStartProbe -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:CaptainStartProbe = $null
+}
+if (-not (Get-Variable -Name StatusProbe -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:StatusProbe = $null
+}
 $root = Split-Path -Parent $PSScriptRoot
 $rootEnv = Join-Path $root '.env'
 $n8nEnv = Join-Path $root '.env.captain-n8n'
