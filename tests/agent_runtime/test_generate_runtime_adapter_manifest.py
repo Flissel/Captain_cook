@@ -59,6 +59,70 @@ def _run_generator(repository: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _generated_metadata(repository: Path) -> dict[str, str]:
+    result = _run_generator(repository)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return dict(line.split("=", 1) for line in result.stdout.splitlines())
+
+
+def _runtime_status_result(
+    repository: Path,
+    *,
+    listener_owner_expression: str,
+) -> subprocess.CompletedProcess[str]:
+    scripts = repository / "scripts"
+    scripts.mkdir(exist_ok=True)
+    for source in (SERVICES, MANAGED_PROCESS, GENERATOR):
+        shutil.copy2(source, scripts / source.name)
+    (scripts / "minibook-demo.ps1").write_text(
+        "param([string]$Action)\nif ($Action -ne 'status') { throw 'unexpected action' }\nWrite-Output 'minibook-status'\n",
+        encoding="utf-8",
+    )
+    (scripts / "demo-preflight.ps1").write_text(
+        "param([string]$EnvFile)\nWrite-Output 'preflight-status'\n",
+        encoding="utf-8",
+    )
+    metadata = _generated_metadata(repository)
+    (repository / ".env").write_text(
+        "\n".join(
+            (
+                "CAPTAIN_RUNTIME_URL=http://127.0.0.1:18091",
+                "CAPTAIN_RUNTIME_TOKEN=fixture-runtime-token",
+                f"CAPTAIN_RUNTIME_ADAPTER_MANIFEST={metadata['manifest_path']}",
+                f"CAPTAIN_RUNTIME_ADAPTER_MANIFEST_SHA256={metadata['manifest_sha256']}",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    harness = repository / "runtime-status.ps1"
+    harness.write_text(
+        "\n".join(
+            (
+                "$ErrorActionPreference = 'Stop'",
+                f". '{(scripts / 'managed-process-identity.ps1').as_posix()}'",
+                "$identityPid = $PID",
+                "$manifest = '" + metadata["manifest_path"].replace("'", "''") + "'",
+                "$manifestSha = '" + metadata["manifest_sha256"] + "'",
+                "$payload = @(",
+                "  'captain.runtime.configuration.v1',",
+                "  'CAPTAIN_RUNTIME_URL=http://127.0.0.1:18091',",
+                "  ('CAPTAIN_RUNTIME_ADAPTER_MANIFEST=' + $manifest),",
+                "  ('CAPTAIN_RUNTIME_ADAPTER_MANIFEST_SHA256=' + $manifestSha)",
+                ") -join \"`n\"",
+                "$sha = [Security.Cryptography.SHA256]::Create()",
+                "try { $configurationSha = [Convert]::ToHexString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload))).ToLowerInvariant() } finally { $sha.Dispose() }",
+                "Write-ManagedProcessIdentity -Process (Get-Process -Id $identityPid) -Path (Join-Path (Get-Location) '.captain-cook/runtime-demo.pid') -ConfigurationSha256 $configurationSha",
+                "$health = { param($url, $token) $true }",
+                "$listener = { param($port) [pscustomobject]@{ OwningProcess = " + listener_owner_expression + " } }.GetNewClosure()",
+                f"& '{(scripts / 'live-demo-services.ps1').as_posix()}' status -RuntimeHealthProbe $health -RuntimeListenerProbe $listener",
+            )
+        ),
+        encoding="utf-8",
+    )
+    return _run(["pwsh", "-NoProfile", "-File", str(harness)], cwd=repository)
+
+
 def test_generator_writes_a_canonical_committed_adapter_manifest(tmp_path: Path) -> None:
     """Changing adapter bytes or JSON formatting must invalidate the generated bundle."""
 
@@ -115,6 +179,29 @@ def test_generator_rejects_an_adapter_that_differs_from_the_committed_bytes(
     assert not (repository / ".captain-cook" / "runtime-adapters").exists()
 
 
+def test_runtime_status_rebinds_the_listener_to_the_managed_runtime_process(
+    tmp_path: Path,
+) -> None:
+    """A healthy response is insufficient if another process owns the runtime port."""
+
+    repository, _ = _create_committed_adapter_repository(tmp_path)
+
+    valid = _runtime_status_result(
+        repository,
+        listener_owner_expression="$identityPid",
+    )
+    mismatched = _runtime_status_result(
+        repository,
+        listener_owner_expression="($identityPid + 1)",
+    )
+
+    assert valid.returncode == 0, valid.stdout + valid.stderr
+    assert "minibook-status" in valid.stdout
+    assert mismatched.returncode != 0
+    assert "minibook-status" not in mismatched.stdout
+    assert "listener" in (mismatched.stdout + mismatched.stderr).lower()
+
+
 @pytest.mark.parametrize(
     ("manifest_setting", "digest_setting"),
     [
@@ -142,6 +229,11 @@ def test_service_start_refuses_invalid_adapter_settings_before_docker(
     if digest_setting is not None:
         lines.append(f"CAPTAIN_RUNTIME_ADAPTER_MANIFEST_SHA256={digest_setting}")
     (repository / ".env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    original_env = (repository / ".env").read_bytes()
+    runtime_pid = repository / ".captain-cook" / "runtime-demo.pid"
+    runtime_pid.parent.mkdir()
+    original_pid = b'{"fixture":"runtime-identity"}\n'
+    runtime_pid.write_bytes(original_pid)
     docker = repository / "docker.cmd"
     docker.write_text("@echo docker-called\r\nexit /b 99\r\n", encoding="utf-8")
     environment = os.environ.copy()
@@ -161,3 +253,5 @@ def test_service_start_refuses_invalid_adapter_settings_before_docker(
     assert result.returncode != 0
     assert "docker-called" not in output
     assert "Runtime adapter" in output or "runtime adapter" in output
+    assert (repository / ".env").read_bytes() == original_env
+    assert runtime_pid.read_bytes() == original_pid

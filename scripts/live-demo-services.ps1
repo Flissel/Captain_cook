@@ -8,7 +8,9 @@ param(
     [string]$CredentialSourceEnv,
     [string]$MinibookCommand = (Join-Path $PSScriptRoot 'minibook-demo.ps1'),
     [scriptblock]$CaptainStartProbe,
-    [scriptblock]$StatusProbe
+    [scriptblock]$StatusProbe,
+    [scriptblock]$RuntimeHealthProbe,
+    [scriptblock]$RuntimeListenerProbe
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -21,6 +23,12 @@ if (-not (Get-Variable -Name CaptainStartProbe -Scope Script -ErrorAction Silent
 }
 if (-not (Get-Variable -Name StatusProbe -Scope Script -ErrorAction SilentlyContinue)) {
     $script:StatusProbe = $null
+}
+if (-not (Get-Variable -Name RuntimeHealthProbe -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:RuntimeHealthProbe = $null
+}
+if (-not (Get-Variable -Name RuntimeListenerProbe -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:RuntimeListenerProbe = $null
 }
 $root = Split-Path -Parent $PSScriptRoot
 $rootEnv = Join-Path $root '.env'
@@ -170,6 +178,23 @@ function Get-RuntimeConfigurationSha256($Values) {
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return [Convert]::ToHexString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload))).ToLowerInvariant() }
     finally { $sha.Dispose() }
+}
+function Test-AuthenticatedRuntimeHealth($Values) {
+    $runtimeUrl = [string]$Values['CAPTAIN_RUNTIME_URL']
+    $runtimeToken = [string]$Values['CAPTAIN_RUNTIME_TOKEN']
+    if ($RuntimeHealthProbe) { return [bool](& $RuntimeHealthProbe $runtimeUrl $runtimeToken) }
+    try {
+        return (Invoke-WebRequest "$runtimeUrl/health" -Headers @{Authorization="Bearer $runtimeToken"} -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200
+    } catch { return $false }
+}
+function Get-RuntimeListeners([int]$Port) {
+    if ($RuntimeListenerProbe) { return @(& $RuntimeListenerProbe $Port) }
+    return @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+}
+function Assert-ManagedRuntimeListener($Process, [int]$Port) {
+    $listeners = @(Get-RuntimeListeners $Port)
+    if ($listeners.Count -ne 1) { throw 'Runtime requires exactly one managed listener.' }
+    if ([int]$listeners[0].OwningProcess -ne $Process.Id) { throw 'Runtime listener is not owned by the managed process.' }
 }
 function Recover-CaptainN8nEnvironment($Values, [string]$SourceEnv) {
     if ($SourceEnv -and [IO.Path]::GetFullPath($SourceEnv) -ne [IO.Path]::GetFullPath($rootEnv)) {
@@ -455,24 +480,22 @@ function Get-ManagedRuntimeProcess($Values) {
         if (-not $process) { Remove-Item -LiteralPath $runtimePid -Force; return $null }
         return $process
     }
-    catch { throw 'Managed Runtime process identity does not match the current verified adapter configuration.' }
+    catch { throw 'PID no longer belongs to the managed Runtime process.' }
 }
 function Start-Runtime($Values) {
     $runtimeUrl = [string]$Values['CAPTAIN_RUNTIME_URL']
+    $runtimePort = ([Uri]$runtimeUrl).Port
     $configurationSha256 = Get-RuntimeConfigurationSha256 $Values
     $managed = Get-ManagedRuntimeProcess $Values
     if ($managed) {
-        try {
-            if ((Invoke-WebRequest "$runtimeUrl/health" -Headers @{Authorization="Bearer $([string]$Values['CAPTAIN_RUNTIME_TOKEN'])"} -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200) {
-                Write-Host '[ready] Runtime already healthy with verified process identity'
-                return
-            }
-        } catch {}
+        if (Test-AuthenticatedRuntimeHealth $Values) {
+            Assert-ManagedRuntimeListener $managed $runtimePort
+            Write-Host '[ready] Runtime already healthy with verified process identity'
+            return
+        }
         throw 'Managed Runtime process exists but is not healthy.'
     }
-    $runtimePort = ([Uri]$runtimeUrl).Port
-    $listener = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $runtimePort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($listener) { throw 'Runtime port is occupied by an unmanaged process; refusing to reuse or stop it.' }
+    if (@(Get-RuntimeListeners $runtimePort).Count -ne 0) { throw 'Runtime port is occupied by an unmanaged process; refusing to reuse or stop it.' }
     New-Item -ItemType Directory -Force $stateDir | Out-Null
     $python = Get-RuntimePythonExecutable
     Set-ProcessEnvironment $Values
@@ -480,12 +503,9 @@ function Start-Runtime($Values) {
     foreach ($attempt in 1..60) {
         if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) { break }
         try {
-            if ((Invoke-WebRequest "$runtimeUrl/health" -Headers @{Authorization="Bearer $([string]$Values['CAPTAIN_RUNTIME_TOKEN'])"} -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) {
-                $listener = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $runtimePort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-                if (-not $listener -or $listener.OwningProcess -ne $process.Id) { throw 'Runtime listener is not owned by the managed process.' }
+            if (Test-AuthenticatedRuntimeHealth $Values) {
+                Assert-ManagedRuntimeListener $process $runtimePort
                 Write-ManagedProcessIdentity -Process $process -Path $runtimePid -ConfigurationSha256 $configurationSha256
-                $verified = Get-ManagedListenerIdentity -Path $runtimePid -Port $runtimePort -ConfigurationSha256 $configurationSha256
-                if ($verified.Id -ne $process.Id) { throw 'Runtime listener does not match the managed process identity.' }
                 Write-Host '[ready] authenticated Runtime boundary with verified process identity'
                 return
             }
@@ -517,7 +537,10 @@ function Invoke-StartServices([switch]$RecoverDemoCredentials, [string]$SourceEn
         $values = [ordered]@{}
         & $CaptainStartProbe $values
     } else {
+        $runtimeAdapterValues = Read-Env $rootEnv @('CAPTAIN_RUNTIME_ADAPTER_MANIFEST','CAPTAIN_RUNTIME_ADAPTER_MANIFEST_SHA256')
+        Get-RuntimeAdapterManifestMetadata $runtimeAdapterValues
         $values = Initialize-LocalEnvironment
+        foreach ($name in @('CAPTAIN_RUNTIME_ADAPTER_MANIFEST','CAPTAIN_RUNTIME_ADAPTER_MANIFEST_SHA256')) { $values[$name] = $runtimeAdapterValues[$name] }
         Set-ProcessEnvironment $values
         Assert-RuntimeConfiguration $values
         Initialize-CaptainN8n $values -Recover:$RecoverDemoCredentials -SourceEnv $SourceEnv
@@ -589,8 +612,10 @@ function Invoke-Health {
     if (-not $values.Contains('CAPTAIN_RUNTIME_URL')) { throw 'Runtime URL is not configured.' }
     if (-not $values.Contains('CAPTAIN_RUNTIME_TOKEN')) { throw 'Runtime health authentication is not configured.' }
     Get-RuntimeAdapterManifestMetadata $values
-    if (-not (Get-ManagedRuntimeProcess $values)) { throw 'Managed Runtime process is not running.' }
-    if ((Invoke-WebRequest "$($values['CAPTAIN_RUNTIME_URL'])/health" -Headers @{Authorization="Bearer $([string]$values['CAPTAIN_RUNTIME_TOKEN'])"} -UseBasicParsing -TimeoutSec 3).StatusCode -ne 200) { throw 'Runtime health check failed.' }
+    $managed = Get-ManagedRuntimeProcess $values
+    if (-not $managed) { throw 'Managed Runtime process is not running.' }
+    if (-not (Test-AuthenticatedRuntimeHealth $values)) { throw 'Runtime health check failed.' }
+    Assert-ManagedRuntimeListener $managed ([Uri]$values['CAPTAIN_RUNTIME_URL']).Port
     & $MinibookCommand status
     & (Join-Path $PSScriptRoot 'demo-preflight.ps1') -EnvFile $rootEnv
     $summary = [ordered]@{schema='captain.live-demo-services.v1';checked_at=(Get-Date).ToUniversalTime().ToString('o');status='ready';secrets='redacted';database='captain_test';services=@('gateway','runtime','minibook','captain-n8n-rest','captain-n8n-mcp','mailpit')}
