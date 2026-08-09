@@ -193,4 +193,3 @@ def test_powershell_wrapper_refuses_paid_run_without_switch_before_bundle_load(
     assert result.returncode == 2
     assert "paid-run authorization" in result.stderr
     assert "D11" not in result.stdout + result.stderr
-

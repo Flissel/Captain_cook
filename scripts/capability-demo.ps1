@@ -49,4 +49,3 @@ if ($AllowPaidRun.IsPresent) {
 & $python @cliArguments
 $code = $LASTEXITCODE
 exit $code
-
