@@ -13,6 +13,7 @@ import sys
 from agenten.agent_factory.input_document import load_factory_input
 from agenten.agent_factory.private_benchmark_catalog import (
     VerifiedFilePrivateBenchmarkCatalog,
+    repository_forbidden_roots,
     write_private_benchmark_catalog,
 )
 
@@ -31,6 +32,7 @@ def main(
         load_factory_input(_repository_input(repository_root, path))
         for path in input_paths
     )
+    forbidden_roots = repository_forbidden_roots(repository_root)
     target = private_root.joinpath(*PurePosixPath(manifest_path).parts)
     if target.is_file() and not arguments.seed_stdin:
         digest = hashlib.sha256(target.read_bytes()).hexdigest()
@@ -39,6 +41,7 @@ def main(
             manifest_path=manifest_path,
             expected_sha256=digest,
             expected_input_sha256s=tuple(item.input_ref.sha256 for item in documents),
+            forbidden_roots=forbidden_roots,
         )
     else:
         seed = os.urandom(32) if not arguments.seed_stdin else _ephemeral_stdin_seed(
@@ -49,6 +52,7 @@ def main(
             documents,
             seed=seed,
             manifest_path=manifest_path,
+            forbidden_roots=forbidden_roots,
         )
         digest = reference.sha256
     print(json.dumps({

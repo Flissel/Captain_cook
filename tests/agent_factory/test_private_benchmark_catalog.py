@@ -417,6 +417,24 @@ def test_file_catalog_rejects_private_root_that_contains_a_forbidden_worktree(
         )
 
 
+def test_catalog_writer_rejects_forbidden_root_before_creating_files(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    private_root = repository / ".captain-cook" / "private-benchmarks"
+
+    with pytest.raises(PrivateBenchmarkCatalogError, match="overlaps"):
+        write_private_benchmark_catalog(
+            private_root,
+            _documents(),
+            seed=b"writer-confinement-seed-value!!" * 2,
+            forbidden_roots=(repository,),
+        )
+
+    assert not private_root.exists()
+
+
 def test_file_catalog_revalidation_detects_atomic_manifest_rotation(tmp_path: Path) -> None:
     documents = _documents()
     root = tmp_path / "private"

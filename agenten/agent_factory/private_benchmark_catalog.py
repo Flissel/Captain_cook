@@ -156,12 +156,7 @@ class VerifiedFilePrivateBenchmarkCatalog(InMemoryPrivateBenchmarkCatalog):
         if not resolved.is_relative_to(root):
             raise PrivateBenchmarkCatalogError("private catalog path escapes its root")
         forbidden = tuple(item.resolve(strict=True) for item in forbidden_roots)
-        for candidate in forbidden:
-            if (root == candidate or root.is_relative_to(candidate)
-                    or candidate.is_relative_to(root)):
-                raise PrivateBenchmarkCatalogError(
-                    "production private catalog root overlaps a repository or workspace"
-                )
+        _require_root_confinement(root, forbidden)
         if any((candidate / ".git").exists() for candidate in (root, *root.parents)):
             raise PrivateBenchmarkCatalogError("private catalog root has Git ambiguity")
         descriptor = -1
@@ -371,6 +366,7 @@ def write_private_benchmark_catalog(
     *,
     seed: bytes,
     manifest_path: str = "catalog.json",
+    forbidden_roots: tuple[Path, ...] = (),
 ) -> ArtifactRef:
     """Create an idempotent local catalog; never print or serialize the seed."""
 
@@ -383,6 +379,7 @@ def write_private_benchmark_catalog(
             or any(part in {"", ".", ".."} for part in relative.parts)):
         raise PrivateBenchmarkCatalogError("private catalog path escapes its root")
     root = private_root.resolve(strict=False)
+    _require_root_confinement(root, forbidden_roots)
     root.mkdir(parents=True, exist_ok=True)
     _reject_reparse_point(private_root)
     target = root.joinpath(*relative.parts)
@@ -571,6 +568,18 @@ def repository_forbidden_roots(repository_root: Path) -> tuple[Path, ...]:
         for line in output.splitlines() if line.startswith("worktree ")
     )
     return tuple(dict.fromkeys((root, *worktrees)))
+
+
+def _require_root_confinement(
+    root: Path, forbidden_roots: tuple[Path, ...],
+) -> None:
+    for forbidden in forbidden_roots:
+        candidate = forbidden.resolve(strict=True)
+        if (root == candidate or root.is_relative_to(candidate)
+                or candidate.is_relative_to(root)):
+            raise PrivateBenchmarkCatalogError(
+                "production private catalog root overlaps a repository or workspace"
+            )
 
 
 def _clean_git_environment() -> dict[str, str]:
