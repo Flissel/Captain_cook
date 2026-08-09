@@ -19,6 +19,10 @@ from minibook.swarm.contracts import (
     validate_build_effect_binding,
 )
 from minibook.swarm.contracts import PackageBuildEvidenceV1, PackageRealCaseEvidenceV1
+from agenten.agent_factory.forge_contracts import (
+    PackageBuildEvidenceV1 as CaptainPackageBuildEvidenceV1,
+    PackageRealCaseEvidenceV1 as CaptainPackageRealCaseEvidenceV1,
+)
 
 
 def test_package_evidence_contracts_are_strict_and_authority_bound() -> None:
@@ -37,6 +41,8 @@ def test_package_evidence_contracts_are_strict_and_authority_bound() -> None:
     build = PackageBuildEvidenceV1.model_validate({"schema": "captain.package-build-evidence.v1", **common, "workspace_snapshot_ref": {"uri": "artifact://snapshot/" + "7" * 64, "sha256": "7" * 64, "media_type": "application/zip"}})
     real = PackageRealCaseEvidenceV1.model_validate({"schema": "captain.package-real-case-evidence.v1", **common, "assertion_ids": ["deterministic_rank"], "declared_test_paths": ["tests/test_team.py"], "evidence_refs": [{"uri": "artifact://build/" + "9" * 64, "sha256": "9" * 64, "media_type": "application/json"}]})
     assert build.outcome == real.outcome == "passed"
+    assert CaptainPackageBuildEvidenceV1.model_validate_json(build.model_dump_json(by_alias=True)).model_dump(mode="json", by_alias=True) == build.model_dump(mode="json", by_alias=True)
+    assert CaptainPackageRealCaseEvidenceV1.model_validate_json(real.model_dump_json(by_alias=True)).model_dump(mode="json", by_alias=True) == real.model_dump(mode="json", by_alias=True)
     with pytest.raises(Exception):
         PackageBuildEvidenceV1.model_validate(build.model_dump(mode="json", by_alias=True) | {"extra": True})
 
