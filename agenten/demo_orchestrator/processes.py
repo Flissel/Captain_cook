@@ -653,7 +653,7 @@ class WindowsProcessBackend:
                 text=True,
                 check=False,
             )
-        except OSError:
+        except Exception:
             raise DemoProcessError("could not inspect process identity") from None
         values = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if result.returncode != 0 or len(values) != 1:
