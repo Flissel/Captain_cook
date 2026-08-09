@@ -27,6 +27,8 @@ from agenten.agent_factory.forge_contracts import (
     CreationResultV1,
     CreationResultV2,
     CreationSubmissionReceipt,
+    FactoryBuildAssignmentV2,
+    FactoryBuildEffectV2,
     ForgeBuildSkillUsageReceiptV1,
 )
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
@@ -96,6 +98,16 @@ class CaptainCreationJobV3Store(Protocol):
 
     def accepted_result_for(self, job: object, attempt: int) -> CreationResultV2: ...
 
+    def record_assignment(
+        self, assignment: FactoryBuildAssignmentV2
+    ) -> FactoryBuildAssignmentV2: ...
+
+    def assignment_for(self, job: object, attempt: int) -> FactoryBuildAssignmentV2: ...
+
+    def record_effect(self, effect: FactoryBuildEffectV2) -> FactoryBuildEffectV2: ...
+
+    def effect_for(self, job: object, attempt: int) -> FactoryBuildEffectV2: ...
+
 
 class FilesystemCaptainCreationJobV3Store:
     """Captain-owned immutable V3 mapping/readback state, durable across restart."""
@@ -132,6 +144,42 @@ class FilesystemCaptainCreationJobV3Store:
     def accepted_result_for(self, job: object, attempt: int) -> CreationResultV2:
         return self._read(
             getattr(job, "job_id", None), attempt, "accepted-result.json", CreationResultV2
+        )
+
+    def record_assignment(
+        self, assignment: FactoryBuildAssignmentV2
+    ) -> FactoryBuildAssignmentV2:
+        return self._record(
+            assignment.factory_job_id,
+            assignment.attempt,
+            "build-assignment.json",
+            assignment,
+            FactoryBuildAssignmentV2,
+        )
+
+    def assignment_for(self, job: object, attempt: int) -> FactoryBuildAssignmentV2:
+        return self._read(
+            getattr(job, "job_id", None),
+            attempt,
+            "build-assignment.json",
+            FactoryBuildAssignmentV2,
+        )
+
+    def record_effect(self, effect: FactoryBuildEffectV2) -> FactoryBuildEffectV2:
+        return self._record(
+            effect.factory_job_id,
+            effect.attempt,
+            "build-effect.json",
+            effect,
+            FactoryBuildEffectV2,
+        )
+
+    def effect_for(self, job: object, attempt: int) -> FactoryBuildEffectV2:
+        return self._read(
+            getattr(job, "job_id", None),
+            attempt,
+            "build-effect.json",
+            FactoryBuildEffectV2,
         )
 
     def _record(self, job_id, attempt, name, value, model):

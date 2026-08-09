@@ -70,6 +70,10 @@ from agenten.agent_factory.hermes_factory_worker import (
     FilesystemHermesFactoryWorkerCheckpointStore,
     HermesFactoryWorker,
 )
+from agenten.agent_factory.forge_contracts import (
+    FactoryBuildAssignmentV2,
+    FactoryBuildEffectV2,
+)
 from agenten.agent_factory.minibook_forge import (
     CaptainCreationJobMapper,
     CaptainCreationJobV3Authority,
@@ -386,6 +390,43 @@ class _CaptainV3CreationAuthorityBuilder:
                 "max_requests": 2,
             },
         )
+
+
+class _CaptainDurableV3WorkerClient:
+    """Record Minibook assignment/effect authority before restart-sensitive use."""
+
+    def __init__(
+        self,
+        *,
+        delegate: AuthenticatedMinibookV3WorkerClient,
+        authority: FilesystemCaptainCreationJobV3Store,
+    ) -> None:
+        self._delegate = delegate
+        self._authority = authority
+
+    async def next_assignment(self, scope=None) -> FactoryBuildAssignmentV2 | None:
+        assignment = await self._delegate.next_assignment(scope)
+        if assignment is not None:
+            self._authority.record_assignment(assignment)
+        return assignment
+
+    async def claim(
+        self, assignment_id: UUID, worker_id: str
+    ) -> FactoryBuildAssignmentV2:
+        assignment = await self._delegate.claim(assignment_id, worker_id)
+        return self._authority.record_assignment(assignment)
+
+    async def accepted_effect(
+        self, assignment_id: UUID
+    ) -> FactoryBuildEffectV2 | None:
+        effect = await self._delegate.accepted_effect(assignment_id)
+        if effect is not None:
+            self._authority.record_effect(effect)
+        return effect
+
+    async def submit_effect(self, effect: FactoryBuildEffectV2) -> FactoryBuildEffectV2:
+        accepted = await self._delegate.submit_effect(effect)
+        return self._authority.record_effect(accepted)
 
 
 @dataclass(frozen=True)
@@ -841,14 +882,17 @@ def compose_business_demo_factory_operator(
         checkpoint_store = FilesystemHermesFactoryWorkerCheckpointStore(
             codex_state_root / "hermes-worker-checkpoints"
         )
-        minibook = AuthenticatedMinibookV3WorkerClient(
-            client=minibook_client,
-            worker_token=_required(
-                environment,
-                "CAPTAIN_FACTORY_V3_WORKER_TOKEN",
+        minibook = _CaptainDurableV3WorkerClient(
+            delegate=AuthenticatedMinibookV3WorkerClient(
+                client=minibook_client,
+                worker_token=_required(
+                    environment,
+                    "CAPTAIN_FACTORY_V3_WORKER_TOKEN",
+                ),
+                worker_id=worker_id,
+                checkpoint_store=checkpoint_store,
             ),
-            worker_id=worker_id,
-            checkpoint_store=checkpoint_store,
+            authority=v3_authority_store,
         )
         leases = GatewayFactoryLeases(store)
         assignment_mapper = CaptainV3CodexRequestMapper(
