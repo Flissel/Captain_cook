@@ -18,7 +18,10 @@ from agenten.agent_factory.capability_live_runner import (
 )
 from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
 from agenten.agent_factory.input_compiler import FactoryInputCompiler
-from agenten.agent_factory.input_contracts import RealCaseRequirement
+from agenten.agent_factory.input_contracts import (
+    BenchmarkExpectedPredicate,
+    PrivateBenchmarkCaseRequirement,
+)
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.delivery.minibook_events import (
     MinibookProjectionAcknowledgementV1,
@@ -53,8 +56,7 @@ from gateway.capability_generic_benchmark import (
     ContentAddressedBenchmarkEvidenceResolver,
     IndependentBenchmarkEvaluationRequest,
     GenericPrivateBenchmarkRepository,
-    GenericToolCallDecision,
-    IndependentBenchmarkOutcome,
+    GenericToolCallEvidence,
     RuleBasedCapabilityBenchmarkEvaluator,
     build_generic_benchmark_suite,
 )
@@ -902,30 +904,69 @@ def test_generic_suite_uses_compiled_private_authority_and_all_five_categories()
 
     with pytest.raises(
         CapabilityLiveAuthorityUnavailable,
-        match="three source-grounded cases",
+        match="fifteen explicit compiler holdouts",
     ):
         build_generic_benchmark_suite(
             admitted.input, GenericPrivateBenchmarkRepository(holdouts=holdouts)
         )
 
 
+def test_raw_execution_contract_contains_no_executor_authored_verdicts() -> None:
+    fields = set(GenericBenchmarkExecutionEvidence.__dataclass_fields__)
+    assert fields.isdisjoint({
+        "assertion_results", "safe", "mandatory_handoff_performed",
+        "rationale_present", "tool_valid", "outcome_satisfied",
+    })
+
+
 def _with_grounded_benchmark_sources(canonical, holdouts):
     document = canonical.document
-    third_integration = document.integrations[0].model_copy(
-        update={"integration_key": "third_grounded_integration"}
-    )
-    conflicts = tuple(
-        RealCaseRequirement(
-            case_key=f"grounded_conflict_{index}",
-            observable_setup=f"Source declares conflict {index} between signed facts",
-            observable_action=f"Resolve documented conflict {index}",
-            observable_expected=f"Use the signed source-of-truth rule {index}",
-        )
-        for index in range(1, 4)
-    )
+    cases = []
+    expectations = {
+        "normal": ("observation_equals", "status", "ok"),
+        "boundary": ("observation_contains", "detail", "bounded"),
+        "missing": ("observation_absent", "required_value", True),
+        "conflicting": ("observation_equals", "resolution", "signed_source"),
+        "mandatory_escalation": ("handoff_event", "reason_code", "mandatory_stop"),
+    }
+    for category, (kind, observed_key, expected) in expectations.items():
+        for index in range(3):
+            predicates = [
+                BenchmarkExpectedPredicate(
+                    predicate_key=f"{category}_{index}_primary",
+                    kind=kind,
+                    observed_key=observed_key,
+                    expected_value=expected,
+                ),
+                BenchmarkExpectedPredicate(
+                    predicate_key=f"{category}_{index}_tool",
+                    kind="tool_receipt",
+                    observed_key="captain_tool",
+                    expected_value=True,
+                ),
+                BenchmarkExpectedPredicate(
+                    predicate_key=f"{category}_{index}_rationale",
+                    kind="rationale_contains",
+                    observed_key="rationale",
+                    expected_value="verified",
+                ),
+                BenchmarkExpectedPredicate(
+                    predicate_key=f"{category}_{index}_safety",
+                    kind="forbidden_tool_absent",
+                    observed_key="forbidden_tool",
+                    expected_value=True,
+                ),
+            ]
+            cases.append(PrivateBenchmarkCaseRequirement(
+                case_key=f"explicit_{category}_{index}",
+                category=category,
+                observable_setup=f"Private source scenario {category} {index}",
+                observable_action=f"Execute source-bound action {category} {index}",
+                source_case_keys=(document.real_cases[index].case_key,),
+                expected_predicates=tuple(predicates),
+            ))
     grounded_document = document.model_copy(update={
-        "integrations": (*document.integrations, third_integration),
-        "real_cases": (*document.real_cases, *conflicts),
+        "private_benchmark_cases": tuple(cases),
     })
     compiled = FactoryInputCompiler(holdout_store=holdouts).compile(
         grounded_document, subject_version=canonical.compiled_specification.subject_version
@@ -934,6 +975,40 @@ def _with_grounded_benchmark_sources(canonical, holdouts):
         "document": grounded_document,
         "compiled_specification": compiled,
     })
+
+
+@pytest.mark.parametrize("mutation", ("missing_category", "duplicate_case"))
+def test_explicit_private_categories_fail_closed_when_incomplete_or_ambiguous(
+    mutation: str,
+) -> None:
+    holdouts = InMemoryPrivateHoldoutStore()
+    admitted, _ = _admitted_demo(
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
+    )
+    grounded = _with_grounded_benchmark_sources(admitted.input, holdouts)
+    cases = list(grounded.document.private_benchmark_cases)
+    if mutation == "missing_category":
+        cases = [
+            item.model_copy(update={"category": "normal"})
+            if item.category == "mandatory_escalation" else item
+            for item in cases
+        ]
+        expected = "exactly three explicit cases"
+    else:
+        cases[-1] = cases[-1].model_copy(update={"case_key": cases[0].case_key})
+        expected = "case keys are ambiguous"
+    document = grounded.document.model_copy(update={
+        "private_benchmark_cases": tuple(cases)
+    })
+    compiled = FactoryInputCompiler(holdout_store=holdouts).compile(document, 1)
+    canonical = grounded.model_copy(update={
+        "document": document, "compiled_specification": compiled
+    })
+
+    with pytest.raises(CapabilityLiveAuthorityUnavailable, match=expected):
+        build_generic_benchmark_suite(
+            canonical, GenericPrivateBenchmarkRepository(holdouts=holdouts)
+        )
 
 
 def test_builder_rejects_mixed_gateway_store_before_schema_effect(tmp_path: Path) -> None:
@@ -1152,22 +1227,51 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             outcome_ref = evidence.put({
                 "schema": "captain.capability-benchmark-outcome.v1",
                 **common,
-                "expected_digest": hashlib.sha256(private_case.expected.encode()).hexdigest(),
-                "assertion_results": {item: True for item in private_case.assertion_ids},
-                "safe": True,
-                "mandatory_handoff_performed": True,
+                "observations": {
+                    "status": "ok",
+                    "detail": "bounded result",
+                    "resolution": "signed_source",
+                },
             })
             rationale_ref = evidence.put({
                 "schema": "captain.capability-benchmark-rationale.v1",
                 **common,
-                "rationale_present": True,
+                "text": "verified against private predicates",
             })
-            tool_ref = evidence.put({
-                "schema": "captain.capability-benchmark-tool-decision.v1",
+            message_ref = evidence.put({
+                "schema": "captain.capability-benchmark-message.v1",
+                **common,
+                "message_key": "result",
+                "content": "observable result",
+            })
+            handoff_ref = evidence.put({
+                "schema": "captain.capability-benchmark-handoff.v1",
+                **common,
+                "from_agent": "worker",
+                "to_agent": "captain",
+                "reason_code": "mandatory_stop",
+            })
+            call_ref = evidence.put({
+                "schema": "captain.capability-benchmark-tool-call.v1",
                 **common,
                 "tool_key": "captain_tool",
-                "decision": "used",
-                "valid": True,
+                "operation": "read",
+                "call_id": f"call-{execution_request.case_ref.case_id}-{kind}",
+            })
+            lease_ref = evidence.put({
+                "schema": "captain.capability-benchmark-tool-lease.v1",
+                **common,
+                "tool_key": "captain_tool",
+                "lease_id": f"lease-{execution_request.case_ref.case_id}-{kind}",
+                "scope": ["read"],
+            })
+            receipt_ref = evidence.put({
+                "schema": "captain.capability-benchmark-tool-receipt.v1",
+                **common,
+                "tool_key": "captain_tool",
+                "call_id": f"call-{execution_request.case_ref.case_id}-{kind}",
+                "status": "succeeded",
+                "result_ref_sha256": outcome_ref.sha256,
             })
             return GenericBenchmarkExecutionEvidence(
                 case_ref=execution_request.case_ref,
@@ -1178,10 +1282,11 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                 input_ref=execution_request.input_ref,
                 capability_id=execution_request.capability_id,
                 outcome_ref=outcome_ref,
-                artifact_refs=(outcome_ref,),
-                tool_call_decisions=(GenericToolCallDecision(
-                    tool_key="captain_tool", decision="used",
-                    evidence_ref=tool_ref,
+                message_event_refs=(message_ref,),
+                handoff_event_refs=(handoff_ref,),
+                tool_calls=(GenericToolCallEvidence(
+                    tool_key="captain_tool", call_ref=call_ref,
+                    lease_ref=lease_ref, receipt_ref=receipt_ref,
                 ),),
                 rationale_ref=rationale_ref,
                 cost_usd=Decimal("0.10") if kind == "team" else Decimal("0.20"),
@@ -1236,7 +1341,10 @@ def test_benchmark_cas_resolver_rejects_forged_artifact_bytes() -> None:
         resolver.resolve(reference)
 
 
-def test_rule_evaluator_rejects_stale_trace_bound_evidence() -> None:
+@pytest.mark.parametrize("mode", ("stale_trace", "malicious_observation"))
+def test_rule_evaluator_rejects_stale_or_malicious_observable_evidence(
+    mode: str,
+) -> None:
     holdouts = InMemoryPrivateHoldoutStore()
     admitted, _ = _admitted_demo(
         "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
@@ -1244,7 +1352,7 @@ def test_rule_evaluator_rejects_stale_trace_bound_evidence() -> None:
     canonical = _with_grounded_benchmark_sources(admitted.input, holdouts)
     private_cases = GenericPrivateBenchmarkRepository(holdouts=holdouts)
     case_ref = build_generic_benchmark_suite(canonical, private_cases).cases[0]
-    private_case = private_cases.resolve(
+    private_cases.resolve(
         case_ref, purpose="execution", authority_id=_id("stale-fixture-executor")
     )
     artifacts = _BenchmarkArtifacts()
@@ -1255,7 +1363,7 @@ def test_rule_evaluator_rejects_stale_trace_bound_evidence() -> None:
     run_id = _id("fresh-run")
     common = {
         "case_digest": case_ref.case_digest,
-        "trace_id": str(stale_trace_id),
+        "trace_id": str(stale_trace_id if mode == "stale_trace" else trace_id),
         "run_id": str(run_id),
         "model_policy_digest": "a" * 64,
     }
@@ -1268,39 +1376,63 @@ def test_rule_evaluator_rejects_stale_trace_bound_evidence() -> None:
 
     outcome = put({
         "schema": "captain.capability-benchmark-outcome.v1", **common,
-        "expected_digest": hashlib.sha256(private_case.expected.encode()).hexdigest(),
-        "assertion_results": {item: True for item in private_case.assertion_ids},
-        "safe": True, "mandatory_handoff_performed": True,
+        "observations": {
+            "status": "malicious_executor_claim" if mode == "malicious_observation" else "ok"
+        },
     })
     rationale = put({
         "schema": "captain.capability-benchmark-rationale.v1", **common,
-        "rationale_present": True,
+        "text": "verified",
     })
-    tool = put({
-        "schema": "captain.capability-benchmark-tool-decision.v1", **common,
-        "tool_key": "captain_tool", "decision": "used",
-        "valid": True,
+    message = put({
+        "schema": "captain.capability-benchmark-message.v1", **common,
+        "message_key": "result", "content": "stale",
+    })
+    handoff = put({
+        "schema": "captain.capability-benchmark-handoff.v1", **common,
+        "from_agent": "worker", "to_agent": "captain", "reason_code": "mandatory_stop",
+    })
+    call = put({
+        "schema": "captain.capability-benchmark-tool-call.v1", **common,
+        "tool_key": "captain_tool", "operation": "read", "call_id": "stale-call",
+    })
+    lease = put({
+        "schema": "captain.capability-benchmark-tool-lease.v1", **common,
+        "tool_key": "captain_tool", "lease_id": "stale-lease", "scope": ["read"],
+    })
+    receipt = put({
+        "schema": "captain.capability-benchmark-tool-receipt.v1", **common,
+        "tool_key": "captain_tool", "call_id": "stale-call", "status": "succeeded",
+        "result_ref_sha256": outcome.sha256,
     })
     execution = GenericBenchmarkExecutionEvidence(
         case_ref=case_ref, team_kind="team", agent_count=2,
         model_id="fixed-model", model_policy_digest="a" * 64,
         input_ref=canonical.source_ref, capability_id="incident_command",
-        outcome_ref=outcome, artifact_refs=(outcome,),
-        tool_call_decisions=(GenericToolCallDecision(
-            tool_key="captain_tool", decision="used", evidence_ref=tool),),
+        outcome_ref=outcome, message_event_refs=(message,),
+        handoff_event_refs=(handoff,),
+        tool_calls=(GenericToolCallEvidence(
+            tool_key="captain_tool", call_ref=call, lease_ref=lease,
+            receipt_ref=receipt),),
         rationale_ref=rationale, cost_usd=Decimal("0.10"), latency_ms=10,
         trace_id=trace_id, run_id=run_id,
     )
 
-    with pytest.raises(
-        CapabilityLiveAuthorityUnavailable,
-        match="changed execution binding",
-    ):
-        RuleBasedCapabilityBenchmarkEvaluator(
-            private_cases=private_cases, evidence=resolver
-        ).evaluate(IndependentBenchmarkEvaluationRequest(
-            job_id=_id("stale-job"), case_ref=case_ref, execution=execution
-        ))
+    evaluator = RuleBasedCapabilityBenchmarkEvaluator(
+        private_cases=private_cases, evidence=resolver
+    )
+    evaluation_request = IndependentBenchmarkEvaluationRequest(
+        job_id=_id("stale-job"), case_ref=case_ref, execution=execution
+    )
+    if mode == "stale_trace":
+        with pytest.raises(
+            CapabilityLiveAuthorityUnavailable,
+            match="changed execution binding",
+        ):
+            evaluator.evaluate(evaluation_request)
+    else:
+        result = evaluator.evaluate(evaluation_request)
+        assert result.outcome_satisfied is False
 
 
 def test_benchmark_rejects_same_executor_and_evaluator_authority() -> None:

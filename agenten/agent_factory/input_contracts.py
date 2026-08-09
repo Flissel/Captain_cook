@@ -33,6 +33,39 @@ class RealCaseRequirement(_FrozenContract):
     observable_expected: str = Field(min_length=1)
 
 
+class BenchmarkExpectedPredicate(_FrozenContract):
+    predicate_key: str = Field(pattern=IDENTIFIER_PATTERN)
+    kind: Literal[
+        "observation_equals",
+        "observation_contains",
+        "observation_absent",
+        "handoff_event",
+        "tool_receipt",
+        "rationale_contains",
+        "forbidden_tool_absent",
+    ]
+    observed_key: str = Field(pattern=IDENTIFIER_PATTERN)
+    expected_value: str | bool
+
+
+class PrivateBenchmarkCaseRequirement(_FrozenContract):
+    case_key: str = Field(pattern=IDENTIFIER_PATTERN)
+    category: Literal[
+        "normal", "boundary", "missing", "conflicting", "mandatory_escalation"
+    ]
+    observable_setup: str = Field(min_length=1)
+    observable_action: str = Field(min_length=1)
+    source_case_keys: tuple[str, ...] = Field(min_length=1)
+    expected_predicates: tuple[BenchmarkExpectedPredicate, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def require_unique_predicates(self) -> "PrivateBenchmarkCaseRequirement":
+        keys = tuple(item.predicate_key for item in self.expected_predicates)
+        if len(keys) != len(set(keys)):
+            raise ValueError("benchmark predicate keys must be unique")
+        return self
+
+
 class RequestedIntegration(_FrozenContract):
     integration_key: str = Field(pattern=IDENTIFIER_PATTERN)
     purpose: str = Field(min_length=1)
@@ -82,6 +115,7 @@ class FactoryInputDocumentV2(_FrozenContract):
     real_cases: tuple[RealCaseRequirement, ...] = Field(min_length=1)
     helpful_resources: tuple[str, ...] = Field(min_length=1)
     stop_conditions: tuple[str, ...] = Field(min_length=1)
+    private_benchmark_cases: tuple[PrivateBenchmarkCaseRequirement, ...] = ()
     sections: tuple[InputSection, ...] = Field(min_length=10)
     extra_sections: tuple[InputSection, ...] = ()
 
@@ -95,6 +129,17 @@ class FactoryInputDocumentV2(_FrozenContract):
             raise ValueError("duplicate integration stable name")
         known_agents = set(agent_keys)
         known_integrations = set(integration_keys)
+        benchmark_keys = tuple(item.case_key for item in self.private_benchmark_cases)
+        if len(benchmark_keys) != len(set(benchmark_keys)):
+            raise ValueError("duplicate private benchmark case stable name")
+        source_case_keys = {
+            *(item.case_key for item in self.real_cases),
+            *(item.case_key for item in self.acceptance_outcomes),
+            *(item.integration_key for item in self.integrations),
+        }
+        for item in self.private_benchmark_cases:
+            if set(item.source_case_keys) - source_case_keys:
+                raise ValueError("private benchmark case references an unknown source case")
         for agent in self.agents:
             unknown_handoffs = set(agent.handoffs) - known_agents
             if unknown_handoffs:

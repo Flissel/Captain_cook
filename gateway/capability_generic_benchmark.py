@@ -12,7 +12,7 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from agenten.agent_factory.capability_live_runner import CapabilityLiveStage
-from agenten.agent_factory.input_compiler import AcceptanceAssertion
+from agenten.agent_factory.input_contracts import BenchmarkExpectedPredicate
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.capability_assembly_contracts import (
     CapabilityAssemblyCanonicalInput,
@@ -39,7 +39,7 @@ class GenericPrivateCaseDefinition:
     private_holdout_uri: str
     setup: str
     action: str
-    expected: str
+    expected_predicates: tuple[BenchmarkExpectedPredicate, ...]
 
 
 @dataclass(frozen=True)
@@ -57,10 +57,11 @@ class GenericBenchmarkSuite:
 
 
 @dataclass(frozen=True)
-class GenericToolCallDecision:
+class GenericToolCallEvidence:
     tool_key: str
-    decision: Literal["used", "not_needed", "escalated"]
-    evidence_ref: ArtifactRef
+    call_ref: ArtifactRef
+    lease_ref: ArtifactRef
+    receipt_ref: ArtifactRef
 
 
 @dataclass(frozen=True)
@@ -73,8 +74,9 @@ class GenericBenchmarkExecutionEvidence:
     input_ref: ArtifactRef
     capability_id: str
     outcome_ref: ArtifactRef
-    artifact_refs: tuple[ArtifactRef, ...]
-    tool_call_decisions: tuple[GenericToolCallDecision, ...]
+    message_event_refs: tuple[ArtifactRef, ...]
+    handoff_event_refs: tuple[ArtifactRef, ...]
+    tool_calls: tuple[GenericToolCallEvidence, ...]
     rationale_ref: ArtifactRef
     cost_usd: Decimal
     latency_ms: int
@@ -244,7 +246,10 @@ class GenericPrivateBenchmarkRepository:
             "private_holdout_uri": definition.private_holdout_uri,
             "setup": definition.setup,
             "action": definition.action,
-            "expected": definition.expected,
+            "expected_predicates": [
+                item.model_dump(mode="json")
+                for item in definition.expected_predicates
+            ],
         })
         digest = hashlib.sha256(payload.encode()).hexdigest()
         case_id = f"case-{digest[:16]}"
@@ -333,13 +338,6 @@ class RuleBasedCapabilityBenchmarkEvaluator:
         ).resolve()
         outcome = self._json_evidence(request.execution.outcome_ref, "captain.capability-benchmark-outcome.v1")
         rationale = self._json_evidence(request.execution.rationale_ref, "captain.capability-benchmark-rationale.v1")
-        tools = tuple(
-            self._json_evidence(item.evidence_ref, "captain.capability-benchmark-tool-decision.v1")
-            for item in request.execution.tool_call_decisions
-        )
-        artifacts = tuple(
-            self._json_any_evidence(item) for item in request.execution.artifact_refs
-        )
         execution = request.execution
         common = {
             "case_digest": request.case_ref.case_digest,
@@ -347,26 +345,86 @@ class RuleBasedCapabilityBenchmarkEvaluator:
             "run_id": str(execution.run_id),
             "model_policy_digest": execution.model_policy_digest,
         }
+        messages = tuple(
+            self._json_evidence(item, "captain.capability-benchmark-message.v1")
+            for item in execution.message_event_refs
+        )
+        handoffs = tuple(
+            self._json_evidence(item, "captain.capability-benchmark-handoff.v1")
+            for item in execution.handoff_event_refs
+        )
+        tool_payloads = tuple(
+            (
+                tool,
+                self._json_evidence(tool.call_ref, "captain.capability-benchmark-tool-call.v1"),
+                self._json_evidence(tool.lease_ref, "captain.capability-benchmark-tool-lease.v1"),
+                self._json_evidence(tool.receipt_ref, "captain.capability-benchmark-tool-receipt.v1"),
+            )
+            for tool in execution.tool_calls
+        )
+        all_payloads = (
+            outcome, rationale, *messages, *handoffs,
+            *(payload for _, call, lease, receipt in tool_payloads
+              for payload in (call, lease, receipt)),
+        )
         if any(payload.get(key) != value for key, value in common.items()
-               for payload in (outcome, rationale, *tools, *artifacts)):
+               for payload in all_payloads):
             raise CapabilityLiveAuthorityUnavailable("benchmark evidence changed execution binding")
-        expected_digest = hashlib.sha256(case.expected.encode()).hexdigest()
-        assertion_results = outcome.get("assertion_results")
-        if (outcome.get("expected_digest") != expected_digest
-                or not isinstance(assertion_results, dict)
-                or set(assertion_results) != set(case.assertion_ids)
-                or any(not isinstance(value, bool) for value in assertion_results.values())):
-            raise CapabilityLiveAuthorityUnavailable("benchmark outcome assertions are stale")
-        if (set(outcome) != {"schema", *common, "expected_digest", "assertion_results", "safe", "mandatory_handoff_performed"}
-                or set(rationale) != {"schema", *common, "rationale_present"}
-                or not isinstance(rationale.get("rationale_present"), bool)
-                or any(set(item) != {"schema", *common, "tool_key", "decision", "valid"}
-                       for item in tools)
-                or any(item.get("tool_key") != decision.tool_key
-                       or item.get("decision") != decision.decision
-                       for item, decision in zip(tools, execution.tool_call_decisions, strict=True))
-                or any(not isinstance(item.get("valid"), bool) for item in tools)):
+        if (set(outcome) != {"schema", *common, "observations"}
+                or not isinstance(outcome.get("observations"), dict)
+                or set(rationale) != {"schema", *common, "text"}
+                or not isinstance(rationale.get("text"), str)
+                or any(set(item) != {"schema", *common, "message_key", "content"}
+                       for item in messages)
+                or any(set(item) != {"schema", *common, "from_agent", "to_agent", "reason_code"}
+                       for item in handoffs)):
             raise CapabilityLiveAuthorityUnavailable("benchmark evaluator evidence schema is invalid")
+        tool_validity: dict[str, bool] = {}
+        for tool, call, lease, receipt in tool_payloads:
+            if (set(call) != {"schema", *common, "tool_key", "operation", "call_id"}
+                    or set(lease) != {"schema", *common, "tool_key", "lease_id", "scope"}
+                    or set(receipt) != {"schema", *common, "tool_key", "call_id", "status", "result_ref_sha256"}
+                    or any(payload.get("tool_key") != tool.tool_key for payload in (call, lease, receipt))):
+                raise CapabilityLiveAuthorityUnavailable("benchmark tool evidence schema is invalid")
+            tool_validity[tool.tool_key] = bool(
+                receipt["call_id"] == call["call_id"]
+                and receipt["status"] == "succeeded"
+                and isinstance(lease["scope"], list)
+                and call["operation"] in lease["scope"]
+                and isinstance(receipt["result_ref_sha256"], str)
+                and re.fullmatch(r"[0-9a-f]{64}", receipt["result_ref_sha256"])
+            )
+        predicate_results = tuple(
+            _evaluate_predicate(
+                predicate,
+                observations=outcome["observations"],
+                handoffs=handoffs,
+                tool_validity=tool_validity,
+                rationale=rationale["text"],
+            )
+            for predicate in case.expected_predicates
+        )
+        forbidden_results = tuple(
+            result for predicate, result in zip(case.expected_predicates, predicate_results, strict=True)
+            if predicate.kind == "forbidden_tool_absent"
+        )
+        handoff_results = tuple(
+            result for predicate, result in zip(case.expected_predicates, predicate_results, strict=True)
+            if predicate.kind == "handoff_event"
+        )
+        rationale_results = tuple(
+            result for predicate, result in zip(case.expected_predicates, predicate_results, strict=True)
+            if predicate.kind == "rationale_contains"
+        )
+        tool_results = tuple(
+            result for predicate, result in zip(case.expected_predicates, predicate_results, strict=True)
+            if predicate.kind == "tool_receipt"
+        )
+        mandatory_handoff = (
+            all(handoff_results) and bool(handoff_results)
+            if request.case_ref.category is GenericBenchmarkCategory.MANDATORY_ESCALATION
+            else True
+        )
         evaluation_payload = _canonical({
             "schema": "captain.capability-benchmark-evaluation.v1",
             "case_digest": request.case_ref.case_digest,
@@ -375,7 +433,13 @@ class RuleBasedCapabilityBenchmarkEvaluator:
             "run_id": str(execution.run_id),
             "outcome_ref": execution.outcome_ref.model_dump(mode="json"),
             "rationale_ref": execution.rationale_ref.model_dump(mode="json"),
-            "tool_evidence_refs": [item.evidence_ref.model_dump(mode="json") for item in execution.tool_call_decisions],
+            "message_event_refs": [item.model_dump(mode="json") for item in execution.message_event_refs],
+            "handoff_event_refs": [item.model_dump(mode="json") for item in execution.handoff_event_refs],
+            "tool_evidence_refs": [
+                ref.model_dump(mode="json")
+                for item in execution.tool_calls
+                for ref in (item.call_ref, item.lease_ref, item.receipt_ref)
+            ],
             "model_policy_digest": execution.model_policy_digest,
             "ruleset_digest": self.RULESET_DIGEST,
         }).encode()
@@ -384,16 +448,19 @@ class RuleBasedCapabilityBenchmarkEvaluator:
             evaluator_authority_id=self.authority_id,
             case_ref=request.case_ref,
             team_kind=execution.team_kind,
-            outcome_satisfied=all(assertion_results.values()),
-            safe=outcome.get("safe") is True,
-            mandatory_handoff_performed=outcome.get("mandatory_handoff_performed") is True,
-            rationale_sufficient=rationale["rationale_present"],
-            tool_decisions_valid=all(item["valid"] for item in tools),
+            outcome_satisfied=all(predicate_results),
+            safe=all(forbidden_results),
+            mandatory_handoff_performed=mandatory_handoff,
+            rationale_sufficient=bool(rationale["text"].strip()) and all(rationale_results),
+            tool_decisions_valid=all(tool_validity.values()) and all(tool_results),
             trace_id=execution.trace_id,
             run_id=execution.run_id,
             outcome_ref=execution.outcome_ref,
             rationale_ref=execution.rationale_ref,
-            tool_evidence_refs=tuple(item.evidence_ref for item in execution.tool_call_decisions),
+            tool_evidence_refs=tuple(
+                ref for item in execution.tool_calls
+                for ref in (item.call_ref, item.lease_ref, item.receipt_ref)
+            ),
             model_policy_digest=execution.model_policy_digest,
             ruleset_digest=self.RULESET_DIGEST,
             evaluation_ref=evaluation_ref,
@@ -408,20 +475,6 @@ class RuleBasedCapabilityBenchmarkEvaluator:
             raise CapabilityLiveAuthorityUnavailable("benchmark evidence schema is invalid")
         return value
 
-    def _json_any_evidence(self, reference: ArtifactRef) -> dict[str, object]:
-        try:
-            value = json.loads(self._evidence.resolve(reference))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            raise CapabilityLiveAuthorityUnavailable("benchmark artifact JSON is invalid") from None
-        allowed = {
-            "captain.capability-benchmark-outcome.v1",
-            "captain.capability-benchmark-rationale.v1",
-            "captain.capability-benchmark-tool-decision.v1",
-            "captain.capability-benchmark-artifact.v1",
-        }
-        if not isinstance(value, dict) or value.get("schema") not in allowed:
-            raise CapabilityLiveAuthorityUnavailable("benchmark artifact schema is invalid")
-        return value
 
 
 class GenericCapabilityBenchmarkAdapter:
@@ -542,104 +595,66 @@ class GenericCapabilityBenchmarkAdapter:
 def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
                                   private_cases: GenericPrivateBenchmarkRepository) -> GenericBenchmarkSuite:
     spec = input.compiled_specification
-    by_kind = {kind: tuple(a for a in spec.assertions if a.kind == kind)
-               for kind in ("business", "integration", "security")}
-    if not by_kind["business"] or not by_kind["security"]:
-        raise CapabilityLiveAuthorityUnavailable("compiler assertions cannot furnish semantic benchmark categories")
-    if len(input.document.authority_boundaries) < 3 or len(input.document.stop_conditions) < 3:
-        raise CapabilityLiveAuthorityUnavailable("authority and stop contracts are required for benchmark cases")
     holdouts = spec.private_holdout_refs
-    if len(holdouts) < 3:
-        raise CapabilityLiveAuthorityUnavailable("private holdout authority is unavailable")
-    parsed_holdouts: list[tuple[str, dict[str, object]]] = []
+    if len(holdouts) != 15:
+        raise CapabilityLiveAuthorityUnavailable(
+            "private benchmark requires exactly fifteen explicit compiler holdouts"
+        )
+    definitions: list[GenericPrivateCaseDefinition] = []
     for holdout in holdouts:
         body = private_cases.holdout_body(holdout.uri, holdout.sha256)
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
             raise CapabilityLiveAuthorityUnavailable("structured private holdout is invalid") from None
-        required = {"observable_setup", "observable_action", "observable_expected", "source_path"}
-        if (not isinstance(payload, dict) or set(payload) != required
-                or any(not isinstance(payload[key], (str, list)) for key in required)
-                or not all(isinstance(payload[key], str) and payload[key].strip()
-                           for key in ("observable_setup", "observable_action", "observable_expected"))):
+        required = {
+            "case_key", "category", "observable_setup", "observable_action",
+            "source_assertion_ids", "expected_predicates",
+        }
+        if not isinstance(payload, dict) or set(payload) != required:
             raise CapabilityLiveAuthorityUnavailable("structured private holdout is invalid")
-        parsed_holdouts.append((holdout.uri, payload))
-
-    def compiled_assertion_id(source_key: str) -> str:
-        matches = tuple(
-            item.assertion_id for item in spec.assertions
-            if item.source_path[-1] == source_key
-        )
-        if len(matches) != 1:
-            raise CapabilityLiveAuthorityUnavailable(
-                "source-grounded case lacks one compiled assertion"
+        try:
+            category = GenericBenchmarkCategory(payload["category"])
+            assertion_ids = tuple(payload["source_assertion_ids"])
+            predicates = tuple(
+                BenchmarkExpectedPredicate.model_validate(item)
+                for item in payload["expected_predicates"]
             )
-        return matches[0]
-
-    normal_sources = tuple(
-        (compiled_assertion_id(item.case_key), item) for item in input.document.real_cases
-    )
-    boundary_sources = tuple(zip(by_kind["security"], input.document.authority_boundaries))
-    missing_sources: list[tuple[tuple[str, ...], str, str, str]] = [
-        ((compiled_assertion_id(item.integration_key),), item.trigger, item.operation, item.failure_behavior)
-        for item in input.document.integrations
-    ]
-    anomaly_tokens = ("missing", "mismatch", "conflict", "duplicate", "repeated", "stale", "incomplete", "widerspr", "fehl")
-    grounded_cases = (*input.document.real_cases, *input.document.acceptance_outcomes)
-    missing_sources.extend(
-        ((compiled_assertion_id(item.case_key),), item.observable_setup, item.observable_action, item.observable_expected)
-        for item in grounded_cases
-        if any(token in " ".join((item.observable_setup, item.observable_action, item.observable_expected)).casefold()
-               for token in ("missing", "absent", "unavailable", "timeout", "stale", "incomplete", "fehl"))
-    )
-    conflicting_sources: list[tuple[tuple[str, ...], str, str, str, str]] = [
-        ((compiled_assertion_id(item.case_key),), item.observable_setup, item.observable_action,
-         item.observable_expected, holdouts[index % len(holdouts)].uri)
-        for index, item in enumerate(grounded_cases)
-        if any(token in " ".join((item.observable_setup, item.observable_action, item.observable_expected)).casefold()
-               for token in anomaly_tokens)
-    ]
-    conflicting_sources.extend(
-        ((str(payload["source_path"]),), str(payload["observable_setup"]),
-         str(payload["observable_action"]), str(payload["observable_expected"]), uri)
-        for uri, payload in parsed_holdouts
-        if any(token in " ".join((str(payload["observable_setup"]), str(payload["observable_action"]),
-                                  str(payload["observable_expected"]))).casefold()
-               for token in anomaly_tokens)
-    )
-    if any(len(items) < 3 for items in (normal_sources, boundary_sources, missing_sources, conflicting_sources, parsed_holdouts)):
-        raise CapabilityLiveAuthorityUnavailable(
-            "canonical input cannot furnish three source-grounded cases per category"
-        )
-
-    definitions: list[GenericPrivateCaseDefinition] = []
-    for index in range(3):
-        normal_assertion_id, normal = normal_sources[index]
-        security, boundary = boundary_sources[index]
-        missing_ids, missing_setup, missing_action, missing_expected = missing_sources[index]
-        conflict_ids, conflict_setup, conflict_action, conflict_expected, conflict_uri = conflicting_sources[index]
-        escalation_uri, escalation = parsed_holdouts[index]
-        definitions.extend((
-            GenericPrivateCaseDefinition(
-                GenericBenchmarkCategory.NORMAL, (normal_assertion_id,), holdouts[index].uri,
-                normal.observable_setup, normal.observable_action, normal.observable_expected),
-            GenericPrivateCaseDefinition(
-                GenericBenchmarkCategory.BOUNDARY, (security.assertion_id,), holdouts[index].uri,
-                boundary, security.observable_action, security.observable_expected),
-            GenericPrivateCaseDefinition(
-                GenericBenchmarkCategory.MISSING, missing_ids, holdouts[index].uri,
-                missing_setup, missing_action, missing_expected),
-            GenericPrivateCaseDefinition(
-                GenericBenchmarkCategory.CONFLICTING, conflict_ids, conflict_uri,
-                conflict_setup, conflict_action, conflict_expected),
-            GenericPrivateCaseDefinition(
-                GenericBenchmarkCategory.MANDATORY_ESCALATION,
-                (f"holdout:{holdouts[index].sha256}",), escalation_uri,
-                str(escalation["observable_setup"]), str(escalation["observable_action"]),
-                str(escalation["observable_expected"])),
+        except (TypeError, ValueError):
+            raise CapabilityLiveAuthorityUnavailable(
+                "explicit private benchmark category or predicate is invalid"
+            ) from None
+        if (not isinstance(payload["case_key"], str)
+                or not isinstance(payload["observable_setup"], str)
+                or not isinstance(payload["observable_action"], str)
+                or not assertion_ids
+                or not set(assertion_ids).issubset(set(spec.assertion_ids))
+                or not predicates):
+            raise CapabilityLiveAuthorityUnavailable(
+                "explicit private benchmark binding is invalid"
+            )
+        definitions.append(GenericPrivateCaseDefinition(
+            category=category,
+            assertion_ids=assertion_ids,
+            private_holdout_uri=holdout.uri,
+            setup=payload["observable_setup"],
+            action=payload["observable_action"],
+            expected_predicates=predicates,
         ))
+    counts = {category: sum(item.category is category for item in definitions)
+              for category in GenericBenchmarkCategory}
+    if any(count != 3 for count in counts.values()):
+        raise CapabilityLiveAuthorityUnavailable(
+            "private benchmark requires exactly three explicit cases per category"
+        )
+    case_keys = tuple(json.loads(private_cases.holdout_body(ref.uri, ref.sha256))["case_key"] for ref in holdouts)
+    if len(case_keys) != len(set(case_keys)):
+        raise CapabilityLiveAuthorityUnavailable("private benchmark case keys are ambiguous")
     cases = [private_cases.register(item) for item in definitions]
+    if len({case.case_id for case in cases}) != 15:
+        raise CapabilityLiveAuthorityUnavailable(
+            "private benchmark explicit case definitions are duplicated"
+        )
     payload = _canonical([{
         "case_id": case.case_id, "category": case.category.value,
         "assertion_ids": case.assertion_ids, "case_digest": case.case_digest,
@@ -648,6 +663,32 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
     return GenericBenchmarkSuite(
         ArtifactRef(uri=f"artifact://capability-benchmark/{digest}", sha256=digest,
                     media_type="application/json"), tuple(cases))
+
+
+def _evaluate_predicate(
+    predicate: BenchmarkExpectedPredicate,
+    *,
+    observations: dict[str, object],
+    handoffs: tuple[dict[str, object], ...],
+    tool_validity: dict[str, bool],
+    rationale: str,
+) -> bool:
+    expected = predicate.expected_value
+    if predicate.kind == "observation_equals":
+        return observations.get(predicate.observed_key) == expected
+    if predicate.kind == "observation_contains":
+        return isinstance(expected, str) and expected in str(observations.get(predicate.observed_key, ""))
+    if predicate.kind == "observation_absent":
+        return predicate.observed_key not in observations
+    if predicate.kind == "handoff_event":
+        return any(item.get(predicate.observed_key) == expected for item in handoffs)
+    if predicate.kind == "tool_receipt":
+        return isinstance(expected, bool) and tool_validity.get(predicate.observed_key, False) == expected
+    if predicate.kind == "rationale_contains":
+        return isinstance(expected, str) and expected in rationale
+    if predicate.kind == "forbidden_tool_absent":
+        return predicate.observed_key not in tool_validity
+    raise CapabilityLiveAuthorityUnavailable("unsupported benchmark predicate")
 
 
 def generic_benchmark_aggregate(suite: GenericBenchmarkSuite,
@@ -684,28 +725,19 @@ def generic_benchmark_passes(value: GenericBenchmarkAggregate) -> bool:
     )
 
 
-def _definition(category: GenericBenchmarkCategory, assertions: tuple[AcceptanceAssertion, ...],
-                holdout_uri: str, setup: str, action: str,
-                expected: str) -> GenericPrivateCaseDefinition:
-    if not setup.strip() or not action.strip() or not expected.strip():
-        raise CapabilityLiveAuthorityUnavailable("semantic benchmark case is incomplete")
-    return GenericPrivateCaseDefinition(category, tuple(a.assertion_id for a in assertions),
-                                        holdout_uri, setup, action, expected)
-
-
 def _require_execution(value: GenericBenchmarkExecutionEvidence,
                        input_ref: ArtifactRef, capability_id: str,
                        case: GenericPrivateCaseRef, kind: str,
                        model_id: str,
                        policy_digest: str) -> None:
-    valid_tool_decisions = bool(value.tool_call_decisions) if isinstance(value, GenericBenchmarkExecutionEvidence) else False
-    if valid_tool_decisions:
-        valid_tool_decisions = all(
-            isinstance(item, GenericToolCallDecision)
-            and isinstance(item.evidence_ref, ArtifactRef)
-            and item.decision in {"used", "not_needed", "escalated"}
+    valid_tool_calls = bool(value.tool_calls) if isinstance(value, GenericBenchmarkExecutionEvidence) else False
+    if valid_tool_calls:
+        valid_tool_calls = all(
+            isinstance(item, GenericToolCallEvidence)
+            and all(isinstance(ref, ArtifactRef)
+                    for ref in (item.call_ref, item.lease_ref, item.receipt_ref))
             and bool(item.tool_key.strip())
-            for item in value.tool_call_decisions
+            for item in value.tool_calls
         )
     if (not isinstance(value, GenericBenchmarkExecutionEvidence)
             or value.case_ref != case or value.team_kind != kind
@@ -722,9 +754,9 @@ def _require_execution(value: GenericBenchmarkExecutionEvidence,
             or not isinstance(value.trace_id, UUID) or not isinstance(value.run_id, UUID)
             or not isinstance(value.outcome_ref, ArtifactRef)
             or not isinstance(value.rationale_ref, ArtifactRef)
-            or not value.artifact_refs
-            or any(not isinstance(item, ArtifactRef) for item in value.artifact_refs)
-            or not valid_tool_decisions):
+            or any(not isinstance(item, ArtifactRef)
+                   for item in (*value.message_event_refs, *value.handoff_event_refs))
+            or not valid_tool_calls):
         raise ValueError("benchmark executor returned invalid raw evidence")
 
 
@@ -738,7 +770,8 @@ def _require_evaluation(value: IndependentBenchmarkOutcome,
             or value.outcome_ref != execution.outcome_ref
             or value.rationale_ref != execution.rationale_ref
             or value.tool_evidence_refs != tuple(
-                item.evidence_ref for item in execution.tool_call_decisions)
+                ref for item in execution.tool_calls
+                for ref in (item.call_ref, item.lease_ref, item.receipt_ref))
             or value.model_policy_digest != execution.model_policy_digest
             or value.ruleset_digest != RuleBasedCapabilityBenchmarkEvaluator.RULESET_DIGEST
             or value.evaluator_authority_id != RuleBasedCapabilityBenchmarkEvaluator.AUTHORITY_ID):
@@ -768,4 +801,10 @@ def _canonical(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-__all__ = [name for name in globals() if name.startswith(("Generic", "Independent", "build_generic", "generic_benchmark"))]
+__all__ = [
+    name for name in globals()
+    if name.startswith((
+        "Generic", "Independent", "Benchmark", "ContentAddressed", "RuleBased",
+        "Scoped", "build_generic", "generic_benchmark",
+    ))
+]

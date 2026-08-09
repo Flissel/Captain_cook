@@ -77,7 +77,7 @@ class FactoryInputCompiler:
         if isinstance(subject_version, bool) or subject_version < 1:
             raise ValueError("subject_version must be a positive integer")
         assertions = self._assertions(document)
-        holdouts = self._holdouts(document)
+        holdouts = self._holdouts(document, assertions)
         nodes = self._nodes(document)
         dependencies = {node.node_id: set(node.dependencies) for node in nodes}
         sorter = TopologicalSorter(dependencies)
@@ -111,8 +111,43 @@ class FactoryInputCompiler:
             result.append(AcceptanceAssertion(assertion_id=assertion_id, source_path=path, observable_setup=case.observable_setup, observable_action=case.observable_action, observable_expected=case.observable_expected, kind=kind))
         return tuple(result)
 
-    def _holdouts(self, document: FactoryInputDocumentV2) -> tuple[PrivateHoldoutRef, ...]:
+    def _holdouts(
+        self,
+        document: FactoryInputDocumentV2,
+        assertions: tuple[AcceptanceAssertion, ...],
+    ) -> tuple[PrivateHoldoutRef, ...]:
         refs = []
+        if document.private_benchmark_cases:
+            assertions_by_source = {
+                item.source_path[-1]: item.assertion_id for item in assertions
+            }
+            for case in document.private_benchmark_cases:
+                assertion_ids = tuple(
+                    assertions_by_source[key] for key in case.source_case_keys
+                )
+                body = _canonical_json({
+                    "case_key": case.case_key,
+                    "category": case.category,
+                    "observable_setup": case.observable_setup,
+                    "observable_action": case.observable_action,
+                    "source_assertion_ids": assertion_ids,
+                    "expected_predicates": [
+                        item.model_dump(mode="json")
+                        for item in case.expected_predicates
+                    ],
+                })
+                digest = hashlib.sha256(body.encode()).hexdigest()
+                holdout_id = "holdout-" + _short_id(
+                    document.input_ref.sha256,
+                    ("private-benchmark", case.category, case.case_key),
+                    digest,
+                )
+                uri = f"holdout://{holdout_id}"
+                self._holdout_store.put(uri, body)
+                refs.append(PrivateHoldoutRef(
+                    holdout_id=holdout_id, uri=uri, sha256=digest
+                ))
+            return tuple(refs)
         cases = list(document.real_cases)
         for index, stop in enumerate(document.stop_conditions):
             source = cases[index % len(cases)]
