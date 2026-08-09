@@ -14,6 +14,10 @@ from agenten.agent_runtime.contracts import (
     RuntimeOperation,
     RuntimeStatus,
 )
+from agenten.provider_proxy.contracts import (
+    ProviderBudgetContextV1,
+    RuntimeProviderProxyBindingV1,
+)
 from gateway.capability_live_pipeline import (
     CapabilityExecutionAuthority,
     CapabilityResumeAuthorization,
@@ -115,11 +119,13 @@ class CapabilityResumeService:
         authority_source: CapabilityResumeAuthoritySource,
         runtime_reader: CapabilityResumeRuntimeReader,
         executor: CapabilityResumeExecutor | None,
+        provider_proxy_binding: RuntimeProviderProxyBindingV1 | None = None,
     ) -> None:
         self._repository = repository
         self._authority_source = authority_source
         self._runtime_reader = runtime_reader
         self._executor = executor
+        self._provider_proxy_binding = provider_proxy_binding
 
     def authorize(
         self, request: CapabilityResumeExecutionRequest
@@ -189,6 +195,46 @@ class CapabilityResumeService:
                 }
             ),
         )
+        if self._provider_proxy_binding is not None:
+            if snapshot.reservation_expires_at is None:
+                raise CapabilityResumeUnavailable(
+                    "provider proxy reservation expiry is unavailable"
+                )
+            session_id = result.session_id
+            if session_id is None:
+                raise CapabilityResumeUnavailable(
+                    "provider proxy session binding is unavailable"
+                )
+            result_id = uuid5(resume_command.event_id, "captain.runtime-result")
+            context = ProviderBudgetContextV1(
+                schema="captain.provider-budget-context.v1",
+                command_id=resume_command.event_id,
+                original_command_id=original.command.event_id,
+                result_id=result_id,
+                reservation_id=request.reservation_id,
+                job_id=request.job_id,
+                run_id=request.run_id,
+                input_id=request.input_id,
+                correlation_id=request.correlation_id,
+                capability_id=request.capability_id,
+                capability_version=request.capability_version,
+                session_id=session_id,
+                cost_authority_ref=resume_command.payload.cost_authority_ref,
+                ceiling_usd=snapshot.resume_budget_usd,
+                expires_at=snapshot.reservation_expires_at,
+                policy_sha256=self._provider_proxy_binding.policy_sha256,
+                price_card_sha256=self._provider_proxy_binding.price_card_sha256,
+            )
+            resume_command = resume_command.model_copy(update={
+                "payload": resume_command.payload.model_copy(update={
+                    "provider_proxy_url": self._provider_proxy_binding.responses_url,
+                    "provider_policy_sha256": self._provider_proxy_binding.policy_sha256,
+                    "provider_price_card_sha256": self._provider_proxy_binding.price_card_sha256,
+                    "provider_context_sha256": context.sha256,
+                    "provider_session_id": session_id,
+                    "provider_result_id": result_id,
+                })
+            })
         record = CapabilityResumeAuthorizationRecordV1(
             request=request,
             authorization=authorization,

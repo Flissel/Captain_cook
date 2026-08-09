@@ -80,6 +80,8 @@ def test_budget_context_requires_complete_d1_binding() -> None:
         cost_authority_ref="gateway://capability-resume-authorizations/one",
         ceiling_usd=Decimal("6"),
         expires_at=NOW + timedelta(hours=1),
+        policy_sha256="1" * 64,
+        price_card_sha256="2" * 64,
     )
     context.require_active(NOW)
     with pytest.raises(ValueError, match="result"):

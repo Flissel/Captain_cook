@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Literal
 from uuid import UUID
@@ -81,6 +82,7 @@ class CapabilityResumeSourceSnapshotV1(_FrozenResumeContract):
     input_id: str = Field(min_length=1)
     maximum_cost_usd: Decimal
     resume_budget_usd: Decimal
+    reservation_expires_at: datetime | None = None
     original_operation: RuntimeOperationProjection
 
     @field_validator(
@@ -95,6 +97,15 @@ class CapabilityResumeSourceSnapshotV1(_FrozenResumeContract):
         if not amount.is_finite() or amount < 0:
             raise ValueError("cost authority must be finite and non-negative")
         return amount
+
+    @field_validator("reservation_expires_at")
+    @classmethod
+    def require_utc_expiry(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (
+            value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value)
+        ):
+            raise ValueError("reservation expiry must be UTC")
+        return value
 
 
 class CapabilityResumeAuthorizationRecordV1(_FrozenResumeContract):

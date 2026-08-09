@@ -34,6 +34,7 @@ from agenten.agent_runtime.contracts import (
     RuntimeResumeCostSettlementRequestV1,
     RuntimeResumeCostSettlementV1,
 )
+from agenten.provider_proxy.contracts import ProviderBudgetContextV1
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
     FactoryBlockStatus,
@@ -287,6 +288,7 @@ class GatewayStore:
         runtime_usage_pricing_snapshots: tuple[
             RuntimeUsagePricingSnapshotV1, ...
         ] = (),
+        runtime_provider_proxy_bindings: tuple[tuple[str, str, str], ...] = (),
     ):
         if claim_ttl <= timedelta(0):
             raise ValueError("claim_ttl must be positive")
@@ -296,6 +298,9 @@ class GatewayStore:
         self._portal_verification_source = portal_verification_source
         self._runtime_usage_artifacts = runtime_usage_artifacts
         self._runtime_usage_pricing_snapshots = runtime_usage_pricing_snapshots
+        self._runtime_provider_proxy_bindings = frozenset(
+            runtime_provider_proxy_bindings
+        )
         self._ensure_schema()
         self._portal_tickets = PortalTicketStore(storage)
 
@@ -2664,6 +2669,52 @@ class GatewayStore:
                     cursor, command, now=now
                 )
 
+    def validate_provider_proxy_authority(
+        self,
+        context: ProviderBudgetContextV1,
+        *,
+        now: datetime,
+    ) -> ProviderBudgetContextV1:
+        """Authenticated exact readback for the proxy immediately before effect."""
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="event_id",
+                    value=str(context.command_id),
+                    for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=409, detail="provider authority is unavailable")
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                authority = self._validate_capability_resume_cost_authority_with_cursor(
+                    cursor, command, now=now
+                )
+                payload = command.payload
+                if (
+                    not authority.hard_ceiling_enforced
+                    or context.sha256 != payload.provider_context_sha256
+                    or context.cost_authority_ref != authority.cost_authority_ref
+                    or context.reservation_id != authority.reservation_id
+                    or context.job_id != authority.job_id
+                    or context.run_id != authority.run_id
+                    or context.input_id != authority.input_id
+                    or context.correlation_id != authority.correlation_id
+                    or context.capability_id != authority.capability_id
+                    or context.capability_version != authority.capability_version
+                    or context.command_id != authority.command_id
+                    or context.result_id != authority.provider_result_id
+                    or context.session_id != authority.provider_session_id
+                    or context.policy_sha256 != authority.provider_policy_sha256
+                    or context.price_card_sha256 != authority.provider_price_card_sha256
+                    or context.ceiling_usd != authority.ceiling_usd
+                    or context.expires_at != authority.expires_at
+                    or context.original_command_id != (command.causation_id or command.event_id)
+                ):
+                    raise HTTPException(status_code=409, detail="provider authority is unavailable")
+                return context
+
     def _validate_capability_resume_cost_authority_with_cursor(
         self,
         cursor: Any,
@@ -2743,6 +2794,24 @@ class GatewayStore:
             raise HTTPException(
                 status_code=409, detail="runtime resume cost reservation is inactive"
             )
+        provider_binding = (
+            payload.provider_proxy_url,
+            payload.provider_policy_sha256,
+            payload.provider_price_card_sha256,
+        )
+        provider_fields = (
+            *provider_binding,
+            payload.provider_context_sha256,
+            payload.provider_session_id,
+            payload.provider_result_id,
+        )
+        hard_ceiling_enforced = (
+            all(value is not None for value in provider_fields)
+            and provider_binding
+            in getattr(self, "_runtime_provider_proxy_bindings", frozenset())
+            and payload.provider_result_id
+            == uuid5(command.event_id, "captain.runtime-result")
+        )
         return RuntimeResumeCostAuthorityV1(
             schema_name="captain.runtime-resume-cost-authority.v1",
             authorization_receipt_id=receipt_id,
@@ -2757,8 +2826,14 @@ class GatewayStore:
             command_id=command.event_id,
             ceiling_usd=reservation.requested_usd,
             expires_at=reservation.expires_at,
-            hard_ceiling_enforced=False,
+            hard_ceiling_enforced=hard_ceiling_enforced,
             metering_mode="provider_usage_receipt",
+            provider_proxy_url=(payload.provider_proxy_url if hard_ceiling_enforced else None),
+            provider_policy_sha256=(payload.provider_policy_sha256 if hard_ceiling_enforced else None),
+            provider_price_card_sha256=(payload.provider_price_card_sha256 if hard_ceiling_enforced else None),
+            provider_context_sha256=(payload.provider_context_sha256 if hard_ceiling_enforced else None),
+            provider_session_id=(payload.provider_session_id if hard_ceiling_enforced else None),
+            provider_result_id=(payload.provider_result_id if hard_ceiling_enforced else None),
         )
 
     def settle_capability_resume_cost(

@@ -104,6 +104,14 @@ class AgentRuntimeCommandPayload(_FrozenContract):
     cost_input_id: str | None = Field(default=None, min_length=1)
     cost_capability_id: str | None = Field(default=None, min_length=1)
     cost_capability_version: int | None = Field(default=None, ge=1, strict=True)
+    provider_proxy_url: str | None = Field(default=None, pattern=r"^http://127\.0\.0\.1:[0-9]{1,5}/v1$")
+    provider_policy_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_price_card_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_context_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_session_id: str | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    provider_result_id: UUID | None = None
 
     @field_validator("workspace_ref")
     @classmethod
@@ -172,6 +180,18 @@ class AgentRuntimeCommandPayload(_FrozenContract):
             not self.maximum_cost_usd.is_finite() or self.maximum_cost_usd <= 0
         ):
             raise ValueError("runtime maximum cost must be finite and positive")
+        provider_fields = (
+            self.provider_proxy_url,
+            self.provider_policy_sha256,
+            self.provider_price_card_sha256,
+            self.provider_context_sha256,
+            self.provider_session_id,
+            self.provider_result_id,
+        )
+        if any(value is not None for value in provider_fields) and not all(
+            value is not None for value in provider_fields
+        ):
+            raise ValueError("runtime provider proxy binding must be complete")
         return self
 
 
@@ -284,6 +304,12 @@ class RuntimeResumeCostAuthorityV1(_FrozenContract):
     expires_at: datetime
     hard_ceiling_enforced: bool = Field(strict=True)
     metering_mode: Literal["provider_usage_receipt", "unavailable"]
+    provider_proxy_url: str | None = Field(default=None, pattern=r"^http://127\.0\.0\.1:[0-9]{1,5}/v1$")
+    provider_policy_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_price_card_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_context_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_session_id: str | None = Field(default=None, min_length=1)
+    provider_result_id: UUID | None = None
 
     @field_validator("ceiling_usd", mode="before")
     @classmethod

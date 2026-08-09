@@ -123,6 +123,19 @@ class RuntimeProviderPolicyV1(_FrozenContract):
         ):
             raise ValueError("runtime provider policy is unsafe")
 
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(canonical_bytes(self)).hexdigest()
+
+
+class RuntimeProviderProxyBindingV1(_FrozenContract):
+    schema_name: Literal["captain.runtime-provider-proxy-binding.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    responses_url: str = Field(pattern=r"^http://127\.0\.0\.1:[0-9]{1,5}/v1$")
+    policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    price_card_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
 
 class ProviderBudgetContextV1(_FrozenContract):
     schema_name: Literal["captain.provider-budget-context.v1"] = Field(
@@ -142,6 +155,8 @@ class ProviderBudgetContextV1(_FrozenContract):
     cost_authority_ref: str = Field(pattern=r"^gateway://capability-resume-authorizations/")
     ceiling_usd: Decimal
     expires_at: datetime
+    policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    price_card_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("ceiling_usd", mode="before")
     @classmethod
@@ -158,3 +173,7 @@ class ProviderBudgetContextV1(_FrozenContract):
             raise ValueError("provider budget context is expired")
         if self.result_id != uuid5(self.command_id, "captain.runtime-result"):
             raise ValueError("provider budget result binding is invalid")
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(canonical_bytes(self)).hexdigest()

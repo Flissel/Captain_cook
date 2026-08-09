@@ -547,6 +547,7 @@ class GatewayCapabilityResumeAuthoritySource:
             input_id=request.input_id,
             maximum_cost_usd=budget.limit_usd,
             resume_budget_usd=budget.remaining_usd,
+            reservation_expires_at=getattr(job, "deadline_at", None),
             original_operation=operation,
         )
 

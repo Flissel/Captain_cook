@@ -35,6 +35,7 @@ from agenten.agent_runtime.contracts import (
     RuntimeProviderUsageReceiptV1,
     canonical_json_bytes,
 )
+from agenten.provider_proxy.contracts import ProviderBudgetContextV1
 from tests.agent_runtime.test_service import (
     FakeCapabilityPolicy,
     FakeCodex,
@@ -861,6 +862,74 @@ def test_production_runtime_cost_authority_does_not_claim_an_absent_cli_hard_cei
     )
 
     assert authority.hard_ceiling_enforced is False
+
+
+def test_gateway_claims_hard_ceiling_only_for_exact_active_proxy_binding() -> None:
+    command = resume_command_with_cost()
+    receipt_id = uuid5(NAMESPACE_URL, "bound-production-authority")
+    expires = datetime(2026, 8, 10, tzinfo=timezone.utc)
+    policy_sha, price_sha = "a" * 64, "b" * 64
+    context = ProviderBudgetContextV1(
+        schema="captain.provider-budget-context.v1",
+        command_id=command.event_id,
+        original_command_id=command.causation_id or command.event_id,
+        result_id=uuid5(command.event_id, "captain.runtime-result"),
+        reservation_id=command.payload.budget_reservation_id,
+        job_id=command.payload.cost_job_id,
+        run_id=command.payload.cost_run_id,
+        input_id=command.payload.cost_input_id,
+        correlation_id=command.correlation_id,
+        capability_id=command.payload.cost_capability_id,
+        capability_version=command.payload.cost_capability_version,
+        session_id="codex-session-bound",
+        cost_authority_ref=f"gateway://capability-resume-authorizations/{receipt_id}",
+        ceiling_usd=command.payload.maximum_cost_usd,
+        expires_at=expires,
+        policy_sha256=policy_sha,
+        price_card_sha256=price_sha,
+    )
+    command = command.model_copy(update={"payload": command.payload.model_copy(update={
+        "cost_authority_ref": context.cost_authority_ref,
+        "provider_proxy_url": "http://127.0.0.1:18091/v1",
+        "provider_policy_sha256": policy_sha,
+        "provider_price_card_sha256": price_sha,
+        "provider_context_sha256": context.sha256,
+        "provider_session_id": context.session_id,
+        "provider_result_id": context.result_id,
+    })})
+    request = {
+        "reservation_id": str(command.payload.budget_reservation_id),
+        "job_id": str(command.payload.cost_job_id), "run_id": str(command.payload.cost_run_id),
+        "input_id": command.payload.cost_input_id, "correlation_id": str(command.correlation_id),
+        "capability_id": command.payload.cost_capability_id,
+        "capability_version": command.payload.cost_capability_version,
+    }
+
+    class Cursor:
+        def execute(self, *_args): return None
+        def fetchone(self):
+            return {"payload": {"resume_command": command.model_dump(mode="json", by_alias=True), "request": request}}
+
+    store = GatewayStore.__new__(GatewayStore)
+    store._runtime_provider_proxy_bindings = frozenset({(
+        "http://127.0.0.1:18091/v1", policy_sha, price_sha,
+    )})
+    store._runtime_block_by_json_value = lambda *_args, **_kwargs: {
+        "data": command.model_dump(mode="json", by_alias=True)
+    }
+    store._factory_reservation = lambda *_args, **_kwargs: SimpleNamespace(
+        reservation_id=command.payload.budget_reservation_id,
+        job_id=command.payload.cost_job_id, correlation_id=command.correlation_id,
+        requested_usd=command.payload.maximum_cost_usd, expires_at=expires,
+    )
+    store._reservation_is_closed = lambda *_args, **_kwargs: False
+
+    authority = store._validate_capability_resume_cost_authority_with_cursor(
+        Cursor(), command, now=datetime(2026, 8, 9, tzinfo=timezone.utc)
+    )
+
+    assert authority.hard_ceiling_enforced is True
+    assert authority.provider_context_sha256 == context.sha256
 
 
 @pytest.mark.parametrize("mutation", ["valid", "forged_zero", "unknown_model", "digest"])

@@ -35,6 +35,10 @@ from agenten.agent_runtime.contracts import (
 from agenten.agent_runtime.captain_production_adapters import (
     ContentAddressedArtifactAdapter,
 )
+from agenten.provider_proxy.contracts import (
+    ProviderBudgetContextV1,
+    RuntimeProviderProxyBindingV1,
+)
 from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob, FactoryLease, FactoryPhase
 from agenten.agent_factory.execution_budget import (
     FactoryBudgetProjection,
@@ -340,6 +344,15 @@ def create_app(
                 )
             ),
             runtime_usage_pricing_snapshots=runtime_usage_pricing_snapshots,
+            runtime_provider_proxy_bindings=(
+                (
+                    configured.provider_proxy_url,
+                    configured.provider_policy_sha256,
+                    configured.provider_price_card_sha256,
+                ),
+            )
+            if configured is not None and configured.provider_proxy_url is not None
+            else (),
         )
         if (
             configured is not None
@@ -483,6 +496,16 @@ def create_app(
                         authority_source=authority,
                         runtime_reader=authority,
                         executor=selected_executor,
+                        provider_proxy_binding=(
+                            RuntimeProviderProxyBindingV1(
+                                schema="captain.runtime-provider-proxy-binding.v1",
+                                responses_url=configured.provider_proxy_url,
+                                policy_sha256=configured.provider_policy_sha256,
+                                price_card_sha256=configured.provider_price_card_sha256,
+                            )
+                            if configured.provider_proxy_url is not None
+                            else None
+                        ),
                     )
         return resume_service
 
@@ -1148,6 +1171,17 @@ def create_app(
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
         return receipt
+
+    @app.post("/v1/capability-resumes/provider-authorities/preflight")
+    async def preflight_runtime_provider_authority(
+        context: ProviderBudgetContextV1,
+        _: GatewayRole = Depends(require_provider_receipt_authority),
+    ) -> ProviderBudgetContextV1:
+        return await run_in_threadpool(
+            get_store().validate_provider_proxy_authority,
+            context,
+            now=datetime.now(timezone.utc),
+        )
 
     @app.post("/v1/capability-resumes/cost-authorities/settle")
     async def settle_capability_resume_cost(

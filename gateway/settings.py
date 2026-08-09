@@ -40,6 +40,9 @@ class GatewaySettings(BaseModel):
     captain_gateway_token: SecretStr
     worker_gateway_token: SecretStr
     provider_receipt_gateway_token: SecretStr | None = None
+    provider_proxy_url: str | None = None
+    provider_policy_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    provider_price_card_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     approval_enabled: bool = False
     host: Literal["127.0.0.1"] = "127.0.0.1"
     port: int = Field(default=8090, ge=1, le=65535)
@@ -209,6 +212,27 @@ class GatewaySettings(BaseModel):
                 raise ValueError("provider receipt token must be a distinct authority")
         if (self.captain_runtime_url is None) != (self.captain_runtime_token is None):
             raise ValueError("Captain Runtime settings must be configured together")
+        proxy_fields = (
+            self.provider_proxy_url,
+            self.provider_policy_sha256,
+            self.provider_price_card_sha256,
+        )
+        if any(value is not None for value in proxy_fields) and not all(
+            value is not None for value in proxy_fields
+        ):
+            raise ValueError("provider proxy binding must be complete")
+        if self.provider_proxy_url is not None:
+            parsed = urlsplit(self.provider_proxy_url)
+            if (
+                parsed.scheme != "http"
+                or parsed.hostname != "127.0.0.1"
+                or parsed.path.rstrip("/") != "/v1"
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError("provider proxy URL must be loopback HTTP /v1")
         portal_settings = (
             self.portal_supabase_issuer,
             self.portal_supabase_audience,
@@ -378,6 +402,16 @@ class GatewaySettings(BaseModel):
                     if source.get("PROVIDER_RECEIPT_GATEWAY_TOKEN") is not None
                     else None
                 ),
+                provider_proxy_url=(
+                    source.get("CAPTAIN_PROVIDER_PROXY_RESPONSES_URL")
+                    or (
+                        source["CAPTAIN_PROVIDER_PROXY_URL"].rstrip("/") + "/v1"
+                        if source.get("CAPTAIN_PROVIDER_PROXY_URL")
+                        else None
+                    )
+                ),
+                provider_policy_sha256=source.get("CAPTAIN_PROVIDER_POLICY_SHA256"),
+                provider_price_card_sha256=source.get("CAPTAIN_PROVIDER_PRICE_CARD_SHA256"),
                 approval_enabled=approval_enabled,
                 port=port,
                 claim_ttl_seconds=claim_ttl_seconds,
