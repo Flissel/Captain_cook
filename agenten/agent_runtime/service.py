@@ -138,6 +138,12 @@ class AgentRuntimeService:
             or authority.expires_at <= now
             or not authority.hard_ceiling_enforced
             or authority.metering_mode != "provider_usage_receipt"
+            or authority.provider_proxy_url != payload.provider_proxy_url
+            or authority.provider_policy_sha256 != payload.provider_policy_sha256
+            or authority.provider_price_card_sha256 != payload.provider_price_card_sha256
+            or authority.provider_context_sha256 != payload.provider_context_sha256
+            or authority.provider_session_id != payload.provider_session_id
+            or authority.provider_result_id != payload.provider_result_id
         ):
             raise RuntimeContractViolation(
                 "codex.resume cost authority binding is invalid"

@@ -316,7 +316,21 @@ class CaptainCodexExecutionAdapter:
                 else None
             ),
             cost_authority_ref=command.payload.cost_authority_ref,
-            hard_ceiling_enforced=False,
+            hard_ceiling_enforced=all(
+                value is not None
+                for value in (
+                    command.payload.provider_proxy_url,
+                    command.payload.provider_policy_sha256,
+                    command.payload.provider_price_card_sha256,
+                    command.payload.provider_context_sha256,
+                )
+            ),
+            provider_proxy_url=command.payload.provider_proxy_url,
+            provider_policy_sha256=command.payload.provider_policy_sha256,
+            provider_price_card_sha256=command.payload.provider_price_card_sha256,
+            provider_context_sha256=command.payload.provider_context_sha256,
+            provider_session_id=command.payload.provider_session_id,
+            provider_result_id=command.payload.provider_result_id,
             **self._usage_invocation(command),
         )
         return self._result(command, grant, evidence)
@@ -441,6 +455,18 @@ class CaptainCodexExecutionAdapter:
             command.payload.operation.value == "codex.resume"
             and command.payload.cost_authority_ref is not None
             and evidence.status == "succeeded"
+            and (
+                cost_evidence is None
+                or not all(
+                    value is not None
+                    for value in (
+                        command.payload.provider_proxy_url,
+                        command.payload.provider_policy_sha256,
+                        command.payload.provider_price_card_sha256,
+                        command.payload.provider_context_sha256,
+                    )
+                )
+            )
         ):
             status = RuntimeStatus.POLICY_FAILED
             error = (

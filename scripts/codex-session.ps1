@@ -30,6 +30,10 @@ param(
     [string] $ResumeThreadId,
 
     [Parameter(ParameterSetName = "Run")]
+    [ValidatePattern('^http://127\.0\.0\.1:[0-9]{1,5}/v1$')]
+    [string] $ProviderProxyUrl,
+
+    [Parameter(ParameterSetName = "Run")]
     [ValidateSet("read-only", "workspace-write")]
     [string] $Sandbox = "workspace-write",
 
@@ -176,6 +180,26 @@ $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
 $startInfo.ArgumentList.Add("--dangerously-bypass-approvals-and-sandbox")
+if ($ProviderProxyUrl) {
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model="gpt-5.6-terra"')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_provider="captain_budget_proxy"')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_reasoning_effort="high"')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_providers.captain_budget_proxy.name="Captain localhost budget proxy"')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add(('model_providers.captain_budget_proxy.base_url="{0}"' -f $ProviderProxyUrl))
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_providers.captain_budget_proxy.env_key="CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_providers.captain_budget_proxy.wire_api="responses"')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_providers.captain_budget_proxy.request_max_retries=0')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_providers.captain_budget_proxy.stream_max_retries=0')
+}
 if ($ResumeThreadId) {
     # Every value is a distinct ArgumentList entry so neither thread names nor
     # prompts cross a shell parsing boundary.

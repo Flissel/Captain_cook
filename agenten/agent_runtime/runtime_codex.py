@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Protocol
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -69,6 +69,11 @@ class RuntimeCodexInvocation:
     maximum_cost_usd: str | None = None
     cost_authority_ref: str | None = None
     hard_ceiling_enforced: bool = False
+    provider_proxy_url: str | None = None
+    provider_policy_sha256: str | None = None
+    provider_price_card_sha256: str | None = None
+    provider_context_sha256: str | None = None
+    provider_result_id: UUID | None = None
     resume: bool = False
     prior_checkpoint_sha256: str | None = None
 
@@ -330,6 +335,12 @@ class RuntimeCodexExecution:
         maximum_cost_usd: str | None = None,
         cost_authority_ref: str | None = None,
         hard_ceiling_enforced: bool = False,
+        provider_proxy_url: str | None = None,
+        provider_policy_sha256: str | None = None,
+        provider_price_card_sha256: str | None = None,
+        provider_context_sha256: str | None = None,
+        provider_session_id: str | None = None,
+        provider_result_id: UUID | None = None,
     ) -> RuntimeCodexTerminalEvidenceV1:
         workspace_binding = _workspace_binding(workspace)
         key = (correlation_id, subject_id, prompt_sha256, workspace_ref, workspace_binding)
@@ -354,6 +365,13 @@ class RuntimeCodexExecution:
             or prior.workspace_binding_sha256 != workspace_binding
         ):
             raise FactoryDispatchError("Codex resume command identity changed")
+        if provider_session_id is not None and provider_session_id != prior.session_id:
+            raise FactoryDispatchError("Codex provider session binding changed")
+        if (
+            provider_result_id is not None
+            and (request_id is None or provider_result_id != uuid5(request_id, "captain.runtime-result"))
+        ):
+            raise FactoryDispatchError("Codex provider result binding changed")
         self._identity_index[key] = command_id
         invocation = RuntimeCodexInvocation(
             command_id=command_id,
@@ -374,6 +392,11 @@ class RuntimeCodexExecution:
             maximum_cost_usd=maximum_cost_usd,
             cost_authority_ref=cost_authority_ref,
             hard_ceiling_enforced=hard_ceiling_enforced,
+            provider_proxy_url=provider_proxy_url,
+            provider_policy_sha256=provider_policy_sha256,
+            provider_price_card_sha256=provider_price_card_sha256,
+            provider_context_sha256=provider_context_sha256,
+            provider_result_id=provider_result_id,
             resume=True,
             prior_checkpoint_sha256=(
                 prior.resumable_checkpoint.sha256
@@ -938,12 +961,27 @@ class PowerShellRuntimeCodexRunner:
             if invocation.resume:
                 command_parts.append(invocation.session_id)
             command_parts.append(invocation.prompt)
+            proxy_bound = invocation.hard_ceiling_enforced
+            if proxy_bound and (
+                invocation.provider_proxy_url is None
+                or invocation.provider_policy_sha256 is None
+                or invocation.provider_price_card_sha256 is None
+                or invocation.provider_context_sha256 is None
+                or not self._environ.get("CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN", "").strip()
+            ):
+                raise FactoryDispatchError("Codex provider proxy binding is unavailable")
+            allowed_environment = self._ALLOWED_ENV - ({"OPENAI_API_KEY"} if proxy_bound else set())
+            child_values = {
+                name: value for name, value in self._environ.items() if name in allowed_environment
+            }
+            if proxy_bound:
+                child_values["CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"] = self._environ[
+                    "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"
+                ]
             authorized = AuthorizedCodexRun(
                 workspace=invocation.workspace,
                 command=tuple(command_parts),
-                environment=FrozenEnvironment(
-                    {name: value for name, value in self._environ.items() if name in self._ALLOWED_ENV}
-                ),
+                environment=FrozenEnvironment(child_values),
             )
             result = await runner.run(authorized)
             failure_kind: RuntimeCodexFailureKind | None = None
@@ -1072,6 +1110,9 @@ class PowerShellRuntimeCodexRunner:
             journal_path=None,
             artifact_references=(),
             codex_home=codex_home,
+            provider_proxy_url=(
+                invocation.provider_proxy_url if invocation.hard_ceiling_enforced else None
+            ),
             deadline_at=datetime.now(timezone.utc) + timedelta(seconds=invocation.timeout_seconds),
             timeout_seconds=float(invocation.timeout_seconds),
             output_policy=CodexOutputJournalPolicy(

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 
@@ -664,6 +664,43 @@ async def test_resume_carries_cost_authority_and_persists_digest_bound_usage_rec
     assert receipt.result_id == result.event_id
     assert receipt.actual_cost_usd == Decimal("0.250000")
     assert receipt.pricing_snapshot_sha256 == PRICING.snapshot_sha256
+
+
+@pytest.mark.asyncio
+async def test_exact_proxy_bound_resume_is_not_downgraded_by_production_adapter(
+    tmp_path: Path,
+) -> None:
+    runner = StreamingRunner(exit_code=124)
+    adapter, _, artifacts = _codex_adapter(
+        tmp_path, runner, pricing_snapshots=(PRICING,)
+    )
+    prompt_ref = artifacts.put(b"proxy-bound resume", "text/markdown")
+    original = _command(prompt_ref)
+    await adapter.start(original, _grant(original))
+    runner.exit_code = 0
+    runner.include_usage = True
+    resumed = _cost_bound(_command(
+        prompt_ref, operation="codex.resume",
+        correlation_id=original.correlation_id, causation_id=original.event_id,
+    ))
+    resumed = resumed.model_copy(update={"payload": resumed.payload.model_copy(update={
+        "provider_proxy_url": "http://127.0.0.1:18091/v1",
+        "provider_policy_sha256": "4" * 64,
+        "provider_price_card_sha256": "5" * 64,
+        "provider_context_sha256": "6" * 64,
+        "provider_session_id": "runtime-thread",
+        "provider_result_id": uuid5(resumed.event_id, "captain.runtime-result"),
+    })})
+
+    result = await adapter.resume(resumed, _grant(resumed))
+
+    invocation = runner.invocations[-1]
+    assert invocation.hard_ceiling_enforced is True
+    assert invocation.provider_proxy_url == "http://127.0.0.1:18091/v1"
+    assert invocation.provider_context_sha256 == "6" * 64
+    assert result.status is RuntimeStatus.SUCCEEDED
+    assert result.error is None
+    assert result.cost_evidence is not None
 
 
 @pytest.mark.asyncio
@@ -1415,6 +1452,62 @@ async def test_current_runner_accepts_real_shaped_jsonl_usage_without_retaining_
         started_at=result.usage.started_at,
         ended_at=result.usage.ended_at,
     )
+
+
+@pytest.mark.asyncio
+async def test_proxy_bound_runtime_child_has_only_proxy_credential_and_immutable_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process_runner = PowerShellRuntimeCodexRunner(
+        repository_root=tmp_path,
+        executable="codex",
+        environ={
+            "PATH": "safe-path",
+            "OPENAI_API_KEY": "must-not-cross",
+            "CAPTAIN_GATEWAY_TOKEN": "must-not-cross",
+            "CAPTAIN_RUNTIME_TOKEN": "must-not-cross",
+            "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN": "must-not-cross",
+            "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "proxy-only",
+        },
+        evidence_root=tmp_path / "runtime-codex",
+    )
+    captured = None
+
+    class FakeCodex:
+        async def run(self, authorized):
+            nonlocal captured
+            captured = authorized
+            return SimpleNamespace(
+                exit_code=0,
+                terminal_status="succeeded",
+                process_cleanup_status="not_required",
+            )
+
+    monkeypatch.setattr(process_runner, "_make_runner", lambda *_args: FakeCodex())
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    invocation = RuntimeCodexInvocation(
+        command_id=uuid4(), correlation_id=uuid4(), subject_id="runtime-task",
+        prompt_sha256="1" * 64, command_identity_sha256="2" * 64,
+        session_id="proxy-session", workspace_ref="workspace://runtime/task",
+        workspace_binding_sha256="3" * 64, workspace=workspace, prompt="build",
+        timeout_seconds=30, resume=True, hard_ceiling_enforced=True,
+        provider_proxy_url="http://127.0.0.1:18091/v1",
+        provider_policy_sha256="4" * 64,
+        provider_price_card_sha256="5" * 64,
+        provider_context_sha256="6" * 64,
+    )
+
+    await process_runner.run(invocation, lambda _event: asyncio.sleep(0))
+
+    assert captured is not None
+    child = captured.child_environment()
+    assert child["CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"] == "proxy-only"
+    assert "OPENAI_API_KEY" not in child
+    assert not any(name in child for name in (
+        "CAPTAIN_GATEWAY_TOKEN", "CAPTAIN_RUNTIME_TOKEN",
+        "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN",
+    ))
 
 
 @pytest.mark.asyncio

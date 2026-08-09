@@ -293,6 +293,7 @@ class PowerShellCodexRunner:
         journal_path: Path | None,
         artifact_references: tuple[str, ...],
         codex_home: Path,
+        provider_proxy_url: str | None = None,
         deadline_at: datetime,
         timeout_seconds: float = 600,
         max_jsonl_record_bytes: int = DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES,
@@ -342,6 +343,7 @@ class PowerShellCodexRunner:
         self._journal_path = journal_path.resolve() if journal_path is not None else None
         self._artifact_references = artifact_references
         self._codex_home = codex_home.resolve(strict=True)
+        self._provider_proxy_url = provider_proxy_url
         self._deadline_at = deadline_at
         self._timeout_seconds = timeout_seconds
         self._max_jsonl_record_bytes = max_jsonl_record_bytes
@@ -428,6 +430,8 @@ class PowerShellCodexRunner:
             launcher_arguments.extend(("-StatePath", str(self._state_path)))
         if resume_thread_id is not None:
             launcher_arguments.extend(("-ResumeThreadId", resume_thread_id))
+        if self._provider_proxy_url is not None:
+            launcher_arguments.extend(("-ProviderProxyUrl", self._provider_proxy_url))
         process = await asyncio.create_subprocess_exec(
             *launcher_arguments,
             cwd=authorized.workspace,
