@@ -15,7 +15,6 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from .configuration import DemoConfiguration
-from .contracts import DemoServiceV1
 
 
 class DemoProcessError(RuntimeError):
@@ -43,6 +42,27 @@ class ManagedProcessRecord:
     command_sha256: str
     config_sha256: str
     bundle_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedServicePlan:
+    name: str
+    argv: tuple[str, ...]
+    working_directory: str
+    port: int
+    health_url: str
+    health_token_env: str
+    environment: tuple[str, ...]
+    artifact_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedProcessPlan:
+    """Injected process plan; D11 does not export this authority yet."""
+
+    services: tuple[ManagedServicePlan, ...]
+    compose_files: tuple[str, ...]
+    compose_project: str
 
 
 class ProcessBackend(Protocol):
@@ -75,7 +95,7 @@ class ProcessBackend(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class _PreparedService:
-    service: DemoServiceV1
+    service: ManagedServicePlan
     argv: tuple[str, ...]
     cwd: Path
     environment: dict[str, str]
@@ -88,13 +108,16 @@ class ManagedProcessSupervisor:
         self,
         configuration: DemoConfiguration,
         *,
+        plan: ManagedProcessPlan | None = None,
         backend: ProcessBackend | None = None,
     ) -> None:
         self._configuration = configuration
+        self._plan = plan
         self._backend = backend or WindowsProcessBackend()
         self._state_path = configuration.state_root / "managed-processes.json"
 
     def start_all(self, *, timeout_seconds: float) -> tuple[ManagedProcessRecord, ...]:
+        plan = self._require_plan()
         if timeout_seconds <= 0:
             raise DemoProcessError("service health timeout must be positive")
         prepared = self._preflight(timeout_seconds=timeout_seconds)
@@ -102,10 +125,10 @@ class ManagedProcessSupervisor:
             return tuple(item.record for item in prepared)
         compose_files = tuple(
             self._configuration.repository_root.joinpath(*PurePosixPath(relative).parts)
-            for relative in self._configuration.bundle.compose_files
+            for relative in plan.compose_files
         )
         self._backend.start_compose(
-            compose_files, self._configuration.bundle.compose_project
+            compose_files, plan.compose_project
         )
         records = {record.service: record for record in self._load_records()}
         started: list[ManagedProcessRecord] = []
@@ -172,6 +195,7 @@ class ManagedProcessSupervisor:
         return result
 
     def restart_runtime(self, *, timeout_seconds: float) -> ManagedProcessRecord:
+        self._require_plan()
         records = {record.service: record for record in self._load_records()}
         existing = records.get("runtime")
         if existing is None:
@@ -243,8 +267,9 @@ class ManagedProcessSupervisor:
         return replacement
 
     def status(self, *, timeout_seconds: float = 2) -> tuple[ManagedProcessRecord, ...]:
+        plan = self._require_plan()
         records = self._load_records()
-        services = {service.name: service for service in self._configuration.bundle.services}
+        services = {service.name: service for service in plan.services}
         expected = {
             item.service.name: item.record
             for item in self._prepare_services(
@@ -256,7 +281,7 @@ class ManagedProcessSupervisor:
             service = services.get(record.service)
             if service is None or expected.get(record.service) != record:
                 continue
-            environment = self._configuration.environment_for(service.name)
+            environment = self._service_authority(service)
             if (
                 self._backend.is_alive(record.pid, record.start_identity)
                 and self._backend.listener_pid(record.port) == record.pid
@@ -282,12 +307,13 @@ class ManagedProcessSupervisor:
         return tuple(stopped)
 
     def _preflight(self, *, timeout_seconds: float) -> tuple[_PreparedService, ...]:
+        plan = self._require_plan()
         compose_files = tuple(
             self._configuration.repository_root.joinpath(*PurePosixPath(relative).parts)
-            for relative in self._configuration.bundle.compose_files
+            for relative in plan.compose_files
         )
         self._backend.validate_compose(
-            compose_files, self._configuration.bundle.compose_project
+            compose_files, plan.compose_project
         )
         existing = {record.service: record for record in self._load_records()}
         prepared = self._prepare_services(existing)
@@ -339,7 +365,7 @@ class ManagedProcessSupervisor:
         self, existing: Mapping[str, ManagedProcessRecord]
     ) -> tuple[_PreparedService, ...]:
         prepared: list[_PreparedService] = []
-        for service in self._configuration.bundle.services:
+        for service in self._require_plan().services:
             argv = tuple(self._expand(argument) for argument in service.argv)
             executable = argv[0]
             if (
@@ -355,7 +381,7 @@ class ManagedProcessSupervisor:
                 )
             cwd = self._resolve_working_directory(service.working_directory)
             environment = self._child_environment(
-                self._configuration.environment_for(service.name)
+                self._service_authority(service)
             )
             command_sha256 = _canonical_sha256(
                 {"argv": argv, "cwd": str(cwd), "artifacts": service.artifact_paths}
@@ -367,7 +393,7 @@ class ManagedProcessSupervisor:
             config_sha256 = _canonical_sha256(
                 {
                     "bundle_sha256": self._configuration.bundle_sha256,
-                    "service": service.model_dump(mode="json"),
+                    "service": asdict(service),
                     "command_sha256": command_sha256,
                     "secret_digests": secret_digests,
                 }
@@ -445,7 +471,24 @@ class ManagedProcessSupervisor:
         return path
 
     def _service_names(self) -> tuple[str, ...]:
-        return tuple(service.name for service in self._configuration.bundle.services)
+        return tuple(service.name for service in self._require_plan().services)
+
+    def _require_plan(self) -> ManagedProcessPlan:
+        if self._plan is None:
+            self._configuration.require_operator_process_bootstrap()
+            raise DemoProcessError("D11 operator process bootstrap is unavailable")
+        return self._plan
+
+    def _service_authority(self, service: ManagedServicePlan) -> dict[str, str]:
+        authority: dict[str, str] = {}
+        for name in service.environment:
+            value = self._configuration.environment.get(name, "").strip()
+            if not value:
+                raise DemoProcessError(
+                    f"required service authority is unavailable: {name}"
+                )
+            authority[name] = value
+        return authority
 
 
 class WindowsProcessBackend:
@@ -647,6 +690,8 @@ __all__ = [
     "DemoProcessError",
     "DemoProcessTimeout",
     "ManagedProcessRecord",
+    "ManagedProcessPlan",
+    "ManagedServicePlan",
     "ManagedProcessSupervisor",
     "SpawnedProcess",
     "WindowsProcessBackend",

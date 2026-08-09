@@ -5,15 +5,18 @@ import json
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from agenten.demo_orchestrator.configuration import DemoConfiguration
-from agenten.demo_orchestrator.contracts import CANONICAL_INPUT_PATHS, DemoBundleV1
+from agenten.demo_orchestrator.configuration import DemoConfiguration, DemoConfigurationError
+from agenten.demo_orchestrator.contracts import CANONICAL_INPUT_PATHS
 from agenten.demo_orchestrator.processes import (
     DemoProcessError,
     DemoProcessTimeout,
     ManagedProcessSupervisor,
+    ManagedProcessPlan,
+    ManagedServicePlan,
     SpawnedProcess,
     WindowsProcessBackend,
     stop_managed_processes,
@@ -31,71 +34,56 @@ def _configuration(tmp_path: Path) -> DemoConfiguration:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"input {index}\n", encoding="utf-8")
         input_digests[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
-    artifact = repository / "service.py"
-    artifact.write_text("# service\n", encoding="utf-8")
+    (repository / "service.py").write_text("# service\n", encoding="utf-8")
     compose = repository / "docker-compose.test.yml"
     compose.write_text("services: {}\n", encoding="utf-8")
-    catalog = state_root / "private/catalog.json"
-    catalog.parent.mkdir(parents=True)
-    catalog.write_text("{}\n", encoding="utf-8")
-    sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-    tokens = {
-        "gateway": "CAPTAIN_GATEWAY_TOKEN",
-        "provider_proxy": "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
-        "runtime": "CAPTAIN_RUNTIME_TOKEN",
-        "benchmark": "CAPTAIN_BENCHMARK_TOKEN",
-    }
-    services = []
-    for offset, name in enumerate(tokens):
-        environment = [tokens[name]]
-        if name == "provider_proxy":
-            environment.append("OPENAI_API_KEY")
-        services.append(
-            {
-                "name": name,
-                "argv": ["{python}", "-m", f"demo_{name}"],
-                "working_directory": ".",
-                "port": 19000 + offset,
-                "health_url": (
-                    "http://127.0.0.1:19000/v1/capability-assemblies/health"
-                    if name == "gateway"
-                    else f"http://127.0.0.1:{19000 + offset}/health"
-                ),
-                "health_token_env": tokens[name],
-                "environment": environment,
-                "artifact_paths": ["service.py"],
-            }
-        )
-    bundle_payload = {
-        "schema": "captain.capability-demo-bundle.v1",
-        "repository_revision": "b" * 40,
-        "canonical_inputs": input_digests,
-        "artifact_digests": {"service.py": sha(artifact)},
-        "compose_files": {"docker-compose.test.yml": sha(compose)},
-        "compose_project": "captain-capability-demo",
-        "benchmark_catalog_path": ".captain-cook/live-demo/private/catalog.json",
-        "benchmark_catalog_sha256": sha(catalog),
-        "gateway_base_url": "http://127.0.0.1:19000",
-        "minibook_evidence_url_template": "http://127.0.0.1:19004/v1/projections/{assembly_id}",
-        "minibook_token_env": "MINIBOOK_PROJECTION_API_KEY",
-        "services": services,
-    }
-    bundle = DemoBundleV1.model_validate_json(json.dumps(bundle_payload))
     environment = {
         "CAPTAIN_GATEWAY_TOKEN": "gateway-secret",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "proxy-secret",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-secret",
-        "CAPTAIN_BENCHMARK_TOKEN": "benchmark-secret",
+        "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-secret",
+        "MINIBOOK_API_KEY": "minibook-api-secret",
         "MINIBOOK_PROJECTION_API_KEY": "minibook-secret",
         "OPENAI_API_KEY": "provider-secret",
     }
     return DemoConfiguration(
         repository_root=repository,
         state_root=state_root,
-        bundle=bundle,
-        bundle_path=state_root / "private/bundle.json",
-        bundle_sha256="c" * 64,
+        production_manifest=SimpleNamespace(
+            manifest_sha256="c" * 64,
+            gateway=SimpleNamespace(base_url="http://127.0.0.1:19000"),
+            provider_context_reference_header="X-Captain-Provider-Context-Ref",
+        ),
+        repository_revision="b" * 40,
+        canonical_input_digests=input_digests,
         environment=environment,
+    )
+
+
+def _plan(configuration: DemoConfiguration) -> ManagedProcessPlan:
+    tokens = {
+        "gateway": "CAPTAIN_GATEWAY_TOKEN",
+        "provider_proxy": "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
+        "runtime": "CAPTAIN_RUNTIME_TOKEN",
+        "benchmark": "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+    }
+    services = tuple(
+        ManagedServicePlan(
+            name=name,
+            argv=("{python}", "-m", f"demo_{name}"),
+            working_directory=".",
+            port=19000 + offset,
+            health_url=f"http://127.0.0.1:{19000 + offset}/healthz",
+            health_token_env=token,
+            environment=(token,),
+            artifact_paths=("service.py",),
+        )
+        for offset, (name, token) in enumerate(tokens.items())
+    )
+    return ManagedProcessPlan(
+        services=services,
+        compose_files=("docker-compose.test.yml",),
+        compose_project="captain-capability-demo",
     )
 
 
@@ -168,7 +156,7 @@ def test_start_preflights_every_service_before_dependency_ordered_mutation(
 ) -> None:
     configuration = _configuration(tmp_path)
     backend = FakeBackend()
-    supervisor = ManagedProcessSupervisor(configuration, backend=backend)
+    supervisor = ManagedProcessSupervisor(configuration, plan=_plan(configuration), backend=backend)
 
     result = supervisor.start_all(timeout_seconds=1)
 
@@ -199,7 +187,7 @@ def test_start_preflights_every_service_before_dependency_ordered_mutation(
 def test_start_safely_reuses_only_exact_healthy_managed_configuration(tmp_path: Path) -> None:
     configuration = _configuration(tmp_path)
     backend = FakeBackend()
-    supervisor = ManagedProcessSupervisor(configuration, backend=backend)
+    supervisor = ManagedProcessSupervisor(configuration, plan=_plan(configuration), backend=backend)
     first = supervisor.start_all(timeout_seconds=1)
     backend.events.clear()
 
@@ -216,7 +204,7 @@ def test_foreign_listener_refuses_start_before_any_mutation(tmp_path: Path) -> N
     configuration = _configuration(tmp_path)
     backend = FakeBackend()
     backend.listeners[19002] = 999
-    supervisor = ManagedProcessSupervisor(configuration, backend=backend)
+    supervisor = ManagedProcessSupervisor(configuration, plan=_plan(configuration), backend=backend)
 
     with pytest.raises(DemoProcessError, match="foreign listener.*19002"):
         supervisor.start_all(timeout_seconds=1)
@@ -227,7 +215,7 @@ def test_foreign_listener_refuses_start_before_any_mutation(tmp_path: Path) -> N
 def test_stop_terminates_only_persisted_pid_and_start_identities(tmp_path: Path) -> None:
     configuration = _configuration(tmp_path)
     backend = FakeBackend()
-    supervisor = ManagedProcessSupervisor(configuration, backend=backend)
+    supervisor = ManagedProcessSupervisor(configuration, plan=_plan(configuration), backend=backend)
     records = supervisor.start_all(timeout_seconds=1)
     backend.processes[999] = "foreign-start"
     backend.events.clear()
@@ -250,7 +238,7 @@ def test_stop_terminates_only_persisted_pid_and_start_identities(tmp_path: Path)
 def test_runtime_restart_keeps_exact_config_and_replaces_only_runtime(tmp_path: Path) -> None:
     configuration = _configuration(tmp_path)
     backend = FakeBackend()
-    supervisor = ManagedProcessSupervisor(configuration, backend=backend)
+    supervisor = ManagedProcessSupervisor(configuration, plan=_plan(configuration), backend=backend)
     first = supervisor.start_all(timeout_seconds=1)
     backend.events.clear()
 
@@ -267,10 +255,17 @@ def test_runtime_restart_keeps_exact_config_and_replaces_only_runtime(tmp_path: 
 def test_status_rejects_healthy_pid_when_sealed_configuration_changed(tmp_path: Path) -> None:
     configuration = _configuration(tmp_path)
     backend = FakeBackend()
-    ManagedProcessSupervisor(configuration, backend=backend).start_all(timeout_seconds=1)
-    changed = replace(configuration, bundle_sha256="f" * 64)
+    ManagedProcessSupervisor(configuration, plan=_plan(configuration), backend=backend).start_all(timeout_seconds=1)
+    changed = replace(
+        configuration,
+        production_manifest=SimpleNamespace(
+            manifest_sha256="f" * 64,
+            gateway=configuration.production_manifest.gateway,
+            provider_context_reference_header="X-Captain-Provider-Context-Ref",
+        ),
+    )
 
-    healthy = ManagedProcessSupervisor(changed, backend=backend).status(timeout_seconds=1)
+    healthy = ManagedProcessSupervisor(changed, plan=_plan(changed), backend=backend).status(timeout_seconds=1)
 
     assert healthy == ()
 
@@ -278,7 +273,7 @@ def test_status_rejects_healthy_pid_when_sealed_configuration_changed(tmp_path: 
 def test_stop_uses_persisted_identity_even_when_d11_bundle_is_unavailable(tmp_path: Path) -> None:
     configuration = _configuration(tmp_path)
     backend = FakeBackend()
-    records = ManagedProcessSupervisor(configuration, backend=backend).start_all(timeout_seconds=1)
+    records = ManagedProcessSupervisor(configuration, plan=_plan(configuration), backend=backend).start_all(timeout_seconds=1)
     backend.events.clear()
 
     stopped = stop_managed_processes(configuration.repository_root, backend=backend)
@@ -293,19 +288,29 @@ def test_missing_service_executable_fails_before_compose_or_process_mutation(
     tmp_path: Path,
 ) -> None:
     configuration = _configuration(tmp_path)
-    gateway = configuration.bundle.services[0].model_copy(
-        update={"argv": ("Z:\\captain-missing\\gateway.exe", "gateway")}
+    plan = _plan(configuration)
+    gateway = replace(
+        plan.services[0], argv=("Z:\\captain-missing\\gateway.exe", "gateway")
     )
-    changed_bundle = configuration.bundle.model_copy(
-        update={"services": (gateway, *configuration.bundle.services[1:])}
-    )
-    changed = replace(configuration, bundle=changed_bundle)
+    changed_plan = replace(plan, services=(gateway, *plan.services[1:]))
     backend = FakeBackend()
 
     with pytest.raises(DemoProcessError, match="service executable is unavailable"):
-        ManagedProcessSupervisor(changed, backend=backend).start_all(timeout_seconds=1)
+        ManagedProcessSupervisor(configuration, plan=changed_plan, backend=backend).start_all(timeout_seconds=1)
 
     assert not any(event.startswith("mutate:") for event in backend.events)
+
+
+def test_start_without_d11_process_plan_fails_before_any_backend_effect(
+    tmp_path: Path,
+) -> None:
+    configuration = _configuration(tmp_path)
+    backend = FakeBackend()
+
+    with pytest.raises(DemoConfigurationError, match="D11 operator process bootstrap is unavailable"):
+        ManagedProcessSupervisor(configuration, backend=backend).start_all(timeout_seconds=1)
+
+    assert backend.events == []
 
 
 def test_spawn_identity_is_persisted_before_health_and_reaped_on_timeout(
@@ -328,7 +333,7 @@ def test_spawn_identity_is_persisted_before_health_and_reaped_on_timeout(
     backend.health_callback = observe_state
 
     with pytest.raises(DemoProcessTimeout, match="authenticated health timed out"):
-        ManagedProcessSupervisor(configuration, backend=backend).start_all(
+        ManagedProcessSupervisor(configuration, plan=_plan(configuration), backend=backend).start_all(
             timeout_seconds=1
         )
 
@@ -351,7 +356,7 @@ def test_failed_spawn_cleanup_retains_identity_when_exact_process_cannot_be_reap
     backend.leave_process_alive = True
 
     with pytest.raises(DemoProcessError, match="orphaned managed process gateway"):
-        ManagedProcessSupervisor(configuration, backend=backend).start_all(
+        ManagedProcessSupervisor(configuration, plan=_plan(configuration), backend=backend).start_all(
             timeout_seconds=1
         )
 
