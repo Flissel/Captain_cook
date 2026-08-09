@@ -74,6 +74,20 @@ def test_init_is_atomic_redacted_idempotent_and_never_creates_provider_key(
     assert not list(private_env.parent.glob("*.tmp"))
 
 
+def test_init_reuses_existing_root_authority_without_copy_or_overlap(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    root_env = repository / ".env"
+    root_env.write_text("CAPTAIN_GATEWAY_TOKEN=operator-owned\n", encoding="utf-8")
+
+    private_env = initialize_private_environment(repository, reporter=lambda _: None)
+
+    assert root_env.read_text(encoding="utf-8") == "CAPTAIN_GATEWAY_TOKEN=operator-owned\n"
+    assert "CAPTAIN_GATEWAY_TOKEN=" not in private_env.read_text(encoding="utf-8")
+
+
 def test_missing_real_d11_loader_reports_exact_gap(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
 
