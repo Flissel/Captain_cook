@@ -42,3 +42,15 @@ Warnings were dependency/environment warnings only: a Starlette `httpx` deprecat
 - Effect replay remains immutable but still rejects terminal or expired authority.
 - Action requests and responses are stored separately so the request projection is never mutated; restart reads both typed records.
 - Every head-writing operation in this scope uses one `BEGIN IMMEDIATE` transaction and an expected-version/legal-state fence where it can create a new lifecycle version.
+
+## Spec re-review replay correction
+
+The re-review identified that an exact accepted effect replay was limited to the immediate `validating` head. A new behavior test accepts one effect, advances legally through `packaging`, `readback`, and `succeeded`, and requires the same canonical effect to replay at every later state.
+
+- RED: focused replay test failed at `packaging` with `CreationConflictError: assignment effect is not valid for the current building state` (`1 failed`).
+- GREEN authority regression: replay plus unclaimed, expired-first-accept, terminal-first-accept, and identity-drift cases passed (`4 passed`).
+- Fresh required four-file command: `50 passed in 4.79s`.
+- Fresh entire `minibook/tests`: `180 passed, 1 deselected, 1 warning in 6.52s`.
+- `python -m compileall -q minibook/swarm` and `git diff --check`: exit 0.
+
+The narrow correction checks the claim and exact assignment/effect binding first, then returns an already persisted byte-identical canonical effect regardless of later legal lifecycle advancement. A changed canonical body still conflicts. Only a first acceptance reaches the deadline, terminal-state, building-state, and checkpoint-version gates, so unclaimed, expired, terminal, or otherwise invalid new effects remain rejected.

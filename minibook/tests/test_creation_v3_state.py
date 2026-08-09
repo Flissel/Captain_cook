@@ -77,6 +77,21 @@ def prepare_assignment(store: CreationJobStore, creation_job: CreationJobV3) -> 
     return store.publish_build_assignment(assignment(creation_job))
 
 
+def successful_result(creation_job: CreationJobV3) -> CreationResultV2:
+    refs = [
+        {"uri": f"artifact://result/{index}/" + f"{index:x}" * 64, "sha256": f"{index:x}" * 64, "media_type": "application/zip" if index == 3 else "application/json"}
+        for index in range(1, 10)
+    ]
+    return CreationResultV2(
+        creation_job_id=creation_job.creation_job_id, factory_job_id=creation_job.factory_job_id,
+        correlation_id=creation_job.correlation_id, subject_version=creation_job.subject_version,
+        attempt=creation_job.attempt, status="succeeded", team_manifest_ref=refs[0],
+        candidate_manifest_ref=refs[1], source_archive_ref=refs[2], package_manifest_ref=refs[3],
+        hermes_usage_receipt_ref=refs[4], codex_build_receipt_ref=refs[5],
+        build_evidence_refs=[refs[6]], real_case_evidence_refs=[refs[7]], cas_readback_receipt_ref=refs[8],
+    )
+
+
 def test_assignment_claim_is_exactly_once_across_restart(tmp_path: Path) -> None:
     path = tmp_path / "creation.sqlite3"
     creation_job = job()
@@ -159,6 +174,27 @@ def test_effect_binding_is_replayed_and_identity_drift_is_rejected(tmp_path: Pat
         store.accept_build_effect(submitted.model_copy(update={"effect_key": "b" * 64}))
 
 
+def test_exact_effect_replay_survives_later_legal_lifecycle_advancement(tmp_path: Path) -> None:
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    creation_job = job()
+    published = prepare_assignment(store, creation_job)
+    store.claim_build_assignment(published.assignment_id, "worker-a")
+    submitted = effect(published)
+    store.accept_build_effect(submitted)
+    store.transition(creation_job.creation_job_id, "packaging", expected_version=5)
+    assert store.accept_build_effect(submitted) == submitted
+    store.transition(creation_job.creation_job_id, "readback", expected_version=6)
+    assert store.accept_build_effect(submitted) == submitted
+    store.finish(successful_result(creation_job), expected_version=7)
+    assert store.accept_build_effect(submitted) == submitted
+    with pytest.raises(CreationConflictError, match="drift"):
+        store.accept_build_effect(submitted.model_copy(update={"effect_key": "b" * 64}))
+    with pytest.raises(CreationConflictError, match="differs"):
+        store.accept_build_effect(
+            submitted.model_copy(update={"build_evidence_refs": submitted.test_evidence_refs})
+        )
+
+
 def test_v3_full_legal_lifecycle_reaches_success(tmp_path: Path) -> None:
     store = CreationJobStore(tmp_path / "creation.sqlite3")
     creation_job = job()
@@ -170,19 +206,7 @@ def test_v3_full_legal_lifecycle_reaches_success(tmp_path: Path) -> None:
     assert store.progress(creation_job.creation_job_id).status == "validating"
     store.transition(creation_job.creation_job_id, "packaging", expected_version=5)
     store.transition(creation_job.creation_job_id, "readback", expected_version=6)
-    refs = [
-        {"uri": f"artifact://result/{index}/" + f"{index:x}" * 64, "sha256": f"{index:x}" * 64, "media_type": "application/zip" if index == 3 else "application/json"}
-        for index in range(1, 10)
-    ]
-    result = CreationResultV2(
-        creation_job_id=creation_job.creation_job_id, factory_job_id=creation_job.factory_job_id,
-        correlation_id=creation_job.correlation_id, subject_version=creation_job.subject_version,
-        attempt=creation_job.attempt, status="succeeded", team_manifest_ref=refs[0],
-        candidate_manifest_ref=refs[1], source_archive_ref=refs[2], package_manifest_ref=refs[3],
-        hermes_usage_receipt_ref=refs[4], codex_build_receipt_ref=refs[5],
-        build_evidence_refs=[refs[6]], real_case_evidence_refs=[refs[7]], cas_readback_receipt_ref=refs[8],
-    )
-    store.finish(result, expected_version=7)
+    store.finish(successful_result(creation_job), expected_version=7)
     assert store.progress(creation_job.creation_job_id).status == "succeeded"
 
 

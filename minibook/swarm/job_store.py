@@ -415,21 +415,19 @@ class CreationJobStore:
             claim = db.execute("SELECT worker_id FROM creation_assignment_claims WHERE assignment_id=?", (str(effect.assignment_id),)).fetchone()
             if claim is None:
                 raise CreationConflictError("assignment must be claimed before accepting an effect")
+            existing = db.execute("SELECT payload FROM creation_build_effects WHERE assignment_id=?", (str(effect.assignment_id),)).fetchone()
+            if existing is not None:
+                if existing["payload"] != encoded:
+                    raise CreationConflictError("build effect already differs")
+                return FactoryBuildEffectV2.model_validate_json(existing["payload"])
             head = self._head(effect.creation_job_id, db)
             job = self._job(effect.creation_job_id, db)
             if head["status"] in self._TERMINAL:
                 raise CreationConflictError("creation job is already terminal")
             if datetime.now(timezone.utc) >= assignment.deadline_at:
                 raise CreationConflictError("assignment deadline expired")
-            existing = db.execute("SELECT payload FROM creation_build_effects WHERE assignment_id=?", (str(effect.assignment_id),)).fetchone()
-            if existing is not None and existing["payload"] == encoded and head["status"] == "validating":
-                return FactoryBuildEffectV2.model_validate_json(existing["payload"])
             if head["status"] != "building" or head["version"] != assignment.checkpoint_version + 2:
                 raise CreationConflictError("assignment effect is not valid for the current building state")
-            if existing is not None:
-                if existing["payload"] != encoded:
-                    raise CreationConflictError("build effect already differs")
-                return FactoryBuildEffectV2.model_validate_json(existing["payload"])
             db.execute("INSERT INTO creation_build_effects VALUES (?, ?, ?)", (str(effect.assignment_id), effect.effect_key, encoded))
             self._require_transition(job, head["status"], "validating")
             self._append_head(db, job_id=effect.creation_job_id, head=head, status="validating")
