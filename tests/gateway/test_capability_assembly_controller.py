@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from decimal import Decimal
+from threading import Barrier, RLock
 from uuid import UUID, uuid5
 
 import pytest
@@ -137,6 +139,7 @@ class _Repository:
     def __init__(self) -> None:
         self._records: dict[UUID, list[_Record]] = {}
         self._consumed_retry_authorizations: dict[UUID, bytes] = {}
+        self._lock = RLock()
 
     def history(self, assembly_id: UUID) -> tuple[_Record, ...]:
         return tuple(self._records.get(assembly_id, ()))
@@ -153,15 +156,16 @@ class _Repository:
         *,
         expected_revision: int,
     ) -> _Record:
-        records = self._records.setdefault(checkpoint.assembly_id, [])
-        current = 0 if not records else records[-1].checkpoint.revision
-        if current != expected_revision:
-            raise CapabilityAssemblyWriteConflict("stale assembly revision")
-        if checkpoint.revision != expected_revision + 1:
-            raise AssertionError("controller attempted a non-monotone append")
-        record = _record_for_checkpoint(checkpoint)
-        records.append(record)
-        return record
+        with self._lock:
+            records = self._records.setdefault(checkpoint.assembly_id, [])
+            current = 0 if not records else records[-1].checkpoint.revision
+            if current != expected_revision:
+                raise CapabilityAssemblyWriteConflict("stale assembly revision")
+            if checkpoint.revision != expected_revision + 1:
+                raise AssertionError("controller attempted a non-monotone append")
+            record = _record_for_checkpoint(checkpoint)
+            records.append(record)
+            return record
 
     def consume_retry_authorization_and_append(
         self,
@@ -170,13 +174,14 @@ class _Repository:
         *,
         expected_revision: int,
     ) -> _Record:
-        receipt_id = authorization.authorization_receipt_id
-        binding = canonical_assembly_model_bytes(authorization)
-        if receipt_id in self._consumed_retry_authorizations:
-            raise CapabilityAssemblyWriteConflict("retry authorization was already consumed")
-        record = self.append(checkpoint, expected_revision=expected_revision)
-        self._consumed_retry_authorizations[receipt_id] = binding
-        return record
+        with self._lock:
+            receipt_id = authorization.authorization_receipt_id
+            binding = canonical_assembly_model_bytes(authorization)
+            if receipt_id in self._consumed_retry_authorizations:
+                raise CapabilityAssemblyWriteConflict("retry authorization was already consumed")
+            record = self.append(checkpoint, expected_revision=expected_revision)
+            self._consumed_retry_authorizations[receipt_id] = binding
+            return record
 
 
 class _Admission:
@@ -401,12 +406,15 @@ class _Reconciliation:
 
 
 class _SharedReceiptReconciliation(_Reconciliation):
-    def __init__(self, receipt_id: UUID) -> None:
+    def __init__(self, receipt_id: UUID, *, barrier: Barrier | None = None) -> None:
         super().__init__()
         self.receipt_id = receipt_id
+        self.barrier = barrier
 
     async def reconcile(self, request: CapabilityAssemblyReconciliationRequest):
         self.calls.append(request)
+        if self.barrier is not None:
+            self.barrier.wait(timeout=10)
         authorization = CapabilityAssemblyNoEffectRetryAuthorization(
             assembly_id=request.assembly_id,
             operation_id=request.operation_id,
@@ -1104,7 +1112,7 @@ def test_retry_authorization_is_atomically_single_use_across_two_assemblies() ->
     first_assembly_id = ASSEMBLY_ID
     second_assembly_id = _id("second-assembly")
     receipt_id = _id("cross-assembly-single-use-authorization")
-    reconciliation = _SharedReceiptReconciliation(receipt_id)
+    reconciliation = _SharedReceiptReconciliation(receipt_id, barrier=Barrier(2))
     first, _, _, first_factory, *_ = _controller(
         repository,
         reconciliation=reconciliation,
@@ -1145,14 +1153,15 @@ def test_retry_authorization_is_atomically_single_use_across_two_assemblies() ->
     before_first = len(repository.history(first_assembly_id))
     before_second = len(repository.history(second_assembly_id))
 
-    async def race_reconciliation():
-        return await asyncio.gather(
-            first_restart.advance(first_request),
-            second_restart.advance(second_request),
-            return_exceptions=True,
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = (
+            pool.submit(lambda: asyncio.run(first_restart.advance(first_request))),
+            pool.submit(lambda: asyncio.run(second_restart.advance(second_request))),
         )
-
-    results = asyncio.run(race_reconciliation())
+        results = tuple(
+            future.exception(timeout=20) or future.result()
+            for future in futures
+        )
 
     conflicts = [result for result in results if isinstance(result, CapabilityAssemblyConflict)]
     assert len(conflicts) == 1
