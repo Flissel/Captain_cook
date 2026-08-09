@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol, cast
 from uuid import UUID
+from weakref import WeakSet
 
 from agenten.agent_factory.capability_live_runner import (
     CapabilityLiveCapabilityEvidence,
@@ -784,7 +785,78 @@ class CapabilityAssemblyCurrentFactoryAdapter(CurrentCapabilityFactoryAdapter):
             )
 
 
-def compose_capability_assembly_controller(
+_PRODUCTION_COMPOSITION_SEAL = object()
+_ISSUED_PRODUCTION_COMPOSITIONS: WeakSet[ProductionCapabilityAssemblyComposition]
+
+
+class ProductionCapabilityAssemblyComposition:
+    """Sealed attestation required by production route/readiness boundaries."""
+
+    __slots__ = (
+        "__controller", "__attestation_digest", "__executor_client",
+        "__executor_configuration_digest", "__seal", "__sealed", "__weakref__",
+    )
+
+    def __init__(self, *, controller: CapabilityAssemblyController,
+                 attestation_digest: str,
+                 executor_client: GatewayIsolatedBenchmarkExecutorClient,
+                 executor_configuration_digest: str, _seal: object) -> None:
+        if (_seal is not _PRODUCTION_COMPOSITION_SEAL
+                or type(controller) is not CapabilityAssemblyController
+                or type(executor_client) is not GatewayIsolatedBenchmarkExecutorClient
+                or re.fullmatch(r"[0-9a-f]{64}", attestation_digest) is None):
+            raise TypeError("production capability assembly composition is sealed")
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__controller", controller)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__attestation_digest", attestation_digest)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__executor_client", executor_client)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__executor_configuration_digest", executor_configuration_digest)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__seal", _seal)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_ProductionCapabilityAssemblyComposition__sealed", False):
+            raise AttributeError("production capability assembly composition is immutable")
+        object.__setattr__(self, name, value)
+
+    @property
+    def controller(self) -> CapabilityAssemblyController:
+        return self.__controller
+
+    @property
+    def attestation_digest(self) -> str:
+        return self.__attestation_digest
+
+    def is_sealed(self) -> bool:
+        try:
+            current_executor_digest = (
+                self.__executor_client.sealed_configuration_digest()
+            )
+        except Exception:
+            return False
+        return (
+            self.__seal is _PRODUCTION_COMPOSITION_SEAL
+            and self in _ISSUED_PRODUCTION_COMPOSITIONS
+            and type(self.__controller) is CapabilityAssemblyController
+            and re.fullmatch(r"[0-9a-f]{64}", self.__attestation_digest) is not None
+            and current_executor_digest == self.__executor_configuration_digest
+        )
+
+
+_ISSUED_PRODUCTION_COMPOSITIONS = WeakSet()
+
+
+def require_production_capability_assembly(
+    value: object,
+) -> CapabilityAssemblyController:
+    if (type(value) is not ProductionCapabilityAssemblyComposition
+            or not value.is_sealed()):
+        raise CapabilityAssemblyProductionConfigurationError(
+            "production capability assembly attestation is required"
+        )
+    return value.controller
+
+
+def _compose_nonproduction_capability_assembly_controller(
     *,
     repository: CapabilityAssemblyRepositoryPort,
     admission: CapabilityAssemblyInputAdmissionPort,
@@ -802,7 +874,7 @@ def compose_capability_assembly_controller(
     holdout_store: GenericPrivateHoldoutReader,
     clock: Callable[[], datetime],
 ) -> CapabilityAssemblyController:
-    """Join already configured Gateway-owned ports without performing effects."""
+    """Test-only low-level composition; it never carries production attestation."""
 
     _preflight_composition(
         repository=repository,
@@ -875,7 +947,7 @@ def build_capability_assembly_controller(
     authorities: CapabilityAssemblyProductionAuthorities,
     holdout_store: PrivateHoldoutStore,
     clock: Callable[[], datetime] | None = None,
-) -> CapabilityAssemblyController:
+) -> ProductionCapabilityAssemblyComposition:
     """Build the future route-ready production controller without live calls."""
 
     root = repository_root.resolve(strict=True)
@@ -926,7 +998,7 @@ def build_capability_assembly_controller(
         require_isolated_executor=True,
     )
     repository = GatewayCapabilityAssemblyRepository(authorities.store)
-    return compose_capability_assembly_controller(
+    controller = _compose_nonproduction_capability_assembly_controller(
         repository=repository,
         admission=admission,
         factory_composition=authorities.factory,
@@ -943,6 +1015,27 @@ def build_capability_assembly_controller(
         holdout_store=cast(GenericPrivateHoldoutReader, holdout_store),
         clock=selected_clock,
     )
+    executor_configuration_digest = (
+        authorities.benchmark_executor.sealed_configuration_digest()
+    )
+    attestation_payload = {
+        "schema": "captain.capability-assembly-production-attestation.v1",
+        "repository_revision": settings.expected_repository_revision,
+        "source_digests": sorted(settings.expected_sha256_by_path.items()),
+        "subject_version": settings.subject_version,
+        "benchmark_executor_configuration_digest": executor_configuration_digest,
+    }
+    attestation_digest = hashlib.sha256(json.dumps(
+        attestation_payload, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    composition = ProductionCapabilityAssemblyComposition(
+        controller=controller, attestation_digest=attestation_digest,
+        executor_client=authorities.benchmark_executor,
+        executor_configuration_digest=executor_configuration_digest,
+        _seal=_PRODUCTION_COMPOSITION_SEAL,
+    )
+    _ISSUED_PRODUCTION_COMPOSITIONS.add(composition)
+    return composition
 
 
 def _require_same_gateway_authority(
@@ -1039,9 +1132,13 @@ def _preflight_composition(
         raise CapabilityAssemblyProductionConfigurationError(
             "benchmark executor and evaluator authorities are not independent"
         )
-    if (require_isolated_executor
-            and (type(benchmark_executor) is not GatewayIsolatedBenchmarkExecutorClient
-                 or not benchmark_executor.uses_production_transport())):
+    isolated_executor_valid = False
+    if type(benchmark_executor) is GatewayIsolatedBenchmarkExecutorClient:
+        try:
+            isolated_executor_valid = benchmark_executor.uses_production_transport()
+        except Exception:
+            isolated_executor_valid = False
+    if require_isolated_executor and not isolated_executor_valid:
         raise CapabilityAssemblyProductionConfigurationError(
             "production benchmark executor must use the immutable Gateway HTTP process client"
         )
@@ -1312,7 +1409,8 @@ __all__ = [
     "CapabilityProjectionGatewayPort",
     "GatewayMinibookProjectionEffectsAdapter",
     "GenericGatewayMinibookCapabilityProjectionAdapter",
+    "ProductionCapabilityAssemblyComposition",
     "RepositoryFactoryInputArtifactStore",
     "build_capability_assembly_controller",
-    "compose_capability_assembly_controller",
+    "require_production_capability_assembly",
 ]

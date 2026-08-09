@@ -197,8 +197,9 @@ def test_isolated_executor_redacts_endpoint_failure() -> None:
 
 
 def test_production_http_binding_and_auth_configuration_are_immutable() -> None:
+    caller_secret = SecretStr("unit-test-runtime-token")
     transport = GatewayHttpBenchmarkProcessTransport(
-        bearer_token=SecretStr("unit-test-runtime-token")
+        bearer_token=caller_secret
     )
     client = GatewayIsolatedBenchmarkExecutorClient(
         gateway_store=object(), authority_id=_id("immutable-runtime"),
@@ -207,6 +208,12 @@ def test_production_http_binding_and_auth_configuration_are_immutable() -> None:
 
     assert client.uses_production_transport() is True
     assert "unit-test-runtime-token" not in repr(client)
+    original_digest = transport.configuration_digest()
+    object.__setattr__(caller_secret, "_secret_value", "caller-mutated-secret")
+    assert transport.configuration_digest() == original_digest
+    assert transport._authorization_header().endswith("runtime-token")
+    assert "caller-mutated-secret" not in transport._authorization_header()
+    assert "unit-test-runtime-token" not in repr(transport)
     with pytest.raises(AttributeError, match="immutable"):
         client._transport = _Transport()  # type: ignore[misc]
     with pytest.raises(AttributeError, match="immutable"):

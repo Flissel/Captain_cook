@@ -14,6 +14,7 @@ from uuid import UUID, uuid5
 
 import pytest
 from pydantic import SecretStr
+import gateway.capability_assembly_production as production_composition_module
 
 from agenten.agent_factory.capability_live_runner import (
     CapabilityLiveReservation,
@@ -50,9 +51,11 @@ from gateway.capability_assembly_production import (
     CapabilityAssemblyProductionConfigurationError,
     CapabilityAssemblyProductionSettings,
     GatewayMinibookProjectionEffectsAdapter,
+    ProductionCapabilityAssemblyComposition,
     RepositoryFactoryInputArtifactStore,
+    _compose_nonproduction_capability_assembly_controller,
     build_capability_assembly_controller,
-    compose_capability_assembly_controller,
+    require_production_capability_assembly,
     _release_projection_digest,
 )
 from gateway.capability_generic_benchmark import (
@@ -906,20 +909,55 @@ def test_production_builder_uses_gateway_repository_and_current_authority_adapte
     )
     authorities = _authorities(store=store)
 
-    controller = build_capability_assembly_controller(
+    composition = build_capability_assembly_controller(
         repository_root=tmp_path,
         settings=settings,
         authorities=authorities,
         holdout_store=InMemoryPrivateHoldoutStore(),
     )
 
-    assert isinstance(controller, CapabilityAssemblyController)
+    assert type(composition) is ProductionCapabilityAssemblyComposition
+    controller = require_production_capability_assembly(composition)
+    assert type(controller) is CapabilityAssemblyController
     assert isinstance(controller._repository, GatewayCapabilityAssemblyRepository)
     assert isinstance(controller._factory, CurrentCapabilityFactoryAdapter)
     assert isinstance(controller._resume, GatewayCapabilityResumeExecutionAdapter)
     assert len(store.storage.statements) == 3
     with pytest.raises(AttributeError, match="immutable"):
         authorities.benchmark_executor._transport = object()  # type: ignore[attr-defined]
+    with pytest.raises(
+        CapabilityAssemblyProductionConfigurationError, match="attestation"
+    ):
+        require_production_capability_assembly(controller)
+    with pytest.raises(TypeError, match="sealed"):
+        ProductionCapabilityAssemblyComposition(
+            controller=controller, attestation_digest="a" * 64,
+            executor_client=authorities.benchmark_executor,
+            executor_configuration_digest=(
+                authorities.benchmark_executor.sealed_configuration_digest()
+            ),
+            _seal=object(),
+        )
+    forged = ProductionCapabilityAssemblyComposition(
+        controller=controller, attestation_digest="f" * 64,
+        executor_client=authorities.benchmark_executor,
+        executor_configuration_digest=(
+            authorities.benchmark_executor.sealed_configuration_digest()
+        ),
+        _seal=production_composition_module._PRODUCTION_COMPOSITION_SEAL,
+    )
+    with pytest.raises(
+        CapabilityAssemblyProductionConfigurationError, match="attestation"
+    ):
+        require_production_capability_assembly(forged)
+    object.__setattr__(
+        authorities.benchmark_executor,
+        "_endpoint", "http://127.0.0.1:8765/v1/substituted",
+    )
+    with pytest.raises(
+        CapabilityAssemblyProductionConfigurationError, match="attestation"
+    ):
+        require_production_capability_assembly(composition)
 
 
 def test_low_level_composition_rejects_missing_authority_before_using_repository() -> None:
@@ -957,7 +995,7 @@ def test_low_level_composition_rejects_missing_authority_before_using_repository
         CapabilityAssemblyProductionConfigurationError,
         match="reconciliation",
     ):
-        compose_capability_assembly_controller(
+        _compose_nonproduction_capability_assembly_controller(
             repository=ExplodingRepository(),  # type: ignore[arg-type]
             admission=Admission(),  # type: ignore[arg-type]
             factory_composition=_factory_composition(),

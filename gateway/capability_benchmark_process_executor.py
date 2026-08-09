@@ -39,7 +39,10 @@ class _RejectBenchmarkRedirects(HTTPRedirectHandler):
 class GatewayHttpBenchmarkProcessTransport:
     """Concrete Gateway HTTP transport; all I/O occurs beyond serialization."""
 
-    __slots__ = ("_timeout_seconds", "_bearer_token", "_sealed")
+    __slots__ = (
+        "_timeout_seconds", "_bearer_token_value", "_configuration_digest",
+        "_sealed",
+    )
 
     def __init__(self, *, bearer_token: SecretStr,
                  timeout_seconds: float = 30.0) -> None:
@@ -50,7 +53,8 @@ class GatewayHttpBenchmarkProcessTransport:
         if len(token) < 16:
             raise ValueError("benchmark runtime bearer token is invalid")
         object.__setattr__(self, "_timeout_seconds", float(timeout_seconds))
-        object.__setattr__(self, "_bearer_token", bearer_token)
+        object.__setattr__(self, "_bearer_token_value", str(token))
+        object.__setattr__(self, "_configuration_digest", self._current_digest())
         object.__setattr__(self, "_sealed", True)
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -59,8 +63,13 @@ class GatewayHttpBenchmarkProcessTransport:
         object.__setattr__(self, name, value)
 
     def configuration_digest(self) -> str:
+        if self._configuration_digest != self._current_digest():
+            raise ValueError("benchmark HTTP transport configuration changed")
+        return self._configuration_digest
+
+    def _current_digest(self) -> str:
         token_digest = hashlib.sha256(
-            self._bearer_token.get_secret_value().encode()
+            self._bearer_token_value.encode()
         ).hexdigest()
         return hashlib.sha256(json.dumps({
             "transport": type(self).__name__,
@@ -69,6 +78,7 @@ class GatewayHttpBenchmarkProcessTransport:
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     async def post(self, endpoint: str, body: bytes) -> bytes:
+        self.configuration_digest()
         return await asyncio.to_thread(self._post_sync, endpoint, body)
 
     def _post_sync(self, endpoint: str, body: bytes) -> bytes:
@@ -76,7 +86,7 @@ class GatewayHttpBenchmarkProcessTransport:
             endpoint, data=body, method="POST",
             headers={
                 "Content-Type": "application/json", "Accept": "application/json",
-                "Authorization": "Bearer " + self._bearer_token.get_secret_value(),
+                "Authorization": self._authorization_header(),
             },
         )
         opener = build_opener(_RejectBenchmarkRedirects())
@@ -85,6 +95,16 @@ class GatewayHttpBenchmarkProcessTransport:
         if len(value) > 4 * 1024 * 1024:
             raise ValueError("benchmark runtime response is too large")
         return value
+
+    def _authorization_header(self) -> str:
+        self.configuration_digest()
+        return "Bearer " + self._bearer_token_value
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(timeout_seconds={self._timeout_seconds!r}, "
+            "bearer_token=<redacted>)"
+        )
 
 
 class GatewayIsolatedBenchmarkExecutorClient:
@@ -133,6 +153,11 @@ class GatewayIsolatedBenchmarkExecutorClient:
             and self._configuration_digest == self._binding_digest()
         )
 
+    def sealed_configuration_digest(self) -> str:
+        if not self.uses_production_transport():
+            raise ValueError("isolated benchmark configuration is not sealed")
+        return self._configuration_digest
+
     def _binding_digest(self) -> str:
         transport_digest = (
             self._transport.configuration_digest()
@@ -155,6 +180,10 @@ class GatewayIsolatedBenchmarkExecutorClient:
     async def execute(
         self, request: GenericBenchmarkExecutionRequest,
     ) -> GenericBenchmarkExecutionEvidence:
+        if self._configuration_digest != self._binding_digest():
+            raise CapabilityLiveAuthorityUnavailable(
+                "isolated benchmark client configuration changed"
+            )
         expected_digest = generic_execution_request_digest(
             job_id=request.job_id, capability_id=request.capability_id,
             input_ref=request.input_ref, case_ref=request.case_ref,
