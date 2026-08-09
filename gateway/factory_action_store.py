@@ -39,6 +39,7 @@ class FactoryActionRow:
 
     request: FactoryActionRequestV1
     tenant_id: str
+    created_at: datetime | None = None
     status: ActionStatus = "pending"
     response: FactoryActionResponseV1 | None = None
     response_sha256: str | None = None
@@ -133,18 +134,25 @@ class FactoryActionStore:
         now: datetime,
     ) -> FactoryActionResponseV1:
         now_utc = _aware_utc(now)
+        answered_at = _exact_utc(response.answered_at, field="answered_at")
+        if answered_at > now_utc:
+            raise ValueError("factory action answered_at is in the future")
         canonical = _canonical(response)
         outcome: FactoryActionResponseV1 | None = None
         error: Exception | None = None
         with self._repository.locked(response.request_id, tenant_id=tenant_id) as row:
             if row is None:
                 error = LookupError("factory action not found")
+            elif answered_at > row.request.deadline_at:
+                raise ValueError("factory action answered_at is after request deadline")
+            elif row.created_at is not None and answered_at < row.created_at:
+                raise ValueError("factory action answered_at is before request created_at")
             elif row.status in {"answered", "consumed"}:
                 if row.response is not None and _canonical(row.response) == canonical:
                     outcome = row.response
                 else:
                     error = ValueError("conflicting action response")
-            elif row.status == "expired" or row.request.deadline_at <= now_utc:
+            elif row.status == "expired" or row.request.deadline_at < now_utc:
                 row.status = "expired"
                 error = TimeoutError("factory action expired")
             elif response.expected_subject_version != row.request.expected_subject_version:
@@ -702,6 +710,7 @@ def _db_row(row: dict[str, object]) -> FactoryActionRow:
     result = FactoryActionRow(
         request=request,
         tenant_id=str(row["tenant_id"]),
+        created_at=_optional_aware(row.get("created_at")),
         status=status,  # type: ignore[arg-type]
         response=response,
         response_sha256=(None if row.get("response_sha256") is None else str(row["response_sha256"])),
@@ -918,6 +927,12 @@ def _json_bytes(value: object) -> bytes:
 def _aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _exact_utc(value: datetime, *, field: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+        raise ValueError(f"factory action {field} must be timezone-aware UTC")
     return value.astimezone(timezone.utc)
 
 

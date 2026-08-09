@@ -155,6 +155,7 @@ class FakePortalGatewayStore:
             (fixture_root / "factory_action_request.v1.json").read_text(encoding="utf-8")
         )
         self.factory_answer: FactoryActionResponseV1 | None = None
+        self.factory_answer_calls = 0
 
     def provision_portal_tenant(self, binding):
         if binding.job_id != JOB_ID:
@@ -215,6 +216,7 @@ class FakePortalGatewayStore:
         return self.factory_action
 
     def answer_portal_factory_action(self, *, request_id, principal, response, now):
+        self.factory_answer_calls += 1
         self.portal_factory_action(request_id=request_id, principal=principal, now=now)
         self.factory_answer = response
         return response
@@ -299,7 +301,9 @@ def client_for(
     application = create_app(
         gateway_store=store,
         mirror=NullMirror(),
-        settings=settings(),
+        settings=settings().model_copy(
+            update={"factory_action_inbox_enabled": action_resume_enabled}
+        ),
         portal_clock=lambda: NOW,
         factory_action_resume_dispatcher=configured_dispatcher,
     )
@@ -378,6 +382,31 @@ def test_answer_fails_closed_before_persisting_when_action_resume_is_disabled() 
 
     assert answered.status_code == 503
     assert store.factory_answer is None
+    assert store.factory_answer_calls == 0
+
+
+def test_disabled_action_inbox_fences_injected_dispatcher_before_body_admission() -> None:
+    store = FakePortalGatewayStore()
+    dispatcher = RecordingResumeDispatcher()
+    principal = PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+
+    with client_for(
+        principal,
+        store,
+        resume_dispatcher=dispatcher,
+        action_resume_enabled=False,
+    ) as client:
+        answered = client.post(
+            f"/v1/portal/factory-actions/{store.factory_action.request_id}/responses",
+            headers={**auth(), "Content-Type": "application/json"},
+            content=b"this body must never be parsed",
+        )
+
+    assert answered.status_code == 503
+    assert answered.json() == {"detail": "factory action resume capability is disabled"}
+    assert store.factory_answer is None
+    assert store.factory_answer_calls == 0
+    assert dispatcher.enqueued == []
 
 
 def test_enabled_action_inbox_rejects_partial_default_composition() -> None:

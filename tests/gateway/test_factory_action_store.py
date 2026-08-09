@@ -45,6 +45,7 @@ def action_response(
     key: str = "c" * 64,
     scope: str | None = None,
     credential_ref: str | None = "credential://tenant-a/n8n-crm-read",
+    answered_at: datetime = NOW,
 ) -> FactoryActionResponseV1:
     return FactoryActionResponseV1(
         request_id=request.request_id,
@@ -53,7 +54,7 @@ def action_response(
         approved_scope=scope or request.required_scope,
         credential_ref=credential_ref,
         answer_metadata={"credential_alias": "n8n-crm-read"},
-        answered_at=NOW,
+        answered_at=answered_at,
         idempotency_key=key,
     )
 
@@ -79,8 +80,10 @@ class TransactionalMemoryActionRepository:
 
     def __init__(self) -> None:
         self.rows: dict[str, FactoryActionRow] = {}
+        self.locked_writes = 0
 
     def create(self, row: FactoryActionRow) -> FactoryActionRow | None:
+        row.created_at = NOW - timedelta(hours=1)
         return self.rows.setdefault(str(row.request.request_id), row)
 
     def list_rows(self, *, tenant_id: str, status: str) -> tuple[FactoryActionRow, ...]:
@@ -96,6 +99,7 @@ class TransactionalMemoryActionRepository:
     def locked(self, request_id, *, tenant_id: str):
         row = self.rows.get(str(request_id))
         yield row if row is not None and row.tenant_id == tenant_id else None
+        self.locked_writes += 1
 
     def expire(self, *, tenant_id: str, now: datetime, request_id=None) -> None:
         for row in self.rows.values():
@@ -259,6 +263,65 @@ def test_deterministic_repository_covers_stale_scope_and_expiry(
     )
     store.create(expired, tenant_id="tenant-a")
     assert store.get(expired.request_id, tenant_id="tenant-a", now=NOW).status == "expired"
+
+
+@pytest.mark.parametrize(
+    ("answered_at", "server_now", "message"),
+    [
+        (NOW + timedelta(microseconds=1), NOW, "future"),
+        (
+            pending_request().deadline_at + timedelta(microseconds=1),
+            pending_request().deadline_at + timedelta(seconds=1),
+            "deadline",
+        ),
+        (NOW - timedelta(hours=1, microseconds=1), NOW, "created"),
+        (NOW.replace(tzinfo=None), NOW, "UTC"),
+        (NOW.astimezone(timezone(timedelta(hours=2))), NOW, "UTC"),
+    ],
+)
+def test_answer_rejects_invalid_timestamp_without_a_durable_write(
+    memory_repository: TransactionalMemoryActionRepository,
+    answered_at: datetime,
+    server_now: datetime,
+    message: str,
+) -> None:
+    request = pending_request()
+    store = FactoryActionStore(repository=memory_repository)
+    store.create(request, tenant_id="tenant-a")
+    writes_before = memory_repository.locked_writes
+
+    with pytest.raises(ValueError, match=message):
+        store.answer(
+            action_response(request).model_copy(update={"answered_at": answered_at}),
+            tenant_id="tenant-a",
+            now=server_now,
+        )
+
+    assert memory_repository.locked_writes == writes_before
+    restarted = FactoryActionStore(repository=memory_repository)
+    assert restarted.list(tenant_id="tenant-a", status="pending", now=NOW) == (request,)
+
+
+@pytest.mark.parametrize(
+    ("answered_at", "server_now", "created_at"),
+    [
+        (NOW, NOW, NOW),
+        (pending_request().deadline_at, pending_request().deadline_at, NOW),
+    ],
+)
+def test_answer_accepts_exact_timestamp_boundaries(
+    memory_repository: TransactionalMemoryActionRepository,
+    answered_at: datetime,
+    server_now: datetime,
+    created_at: datetime,
+) -> None:
+    request = pending_request()
+    store = FactoryActionStore(repository=memory_repository)
+    store.create(request, tenant_id="tenant-a")
+    memory_repository.rows[str(request.request_id)].created_at = created_at
+    response = action_response(request, answered_at=answered_at)
+
+    assert store.answer(response, tenant_id="tenant-a", now=server_now) == response
 
 
 @pytest.mark.parametrize(

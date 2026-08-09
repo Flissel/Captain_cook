@@ -422,6 +422,8 @@ def create_app(
 
     def get_factory_action_resume_dispatcher() -> FactoryActionResumeDispatcher | None:
         nonlocal owned_resume_service
+        if not load_gateway_settings(app).factory_action_inbox_enabled:
+            return None
         if factory_action_resume_dispatcher is not None:
             return factory_action_resume_dispatcher
         if factory_action_projection is None or factory_continuation_scheduler is None:
@@ -765,7 +767,7 @@ def create_app(
     @app.post("/v1/portal/factory-actions/{request_id}/responses")
     async def answer_portal_factory_action(
         request_id: UUID,
-        response: FactoryActionResponseV1,
+        request: Request,
         principal: PortalPrincipalV1 = Depends(require_portal_principal),
     ) -> FactoryActionResponseV1:
         try:
@@ -775,6 +777,13 @@ def create_app(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="factory action resume capability is disabled",
                 )
+            try:
+                response = FactoryActionResponseV1.model_validate(await request.json())
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="invalid portal request",
+                ) from None
             answered = get_store().answer_portal_factory_action(
                 request_id=request_id,
                 principal=principal,
