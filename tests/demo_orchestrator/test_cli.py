@@ -10,7 +10,7 @@ import pytest
 
 from agenten.demo_orchestrator.cli import main
 from agenten.demo_orchestrator.client import DemoTimeout
-from agenten.demo_orchestrator.processes import DemoProcessTimeout
+from agenten.demo_orchestrator.processes import DemoProcessError, DemoProcessTimeout
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -141,6 +141,26 @@ def test_cli_preserves_service_health_timeout_exit_124(tmp_path: Path) -> None:
     )
 
     assert exit_code == 124
+
+
+def test_cli_stop_failure_never_prints_stopped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class FailedStopActions(FakeActions):
+        def stop(self) -> dict[str, object]:
+            raise DemoProcessError(
+                "managed process termination could not be verified"
+            )
+
+    exit_code = main(
+        ["stop", "--repository-root", str(tmp_path)],
+        actions_factory=lambda _: FailedStopActions(),
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "stopped" not in captured.out
+    assert "termination could not be verified" in captured.err
 
 
 def test_powershell_wrapper_init_creates_only_gitignored_private_environment(
