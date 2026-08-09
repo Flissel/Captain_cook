@@ -4,7 +4,7 @@
 
 **Goal:** Provide one reproducible, resumable operator lifecycle for the three canonical Captain capability inputs without caller-invented patterns, provider receipts, or live-success claims.
 
-**Architecture:** A new Python package owns immutable bundle/env preflight, managed process identity, and the Captain HTTP lifecycle. A thin PowerShell wrapper exposes `init`, `start`, `status`, `run`, `resume`, and `stop`; every paid transition requires an explicit switch and a total ceiling no greater than USD 6.00. D10/D11 remain independent producers of the private benchmark catalog and sealed process bundle, so missing inputs fail before Docker, process, HTTP, or provider effects.
+**Architecture:** A new Python package consumes D10's private catalog and D11's production-bundle manifest without defining either producer contract. A thin PowerShell wrapper exposes `init`, `start`, `status`, `run`, `resume`, and `stop`; every paid transition requires an explicit switch and a total ceiling no greater than USD 6.00. Missing D11 process control or Minibook assembly readback fails before Docker, process, HTTP, or provider effects.
 
 **Tech Stack:** Python 3.11, Pydantic 2, httpx, PowerShell 7, pytest, Windows process/listener inspection.
 
@@ -28,8 +28,8 @@
 - Create: `tests/demo_orchestrator/test_configuration.py`
 
 **Interfaces:**
-- Produces `DemoBundleV1`, `DemoServiceV1`, `DemoConfiguration`, `initialize_private_environment(...)`, and `load_demo_configuration(...)`.
-- The sealed bundle contains the exact service order `gateway`, `provider_proxy`, `runtime`, `benchmark`, health URLs, listener ports, argv arrays, env allowlists, Compose inputs, canonical input digests, and Minibook evidence readback URL.
+- Produces `DemoConfiguration`, `initialize_private_environment(...)`, and `load_demo_configuration(...)` over D11's real `CapabilityProductionBundleManifestV1`.
+- No D12-owned production topology exists. An internal injected process plan is test-only until D11 exports real operator process commands.
 
 - [x] Write failing tests proving init is atomic, preserves an existing private environment, never creates an OpenAI key, and emits only redacted output.
 - [x] Run `python -m pytest -q --no-cov tests/demo_orchestrator/test_configuration.py` and confirm the missing package failure.
@@ -99,10 +99,10 @@
 
 ## Verification evidence
 
-- Focused D12 and adjacent Assembly/Provider/Runtime gate: `256 passed`.
+- Focused D12 gate after Round 1: see the final branch verification output.
 - Architecture, import-boundary, and workstream-doc gate: `18 passed`.
 - `python -m compileall -q agenten gateway scripts`: exit `0`.
 - `scripts/verify_submission.py`: `Submission evidence check passed.`
 - `git diff --check`: exit `0`.
 - High-confidence credential-pattern scan over the branch diff: `0` candidates.
-- No live Docker, provider, database, n8n, Gateway, Runtime, benchmark, or Minibook action was executed. D10 catalog and D11 sealed bundle remain required external prerequisites for an operator live run.
+- No live Docker, provider, database, n8n, Gateway, Runtime, benchmark, or Minibook action was executed. D11 operator process bootstrap/restart and exact Minibook assembly-evidence readback remain explicit blockers.

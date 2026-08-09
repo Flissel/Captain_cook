@@ -160,9 +160,10 @@ def initialize_private_environment(
     private_env = repository / PRIVATE_ENV_RELATIVE
     private_env.parent.mkdir(parents=True, exist_ok=True)
     existing = _read_env(private_env) if private_env.exists() else {}
+    root = _read_env(repository / ".env")
     updated = dict(existing)
     for name in GENERATED_SECRET_NAMES:
-        if not updated.get(name, "").strip():
+        if not updated.get(name, "").strip() and not root.get(name, "").strip():
             updated[name] = secrets.token_urlsafe(32)
     if updated != existing:
         _atomic_write_env(private_env, updated)
