@@ -1,0 +1,415 @@
+"""Typed, redacted contracts for the server-side capability assembly facade.
+
+The contracts carry caller-selected identities and authority receipts only.
+They never mint a provider, Gateway, Runtime, or Minibook receipt.
+"""
+
+from __future__ import annotations
+
+import re
+from decimal import Decimal, InvalidOperation
+from enum import Enum
+from pathlib import PurePosixPath
+from typing import Literal, Protocol
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from agenten.agent_factory.capability_live_runner import (
+    CAPABILITY_LIVE_STAGES,
+    CapabilityLiveCapabilityEvidence,
+    CapabilityLiveInput,
+    CapabilityLiveReservation,
+    CapabilityLiveStage,
+)
+from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN, SHA256_PATTERN
+from gateway.capability_live_pipeline import (
+    CapabilityBusinessBenchmarkAuthority,
+    CapabilityExecutionAuthority,
+    CapabilityFactoryAuthority,
+    CapabilityProjectionAuthority,
+    CapabilityResumeAuthorization,
+)
+
+
+class CapabilityAssemblyStatus(str, Enum):
+    ADMITTED = "admitted"
+    ADVANCING = "advancing"
+    READY_TO_USE = "ready_to_use"
+
+
+class CapabilityAssemblySliceKind(str, Enum):
+    SCAFFOLD_AND_TEST_HARNESS = "scaffold_and_test_harness"
+    CODEX_IMPLEMENTATION = "codex_implementation"
+    SEAL = "seal"
+    EVALUATE = "evaluate"
+    PROMOTE = "promote"
+    EXECUTE = "execute"
+    PROJECT = "project"
+    RESUME_AUTHORIZE = "resume_authorize"
+    RESUME_DISPATCH = "resume_dispatch"
+    RESUME_READBACK = "resume_readback"
+
+
+ASSEMBLY_INPUT_STAGES = tuple(CapabilityLiveStage)
+ASSEMBLY_TOTAL_SLICES = len(ASSEMBLY_INPUT_STAGES) * 3 + 3
+
+
+class CapabilityAssemblyWriteConflict(RuntimeError):
+    """The sole-writer repository rejected a stale or conflicting append."""
+
+
+class _FrozenContract(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+        strict=True,
+    )
+
+
+class CapabilityAssemblyInputRequest(_FrozenContract):
+    """One caller-bound repository path and its immutable run authority."""
+
+    input_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    repository_path: str = Field(min_length=1, max_length=512)
+    conversation_pattern: Literal["sequential", "selector_group_chat", "swarm"]
+    correlation_id: UUID
+    reservation: CapabilityLiveReservation
+
+    @field_validator("repository_path")
+    @classmethod
+    def require_repository_relative_input(cls, value: str) -> str:
+        if "\\" in value or re.match(r"^[A-Za-z]:", value):
+            raise ValueError("repository-relative TO_BE_BUILT.md path is required")
+        path = PurePosixPath(value)
+        if path.is_absolute() or path.name != "TO_BE_BUILT.md":
+            raise ValueError("repository-relative TO_BE_BUILT.md path is required")
+        if any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError("repository-relative TO_BE_BUILT.md path is required")
+        return path.as_posix()
+
+    @model_validator(mode="after")
+    def require_reservation_binding(self) -> "CapabilityAssemblyInputRequest":
+        if self.reservation.input_id != self.input_id:
+            raise ValueError("input reservation changed the input identity")
+        return self
+
+
+class CapabilityAssemblySubmitRequest(_FrozenContract):
+    schema_name: Literal["captain.capability-assembly-submit.v1"] = Field(
+        default="captain.capability-assembly-submit.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    assembly_id: UUID
+    idempotency_key: str = Field(pattern=SHA256_PATTERN)
+    maximum_cost_usd: Decimal
+    inputs: tuple[CapabilityAssemblyInputRequest, ...] = Field(
+        min_length=3,
+        max_length=3,
+    )
+
+    @field_validator("maximum_cost_usd", mode="before")
+    @classmethod
+    def require_positive_cost(cls, value: object) -> Decimal:
+        return _positive_decimal(value, "maximum_cost_usd")
+
+    @model_validator(mode="after")
+    def require_exact_three_input_envelope(self) -> "CapabilityAssemblySubmitRequest":
+        if tuple(item.conversation_pattern for item in self.inputs) != (
+            "sequential",
+            "selector_group_chat",
+            "swarm",
+        ):
+            raise ValueError("assembly requires the three distinct conversation patterns")
+        if len({item.input_id for item in self.inputs}) != 3:
+            raise ValueError("assembly requires three distinct input IDs")
+        if len({item.repository_path for item in self.inputs}) != 3:
+            raise ValueError("assembly requires three distinct repository inputs")
+        if len({item.correlation_id for item in self.inputs}) != 3:
+            raise ValueError("assembly requires three distinct correlations")
+        if len({item.reservation.reservation_id for item in self.inputs}) != 3:
+            raise ValueError("assembly requires three distinct reservations")
+        if any(item.reservation.run_id != self.assembly_id for item in self.inputs):
+            raise ValueError("input reservation changed the assembly identity")
+        reserved = sum(
+            (item.reservation.maximum_cost_usd for item in self.inputs),
+            Decimal("0"),
+        )
+        if reserved != self.maximum_cost_usd:
+            raise ValueError("three reservations must equal the assembly cost ceiling")
+        return self
+
+
+class CapabilityAssemblyAdmittedInput(_FrozenContract):
+    """Read-only admission result for exact repository-owned source bytes."""
+
+    repository_path: str = Field(min_length=1, max_length=512)
+    input: CapabilityLiveInput
+
+    @field_validator("repository_path")
+    @classmethod
+    def require_canonical_path(cls, value: str) -> str:
+        return CapabilityAssemblyInputRequest.require_repository_relative_input(value)
+
+
+class CapabilityAssemblyItemState(_FrozenContract):
+    request: CapabilityAssemblyInputRequest
+    admitted: CapabilityAssemblyAdmittedInput
+    completed_stages: tuple[CapabilityLiveStage, ...] = ()
+    stage_authority: CapabilityFactoryAuthority | None = None
+    benchmark_authority: CapabilityBusinessBenchmarkAuthority | None = None
+    release_authority: CapabilityFactoryAuthority | None = None
+    execution_authority: CapabilityExecutionAuthority | None = None
+    projection_authority: CapabilityProjectionAuthority | None = None
+    capability_evidence: CapabilityLiveCapabilityEvidence | None = None
+
+    @model_validator(mode="after")
+    def require_monotone_stage_prefix(self) -> "CapabilityAssemblyItemState":
+        expected = ASSEMBLY_INPUT_STAGES[: len(self.completed_stages)]
+        if self.completed_stages != expected:
+            raise ValueError("assembly item stages must form a monotone prefix")
+        count = len(self.completed_stages)
+        if count >= 1 and self.stage_authority is None:
+            raise ValueError("Factory stage authority is unavailable")
+        if count >= 4 and self.benchmark_authority is None:
+            raise ValueError("benchmark authority is unavailable")
+        if count >= 5 and self.release_authority is None:
+            raise ValueError("release authority is unavailable")
+        if count >= 6 and self.execution_authority is None:
+            raise ValueError("execution authority is unavailable")
+        if count >= 7 and (
+            self.projection_authority is None or self.capability_evidence is None
+        ):
+            raise ValueError("projection authority is unavailable")
+        return self
+
+
+class CapabilityAssemblySlice(_FrozenContract):
+    ordinal: int = Field(ge=0, lt=ASSEMBLY_TOTAL_SLICES, strict=True)
+    kind: CapabilityAssemblySliceKind
+    input_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
+
+
+class CapabilityAssemblyActiveAdvance(_FrozenContract):
+    operation_id: UUID
+    request_sha256: str = Field(pattern=SHA256_PATTERN)
+    maximum_slices: int = Field(ge=1, le=8, strict=True)
+    start_completed_slices: int = Field(ge=0, le=ASSEMBLY_TOTAL_SLICES, strict=True)
+    target_completed_slices: int = Field(ge=0, le=ASSEMBLY_TOTAL_SLICES, strict=True)
+
+    @model_validator(mode="after")
+    def require_bounded_target(self) -> "CapabilityAssemblyActiveAdvance":
+        if not (
+            self.start_completed_slices
+            <= self.target_completed_slices
+            <= self.start_completed_slices + self.maximum_slices
+        ):
+            raise ValueError("advance target exceeds its bounded slice request")
+        return self
+
+
+class CapabilityAssemblyAdvanceReceipt(_FrozenContract):
+    schema_name: Literal["captain.capability-assembly-advance-receipt.v1"] = Field(
+        default="captain.capability-assembly-advance-receipt.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    assembly_id: UUID
+    operation_id: UUID
+    request_sha256: str = Field(pattern=SHA256_PATTERN)
+    maximum_slices: int = Field(ge=1, le=8, strict=True)
+    start_completed_slices: int = Field(ge=0, le=ASSEMBLY_TOTAL_SLICES, strict=True)
+    end_completed_slices: int = Field(ge=0, le=ASSEMBLY_TOTAL_SLICES, strict=True)
+    executed_slices: int = Field(ge=0, le=8, strict=True)
+    status: CapabilityAssemblyStatus
+
+    @model_validator(mode="after")
+    def require_exact_delta(self) -> "CapabilityAssemblyAdvanceReceipt":
+        if self.end_completed_slices - self.start_completed_slices != self.executed_slices:
+            raise ValueError("advance receipt slice delta is invalid")
+        if self.executed_slices > self.maximum_slices:
+            raise ValueError("advance receipt exceeded its slice bound")
+        return self
+
+
+class CapabilityAssemblyCheckpoint(_FrozenContract):
+    schema_name: Literal["captain.capability-assembly-checkpoint.v1"] = Field(
+        default="captain.capability-assembly-checkpoint.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    assembly_id: UUID
+    request: CapabilityAssemblySubmitRequest
+    request_sha256: str = Field(pattern=SHA256_PATTERN)
+    revision: int = Field(ge=1, strict=True)
+    status: CapabilityAssemblyStatus
+    completed_slices: int = Field(ge=0, le=ASSEMBLY_TOTAL_SLICES, strict=True)
+    items: tuple[CapabilityAssemblyItemState, ...] = Field(min_length=3, max_length=3)
+    active_advance: CapabilityAssemblyActiveAdvance | None = None
+    advance_receipts: tuple[CapabilityAssemblyAdvanceReceipt, ...] = ()
+    resume_authorization: CapabilityResumeAuthorization | None = None
+    resume_dispatch: CapabilityExecutionAuthority | None = None
+    resume_readback: CapabilityExecutionAuthority | None = None
+    last_slice: CapabilityAssemblySlice | None = None
+    started_slice: CapabilityAssemblySlice | None = None
+
+    @property
+    def idempotency_key(self) -> str:
+        return self.request.idempotency_key
+
+    @property
+    def inputs(self) -> tuple[CapabilityAssemblyAdmittedInput, ...]:
+        return tuple(item.admitted for item in self.items)
+
+    @model_validator(mode="after")
+    def require_internal_binding(self) -> "CapabilityAssemblyCheckpoint":
+        if self.request.assembly_id != self.assembly_id:
+            raise ValueError("checkpoint changed the assembly identity")
+        if tuple(item.request for item in self.items) != self.request.inputs:
+            raise ValueError("checkpoint changed the submitted inputs")
+        resume_count = 0
+        if self.resume_authorization is not None:
+            resume_count = 1
+        if self.resume_dispatch is not None:
+            if self.resume_authorization is None:
+                raise ValueError("resume dispatch lacks authorization")
+            resume_count = 2
+        if self.resume_readback is not None:
+            if self.resume_dispatch is None:
+                raise ValueError("resume read-back lacks dispatch")
+            resume_count = 3
+        observed_slices = sum(len(item.completed_stages) for item in self.items) + resume_count
+        if observed_slices != self.completed_slices:
+            raise ValueError("checkpoint slice count does not match authority progress")
+        if self.active_advance is not None and not (
+            self.active_advance.start_completed_slices
+            <= self.completed_slices
+            <= self.active_advance.target_completed_slices
+        ):
+            raise ValueError("checkpoint progress escaped its active advance bound")
+        if self.started_slice is not None:
+            if (
+                self.active_advance is None
+                or self.completed_slices >= self.active_advance.target_completed_slices
+                or self.started_slice.ordinal != self.completed_slices
+            ):
+                raise ValueError("started slice escaped its active advance bound")
+        if len({receipt.operation_id for receipt in self.advance_receipts}) != len(
+            self.advance_receipts
+        ):
+            raise ValueError("checkpoint contains duplicate advance receipts")
+        if any(
+            receipt.assembly_id != self.assembly_id
+            or receipt.request_sha256 != self.request_sha256
+            for receipt in self.advance_receipts
+        ):
+            raise ValueError("advance receipt changed assembly authority")
+        if self.status is CapabilityAssemblyStatus.READY_TO_USE:
+            if self.completed_slices != ASSEMBLY_TOTAL_SLICES:
+                raise ValueError("ready assembly has incomplete slices")
+            if self.resume_readback is None:
+                raise ValueError("ready assembly lacks resume read-back")
+        elif self.completed_slices == ASSEMBLY_TOTAL_SLICES:
+            raise ValueError("complete assembly must be ready_to_use")
+        return self
+
+
+class CapabilityAssemblyAdvanceRequest(_FrozenContract):
+    schema_name: Literal["captain.capability-assembly-advance.v1"] = Field(
+        default="captain.capability-assembly-advance.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    assembly_id: UUID
+    operation_id: UUID
+    request_sha256: str = Field(pattern=SHA256_PATTERN)
+    maximum_slices: int = Field(ge=1, le=8, strict=True)
+
+
+class CapabilityAssemblyInputAdmissionPort(Protocol):
+    """Read exact repository bytes and return their content-addressed input."""
+
+    def admit(
+        self,
+        request: CapabilityAssemblyInputRequest,
+    ) -> CapabilityAssemblyAdmittedInput: ...
+
+
+class CapabilityAssemblyRecordPort(Protocol):
+    checkpoint: CapabilityAssemblyCheckpoint
+    artifact_ref: ArtifactRef
+
+
+class CapabilityAssemblyRepositoryPort(Protocol):
+    """Append-only, atomic sole-writer persistence for assembly checkpoints."""
+
+    def history(self, assembly_id: UUID) -> tuple[CapabilityAssemblyRecordPort, ...]: ...
+
+    def find_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> CapabilityAssemblyRecordPort | None: ...
+
+    def append(
+        self,
+        checkpoint: CapabilityAssemblyCheckpoint,
+        *,
+        expected_revision: int,
+    ) -> CapabilityAssemblyRecordPort: ...
+
+
+def canonical_assembly_model_bytes(value: BaseModel) -> bytes:
+    import json
+
+    return (
+        json.dumps(
+            value.model_dump(mode="json", by_alias=True),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def assembly_request_sha256(request: CapabilityAssemblySubmitRequest) -> str:
+    import hashlib
+
+    return hashlib.sha256(canonical_assembly_model_bytes(request)).hexdigest()
+
+
+def _positive_decimal(value: object, label: str) -> Decimal:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a finite decimal")
+    try:
+        parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"{label} must be a finite decimal") from None
+    if not parsed.is_finite() or parsed <= 0:
+        raise ValueError(f"{label} must be positive and finite")
+    return parsed
+
+
+__all__ = [
+    "ASSEMBLY_INPUT_STAGES",
+    "ASSEMBLY_TOTAL_SLICES",
+    "CapabilityAssemblyActiveAdvance",
+    "CapabilityAssemblyAdmittedInput",
+    "CapabilityAssemblyAdvanceReceipt",
+    "CapabilityAssemblyAdvanceRequest",
+    "CapabilityAssemblyCheckpoint",
+    "CapabilityAssemblyInputAdmissionPort",
+    "CapabilityAssemblyInputRequest",
+    "CapabilityAssemblyItemState",
+    "CapabilityAssemblyRecordPort",
+    "CapabilityAssemblyRepositoryPort",
+    "CapabilityAssemblySlice",
+    "CapabilityAssemblySliceKind",
+    "CapabilityAssemblyStatus",
+    "CapabilityAssemblySubmitRequest",
+    "CapabilityAssemblyWriteConflict",
+    "assembly_request_sha256",
+    "canonical_assembly_model_bytes",
+]
