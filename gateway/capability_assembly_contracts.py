@@ -192,6 +192,103 @@ class CapabilityAssemblySlice(_FrozenContract):
     input_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
 
 
+class CapabilityAssemblyNoEffectRetryAuthorization(_FrozenContract):
+    """Captain receipt proving a started slice produced no external effect."""
+
+    schema_name: Literal["captain.capability-assembly-no-effect-retry.v1"] = Field(
+        default="captain.capability-assembly-no-effect-retry.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    assembly_id: UUID
+    operation_id: UUID
+    request_sha256: str = Field(pattern=SHA256_PATTERN)
+    started_slice: CapabilityAssemblySlice
+    started_checkpoint_ref: ArtifactRef
+    authorization_receipt_id: UUID
+    evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+    no_effect_observed: Literal[True]
+
+
+class CapabilityAssemblyReconciliationOutcome(_FrozenContract):
+    """External readback or explicit Captain no-effect retry authorization."""
+
+    schema_name: Literal["captain.capability-assembly-reconciliation.v1"] = Field(
+        default="captain.capability-assembly-reconciliation.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    assembly_id: UUID
+    operation_id: UUID
+    request_sha256: str = Field(pattern=SHA256_PATTERN)
+    started_slice: CapabilityAssemblySlice
+    started_checkpoint_ref: ArtifactRef
+    disposition: Literal["terminal_readback", "retry_authorized_no_effect"]
+    retry_authorization: CapabilityAssemblyNoEffectRetryAuthorization | None = None
+    factory_authority: CapabilityFactoryAuthority | None = None
+    benchmark_authority: CapabilityBusinessBenchmarkAuthority | None = None
+    execution_authority: CapabilityExecutionAuthority | None = None
+    projection_authority: CapabilityProjectionAuthority | None = None
+    resume_authorization: CapabilityResumeAuthorization | None = None
+
+    @model_validator(mode="after")
+    def require_typed_slice_result(self) -> "CapabilityAssemblyReconciliationOutcome":
+        authorities = (
+            self.factory_authority,
+            self.benchmark_authority,
+            self.execution_authority,
+            self.projection_authority,
+            self.resume_authorization,
+        )
+        if self.disposition == "retry_authorized_no_effect":
+            if self.retry_authorization is None or any(
+                authority is not None for authority in authorities
+            ):
+                raise ValueError("no-effect retry requires only Captain authorization")
+            authorization = self.retry_authorization
+            if (
+                authorization.assembly_id != self.assembly_id
+                or authorization.operation_id != self.operation_id
+                or authorization.request_sha256 != self.request_sha256
+                or authorization.started_slice != self.started_slice
+                or authorization.started_checkpoint_ref != self.started_checkpoint_ref
+            ):
+                raise ValueError("no-effect retry authorization changed reconciliation scope")
+            return self
+        if self.retry_authorization is not None:
+            raise ValueError("terminal readback cannot contain retry authorization")
+        expected_field = {
+            CapabilityAssemblySliceKind.SCAFFOLD_AND_TEST_HARNESS: "factory_authority",
+            CapabilityAssemblySliceKind.CODEX_IMPLEMENTATION: "factory_authority",
+            CapabilityAssemblySliceKind.SEAL: "factory_authority",
+            CapabilityAssemblySliceKind.EVALUATE: "benchmark_authority",
+            CapabilityAssemblySliceKind.PROMOTE: "factory_authority",
+            CapabilityAssemblySliceKind.EXECUTE: "execution_authority",
+            CapabilityAssemblySliceKind.PROJECT: "projection_authority",
+            CapabilityAssemblySliceKind.RESUME_AUTHORIZE: "resume_authorization",
+            CapabilityAssemblySliceKind.RESUME_DISPATCH: "execution_authority",
+            CapabilityAssemblySliceKind.RESUME_READBACK: "execution_authority",
+        }[self.started_slice.kind]
+        if sum(authority is not None for authority in authorities) != 1:
+            raise ValueError("terminal reconciliation requires one typed authority")
+        if getattr(self, expected_field) is None:
+            raise ValueError("terminal reconciliation authority does not match its slice")
+        return self
+
+
+class CapabilityAssemblyReconciliationRequest(_FrozenContract):
+    schema_name: Literal["captain.capability-assembly-reconcile.v1"] = Field(
+        default="captain.capability-assembly-reconcile.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    assembly_id: UUID
+    operation_id: UUID
+    request_sha256: str = Field(pattern=SHA256_PATTERN)
+    started_slice: CapabilityAssemblySlice
+    started_checkpoint_ref: ArtifactRef
+
+
 class CapabilityAssemblyActiveAdvance(_FrozenContract):
     operation_id: UUID
     request_sha256: str = Field(pattern=SHA256_PATTERN)
@@ -254,6 +351,7 @@ class CapabilityAssemblyCheckpoint(_FrozenContract):
     resume_readback: CapabilityExecutionAuthority | None = None
     last_slice: CapabilityAssemblySlice | None = None
     started_slice: CapabilityAssemblySlice | None = None
+    reconciliation_outcomes: tuple[CapabilityAssemblyReconciliationOutcome, ...] = ()
 
     @property
     def idempotency_key(self) -> str:
@@ -306,6 +404,22 @@ class CapabilityAssemblyCheckpoint(_FrozenContract):
             for receipt in self.advance_receipts
         ):
             raise ValueError("advance receipt changed assembly authority")
+        if any(
+            outcome.assembly_id != self.assembly_id
+            or outcome.request_sha256 != self.request_sha256
+            for outcome in self.reconciliation_outcomes
+        ):
+            raise ValueError("reconciliation outcome changed assembly authority")
+        outcome_keys = tuple(
+            (
+                outcome.operation_id,
+                outcome.started_checkpoint_ref.sha256,
+                outcome.disposition,
+            )
+            for outcome in self.reconciliation_outcomes
+        )
+        if len(set(outcome_keys)) != len(outcome_keys):
+            raise ValueError("checkpoint contains duplicate reconciliation outcomes")
         if self.status is CapabilityAssemblyStatus.READY_TO_USE:
             if self.completed_slices != ASSEMBLY_TOTAL_SLICES:
                 raise ValueError("ready assembly has incomplete slices")
@@ -335,6 +449,15 @@ class CapabilityAssemblyInputAdmissionPort(Protocol):
         self,
         request: CapabilityAssemblyInputRequest,
     ) -> CapabilityAssemblyAdmittedInput: ...
+
+
+class CapabilityAssemblyReconciliationPort(Protocol):
+    """Read external truth for a durably started slice without re-executing it."""
+
+    async def reconcile(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+    ) -> CapabilityAssemblyReconciliationOutcome | None: ...
 
 
 class CapabilityAssemblyRecordPort(Protocol):
@@ -404,7 +527,11 @@ __all__ = [
     "CapabilityAssemblyInputRequest",
     "CapabilityAssemblyItemState",
     "CapabilityAssemblyRecordPort",
+    "CapabilityAssemblyReconciliationOutcome",
+    "CapabilityAssemblyReconciliationPort",
+    "CapabilityAssemblyReconciliationRequest",
     "CapabilityAssemblyRepositoryPort",
+    "CapabilityAssemblyNoEffectRetryAuthorization",
     "CapabilityAssemblySlice",
     "CapabilityAssemblySliceKind",
     "CapabilityAssemblyStatus",

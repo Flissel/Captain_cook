@@ -9,6 +9,8 @@ slice allowance.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 from decimal import Decimal
 from typing import TypeVar, cast
 from uuid import UUID
@@ -32,6 +34,9 @@ from gateway.capability_assembly_contracts import (
     CapabilityAssemblyCheckpoint,
     CapabilityAssemblyInputAdmissionPort,
     CapabilityAssemblyItemState,
+    CapabilityAssemblyReconciliationOutcome,
+    CapabilityAssemblyReconciliationPort,
+    CapabilityAssemblyReconciliationRequest,
     CapabilityAssemblyRepositoryPort,
     CapabilityAssemblySlice,
     CapabilityAssemblySliceKind,
@@ -39,6 +44,7 @@ from gateway.capability_assembly_contracts import (
     CapabilityAssemblySubmitRequest,
     CapabilityAssemblyWriteConflict,
     assembly_request_sha256,
+    canonical_assembly_model_bytes,
 )
 from gateway.capability_live_current_adapters import CapabilityResumeExecutionPort
 from gateway.capability_live_pipeline import (
@@ -81,6 +87,7 @@ class CapabilityAssemblyController:
         factory: CapabilityFactoryPort,
         benchmark: CapabilityBusinessBenchmarkPort,
         resume: CapabilityResumeExecutionPort,
+        reconciliation: CapabilityAssemblyReconciliationPort,
         execution: PromotedCapabilityExecutionPort,
         minibook_projection: CapabilityProjectionPort,
     ) -> None:
@@ -92,6 +99,7 @@ class CapabilityAssemblyController:
                 factory,
                 benchmark,
                 resume,
+                reconciliation,
                 execution,
                 minibook_projection,
             )
@@ -102,10 +110,13 @@ class CapabilityAssemblyController:
         self._factory = factory
         self._benchmark = benchmark
         self._resume = resume
+        self._reconciliation = reconciliation
         self._execution = execution
         self._projection = minibook_projection
+        self._validate_ports()
 
     def submit(self, request: CapabilityAssemblySubmitRequest) -> CapabilityAssemblyCheckpoint:
+        self._validate_ports()
         digest = assembly_request_sha256(request)
         existing = self._history_optional(request.assembly_id)
         by_key = self._repository.find_by_idempotency_key(request.idempotency_key)
@@ -134,6 +145,7 @@ class CapabilityAssemblyController:
                 raise CapabilityAssemblyConflict(
                     "input admission changed repository or conversation authority"
                 )
+        self._require_distinct_sources(admitted)
         checkpoint = CapabilityAssemblyCheckpoint(
             assembly_id=request.assembly_id,
             request=request,
@@ -156,6 +168,7 @@ class CapabilityAssemblyController:
         self,
         request: CapabilityAssemblyAdvanceRequest,
     ) -> CapabilityAssemblyCheckpoint:
+        self._validate_ports()
         history = self._history(request.assembly_id)
         current = history[-1].checkpoint
         self._require_request_binding(current, request)
@@ -193,6 +206,7 @@ class CapabilityAssemblyController:
         self,
         request: CapabilityAssemblyAdvanceRequest,
     ) -> CapabilityAssemblyAdvanceReceipt:
+        self._validate_ports()
         history = self._history(request.assembly_id)
         current = history[-1].checkpoint
         self._require_request_binding(current, request)
@@ -206,9 +220,16 @@ class CapabilityAssemblyController:
         if active is None:
             raise CapabilityAssemblyConflict("advance operation claim is unavailable")
         if current.started_slice is not None:
-            raise CapabilityAssemblyIncomplete(
-                "started slice has no terminal authority; effect replay is forbidden"
+            started_record = self._history(request.assembly_id)[-1]
+            current = await self._reconcile_started_slice(
+                current,
+                started_checkpoint_ref=started_record.artifact_ref,
             )
+            active = current.active_advance
+            if active is None:
+                raise CapabilityAssemblyConflict(
+                    "reconciliation lost the active advance"
+                )
         while current.completed_slices < active.target_completed_slices:
             current = self._mark_next_slice_started(current)
             current = await self._execute_next_slice(current)
@@ -338,6 +359,225 @@ class CapabilityAssemblyController:
         self._append(started, expected_revision=current.revision)
         return started
 
+    async def _reconcile_started_slice(
+        self,
+        current: CapabilityAssemblyCheckpoint,
+        *,
+        started_checkpoint_ref,
+    ) -> CapabilityAssemblyCheckpoint:
+        started = current.started_slice
+        active = current.active_advance
+        if started is None or active is None:
+            raise CapabilityAssemblyConflict("reconciliation lacks a started slice")
+        request = CapabilityAssemblyReconciliationRequest(
+            assembly_id=current.assembly_id,
+            operation_id=active.operation_id,
+            request_sha256=current.request_sha256,
+            started_slice=started,
+            started_checkpoint_ref=started_checkpoint_ref,
+        )
+        outcome = await self._reconciliation.reconcile(request)
+        if outcome is None:
+            raise CapabilityAssemblyIncomplete(
+                "started slice has no authoritative reconciliation"
+            )
+        if (
+            outcome.assembly_id != request.assembly_id
+            or outcome.operation_id != request.operation_id
+            or outcome.request_sha256 != request.request_sha256
+            or outcome.started_slice != request.started_slice
+            or outcome.started_checkpoint_ref != request.started_checkpoint_ref
+        ):
+            raise CapabilityAssemblyConflict(
+                "reconciliation changed the started slice authority"
+            )
+        if outcome.disposition == "retry_authorized_no_effect":
+            cleared = _validated_copy(
+                current,
+                revision=current.revision + 1,
+                started_slice=None,
+                reconciliation_outcomes=(
+                    *current.reconciliation_outcomes,
+                    outcome,
+                ),
+            )
+            self._append(cleared, expected_revision=current.revision)
+            return cleared
+        return self._complete_from_reconciliation(current, outcome)
+
+    def _complete_from_reconciliation(
+        self,
+        current: CapabilityAssemblyCheckpoint,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> CapabilityAssemblyCheckpoint:
+        started = current.started_slice
+        if started is None:
+            raise CapabilityAssemblyConflict("reconciliation lost the started slice")
+        if started.input_id is not None:
+            input_index = next(
+                (
+                    index
+                    for index, item in enumerate(current.items)
+                    if item.request.input_id == started.input_id
+                ),
+                None,
+            )
+            if input_index is None:
+                raise CapabilityAssemblyConflict(
+                    "reconciliation input is unavailable"
+                )
+            item = current.items[input_index]
+            stage = CapabilityLiveStage(started.kind.value)
+            request = self._stage_request(current, item, stage)
+            changes: dict[str, object] = {
+                "completed_stages": (*item.completed_stages, stage),
+            }
+            if stage in (
+                CapabilityLiveStage.SCAFFOLD_AND_TEST_HARNESS,
+                CapabilityLiveStage.CODEX_IMPLEMENTATION,
+                CapabilityLiveStage.SEAL,
+            ):
+                authority = outcome.factory_authority
+                self._require_factory(
+                    request,
+                    authority,
+                    expected=stage,
+                    prior=item,
+                )
+                changes["stage_authority"] = authority
+            elif stage is CapabilityLiveStage.EVALUATE:
+                authority = outcome.benchmark_authority
+                self._require_factory(
+                    request,
+                    authority,
+                    expected=stage,
+                    prior=item,
+                )
+                if authority is None:
+                    raise CapabilityAssemblyIncomplete(
+                        "benchmark reconciliation is unavailable"
+                    )
+                changes["benchmark_authority"] = authority
+            elif stage is CapabilityLiveStage.PROMOTE:
+                authority = outcome.factory_authority
+                self._require_factory(
+                    request,
+                    authority,
+                    expected=stage,
+                    prior=item,
+                )
+                self._require_release(
+                    authority,
+                    item,
+                    controlled_recovery=input_index == 0,
+                )
+                changes["release_authority"] = authority
+            elif stage is CapabilityLiveStage.EXECUTE:
+                release = self._release(item)
+                execution = outcome.execution_authority
+                self._require_execution(
+                    request,
+                    release,
+                    execution,
+                    fresh_resume=False,
+                )
+                changes["execution_authority"] = execution
+            elif stage is CapabilityLiveStage.PROJECT:
+                release = self._release(item)
+                execution = self._execution_authority(item)
+                projection = outcome.projection_authority
+                self._require_projection(release, execution, projection)
+                if projection is None:
+                    raise CapabilityAssemblyIncomplete(
+                        "projection reconciliation is unavailable"
+                    )
+                changes["projection_authority"] = projection
+                changes["capability_evidence"] = self._capability_evidence(
+                    item,
+                    release=release,
+                    execution=execution,
+                    projection=projection,
+                )
+            else:
+                raise CapabilityAssemblyConflict(
+                    "unsupported reconciled input stage"
+                )
+            items = list(current.items)
+            items[input_index] = _validated_copy(item, **changes)
+            return self._append_slice(
+                current,
+                items=tuple(items),
+                kind=started.kind,
+                input_id=started.input_id,
+                ordinal=started.ordinal,
+                reconciliation_outcome=outcome,
+            )
+
+        if started.kind is CapabilityAssemblySliceKind.RESUME_AUTHORIZE:
+            authorization = outcome.resume_authorization
+            if authorization is None:
+                raise CapabilityAssemblyIncomplete(
+                    "resume authorization reconciliation is unavailable"
+                )
+            self._require_resume_authorization(current, authorization)
+            return self._append_slice(
+                current,
+                items=current.items,
+                kind=started.kind,
+                input_id=None,
+                ordinal=started.ordinal,
+                resume_authorization=authorization,
+                reconciliation_outcome=outcome,
+            )
+        if started.kind is CapabilityAssemblySliceKind.RESUME_DISPATCH:
+            execution = outcome.execution_authority
+            authorization = current.resume_authorization
+            if execution is None or authorization is None:
+                raise CapabilityAssemblyIncomplete(
+                    "resume dispatch reconciliation is unavailable"
+                )
+            release = self._release(current.items[0])
+            request = self._stage_request(
+                current,
+                current.items[0],
+                CapabilityLiveStage.PROJECT,
+            )
+            self._require_execution(
+                request,
+                release,
+                execution,
+                fresh_resume=True,
+            )
+            if execution.execution_authority_id != authorization.authorization_receipt_id:
+                raise CapabilityAssemblyConflict(
+                    "reconciled resume dispatch lacks authorization binding"
+                )
+            self._require_fresh_identity(current.items[0], execution)
+            return self._append_slice(
+                current,
+                items=current.items,
+                kind=started.kind,
+                input_id=None,
+                ordinal=started.ordinal,
+                resume_dispatch=execution,
+                reconciliation_outcome=outcome,
+            )
+        execution = outcome.execution_authority
+        if execution is None or execution != current.resume_dispatch:
+            raise CapabilityAssemblyConflict(
+                "reconciled resume read-back changed dispatched authority"
+            )
+        return self._append_slice(
+            current,
+            items=current.items,
+            kind=started.kind,
+            input_id=None,
+            ordinal=started.ordinal,
+            resume_readback=execution,
+            reconciliation_outcome=outcome,
+            status=CapabilityAssemblyStatus.READY_TO_USE,
+        )
+
     async def _execute_input_stage(
         self,
         current: CapabilityAssemblyCheckpoint,
@@ -440,22 +680,7 @@ class CapabilityAssemblyController:
         )
         if authorization is None:
             raise CapabilityAssemblyIncomplete("resume authorization is unavailable")
-        expected = (
-            first.job_id,
-            current.items[0].request.reservation.reservation_id,
-            first.correlation_id,
-            first.capability_id,
-            first.capability_version,
-        )
-        observed = (
-            authorization.job_id,
-            authorization.reservation_id,
-            authorization.correlation_id,
-            authorization.capability_id,
-            authorization.capability_version,
-        )
-        if observed != expected:
-            raise CapabilityAssemblyConflict("resume authorization changed release authority")
+        self._require_resume_authorization(current, authorization)
         return self._append_slice(
             current,
             items=current.items,
@@ -533,6 +758,7 @@ class CapabilityAssemblyController:
         resume_dispatch: CapabilityExecutionAuthority | None = None,
         resume_readback: CapabilityExecutionAuthority | None = None,
         status: CapabilityAssemblyStatus = CapabilityAssemblyStatus.ADVANCING,
+        reconciliation_outcome: CapabilityAssemblyReconciliationOutcome | None = None,
     ) -> CapabilityAssemblyCheckpoint:
         completed = _validated_copy(
             current,
@@ -561,6 +787,11 @@ class CapabilityAssemblyController:
                 input_id=input_id,
             ),
             started_slice=None,
+            reconciliation_outcomes=(
+                (*current.reconciliation_outcomes, reconciliation_outcome)
+                if reconciliation_outcome is not None
+                else current.reconciliation_outcomes
+            ),
         )
         self._append(completed, expected_revision=current.revision)
         return completed
@@ -575,6 +806,51 @@ class CapabilityAssemblyController:
             raise CapabilityAssemblyConflict("assembly append lost sole-writer fencing") from exc
         if record.checkpoint != checkpoint:
             raise CapabilityAssemblyConflict("assembly repository changed checkpoint bytes")
+        self._require_record_digest(record)
+
+    def _validate_ports(self) -> None:
+        positional = object()
+        method_specs = (
+            (self._repository, "history", False, (positional,), {}),
+            (self._repository, "find_by_idempotency_key", False, (positional,), {}),
+            (
+                self._repository,
+                "append",
+                False,
+                (positional,),
+                {"expected_revision": 0},
+            ),
+            (self._admission, "admit", False, (positional,), {}),
+            (self._factory, "scaffold", True, (positional,), {}),
+            (self._factory, "implement", True, (positional,), {}),
+            (self._factory, "seal", True, (positional,), {}),
+            (self._factory, "promote", True, (positional,), {}),
+            (self._benchmark, "evaluate", True, (positional,), {}),
+            (self._resume, "authorize_resume", True, (positional,), {}),
+            (self._resume, "dispatch_resume", True, (positional,), {}),
+            (self._resume, "readback_resume", True, (positional,), {}),
+            (self._reconciliation, "reconcile", True, (positional,), {}),
+            (self._execution, "execute", True, (positional, positional), {}),
+            (
+                self._projection,
+                "project_and_readback",
+                True,
+                (positional, positional, positional),
+                {},
+            ),
+        )
+        for port, method_name, async_required, args, kwargs in method_specs:
+            method = getattr(port, method_name, None)
+            if not callable(method) or inspect.iscoroutinefunction(method) is not async_required:
+                raise ValueError(
+                    f"capability assembly port binding {method_name} has wrong call mode"
+                )
+            try:
+                inspect.signature(method).bind(*args, **kwargs)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"capability assembly port binding {method_name} has incompatible signature"
+                ) from exc
 
     def _history_optional(self, assembly_id: UUID):
         history = self._repository.history(assembly_id)
@@ -591,6 +867,10 @@ class CapabilityAssemblyController:
     @staticmethod
     def _validate_history(assembly_id: UUID, history) -> None:
         first = history[0].checkpoint
+        if first.request_sha256 != assembly_request_sha256(first.request):
+            raise CapabilityAssemblyConflict(
+                "assembly request digest does not match immutable submission"
+            )
         if (
             first.assembly_id != assembly_id
             or first.revision != 1
@@ -599,6 +879,7 @@ class CapabilityAssemblyController:
         ):
             raise CapabilityAssemblyConflict("assembly history is not monotone")
         for expected_revision, record in enumerate(history, start=1):
+            CapabilityAssemblyController._require_record_digest(record)
             checkpoint = record.checkpoint
             CapabilityAssemblyController._require_checkpoint_shape(checkpoint)
             if (
@@ -618,10 +899,25 @@ class CapabilityAssemblyController:
                 prior,
                 checkpoint,
                 completed_delta=delta,
+                prior_record_ref=history[expected_revision - 2].artifact_ref,
+            )
+
+    @staticmethod
+    def _require_record_digest(record) -> None:
+        expected = hashlib.sha256(
+            canonical_assembly_model_bytes(record.checkpoint)
+        ).hexdigest()
+        if (
+            record.artifact_ref.sha256 != expected
+            or record.artifact_ref.media_type != "application/json"
+        ):
+            raise CapabilityAssemblyConflict(
+                "assembly repository artifact digest does not bind checkpoint bytes"
             )
 
     @staticmethod
     def _require_checkpoint_shape(checkpoint: CapabilityAssemblyCheckpoint) -> None:
+        CapabilityAssemblyController._require_distinct_sources(checkpoint.inputs)
         stage_slices = sum(len(item.completed_stages) for item in checkpoint.items)
         resume_count = 0
         if checkpoint.resume_authorization is not None:
@@ -667,11 +963,25 @@ class CapabilityAssemblyController:
             raise CapabilityAssemblyConflict("assembly history is not monotone")
 
     @staticmethod
+    def _require_distinct_sources(admitted) -> None:
+        source_refs = tuple(item.input.source_ref for item in admitted)
+        if (
+            len(source_refs) != 3
+            or len(set(source_refs)) != 3
+            or len({reference.sha256 for reference in source_refs}) != 3
+            or len({reference.uri for reference in source_refs}) != 3
+        ):
+            raise CapabilityAssemblyConflict(
+                "assembly requires three distinct source refs and content digests"
+            )
+
+    @staticmethod
     def _require_history_transition(
         prior: CapabilityAssemblyCheckpoint,
         current: CapabilityAssemblyCheckpoint,
         *,
         completed_delta: int,
+        prior_record_ref,
     ) -> None:
         authority_before = (
             prior.items,
@@ -691,6 +1001,8 @@ class CapabilityAssemblyController:
             if prior.active_advance is None and current.active_advance is not None:
                 if (
                     current.advance_receipts != prior.advance_receipts
+                    or current.reconciliation_outcomes
+                    != prior.reconciliation_outcomes
                     or prior.started_slice is not None
                     or current.started_slice is not None
                 ):
@@ -713,12 +1025,34 @@ class CapabilityAssemblyController:
                 and current.started_slice
                 == _slice_for_ordinal(prior.completed_slices, prior)
                 and current.advance_receipts == prior.advance_receipts
+                and current.reconciliation_outcomes
+                == prior.reconciliation_outcomes
             ):
                 return
+            if (
+                prior.active_advance is not None
+                and current.active_advance == prior.active_advance
+                and prior.started_slice is not None
+                and current.started_slice is None
+                and current.advance_receipts == prior.advance_receipts
+                and len(current.reconciliation_outcomes)
+                == len(prior.reconciliation_outcomes) + 1
+                and current.reconciliation_outcomes[:-1]
+                == prior.reconciliation_outcomes
+            ):
+                outcome = current.reconciliation_outcomes[-1]
+                if (
+                    outcome.disposition == "retry_authorized_no_effect"
+                    and outcome.started_slice == prior.started_slice
+                    and outcome.started_checkpoint_ref == prior_record_ref
+                ):
+                    return
             if prior.active_advance is not None and current.active_advance is None:
                 if (
                     prior.started_slice is not None
                     or current.started_slice is not None
+                    or current.reconciliation_outcomes
+                    != prior.reconciliation_outcomes
                     or len(current.advance_receipts) != len(prior.advance_receipts) + 1
                 ):
                     raise CapabilityAssemblyConflict("assembly history is not monotone")
@@ -748,6 +1082,23 @@ class CapabilityAssemblyController:
             raise CapabilityAssemblyConflict("assembly history is not monotone")
         expected_slice = _slice_for_ordinal(prior.completed_slices, prior)
         if current.last_slice != expected_slice:
+            raise CapabilityAssemblyConflict("assembly history is not monotone")
+        if current.reconciliation_outcomes == prior.reconciliation_outcomes:
+            pass
+        elif (
+            len(current.reconciliation_outcomes)
+            == len(prior.reconciliation_outcomes) + 1
+            and current.reconciliation_outcomes[:-1]
+            == prior.reconciliation_outcomes
+        ):
+            outcome = current.reconciliation_outcomes[-1]
+            if (
+                outcome.disposition != "terminal_readback"
+                or outcome.started_slice != prior.started_slice
+                or outcome.started_checkpoint_ref != prior_record_ref
+            ):
+                raise CapabilityAssemblyConflict("assembly history is not monotone")
+        else:
             raise CapabilityAssemblyConflict("assembly history is not monotone")
         CapabilityAssemblyController._require_authority_transition(
             prior,
@@ -1043,6 +1394,31 @@ class CapabilityAssemblyController:
             raise CapabilityAssemblyConflict("resume execution reused original command")
         if execution.execution_result_id == original.execution_result_id:
             raise CapabilityAssemblyConflict("resume execution reused original result")
+
+    @staticmethod
+    def _require_resume_authorization(
+        current: CapabilityAssemblyCheckpoint,
+        authorization: CapabilityResumeAuthorization,
+    ) -> None:
+        first = CapabilityAssemblyController._completed_capability(current.items[0])
+        expected = (
+            first.job_id,
+            current.items[0].request.reservation.reservation_id,
+            first.correlation_id,
+            first.capability_id,
+            first.capability_version,
+        )
+        observed = (
+            authorization.job_id,
+            authorization.reservation_id,
+            authorization.correlation_id,
+            authorization.capability_id,
+            authorization.capability_version,
+        )
+        if observed != expected:
+            raise CapabilityAssemblyConflict(
+                "resume authorization changed release authority"
+            )
 
     @staticmethod
     def _capability_evidence(
