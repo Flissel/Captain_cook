@@ -31,10 +31,10 @@
 - Produces `DemoBundleV1`, `DemoServiceV1`, `DemoConfiguration`, `initialize_private_environment(...)`, and `load_demo_configuration(...)`.
 - The sealed bundle contains the exact service order `gateway`, `provider_proxy`, `runtime`, `benchmark`, health URLs, listener ports, argv arrays, env allowlists, Compose inputs, canonical input digests, and Minibook evidence readback URL.
 
-- [ ] Write failing tests proving init is atomic, preserves an existing private environment, never creates an OpenAI key, and emits only redacted output.
-- [ ] Run `python -m pytest -q --no-cov tests/demo_orchestrator/test_configuration.py` and confirm the missing package failure.
-- [ ] Implement strict parsing, SHA-256 validation, canonical input validation, distinct secret checks, and provider-only OpenAI env isolation.
-- [ ] Re-run the focused tests and commit the configuration boundary.
+- [x] Write failing tests proving init is atomic, preserves an existing private environment, never creates an OpenAI key, and emits only redacted output.
+- [x] Run `python -m pytest -q --no-cov tests/demo_orchestrator/test_configuration.py` and confirm the missing package failure.
+- [x] Implement strict parsing, SHA-256 validation, canonical input validation, distinct secret checks, and provider-only OpenAI env isolation.
+- [x] Re-run the focused tests and commit the configuration boundary.
 
 ### Task 2: Managed dependency-ordered service lifecycle
 
@@ -46,10 +46,10 @@
 - Produces `ManagedProcessSupervisor.start_all(...)`, `restart_runtime(...)`, `status(...)`, and `stop(...)` over injected process, listener, health, and Compose ports.
 - Persists PID, process start identity, command digest, configuration digest, and listener port after authenticated health and listener ownership agree.
 
-- [ ] Write failing tests for complete preflight-before-mutation, Gateway-to-benchmark order, exact-config reuse, foreign-listener refusal, and managed-PID-only stop.
-- [ ] Run the focused test and confirm behavior is absent.
-- [ ] Implement immutable preflight records and managed lifecycle transitions.
-- [ ] Re-run the focused tests and commit the service lifecycle.
+- [x] Write failing tests for complete preflight-before-mutation, Gateway-to-benchmark order, exact-config reuse, foreign-listener refusal, and managed-PID-only stop.
+- [x] Run the focused test and confirm behavior is absent.
+- [x] Implement immutable preflight records and managed lifecycle transitions.
+- [x] Re-run the focused tests and commit the service lifecycle.
 
 ### Task 3: Resumable Captain assembly HTTP client
 
@@ -61,10 +61,10 @@
 - Produces `CapabilityDemoClient.submit()`, `run(resume=False)`, and `resume()`.
 - Posts exactly three canonical paths, derives stable caller request identities from bundle/input digests, advances one slice at a time, persists every API checkpoint, restarts Runtime only after `resume_authorize`, and compares Gateway final evidence with Minibook readback.
 
-- [ ] Write failing fake-HTTP tests for exact paths, no pattern field, `maximum_slices=1`, stable resume identity, controlled restart, redacted progress, bounded timeout, and exact final-evidence equality.
-- [ ] Run the focused test and confirm behavior is absent.
-- [ ] Implement the minimal authenticated HTTP/checkpoint loop with exit-code-124 timeout preservation.
-- [ ] Re-run the focused tests and commit the HTTP lifecycle.
+- [x] Write failing fake-HTTP tests for exact paths, no pattern field, `maximum_slices=1`, stable resume identity, controlled restart, redacted progress, bounded timeout, and exact final-evidence equality.
+- [x] Run the focused test and confirm behavior is absent.
+- [x] Implement the minimal authenticated HTTP/checkpoint loop with exit-code-124 timeout preservation.
+- [x] Re-run the focused tests and commit the HTTP lifecycle.
 
 ### Task 4: Operator CLI and PowerShell wrapper
 
@@ -79,10 +79,10 @@
 - `pwsh -NoProfile -File scripts/capability-demo.ps1 <init|start|status|run|resume|stop>` delegates to the repository package.
 - Only `run`/`resume -AllowPaidRun -MaxCostUsd 6.00` enable provider-capable HTTP transitions.
 
-- [ ] Write failing subprocess tests for all six actions, paid-run gating, ceiling validation, timeout 124, and secret-free output.
-- [ ] Run the focused test and confirm the missing wrapper failure.
-- [ ] Implement the thin entrypoints and stable exit-code mapping.
-- [ ] Re-run all D12 tests and commit the operator surface.
+- [x] Write failing subprocess tests for all six actions, paid-run gating, ceiling validation, timeout 124, and secret-free output.
+- [x] Run the focused test and confirm the missing wrapper failure.
+- [x] Implement the thin entrypoints and stable exit-code mapping.
+- [x] Re-run all D12 tests and commit the operator surface.
 
 ### Task 5: Verification and operator documentation
 
@@ -93,7 +93,16 @@
 **Interfaces:**
 - Documents the exact one-command lifecycle, D10/D11 preflight dependencies, paid authorization, recovery, evidence, and non-claims.
 
-- [ ] Run D12 focused tests, architecture/import tests, compileall, submission verification, diff check, and credential scan.
-- [ ] Record exact counts and known blocked live prerequisites without claiming Docker/provider/DB execution.
-- [ ] Commit the verified documentation and hand off the branch without merging.
+- [x] Run D12 focused tests, architecture/import tests, compileall, submission verification, diff check, and credential scan.
+- [x] Record exact counts and known blocked live prerequisites without claiming Docker/provider/DB execution.
+- [x] Commit the verified documentation and hand off the branch without merging.
 
+## Verification evidence
+
+- Focused D12 and adjacent Assembly/Provider/Runtime gate: `256 passed`.
+- Architecture, import-boundary, and workstream-doc gate: `18 passed`.
+- `python -m compileall -q agenten gateway scripts`: exit `0`.
+- `scripts/verify_submission.py`: `Submission evidence check passed.`
+- `git diff --check`: exit `0`.
+- High-confidence credential-pattern scan over the branch diff: `0` candidates.
+- No live Docker, provider, database, n8n, Gateway, Runtime, benchmark, or Minibook action was executed. D10 catalog and D11 sealed bundle remain required external prerequisites for an operator live run.
