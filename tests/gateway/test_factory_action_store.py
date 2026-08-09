@@ -105,7 +105,7 @@ class TransactionalMemoryActionRepository:
         for row in self.rows.values():
             if (
                 row.tenant_id == tenant_id
-                and row.status == "pending"
+                and row.status in {"pending", "answered"}
                 and row.request.deadline_at <= now
                 and (request_id is None or row.request.request_id == request_id)
             ):
@@ -180,6 +180,37 @@ def db_row_for_phase(phase: str) -> dict[str, object]:
             }
         )
     return row
+
+
+def advance_to_phase(
+    store: FactoryActionStore,
+    request: FactoryActionRequestV1,
+    phase: str,
+    *,
+    now: datetime,
+) -> None:
+    response = action_response(request, answered_at=now)
+    store.answer(response, tenant_id="tenant-a", now=now)
+    if phase == "answered":
+        return
+    projection = store.prepare_projection(
+        request.request_id, tenant_id="tenant-a", now=now
+    )
+    if phase == "projection_intent":
+        return
+    store.acknowledge_projection(
+        request.request_id,
+        tenant_id="tenant-a",
+        idempotency_key=projection.projection_idempotency_key,
+        now=now,
+    )
+    if phase == "projection_acknowledged":
+        return
+    store.prepare_continuation(
+        request.request_id, tenant_id="tenant-a", now=now
+    )
+    if phase != "continuation_intent":
+        raise AssertionError(f"unsupported test phase: {phase}")
 
 
 @pytest.fixture
@@ -366,6 +397,207 @@ def test_restart_recovery_excludes_answered_action_at_deadline(
     restarted = FactoryActionStore(repository=memory_repository)
 
     assert restarted.resume_candidates(now=request.deadline_at) == ()
+    assert memory_repository.rows[str(request.request_id)].status == "expired"
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "answered",
+        "projection_intent",
+        "projection_acknowledged",
+        "continuation_intent",
+        "continuation_acknowledged",
+    ],
+)
+def test_deadline_expires_every_nonterminal_phase_and_preserves_audit_evidence(
+    memory_repository: TransactionalMemoryActionRepository,
+    phase: str,
+) -> None:
+    request = pending_request()
+    before_deadline = request.deadline_at - timedelta(microseconds=1)
+    store = FactoryActionStore(repository=memory_repository)
+    store.create(request, tenant_id="tenant-a")
+    advance_to_phase(
+        store,
+        request,
+        "continuation_intent" if phase == "continuation_acknowledged" else phase,
+        now=before_deadline,
+    )
+    durable = memory_repository.rows[str(request.request_id)]
+    if phase == "continuation_acknowledged":
+        durable.resume_phase = "continuation_acknowledged"
+        durable.continuation_acknowledged_at = before_deadline
+    audit_before = (
+        durable.response,
+        durable.response_sha256,
+        durable.resume_phase,
+        durable.projection_idempotency_key,
+        durable.projection_intent_at,
+        durable.projection_acknowledged_at,
+        durable.continuation_idempotency_key,
+        durable.continuation_intent_at,
+        durable.continuation_acknowledged_at,
+        durable.consumed_at,
+    )
+
+    restarted = FactoryActionStore(repository=memory_repository)
+    observed = restarted.get(
+        request.request_id, tenant_id="tenant-a", now=request.deadline_at
+    )
+
+    assert observed.status == "expired"
+    assert restarted.list(
+        tenant_id="tenant-a", status="answered", now=request.deadline_at
+    ) == ()
+    assert restarted.list(
+        tenant_id="tenant-a", status="expired", now=request.deadline_at
+    ) == (request.model_copy(update={"status": "expired"}),)
+    assert restarted.resume_candidates(now=request.deadline_at) == ()
+    assert (
+        durable.response,
+        durable.response_sha256,
+        durable.resume_phase,
+        durable.projection_idempotency_key,
+        durable.projection_intent_at,
+        durable.projection_acknowledged_at,
+        durable.continuation_idempotency_key,
+        durable.continuation_intent_at,
+        durable.continuation_acknowledged_at,
+        durable.consumed_at,
+    ) == audit_before
+
+
+def test_expired_answered_action_rejects_every_resume_operation(
+    memory_repository: TransactionalMemoryActionRepository,
+) -> None:
+    request = pending_request()
+    before_deadline = request.deadline_at - timedelta(microseconds=1)
+    store = FactoryActionStore(repository=memory_repository)
+    store.create(request, tenant_id="tenant-a")
+    advance_to_phase(store, request, "projection_intent", now=before_deadline)
+    durable = memory_repository.rows[str(request.request_id)]
+    assert durable.projection_idempotency_key is not None
+    store.get(request.request_id, tenant_id="tenant-a", now=request.deadline_at)
+
+    operations = (
+        lambda: store.prepare_projection(
+            request.request_id, tenant_id="tenant-a", now=request.deadline_at
+        ),
+        lambda: store.acknowledge_projection(
+            request.request_id,
+            tenant_id="tenant-a",
+            idempotency_key=str(durable.projection_idempotency_key),
+            now=request.deadline_at,
+        ),
+        lambda: store.prepare_continuation(
+            request.request_id, tenant_id="tenant-a", now=request.deadline_at
+        ),
+        lambda: store.acknowledge_continuation(
+            request.request_id,
+            tenant_id="tenant-a",
+            idempotency_key="f" * 64,
+            now=request.deadline_at,
+        ),
+        lambda: store.consume(
+            request.request_id,
+            tenant_id="tenant-a",
+            factory_job_id=request.factory_job_id,
+            creation_job_id=request.creation_job_id,
+            correlation_id=request.correlation_id,
+            expected_subject_version=request.expected_subject_version,
+            safe_checkpoint_sha256=request.safe_checkpoint_sha256,
+            now=request.deadline_at,
+        ),
+    )
+    for operation in operations:
+        with pytest.raises(TimeoutError, match="expired"):
+            operation()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "answered",
+        "projection_intent",
+        "projection_acknowledged",
+        "continuation_intent",
+        "continuation_acknowledged",
+    ],
+)
+def test_db_row_accepts_exact_audit_preserving_expired_phase_matrix(
+    phase: str,
+) -> None:
+    row = db_row_for_phase(phase)
+    row["status"] = "expired"
+    row["consumed_at"] = None
+
+    durable = _db_row(row)
+
+    assert durable.status == "expired"
+    assert durable.resume_phase == phase
+    assert durable.response == action_response(pending_request())
+
+
+@pytest.mark.parametrize(
+    ("phase", "column", "value"),
+    [
+        ("answered", "projection_intent_at", NOW.replace(tzinfo=None)),
+        ("projection_intent", "projection_acknowledged_at", NOW.replace(tzinfo=None)),
+        ("projection_acknowledged", "continuation_intent_at", NOW.replace(tzinfo=None)),
+        ("continuation_intent", "continuation_acknowledged_at", NOW.replace(tzinfo=None)),
+        ("continuation_acknowledged", "consumed_at", NOW.replace(tzinfo=None)),
+    ],
+)
+def test_db_row_rejects_extraneous_expired_phase_columns(
+    phase: str, column: str, value: object
+) -> None:
+    row = db_row_for_phase(phase)
+    row["status"] = "expired"
+    row["consumed_at"] = None
+    row[column] = value
+
+    with pytest.raises(ValueError, match="factory action durable row"):
+        _db_row(row)
+
+
+def test_mariadb_expiry_updates_pending_and_answered_rows_only() -> None:
+    calls: list[tuple[str, object]] = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def execute(self, query, parameters=None):
+            calls.append((" ".join(str(query).split()), parameters))
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    class Storage:
+        @contextmanager
+        def transaction(self):
+            yield Connection()
+
+    repository = object.__new__(MariaDBFactoryActionRepository)
+    repository.storage = Storage()  # type: ignore[assignment]
+    request = pending_request()
+
+    repository.expire(
+        tenant_id="tenant-a", now=request.deadline_at, request_id=request.request_id
+    )
+
+    query, parameters = calls[0]
+    assert "status IN ('pending', 'answered')" in query
+    assert parameters == (
+        "tenant-a",
+        request.deadline_at.replace(tzinfo=None),
+        str(request.request_id),
+    )
 
 
 @pytest.mark.parametrize(

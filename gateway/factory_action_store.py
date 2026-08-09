@@ -111,11 +111,17 @@ class FactoryActionStore:
 
     def resume_candidates(self, *, now: datetime) -> tuple[tuple[UUID, str], ...]:
         now_utc = _aware_utc(now)
-        return tuple(
-            (row.request.request_id, row.tenant_id)
-            for row in self._repository.resume_rows()
-            if row.request.deadline_at > now_utc
-        )
+        candidates: list[tuple[UUID, str]] = []
+        for row in self._repository.resume_rows():
+            if row.request.deadline_at <= now_utc:
+                self._repository.expire(
+                    tenant_id=row.tenant_id,
+                    now=now_utc,
+                    request_id=row.request.request_id,
+                )
+            else:
+                candidates.append((row.request.request_id, row.tenant_id))
+        return tuple(candidates)
 
     def get(
         self, request_id: UUID, *, tenant_id: str, now: datetime
@@ -147,10 +153,13 @@ class FactoryActionStore:
                 error = LookupError("factory action not found")
             elif (
                 row.status == "expired"
-                or now_utc >= row.request.deadline_at
+                or (
+                    row.status != "consumed"
+                    and now_utc >= row.request.deadline_at
+                )
                 or answered_at >= row.request.deadline_at
             ):
-                if row.status == "pending":
+                if row.status in {"pending", "answered"}:
                     row.status = "expired"
                 error = TimeoutError("factory action expired")
             elif row.created_at is not None and answered_at < row.created_at:
@@ -195,9 +204,14 @@ class FactoryActionStore:
         safe_checkpoint_sha256: str,
         now: datetime,
     ) -> FactoryActionResponseV1:
+        self._repository.expire(
+            tenant_id=tenant_id, now=_aware_utc(now), request_id=request_id
+        )
         with self._repository.locked(request_id, tenant_id=tenant_id) as row:
             if row is None:
                 raise LookupError("factory action not found")
+            if row.status == "expired":
+                raise TimeoutError("factory action expired")
             request = row.request
             expected = (
                 factory_job_id,
@@ -222,6 +236,9 @@ class FactoryActionStore:
     def prepare_projection(
         self, request_id: UUID, *, tenant_id: str, now: datetime
     ) -> FactoryActionResumeRecord:
+        self._repository.expire(
+            tenant_id=tenant_id, now=_aware_utc(now), request_id=request_id
+        )
         with self._repository.locked(request_id, tenant_id=tenant_id) as row:
             self._validate_resumable(row, now=now)
             assert row is not None and row.response is not None
@@ -241,6 +258,9 @@ class FactoryActionStore:
         idempotency_key: str,
         now: datetime,
     ) -> FactoryActionResumeRecord:
+        self._repository.expire(
+            tenant_id=tenant_id, now=_aware_utc(now), request_id=request_id
+        )
         with self._repository.locked(request_id, tenant_id=tenant_id) as row:
             self._validate_resumable(row, now=now)
             assert row is not None
@@ -260,6 +280,9 @@ class FactoryActionStore:
     def prepare_continuation(
         self, request_id: UUID, *, tenant_id: str, now: datetime
     ) -> FactoryActionResumeRecord:
+        self._repository.expire(
+            tenant_id=tenant_id, now=_aware_utc(now), request_id=request_id
+        )
         with self._repository.locked(request_id, tenant_id=tenant_id) as row:
             self._validate_resumable(row, now=now)
             assert row is not None
@@ -281,6 +304,9 @@ class FactoryActionStore:
         idempotency_key: str,
         now: datetime,
     ) -> FactoryActionResumeRecord:
+        self._repository.expire(
+            tenant_id=tenant_id, now=_aware_utc(now), request_id=request_id
+        )
         with self._repository.locked(request_id, tenant_id=tenant_id) as row:
             self._validate_resumable(row, now=now)
             assert row is not None
@@ -300,6 +326,8 @@ class FactoryActionStore:
     def _validate_resumable(row: FactoryActionRow | None, *, now: datetime) -> None:
         if row is None:
             raise LookupError("factory action not found")
+        if row.status == "expired":
+            raise TimeoutError("factory action expired")
         if row.status not in {"answered", "consumed"} or row.response is None:
             raise ValueError("factory action is not answered")
         if row.request.deadline_at <= _aware_utc(now) and row.status != "consumed":
@@ -493,7 +521,7 @@ class MariaDBFactoryActionRepository:
     ) -> None:
         query = (
             "UPDATE factory_action_inbox SET status = 'expired' WHERE tenant_id = %s "
-            "AND status = 'pending' AND deadline_at <= %s"
+            "AND status IN ('pending', 'answered') AND deadline_at <= %s"
         )
         parameters: tuple[object, ...] = (tenant_id, _naive_utc(now))
         if request_id is not None:
@@ -689,7 +717,22 @@ def _db_row(row: dict[str, object]) -> FactoryActionRow:
             "answered", "projection_intent", "projection_acknowledged", "continuation_intent"
         })
         or (status == "consumed" and response is not None and phase == "continuation_acknowledged")
-        or (status == "expired" and response is None and phase is None)
+        or (
+            status == "expired"
+            and (
+                (response is None and phase is None)
+                or (
+                    response is not None
+                    and phase in {
+                        "answered",
+                        "projection_intent",
+                        "projection_acknowledged",
+                        "continuation_intent",
+                        "continuation_acknowledged",
+                    }
+                )
+            )
+        )
     )
     if (
         request_bytes != _canonical_request_payload(request, payload_tenant)
@@ -830,7 +873,7 @@ def _valid_phase_columns(row: FactoryActionRow) -> bool:
         )
     if row.resume_phase == "answered":
         return (
-            row.status == "answered"
+            row.status in {"answered", "expired"}
             and row.response is not None
             and projection_key is None
             and projection_intent_at is None
@@ -842,7 +885,7 @@ def _valid_phase_columns(row: FactoryActionRow) -> bool:
         )
     if row.resume_phase == "projection_intent":
         return (
-            row.status == "answered" and projection_key is not None
+            row.status in {"answered", "expired"} and projection_key is not None
             and projection_intent_at is not None
             and projection_at is None and continuation_key is None
             and continuation_intent_at is None
@@ -850,7 +893,7 @@ def _valid_phase_columns(row: FactoryActionRow) -> bool:
         )
     if row.resume_phase == "projection_acknowledged":
         return (
-            row.status == "answered" and projection_key is not None
+            row.status in {"answered", "expired"} and projection_key is not None
             and projection_intent_at is not None
             and projection_at is not None and continuation_key is None
             and continuation_intent_at is None
@@ -858,17 +901,21 @@ def _valid_phase_columns(row: FactoryActionRow) -> bool:
         )
     if row.resume_phase == "continuation_intent":
         return (
-            row.status == "answered" and projection_key is not None
+            row.status in {"answered", "expired"} and projection_key is not None
             and projection_at is not None and continuation_key is not None
             and projection_intent_at is not None and continuation_intent_at is not None
             and continuation_at is None and consumed_at is None
         )
     if row.resume_phase == "continuation_acknowledged":
         return (
-            row.status == "consumed" and projection_key is not None
+            row.status in {"consumed", "expired"} and projection_key is not None
             and projection_at is not None and continuation_key is not None
             and projection_intent_at is not None and continuation_intent_at is not None
-            and continuation_at is not None and consumed_at is not None
+            and continuation_at is not None
+            and (
+                (row.status == "consumed" and consumed_at is not None)
+                or (row.status == "expired" and consumed_at is None)
+            )
         )
     return False
 
@@ -892,7 +939,11 @@ def _valid_phase_timestamps(row: FactoryActionRow) -> bool:
     if timestamps and timestamps[-1] >= row.request.deadline_at:
         return False
     if row.resume_phase == "continuation_acknowledged":
-        return row.consumed_at == row.continuation_acknowledged_at
+        return (
+            row.consumed_at == row.continuation_acknowledged_at
+            if row.status == "consumed"
+            else row.status == "expired" and row.consumed_at is None
+        )
     return row.consumed_at is None
 
 

@@ -13,7 +13,10 @@ from agenten.agent_factory.action_resume import (
 )
 from agenten.agent_factory.forge_contracts import FactoryActionRequestV1, FactoryActionResponseV1
 from gateway.factory_action_store import FactoryActionStore
-from tests.gateway.test_factory_action_store import TransactionalMemoryActionRepository
+from tests.gateway.test_factory_action_store import (
+    TransactionalMemoryActionRepository,
+    advance_to_phase,
+)
 
 
 NOW = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
@@ -182,6 +185,52 @@ def test_answer_just_before_deadline_completes_after_restart() -> None:
     assert durable.resume_phase == "continuation_acknowledged"
     assert len(projection.values) == 1
     assert len(scheduler.values) == 1
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "answered",
+        "projection_intent",
+        "projection_acknowledged",
+        "continuation_intent",
+        "continuation_acknowledged",
+    ],
+)
+def test_restart_at_deadline_expires_partial_resume_without_duplicate_effects(
+    phase: str,
+) -> None:
+    request = FactoryActionRequestV1.model_validate_json(
+        (FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8")
+    )
+    before_deadline = request.deadline_at - timedelta(microseconds=1)
+    repository = TransactionalMemoryActionRepository()
+    store = FactoryActionStore(repository=repository)
+    store.create(request, tenant_id="tenant-a")
+    advance_to_phase(
+        store,
+        request,
+        "continuation_intent" if phase == "continuation_acknowledged" else phase,
+        now=before_deadline,
+    )
+    if phase == "continuation_acknowledged":
+        durable = repository.rows[str(request.request_id)]
+        durable.resume_phase = "continuation_acknowledged"
+        durable.continuation_acknowledged_at = before_deadline
+    projection = RecordingProjection()
+    scheduler = RecordingScheduler()
+
+    with pytest.raises(TimeoutError, match="expired"):
+        FactoryActionResumeCoordinator(
+            store=FactoryActionStore(repository=repository),
+            projection=projection,
+            scheduler=scheduler,
+            clock=lambda: request.deadline_at,
+        ).resume(request_id=request.request_id, tenant_id="tenant-a")
+
+    assert repository.rows[str(request.request_id)].status == "expired"
+    assert projection.values == []
+    assert scheduler.values == []
 
 
 @pytest.mark.parametrize("failure_mode", ["before", "after"])
