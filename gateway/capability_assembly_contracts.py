@@ -22,6 +22,8 @@ from agenten.agent_factory.capability_live_runner import (
     CapabilityLiveReservation,
     CapabilityLiveStage,
 )
+from agenten.agent_factory.input_compiler import CompiledFactorySpecification
+from agenten.agent_factory.input_contracts import FactoryInputDocumentV2
 from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN, SHA256_PATTERN
 from gateway.capability_live_pipeline import (
     CapabilityBusinessBenchmarkAuthority,
@@ -135,11 +137,40 @@ class CapabilityAssemblySubmitRequest(_FrozenContract):
         return self
 
 
+class CapabilityAssemblyCanonicalInput(_FrozenContract):
+    """Exact canonical input and compiler result admitted by production Captain."""
+
+    schema_name: Literal["captain.capability-assembly-canonical-input.v1"] = Field(
+        default="captain.capability-assembly-canonical-input.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    input_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    conversation_pattern: Literal["sequential", "selector_group_chat", "swarm"]
+    document: FactoryInputDocumentV2
+    compiled_specification: CompiledFactorySpecification
+    required_tool_markers: tuple[Literal["TODO_TOOL.v1"], ...] = ()
+
+    @property
+    def source_ref(self) -> ArtifactRef:
+        return self.document.input_ref
+
+    @property
+    def n8n_required(self) -> bool:
+        return any(integration.required for integration in self.document.integrations)
+
+    @model_validator(mode="after")
+    def require_compiler_source_binding(self) -> "CapabilityAssemblyCanonicalInput":
+        if self.compiled_specification.source_ref != self.document.input_ref:
+            raise ValueError("compiled specification changed canonical source authority")
+        return self
+
+
 class CapabilityAssemblyAdmittedInput(_FrozenContract):
     """Read-only admission result for exact repository-owned source bytes."""
 
     repository_path: str = Field(min_length=1, max_length=512)
-    input: CapabilityLiveInput
+    input: CapabilityAssemblyCanonicalInput | CapabilityLiveInput
 
     @field_validator("repository_path")
     @classmethod
@@ -506,7 +537,11 @@ def canonical_assembly_model_bytes(value: BaseModel) -> bytes:
 
     return (
         json.dumps(
-            value.model_dump(mode="json", by_alias=True),
+            value.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_computed_fields=True,
+            ),
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
@@ -538,6 +573,7 @@ __all__ = [
     "ASSEMBLY_TOTAL_SLICES",
     "CapabilityAssemblyActiveAdvance",
     "CapabilityAssemblyAdmittedInput",
+    "CapabilityAssemblyCanonicalInput",
     "CapabilityAssemblyAdvanceReceipt",
     "CapabilityAssemblyAdvanceRequest",
     "CapabilityAssemblyCheckpoint",

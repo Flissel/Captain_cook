@@ -7,6 +7,7 @@ import hmac
 import inspect
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
 
 _MANIFEST_SCHEMA = "captain.runtime-adapters.v1"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
+_REVISION_PATTERN = r"^[0-9a-f]{40}$"
 
 
 class RuntimeAdapterManifestError(ValueError):
@@ -456,6 +458,66 @@ def load_verified_repository_module(
         raise RuntimeAdapterManifestError("runtime adapter module digest mismatch")
     _require_committed_repository_bytes(path, content, repository_root=root)
     return _load_verified_module(path, content, expected_digest)
+
+
+def read_verified_repository_bytes(
+    file_path: str | Path,
+    *,
+    expected_sha256: str,
+    expected_repository_revision: str,
+    repository_root: Path,
+) -> tuple[Path, bytes]:
+    """Single-open one digest-pinned file and attest it to clean HEAD/index bytes."""
+
+    root = repository_root.resolve(strict=True)
+    if re.fullmatch(_REVISION_PATTERN, expected_repository_revision) is None:
+        raise RuntimeAdapterManifestError("repository revision is invalid")
+    requested_path = _normalize_requested_path(file_path, repository_root=root)
+    path, content = _read_authorized_file(
+        file_path,
+        repository_root=root,
+        description="repository input",
+    )
+    if os.path.normcase(os.path.abspath(path)) != os.path.normcase(
+        os.path.abspath(requested_path)
+    ):
+        raise RuntimeAdapterManifestError(
+            "repository input link or final path mismatch"
+        )
+    expected_digest = _require_sha256(
+        expected_sha256,
+        description="repository input",
+    )
+    if not hmac.compare_digest(_sha256(content), expected_digest):
+        raise RuntimeAdapterManifestError("repository input digest mismatch")
+
+    git_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=git_environment,
+        )
+    except OSError:
+        raise RuntimeAdapterManifestError(
+            "repository revision could not be verified"
+        ) from None
+    if result.returncode != 0:
+        raise RuntimeAdapterManifestError(
+            "repository revision could not be verified"
+        )
+    observed_revision = os.fsdecode(result.stdout.strip())
+    if not hmac.compare_digest(observed_revision, expected_repository_revision):
+        raise RuntimeAdapterManifestError("repository revision mismatch")
+
+    _require_committed_repository_bytes(path, content, repository_root=root)
+    return path, content
 
 
 def _validate_binding(value: object) -> RuntimeAdapterBinding:
