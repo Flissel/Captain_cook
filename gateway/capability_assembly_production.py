@@ -20,6 +20,7 @@ from typing import Literal, Protocol, cast
 from uuid import UUID
 
 from agenten.agent_factory.capability_live_runner import (
+    CapabilityLiveCapabilityEvidence,
     CapabilityLiveReservation,
     CapabilityLiveStage,
     CapabilityLiveStageRequest,
@@ -48,17 +49,27 @@ from gateway.capability_assembly_contracts import (
 )
 from gateway.capability_assembly_controller import CapabilityAssemblyController
 from gateway.capability_assembly_repository import GatewayCapabilityAssemblyRepository
+from gateway.capability_generic_benchmark import (
+    GenericBenchmarkExecutorPort,
+    GenericBenchmarkRecorderPort,
+    GenericCapabilityBenchmarkAdapter,
+    GenericPrivateHoldoutReader,
+    build_generic_benchmark_suite,
+)
 from gateway.capability_live_current_adapters import (
     CapabilityProjectionReadback,
-    GatewayCapabilityBusinessBenchmarkAdapter,
-    GatewayMinibookCapabilityProjectionAdapter,
     RecordedFactoryCapabilityExecutionAdapter,
 )
 from gateway.capability_live_factory_adapter import (
     CapabilityFactoryProvisioningPort,
     CurrentCapabilityFactoryAdapter,
 )
-from gateway.capability_live_pipeline import CapabilityLiveAuthorityUnavailable
+from gateway.capability_live_pipeline import (
+    CapabilityExecutionAuthority,
+    CapabilityFactoryAuthority,
+    CapabilityLiveAuthorityUnavailable,
+    CapabilityProjectionAuthority,
+)
 from gateway.capability_live_runtime_resume import (
     CapabilityResumeGatewayPort,
     GatewayCapabilityResumeExecutionAdapter,
@@ -94,6 +105,10 @@ class CapabilityProjectionGatewayPort(Protocol):
         event_id: UUID,
     ) -> MinibookProjectionEvent | None: ...
 
+    async def capability_promotion_event(
+        self, release: CapabilityFactoryAuthority
+    ) -> MinibookProjectionEvent: ...
+
     async def acknowledge_projection(
         self,
         acknowledgement: MinibookProjectionAcknowledgementV1,
@@ -109,6 +124,62 @@ class Sha256ArtifactStorePort(Protocol):
     def put(self, content: bytes, media_type: str) -> ArtifactRef: ...
 
     def read_bytes(self, reference: ArtifactRef) -> bytes: ...
+
+
+class CapabilityN8nWorkBatchAuthorityPort(Protocol):
+    gateway_store: object
+
+    def active_n8n_work_batch_id(self, job_id: UUID) -> str | None: ...
+
+
+class GenericCapabilityPromotionPort(Protocol):
+    gateway_store: object
+
+    async def promote_generic_capability(
+        self, request: CapabilityAssemblyStageRequest, binding: object
+    ) -> object: ...
+
+
+class _SanitizedResumeGateway:
+    def __init__(self, gateway: CapabilityResumeGatewayPort) -> None:
+        self._gateway = gateway
+
+    async def authorize_resume(self, request: object):
+        try:
+            return await self._gateway.authorize_resume(request)
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway resume authorization is unavailable"
+            ) from None
+
+    async def dispatch_resume(self, authorization: object):
+        try:
+            return await self._gateway.dispatch_resume(authorization)
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway resume dispatch is unavailable"
+            ) from None
+
+    async def readback_resume(self, authorization: object):
+        try:
+            return await self._gateway.readback_resume(authorization)
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway resume readback is unavailable"
+            ) from None
+
+
+class _SanitizedReconciliation:
+    def __init__(self, reconciliation: CapabilityAssemblyReconciliationPort) -> None:
+        self._reconciliation = reconciliation
+
+    async def reconcile(self, request: object):
+        try:
+            return await self._reconciliation.reconcile(request)
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway reconciliation authority is unavailable"
+            ) from None
 
 
 class RepositoryFactoryInputArtifactStore:
@@ -186,7 +257,12 @@ class AsyncMinibookProjectorAdapter:
         self._projector = projector
 
     async def project(self, event: MinibookProjectionEvent) -> ProjectionResult:
-        result = await asyncio.to_thread(self._projector.project, event)
+        try:
+            result = await asyncio.to_thread(self._projector.project, event)
+        except Exception:
+            raise CapabilityAssemblyProductionConfigurationError(
+                "Minibook projection authority is unavailable"
+            ) from None
         if not isinstance(result, ProjectionResult):
             raise CapabilityAssemblyProductionConfigurationError(
                 "Minibook projector returned an invalid projection result"
@@ -197,7 +273,12 @@ class AsyncMinibookProjectorAdapter:
         self,
         event: MinibookProjectionEvent,
     ) -> MinibookProjectionAcknowledgementV1:
-        result = await asyncio.to_thread(self._projector.acknowledgement, event)
+        try:
+            result = await asyncio.to_thread(self._projector.acknowledgement, event)
+        except Exception:
+            raise CapabilityAssemblyProductionConfigurationError(
+                "Minibook acknowledgement authority is unavailable"
+            ) from None
         if not isinstance(result, MinibookProjectionAcknowledgementV1):
             raise CapabilityAssemblyProductionConfigurationError(
                 "Minibook projector returned an invalid acknowledgement"
@@ -217,6 +298,7 @@ class GatewayMinibookProjectionEffectsAdapter:
         _preflight_methods(
             (
                 (gateway, "projection_event", True, 1),
+                (gateway, "capability_promotion_event", True, 1),
                 (gateway, "acknowledge_projection", True, 1),
                 (gateway, "projection_readback", True, 1),
                 (minibook, "project", True, 1),
@@ -226,9 +308,40 @@ class GatewayMinibookProjectionEffectsAdapter:
         self._gateway = gateway
         self._minibook = minibook
 
+    async def promotion_event(
+        self, release: CapabilityFactoryAuthority
+    ) -> MinibookProjectionEvent:
+        try:
+            event = await self._gateway.capability_promotion_event(release)
+        except Exception:
+            raise CapabilityAssemblyProductionConfigurationError(
+                "Gateway promotion projection authority is unavailable"
+            ) from None
+        if (
+            not isinstance(event, MinibookProjectionEvent)
+            or event.correlation_id != release.correlation_id
+            or event.subject_version != release.capability_version
+        ):
+            raise CapabilityAssemblyProductionConfigurationError(
+                "Gateway promotion projection authority is invalid"
+            )
+        return event
+
     async def project_and_ack(
         self,
         event: MinibookProjectionEvent,
+    ) -> CapabilityProjectionReadback:
+        try:
+            return await self._project_and_ack(event)
+        except CapabilityAssemblyProductionConfigurationError:
+            raise
+        except Exception:
+            raise CapabilityAssemblyProductionConfigurationError(
+                "Gateway Minibook projection authority is unavailable"
+            ) from None
+
+    async def _project_and_ack(
+        self, event: MinibookProjectionEvent
     ) -> CapabilityProjectionReadback:
         authoritative = await self._gateway.projection_event(event.event_id)
         if authoritative != event:
@@ -257,6 +370,18 @@ class GatewayMinibookProjectionEffectsAdapter:
     async def readback(
         self,
         event_id: UUID,
+    ) -> CapabilityProjectionReadback | None:
+        try:
+            return await self._readback(event_id)
+        except CapabilityAssemblyProductionConfigurationError:
+            raise
+        except Exception:
+            raise CapabilityAssemblyProductionConfigurationError(
+                "Gateway Minibook readback authority is unavailable"
+            ) from None
+
+    async def _readback(
+        self, event_id: UUID
     ) -> CapabilityProjectionReadback | None:
         event = await self._gateway.projection_event(event_id)
         if event is None:
@@ -301,6 +426,78 @@ class GatewayMinibookProjectionEffectsAdapter:
                 "Gateway projection acknowledgement read-back is unavailable"
             )
         return readback
+
+
+class GenericGatewayMinibookCapabilityProjectionAdapter:
+    """Project an event issued by Gateway, without profile-specific summaries."""
+
+    def __init__(self, *, effects: GatewayMinibookProjectionEffectsAdapter) -> None:
+        self._effects = effects
+
+    async def project_and_readback(
+        self,
+        request: CapabilityAssemblyStageRequest,
+        release: CapabilityFactoryAuthority,
+        execution: CapabilityExecutionAuthority,
+    ) -> CapabilityProjectionAuthority:
+        del request
+        try:
+            event = await self._effects.promotion_event(release)
+            readback = await self._effects.project_and_ack(event)
+            return self._authority(release, execution, event, readback)
+        except CapabilityAssemblyProductionConfigurationError:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Minibook projection authority is unavailable"
+            ) from None
+
+    async def readback(
+        self,
+        capability: CapabilityLiveCapabilityEvidence,
+        release: CapabilityFactoryAuthority,
+        execution: CapabilityExecutionAuthority,
+    ) -> CapabilityProjectionAuthority:
+        del capability
+        try:
+            event = await self._effects.promotion_event(release)
+            readback = await self._effects.readback(event.event_id)
+        except CapabilityAssemblyProductionConfigurationError:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Minibook projection readback is unavailable"
+            ) from None
+        if readback is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Minibook projection readback is unavailable"
+            )
+        return self._authority(release, execution, event, readback)
+
+    @staticmethod
+    def _authority(
+        release: CapabilityFactoryAuthority,
+        execution: CapabilityExecutionAuthority,
+        event: MinibookProjectionEvent,
+        readback: CapabilityProjectionReadback,
+    ) -> CapabilityProjectionAuthority:
+        acknowledgement = readback.acknowledgement
+        if (
+            readback.event != event
+            or acknowledgement.projection_event_id != event.event_id
+            or acknowledgement.correlation_id != release.correlation_id
+            or acknowledgement.subject_version != release.capability_version
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "Minibook acknowledgement does not match Gateway promotion"
+            )
+        return CapabilityProjectionAuthority(
+            job_id=release.job_id,
+            correlation_id=release.correlation_id,
+            capability_id=release.capability_id,
+            capability_version=release.capability_version,
+            execution_command_id=execution.execution_command_id,
+            execution_result_id=execution.execution_result_id,
+            projection_event_id=event.event_id,
+            projection_readback_id=acknowledgement.acknowledgement_id,
+            evidence_refs=(readback.evidence_ref,),
+        )
 
 
 @dataclass(frozen=True, repr=False)
@@ -388,6 +585,10 @@ class CapabilityAssemblyProductionAuthorities:
     reconciliation: CapabilityAssemblyReconciliationPort
     minibook_effects: GatewayMinibookProjectionEffectsAdapter
     source_artifacts: RepositoryFactoryInputArtifactStore
+    benchmark_executor: GenericBenchmarkExecutorPort
+    benchmark_recorder: GenericBenchmarkRecorderPort
+    promotion: GenericCapabilityPromotionPort
+    n8n_work_batches: CapabilityN8nWorkBatchAuthorityPort
 
 
 @dataclass(frozen=True)
@@ -414,34 +615,130 @@ class _CurrentStageRequestView:
 class CapabilityAssemblyCurrentFactoryAdapter(CurrentCapabilityFactoryAdapter):
     """Adapt canonical assembly input semantics to the current Factory seam."""
 
+    def __init__(self, *, generic_holdouts: GenericPrivateHoldoutReader,
+                 n8n_work_batches: CapabilityN8nWorkBatchAuthorityPort,
+                 promotion: GenericCapabilityPromotionPort, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self._generic_holdouts = generic_holdouts
+        self._n8n_work_batches = n8n_work_batches
+        self._promotion = promotion
+
     def job_id_for(self, request: CapabilityAssemblyStageRequest) -> UUID | None:
-        return super().job_id_for(
-            cast(CapabilityLiveStageRequest, _current_stage_request(request))
-        )
+        try:
+            return super().job_id_for(
+                cast(CapabilityLiveStageRequest, _current_stage_request(request))
+            )
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway Factory job authority is unavailable"
+            ) from None
+
+    def binding_for(self, request: CapabilityAssemblyStageRequest):
+        try:
+            return self._provisioning.binding_for(
+                cast(CapabilityLiveStageRequest, _current_stage_request(request))
+            )
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway Factory binding authority is unavailable"
+            ) from None
 
     async def scaffold(self, request: CapabilityAssemblyStageRequest):
-        return await super().scaffold(
-            cast(CapabilityLiveStageRequest, _current_stage_request(request))
-        )
+        try:
+            authority = await super().scaffold(
+                cast(CapabilityLiveStageRequest, _current_stage_request(request))
+            )
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway Factory scaffold authority is unavailable"
+            ) from None
+        self._require_n8n_authority(request)
+        return self._generic_suite_authority(request, authority)
 
     async def implement(self, request: CapabilityAssemblyStageRequest):
-        return await super().implement(
-            cast(CapabilityLiveStageRequest, _current_stage_request(request))
-        )
+        try:
+            authority = await super().implement(
+                cast(CapabilityLiveStageRequest, _current_stage_request(request))
+            )
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway Factory implementation authority is unavailable"
+            ) from None
+        self._require_n8n_authority(request)
+        return self._generic_suite_authority(request, authority)
 
     async def seal(self, request: CapabilityAssemblyStageRequest):
-        return await super().seal(
-            cast(CapabilityLiveStageRequest, _current_stage_request(request))
-        )
+        try:
+            authority = await super().seal(
+                cast(CapabilityLiveStageRequest, _current_stage_request(request))
+            )
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway Factory seal authority is unavailable"
+            ) from None
+        self._require_n8n_authority(request)
+        return self._generic_suite_authority(request, authority)
 
     async def promote(self, request: CapabilityAssemblyStageRequest):
         if request.input.required_tool_gaps:
             raise CapabilityLiveAuthorityUnavailable(
                 "required TODO_TOOL gaps block capability promotion"
             )
-        return await super().promote(
+        binding = self._provisioning.binding_for(
             cast(CapabilityLiveStageRequest, _current_stage_request(request))
         )
+        if binding is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Factory provisioning binding is unavailable"
+            )
+        self._require_n8n_authority(request)
+        try:
+            authority = await self._promotion.promote_generic_capability(request, binding)
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "generic capability promotion authority is unavailable"
+            ) from None
+        return self._generic_suite_authority(request, authority)
+
+    def _generic_suite_authority(self, request: CapabilityAssemblyStageRequest, authority: object):
+        if authority is None:
+            return None
+        if not isinstance(authority, CapabilityFactoryAuthority):
+            raise CapabilityLiveAuthorityUnavailable(
+                "generic Factory authority is invalid"
+            )
+        try:
+            suite_ref = build_generic_benchmark_suite(
+                request.input.compiled_specification, self._generic_holdouts
+            ).suite_ref
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "private benchmark suite authority is unavailable"
+            ) from None
+        return authority.model_copy(update={"suite_ref": suite_ref})
+
+    def _require_n8n_authority(self, request: CapabilityAssemblyStageRequest) -> None:
+        binding = self._provisioning.binding_for(
+            cast(CapabilityLiveStageRequest, _current_stage_request(request))
+        )
+        if binding is None:
+            raise CapabilityLiveAuthorityUnavailable("Factory provisioning binding is unavailable")
+        expected = _compiled_n8n_required(request)
+        try:
+            recorded = self._n8n_work_batches.active_n8n_work_batch_id(binding.job.job_id)
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway n8n WorkBatch authority is unavailable"
+            ) from None
+        bound = binding.n8n_work_batch_id
+        if expected and (not bound or recorded != bound):
+            raise CapabilityLiveAuthorityUnavailable(
+                "required n8n WorkBatch lease does not match compiled integration intent"
+            )
+        if not expected and (bound is not None or recorded is not None):
+            raise CapabilityLiveAuthorityUnavailable(
+                "unexpected n8n WorkBatch lease conflicts with compiled integration intent"
+            )
 
 
 def compose_capability_assembly_controller(
@@ -453,6 +750,11 @@ def compose_capability_assembly_controller(
     resume_gateway: CapabilityResumeGatewayPort,
     reconciliation: CapabilityAssemblyReconciliationPort,
     minibook_effects: GatewayMinibookProjectionEffectsAdapter,
+    benchmark_executor: GenericBenchmarkExecutorPort,
+    benchmark_recorder: GenericBenchmarkRecorderPort,
+    promotion: GenericCapabilityPromotionPort,
+    n8n_work_batches: CapabilityN8nWorkBatchAuthorityPort,
+    holdout_store: GenericPrivateHoldoutReader,
     clock: Callable[[], datetime],
 ) -> CapabilityAssemblyController:
     """Join already configured Gateway-owned ports without performing effects."""
@@ -465,27 +767,36 @@ def compose_capability_assembly_controller(
         resume_gateway=resume_gateway,
         reconciliation=reconciliation,
         minibook_effects=minibook_effects,
+        benchmark_executor=benchmark_executor,
+        benchmark_recorder=benchmark_recorder,
+        promotion=promotion,
+        n8n_work_batches=n8n_work_batches,
+        holdout_store=holdout_store,
         clock=clock,
     )
-    resume = GatewayCapabilityResumeExecutionAdapter(gateway=resume_gateway)
+    resume = GatewayCapabilityResumeExecutionAdapter(
+        gateway=cast(CapabilityResumeGatewayPort, _SanitizedResumeGateway(resume_gateway))
+    )
     factory: CapabilityAssemblyFactoryPort = CapabilityAssemblyCurrentFactoryAdapter(
         composition=factory_composition,
         provisioning=provisioning,
         clock=clock,
+        generic_holdouts=holdout_store,
+        n8n_work_batches=n8n_work_batches,
+        promotion=promotion,
     )
-    benchmark: CapabilityAssemblyBusinessBenchmarkPort = (
-        GatewayCapabilityBusinessBenchmarkAdapter(
-            composition=factory_composition,
-            bindings=cast(object, factory),
-        )
+    benchmark: CapabilityAssemblyBusinessBenchmarkPort = GenericCapabilityBenchmarkAdapter(
+        bindings=factory,
+        executor=benchmark_executor,
+        recorder=benchmark_recorder,
+        holdouts=holdout_store,
     )
     execution: CapabilityAssemblyExecutionPort = RecordedFactoryCapabilityExecutionAdapter(
         composition=factory_composition,
         resume_execution=resume,
     )
-    projection: CapabilityAssemblyProjectionPort = GatewayMinibookCapabilityProjectionAdapter(
-        composition=factory_composition,
-        effects=minibook_effects,
+    projection: CapabilityAssemblyProjectionPort = (
+        GenericGatewayMinibookCapabilityProjectionAdapter(effects=minibook_effects)
     )
     return CapabilityAssemblyController(
         repository=repository,
@@ -493,7 +804,10 @@ def compose_capability_assembly_controller(
         factory=factory,
         benchmark=benchmark,
         resume=resume,
-        reconciliation=reconciliation,
+        reconciliation=cast(
+            CapabilityAssemblyReconciliationPort,
+            _SanitizedReconciliation(reconciliation),
+        ),
         execution=execution,
         minibook_projection=projection,
     )
@@ -515,6 +829,7 @@ def build_capability_assembly_controller(
         raise CapabilityAssemblyProductionConfigurationError(
             "capability assembly requires the Gateway-owned store"
         )
+    _require_same_gateway_authority(authorities)
     _require_method(
         authorities.store.storage,
         "transaction",
@@ -543,6 +858,11 @@ def build_capability_assembly_controller(
         resume_gateway=authorities.resume_gateway,
         reconciliation=authorities.reconciliation,
         minibook_effects=authorities.minibook_effects,
+        benchmark_executor=authorities.benchmark_executor,
+        benchmark_recorder=authorities.benchmark_recorder,
+        promotion=authorities.promotion,
+        n8n_work_batches=authorities.n8n_work_batches,
+        holdout_store=holdout_store,
         source_artifacts=authorities.source_artifacts,
         clock=selected_clock,
     )
@@ -555,8 +875,43 @@ def build_capability_assembly_controller(
         resume_gateway=authorities.resume_gateway,
         reconciliation=authorities.reconciliation,
         minibook_effects=authorities.minibook_effects,
+        benchmark_executor=authorities.benchmark_executor,
+        benchmark_recorder=authorities.benchmark_recorder,
+        promotion=authorities.promotion,
+        n8n_work_batches=authorities.n8n_work_batches,
+        holdout_store=cast(GenericPrivateHoldoutReader, holdout_store),
         clock=selected_clock,
     )
+
+
+def _require_same_gateway_authority(
+    authorities: CapabilityAssemblyProductionAuthorities,
+) -> None:
+    """Reject mixed/fake authority graphs before schema or external effects."""
+    store = authorities.store
+    repository = getattr(authorities.factory, "repository", None)
+    candidates = {
+        "Factory repository": getattr(repository, "_store", None),
+        "Factory provisioner": getattr(
+            getattr(authorities.provisioning, "_repository", None), "_store", None
+        ),
+        "resume Gateway": getattr(authorities.resume_gateway, "gateway_store", None),
+        "reconciliation Gateway": getattr(authorities.reconciliation, "gateway_store", None),
+        "benchmark executor": getattr(authorities.benchmark_executor, "gateway_store", None),
+        "benchmark recorder": getattr(authorities.benchmark_recorder, "gateway_store", None),
+        "promotion Gateway": getattr(authorities.promotion, "gateway_store", None),
+        "n8n WorkBatch Gateway": getattr(authorities.n8n_work_batches, "gateway_store", None),
+        "projection Gateway": getattr(
+            getattr(authorities.minibook_effects, "_gateway", None),
+            "gateway_store",
+            None,
+        ),
+    }
+    for label, candidate in candidates.items():
+        if candidate is not store:
+            raise CapabilityAssemblyProductionConfigurationError(
+                f"{label} is not bound to the production Gateway store"
+            )
 
 
 class _RepositoryContractProbe:
@@ -593,6 +948,11 @@ def _preflight_composition(
     resume_gateway: object,
     reconciliation: object,
     minibook_effects: object,
+    benchmark_executor: object,
+    benchmark_recorder: object,
+    promotion: object,
+    n8n_work_batches: object,
+    holdout_store: object,
     source_artifacts: object | None = None,
     clock: object,
 ) -> None:
@@ -669,6 +1029,11 @@ def _preflight_composition(
             (reconciliation, "reconcile", True, 1, "reconciliation.reconcile"),
             (minibook_effects, "project_and_ack", True, 1),
             (minibook_effects, "readback", True, 1),
+            (benchmark_executor, "execute_pair", True, 1),
+            (benchmark_recorder, "record_generic_benchmark", False, 1),
+            (promotion, "promote_generic_capability", True, 2),
+            (n8n_work_batches, "active_n8n_work_batch_id", False, 1),
+            (holdout_store, "get", False, 1),
             *(
                 (
                     (source_artifacts, "put_factory_input", False, 1),
@@ -774,9 +1139,7 @@ def _require_callable(
 def _current_stage_request(
     request: CapabilityAssemblyStageRequest,
 ) -> _CurrentStageRequestView:
-    n8n_required = any(
-        agent.n8n_requirement == "required" for agent in request.input.document.agents
-    )
+    n8n_required = _compiled_n8n_required(request)
     return _CurrentStageRequestView(
         run_id=request.run_id,
         input=_CurrentInputView(
@@ -789,10 +1152,33 @@ def _current_stage_request(
         reservation=request.reservation,
         stage=request.stage,
         controlled_recovery_required=request.controlled_recovery_required,
-        suite_ref=request.suite_ref,
+        suite_ref=None,
         hermes_result_ref=request.hermes_result_ref,
         retry_number=request.retry_number,
     )
+
+
+def _compiled_n8n_required(request: CapabilityAssemblyStageRequest) -> bool:
+    required = {item.integration_key for item in request.input.document.integrations if item.required}
+    bound = {key for agent in request.input.document.agents for key in agent.integration_keys}
+    if required - bound:
+        raise CapabilityLiveAuthorityUnavailable(
+            "required integration is not bound to a canonical agent"
+        )
+    decisions = {key for node in request.input.compiled_specification.work_nodes
+                 if node.kind == "integration_decision" for key in node.integration_keys}
+    workflows = {node.node_id.removeprefix("n8n-")
+                 for node in request.input.compiled_specification.work_nodes
+                 if node.kind == "n8n_workflow" and node.node_id.startswith("n8n-")}
+    if (required - decisions) or (required - workflows):
+        raise CapabilityLiveAuthorityUnavailable(
+            "compiled n8n work graph does not cover required integration bindings"
+        )
+    if (decisions & bound) != (workflows & bound):
+        raise CapabilityLiveAuthorityUnavailable(
+            "compiled n8n work graph contains an unmatched integration decision"
+        )
+    return bool(required)
 
 
 def _canonical_input_path(value: object) -> str:
@@ -832,6 +1218,7 @@ __all__ = [
     "CapabilityAssemblyProductionSettings",
     "CapabilityProjectionGatewayPort",
     "GatewayMinibookProjectionEffectsAdapter",
+    "GenericGatewayMinibookCapabilityProjectionAdapter",
     "RepositoryFactoryInputArtifactStore",
     "build_capability_assembly_controller",
     "compose_capability_assembly_controller",

@@ -41,6 +41,10 @@ from gateway.capability_assembly_production import (
     build_capability_assembly_controller,
     compose_capability_assembly_controller,
 )
+from gateway.capability_generic_benchmark import (
+    GenericBenchmarkCategory,
+    build_generic_benchmark_suite,
+)
 from gateway.capability_assembly_repository import GatewayCapabilityAssemblyRepository
 from gateway.capability_live_current_adapters import CapabilityProjectionReadback
 from gateway.capability_live_factory_adapter import CurrentCapabilityFactoryAdapter
@@ -115,10 +119,15 @@ class _ProjectionGateway:
         self.event = event
         self.acknowledgement: MinibookProjectionAcknowledgementV1 | None = None
         self.calls: list[str] = []
+        self.gateway_store: object | None = None
 
     async def projection_event(self, event_id: UUID) -> MinibookProjectionEvent | None:
         self.calls.append("feed")
         return self.event if event_id == self.event.event_id else None
+
+    async def capability_promotion_event(self, release: object) -> MinibookProjectionEvent:
+        del release
+        return self.event
 
     async def acknowledge_projection(
         self, acknowledgement: MinibookProjectionAcknowledgementV1
@@ -431,6 +440,8 @@ class _GatewayStore(GatewayStore):
 
 
 class _Provisioning:
+    def __init__(self, store: object | None = None) -> None:
+        self._repository = SimpleNamespace(_store=store)
     def provision(self, request: object) -> object | None:
         del request
         return None
@@ -441,6 +452,8 @@ class _Provisioning:
 
 
 class _ResumeGateway:
+    def __init__(self, store: object | None = None) -> None:
+        self.gateway_store = store
     async def authorize_resume(self, request: object) -> object | None:
         del request
         return None
@@ -455,6 +468,8 @@ class _ResumeGateway:
 
 
 class _Reconciliation:
+    def __init__(self, store: object | None = None) -> None:
+        self.gateway_store = store
     async def reconcile(self, request: object) -> object | None:
         del request
         return None
@@ -488,6 +503,8 @@ class _FactoryCoordinator:
 
 
 class _FactoryRepository:
+    def __init__(self, store: object | None = None) -> None:
+        self._store = store
     def snapshot(self, job_id: object) -> object:
         del job_id
         return object()
@@ -505,9 +522,9 @@ class _FactoryRepository:
         return None
 
 
-def _factory_composition() -> AgentFactoryLiveComposition:
+def _factory_composition(store: object | None = None) -> AgentFactoryLiveComposition:
     return AgentFactoryLiveComposition(
-        repository=_FactoryRepository(),  # type: ignore[arg-type]
+        repository=_FactoryRepository(store),  # type: ignore[arg-type]
         coordinator=_FactoryCoordinator(),  # type: ignore[arg-type]
         lease_issuer=object(),  # type: ignore[arg-type]
         hermes=object(),  # type: ignore[arg-type]
@@ -528,20 +545,43 @@ def _authorities(
 ) -> CapabilityAssemblyProductionAuthorities:
     event = _event()
     projection = GatewayMinibookProjectionEffectsAdapter(
-        gateway=_ProjectionGateway(event),
+        gateway=(projection_gateway := _ProjectionGateway(event)),
         minibook=_MinibookProjection(_acknowledgement(event)),
     )
     source_artifacts = RepositoryFactoryInputArtifactStore(
         artifacts=_Sha256Artifacts()
     )
+    projection_gateway.gateway_store = store
+    class BenchmarkExecutor:
+        gateway_store = store
+        async def execute_pair(self, request: object) -> object:
+            raise AssertionError("not called by builder")
+    class BenchmarkRecorder:
+        gateway_store = store
+        def record_generic_benchmark(self, request: object) -> object:
+            raise AssertionError("not called by builder")
+    class Promotion:
+        gateway_store = store
+        async def promote_generic_capability(self, request: object, binding: object) -> object:
+            raise AssertionError("not called by builder")
+    class N8nBatches:
+        gateway_store = store
+        def active_n8n_work_batch_id(self, job_id: object) -> str | None:
+            return None
+    selected_resume = resume_gateway or _ResumeGateway(store)
+    setattr(selected_resume, "gateway_store", store)
     return CapabilityAssemblyProductionAuthorities(
         store=store,  # type: ignore[arg-type]
-        factory=_factory_composition(),
-        provisioning=_Provisioning(),
-        resume_gateway=resume_gateway or _ResumeGateway(),  # type: ignore[arg-type]
-        reconciliation=_Reconciliation(),
+        factory=_factory_composition(store),
+        provisioning=_Provisioning(store),
+        resume_gateway=selected_resume,  # type: ignore[arg-type]
+        reconciliation=_Reconciliation(store),
         minibook_effects=projection,
         source_artifacts=source_artifacts,
+        benchmark_executor=BenchmarkExecutor(),  # type: ignore[arg-type]
+        benchmark_recorder=BenchmarkRecorder(),  # type: ignore[arg-type]
+        promotion=Promotion(),  # type: ignore[arg-type]
+        n8n_work_batches=N8nBatches(),  # type: ignore[arg-type]
     )
 
 
@@ -596,10 +636,19 @@ def test_production_builder_rejects_non_exact_port_signature_before_schema_effec
 
 
 def test_current_factory_adapter_blocks_required_todo_before_promotion() -> None:
+    class N8n:
+        def active_n8n_work_batch_id(self, job_id: object) -> str | None:
+            return None
+    class Promotion:
+        async def promote_generic_capability(self, request: object, binding: object) -> object:
+            return object()
     adapter = CapabilityAssemblyCurrentFactoryAdapter(
         composition=_factory_composition(),
         provisioning=_Provisioning(),
         clock=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
+        generic_holdouts=InMemoryPrivateHoldoutStore(),
+        n8n_work_batches=N8n(),  # type: ignore[arg-type]
+        promotion=Promotion(),  # type: ignore[arg-type]
     )
     request = SimpleNamespace(
         input=SimpleNamespace(required_tool_gaps=(object(),)),
@@ -609,15 +658,12 @@ def test_current_factory_adapter_blocks_required_todo_before_promotion() -> None
         asyncio.run(adapter.promote(request))  # type: ignore[arg-type]
 
 
-class _ProvisioningProbe(Exception):
-    def __init__(self, request: object) -> None:
-        super().__init__("captured current provisioning request")
-        self.request = request
-
-
 class _CapturingProvisioning(_Provisioning):
+    request: object | None = None
+
     def provision(self, request: object) -> object | None:
-        raise _ProvisioningProbe(request)
+        self.request = request
+        return None
 
 
 @pytest.mark.parametrize(
@@ -678,16 +724,26 @@ def test_current_factory_bridge_derives_n8n_only_from_canonical_agent_requiremen
         stage=CapabilityLiveStage.SCAFFOLD_AND_TEST_HARNESS,
         controlled_recovery_required=True,
     )
+    class N8n:
+        def active_n8n_work_batch_id(self, job_id: object) -> str | None:
+            return None
+    class Promotion:
+        async def promote_generic_capability(self, request: object, binding: object) -> object:
+            return object()
+    provisioning = _CapturingProvisioning()
     adapter = CapabilityAssemblyCurrentFactoryAdapter(
         composition=_factory_composition(),
-        provisioning=_CapturingProvisioning(),
+        provisioning=provisioning,
         clock=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
+        generic_holdouts=InMemoryPrivateHoldoutStore(),
+        n8n_work_batches=N8n(),  # type: ignore[arg-type]
+        promotion=Promotion(),  # type: ignore[arg-type]
     )
 
-    with pytest.raises(_ProvisioningProbe) as captured:
+    with pytest.raises(CapabilityLiveAuthorityUnavailable):
         asyncio.run(adapter.scaffold(request))
 
-    assert captured.value.request.input.integration_intent == expected_intent
+    assert provisioning.request.input.integration_intent == expected_intent
 
 
 def test_production_builder_uses_gateway_repository_and_current_authority_adapters(
@@ -753,5 +809,164 @@ def test_low_level_composition_rejects_missing_authority_before_using_repository
                 gateway=_ProjectionGateway(_event()),
                 minibook=_MinibookProjection(_acknowledgement(_event())),
             ),
+            benchmark_executor=None,  # type: ignore[arg-type]
+            benchmark_recorder=None,  # type: ignore[arg-type]
+            promotion=None,  # type: ignore[arg-type]
+            n8n_work_batches=None,  # type: ignore[arg-type]
+            holdout_store=InMemoryPrivateHoldoutStore(),  # type: ignore[arg-type]
             clock=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
         )
+
+
+def _admitted_demo(relative_path: str, holdouts: InMemoryPrivateHoldoutStore):
+    root = Path(__file__).resolve().parents[2]
+    source = (root / relative_path).read_bytes()
+    digest = hashlib.sha256(source).hexdigest()
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    input_id = "review-input"
+    run_id = _id("review-run")
+    reservation = CapabilityLiveReservation(
+        reservation_id=_id("review-reservation"), run_id=run_id,
+        input_id=input_id, maximum_cost_usd="1.00",
+    )
+    admitted = RepositoryCapabilityAssemblyInputAdmission(
+        repository_root=root,
+        expected_repository_revision=revision,
+        expected_sha256_by_path={relative_path: digest},
+        compiled_tool_gaps_by_source_sha256={digest: ()},
+        holdout_store=holdouts,
+        subject_version=1,
+    ).admit(CapabilityAssemblyInputRequest(
+        input_id=input_id, repository_path=relative_path,
+        correlation_id=_id("review-correlation"), reservation=reservation,
+    ))
+    return admitted, reservation
+
+
+def test_generic_suite_uses_compiled_private_authority_and_all_five_categories() -> None:
+    holdouts = InMemoryPrivateHoldoutStore()
+    admitted, _ = _admitted_demo(
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
+    )
+
+    first = build_generic_benchmark_suite(
+        admitted.input.compiled_specification, holdouts
+    )
+    second = build_generic_benchmark_suite(
+        admitted.input.compiled_specification, holdouts
+    )
+
+    assert first == second
+    assert len(first.cases) == 15
+    assert {case.category for case in first.cases} == set(GenericBenchmarkCategory)
+    assert all(case.private_holdout_ref.startswith("holdout://") for case in first.cases)
+    assert "claims" not in repr(first).casefold()
+    assert "renewal" not in repr(first).casefold()
+
+
+def test_builder_rejects_mixed_gateway_store_before_schema_effect(tmp_path: Path) -> None:
+    store = _GatewayStore()
+    authorities = _authorities(store=store)
+    object.__setattr__(authorities.benchmark_recorder, "gateway_store", _GatewayStore())
+
+    with pytest.raises(
+        CapabilityAssemblyProductionConfigurationError,
+        match="benchmark recorder.*production Gateway store",
+    ):
+        build_capability_assembly_controller(
+            repository_root=tmp_path,
+            settings=CapabilityAssemblyProductionSettings.from_environment(
+                _settings_environment(tmp_path)
+            ),
+            authorities=authorities,
+            holdout_store=InMemoryPrivateHoldoutStore(),
+        )
+
+    assert store.storage.statements == []
+
+
+def test_projection_external_error_is_redacted_without_cause_or_secret() -> None:
+    secret = "sensitive-provider-token /private/provider/body.json"
+    event = _event()
+
+    class ExplodingGateway(_ProjectionGateway):
+        async def projection_event(self, event_id: UUID):
+            raise RuntimeError(secret)
+
+    effects = GatewayMinibookProjectionEffectsAdapter(
+        gateway=ExplodingGateway(event),
+        minibook=_MinibookProjection(_acknowledgement(event)),
+    )
+
+    with pytest.raises(CapabilityAssemblyProductionConfigurationError) as captured:
+        asyncio.run(effects.project_and_ack(event))
+
+    assert captured.value.__cause__ is None
+    assert secret not in "".join(__import__("traceback").format_exception(captured.value))
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "bound_batch", "recorded_batch", "message"),
+    (
+        (
+            "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md",
+            "n8n-required-batch",
+            None,
+            "required n8n WorkBatch lease",
+        ),
+        (
+            "demo_inputs/agent_factory/sales_pipeline_brief/TO_BE_BUILT.md",
+            "n8n-unexpected-batch",
+            "n8n-unexpected-batch",
+            "unexpected n8n WorkBatch lease",
+        ),
+    ),
+)
+def test_n8n_gateway_lease_is_cross_checked_in_both_directions(
+    relative_path: str,
+    bound_batch: str,
+    recorded_batch: str | None,
+    message: str,
+) -> None:
+    holdouts = InMemoryPrivateHoldoutStore()
+    admitted, reservation = _admitted_demo(relative_path, holdouts)
+    request = CapabilityAssemblyStageRequest(
+        run_id=reservation.run_id,
+        input=admitted.input,
+        correlation_id=_id("review-correlation"),
+        reservation=reservation,
+        stage=CapabilityLiveStage.SCAFFOLD_AND_TEST_HARNESS,
+        controlled_recovery_required=True,
+    )
+    binding = SimpleNamespace(
+        job=SimpleNamespace(job_id=_id("review-job")),
+        n8n_work_batch_id=bound_batch,
+    )
+
+    class Provisioning(_Provisioning):
+        def binding_for(self, request: object) -> object:
+            return binding
+
+    class N8n:
+        def active_n8n_work_batch_id(self, job_id: UUID) -> str | None:
+            assert job_id == binding.job.job_id
+            return recorded_batch
+
+    class Promotion:
+        async def promote_generic_capability(self, request: object, binding: object):
+            return object()
+
+    adapter = CapabilityAssemblyCurrentFactoryAdapter(
+        composition=_factory_composition(),
+        provisioning=Provisioning(),
+        clock=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
+        generic_holdouts=holdouts,
+        n8n_work_batches=N8n(),  # type: ignore[arg-type]
+        promotion=Promotion(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(CapabilityLiveAuthorityUnavailable, match=message):
+        adapter._require_n8n_authority(request)
