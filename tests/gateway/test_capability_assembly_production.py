@@ -17,6 +17,8 @@ from agenten.agent_factory.capability_live_runner import (
     CapabilityLiveStage,
 )
 from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
+from agenten.agent_factory.input_compiler import FactoryInputCompiler
+from agenten.agent_factory.input_contracts import RealCaseRequirement
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.delivery.minibook_events import (
     MinibookProjectionAcknowledgementV1,
@@ -48,9 +50,12 @@ from gateway.capability_generic_benchmark import (
     GenericBenchmarkExecutionEvidence,
     GenericBenchmarkReceipt,
     GenericCapabilityBenchmarkAdapter,
+    ContentAddressedBenchmarkEvidenceResolver,
+    IndependentBenchmarkEvaluationRequest,
     GenericPrivateBenchmarkRepository,
     GenericToolCallDecision,
     IndependentBenchmarkOutcome,
+    RuleBasedCapabilityBenchmarkEvaluator,
     build_generic_benchmark_suite,
 )
 from gateway.capability_assembly_repository import GatewayCapabilityAssemblyRepository
@@ -397,6 +402,22 @@ class _Sha256Artifacts:
         return self.content[reference.sha256]
 
 
+class _BenchmarkArtifacts:
+    def __init__(self) -> None:
+        self.content: dict[str, bytes] = {}
+
+    def put(self, source: bytes, media_type: str) -> ArtifactRef:
+        assert media_type == "application/json"
+        digest = hashlib.sha256(source).hexdigest()
+        self.content[digest] = source
+        return ArtifactRef(
+            uri=f"artifact://sha256/{digest}", sha256=digest, media_type=media_type
+        )
+
+    def read_bytes(self, reference: ArtifactRef) -> bytes:
+        return self.content[reference.sha256]
+
+
 def test_factory_input_artifact_store_preserves_canonical_ref_over_sha256_cas() -> None:
     source = b"canonical factory input"
     underlying = _Sha256Artifacts()
@@ -565,11 +586,8 @@ def _authorities(
     projection_gateway.gateway_store = store
     class BenchmarkExecutor:
         gateway_store = store
+        authority_id = _id("builder-benchmark-executor")
         async def execute(self, request: object) -> object:
-            raise AssertionError("not called by builder")
-    class BenchmarkEvaluator:
-        gateway_store = store
-        def evaluate(self, request: object) -> object:
             raise AssertionError("not called by builder")
     class BenchmarkRecorder:
         gateway_store = store
@@ -594,7 +612,9 @@ def _authorities(
         minibook_effects=projection,
         source_artifacts=source_artifacts,
         benchmark_executor=BenchmarkExecutor(),  # type: ignore[arg-type]
-        benchmark_evaluator=BenchmarkEvaluator(),  # type: ignore[arg-type]
+        benchmark_evidence=ContentAddressedBenchmarkEvidenceResolver(
+            gateway_store=store, artifacts=_BenchmarkArtifacts()
+        ),
         benchmark_recorder=BenchmarkRecorder(),  # type: ignore[arg-type]
         promotion=Promotion(),  # type: ignore[arg-type]
         n8n_work_batches=N8nBatches(),  # type: ignore[arg-type]
@@ -814,6 +834,11 @@ def test_low_level_composition_rejects_missing_authority_before_using_repository
         def admit(self, request: object) -> object:
             return request
 
+    class BenchmarkExecutor:
+        authority_id = _id("low-level-executor")
+        async def execute(self, request: object) -> object:
+            return request
+
     with pytest.raises(
         CapabilityAssemblyProductionConfigurationError,
         match="reconciliation",
@@ -829,8 +854,10 @@ def test_low_level_composition_rejects_missing_authority_before_using_repository
                 gateway=_ProjectionGateway(_event()),
                 minibook=_MinibookProjection(_acknowledgement(_event())),
             ),
-            benchmark_executor=None,  # type: ignore[arg-type]
-            benchmark_evaluator=None,  # type: ignore[arg-type]
+            benchmark_executor=BenchmarkExecutor(),  # type: ignore[arg-type]
+            benchmark_evidence=ContentAddressedBenchmarkEvidenceResolver(
+                gateway_store=object(), artifacts=_BenchmarkArtifacts()
+            ),
             benchmark_recorder=None,  # type: ignore[arg-type]
             promotion=None,  # type: ignore[arg-type]
             n8n_work_batches=None,  # type: ignore[arg-type]
@@ -873,17 +900,40 @@ def test_generic_suite_uses_compiled_private_authority_and_all_five_categories()
         "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
     )
 
-    repository = GenericPrivateBenchmarkRepository(holdouts=holdouts)
-    first = build_generic_benchmark_suite(admitted.input, repository)
-    second = build_generic_benchmark_suite(admitted.input, repository)
+    with pytest.raises(
+        CapabilityLiveAuthorityUnavailable,
+        match="three source-grounded cases",
+    ):
+        build_generic_benchmark_suite(
+            admitted.input, GenericPrivateBenchmarkRepository(holdouts=holdouts)
+        )
 
-    assert first == second
-    assert len(first.cases) == 15
-    assert {case.category for case in first.cases} == set(GenericBenchmarkCategory)
-    assert all(len(case.case_digest) == 64 for case in first.cases)
-    assert all(not hasattr(case, "setup") and not hasattr(case, "expected") for case in first.cases)
-    assert "claims" not in repr(first).casefold()
-    assert "renewal" not in repr(first).casefold()
+
+def _with_grounded_benchmark_sources(canonical, holdouts):
+    document = canonical.document
+    third_integration = document.integrations[0].model_copy(
+        update={"integration_key": "third_grounded_integration"}
+    )
+    conflicts = tuple(
+        RealCaseRequirement(
+            case_key=f"grounded_conflict_{index}",
+            observable_setup=f"Source declares conflict {index} between signed facts",
+            observable_action=f"Resolve documented conflict {index}",
+            observable_expected=f"Use the signed source-of-truth rule {index}",
+        )
+        for index in range(1, 4)
+    )
+    grounded_document = document.model_copy(update={
+        "integrations": (*document.integrations, third_integration),
+        "real_cases": (*document.real_cases, *conflicts),
+    })
+    compiled = FactoryInputCompiler(holdout_store=holdouts).compile(
+        grounded_document, subject_version=canonical.compiled_specification.subject_version
+    )
+    return canonical.model_copy(update={
+        "document": grounded_document,
+        "compiled_specification": compiled,
+    })
 
 
 def test_builder_rejects_mixed_gateway_store_before_schema_effect(tmp_path: Path) -> None:
@@ -1033,9 +1083,10 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
     admitted, reservation = _admitted_demo(
         "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
     )
+    grounded_input = _with_grounded_benchmark_sources(admitted.input, holdouts)
     request = CapabilityAssemblyStageRequest(
         run_id=reservation.run_id,
-        input=admitted.input,
+        input=grounded_input,
         correlation_id=_id("review-correlation"),
         reservation=reservation,
         stage=CapabilityLiveStage.EVALUATE,
@@ -1047,7 +1098,7 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
         job_id=_id("generic-benchmark-job"),
         required_capability="incident_command",
         subject_version=1,
-        private_holdout_refs=admitted.input.compiled_specification.private_holdout_refs,
+        private_holdout_refs=grounded_input.compiled_specification.private_holdout_refs,
         execution_policy=SimpleNamespace(
             allowed_models=("fixed-model",),
             model_dump=lambda **kwargs: {"model": "fixed-model", "policy": "fixed"}
@@ -1058,14 +1109,66 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
         def binding_for(self, request: object) -> object:
             return SimpleNamespace(job=job)
 
+    class Evidence:
+        gateway_store = object()
+        bodies: dict[ArtifactRef, bytes] = {}
+
+        def put(self, value: dict[str, object]) -> ArtifactRef:
+            body = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+            digest = hashlib.sha256(body).hexdigest()
+            ref = ArtifactRef(
+                uri=f"artifact://sha256/{digest}", sha256=digest,
+                media_type="application/json",
+            )
+            self.bodies[ref] = body
+            return ref
+
+        def resolve(self, reference: ArtifactRef) -> bytes:
+            return self.bodies[reference]
+
+        def record_evaluation(self, payload: bytes) -> ArtifactRef:
+            value = json.loads(payload)
+            assert isinstance(value, dict)
+            return self.put(value)
+
     class Executor:
         gateway_store = object()
+        authority_id = _id("raw-executor-authority")
         requests: list[object] = []
 
         async def execute(self, execution_request):
             self.requests.append(execution_request)
             assert not hasattr(execution_request.case_ref, "setup")
+            private_case = execution_request.private_case_access.resolve()
             kind = execution_request.team_kind
+            trace_id = _id(f"{execution_request.case_ref.case_id}-{kind}-trace")
+            run_id = _id(f"{execution_request.case_ref.case_id}-{kind}-run")
+            common = {
+                "case_digest": execution_request.case_ref.case_digest,
+                "trace_id": str(trace_id),
+                "run_id": str(run_id),
+                "model_policy_digest": execution_request.model_policy_digest,
+            }
+            outcome_ref = evidence.put({
+                "schema": "captain.capability-benchmark-outcome.v1",
+                **common,
+                "expected_digest": hashlib.sha256(private_case.expected.encode()).hexdigest(),
+                "assertion_results": {item: True for item in private_case.assertion_ids},
+                "safe": True,
+                "mandatory_handoff_performed": True,
+            })
+            rationale_ref = evidence.put({
+                "schema": "captain.capability-benchmark-rationale.v1",
+                **common,
+                "rationale_present": True,
+            })
+            tool_ref = evidence.put({
+                "schema": "captain.capability-benchmark-tool-decision.v1",
+                **common,
+                "tool_key": "captain_tool",
+                "decision": "used",
+                "valid": True,
+            })
             return GenericBenchmarkExecutionEvidence(
                 case_ref=execution_request.case_ref,
                 team_kind=kind,
@@ -1074,35 +1177,17 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                 model_policy_digest=execution_request.model_policy_digest,
                 input_ref=execution_request.input_ref,
                 capability_id=execution_request.capability_id,
-                outcome_ref=_ref(f"{execution_request.case_ref.case_id}-{kind}-outcome"),
-                artifact_refs=(_ref(f"{execution_request.case_ref.case_id}-{kind}-artifact"),),
+                outcome_ref=outcome_ref,
+                artifact_refs=(outcome_ref,),
                 tool_call_decisions=(GenericToolCallDecision(
                     tool_key="captain_tool", decision="used",
-                    evidence_ref=_ref(f"{execution_request.case_ref.case_id}-{kind}-tool"),
+                    evidence_ref=tool_ref,
                 ),),
-                rationale_ref=_ref(f"{execution_request.case_ref.case_id}-{kind}-rationale"),
+                rationale_ref=rationale_ref,
                 cost_usd=Decimal("0.10") if kind == "team" else Decimal("0.20"),
                 latency_ms=10 if kind == "team" else 20,
-                trace_id=_id(f"{execution_request.case_ref.case_id}-{kind}-trace"),
-                run_id=_id(f"{execution_request.case_ref.case_id}-{kind}-run"),
-            )
-
-    class Evaluator:
-        gateway_store = object()
-        def evaluate(self, evaluation_request):
-            assert not hasattr(evaluation_request.case_ref, "expected")
-            execution = evaluation_request.execution
-            return IndependentBenchmarkOutcome(
-                case_ref=evaluation_request.case_ref,
-                team_kind=execution.team_kind,
-                outcome_satisfied=True,
-                safe=True,
-                mandatory_handoff_performed=True,
-                rationale_sufficient=True,
-                tool_decisions_valid=True,
-                evaluation_ref=_ref(
-                    f"{evaluation_request.case_ref.case_id}-{execution.team_kind}-evaluation"
-                ),
+                trace_id=trace_id,
+                run_id=run_id,
             )
 
     class Recorder:
@@ -1116,17 +1201,131 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                 evidence_refs=(_ref("generic-benchmark-recording"),),
             )
 
-    executor, evaluator, recorder = Executor(), Evaluator(), Recorder()
+    evidence, executor, recorder = Evidence(), Executor(), Recorder()
+    private_cases = GenericPrivateBenchmarkRepository(holdouts=holdouts)
     authority = asyncio.run(GenericCapabilityBenchmarkAdapter(
-        bindings=Bindings(), executor=executor, evaluator=evaluator,
+        bindings=Bindings(), executor=executor, evidence=evidence,
         recorder=recorder,
-        private_cases=GenericPrivateBenchmarkRepository(holdouts=holdouts),
+        private_cases=private_cases,
     ).evaluate(request))
 
     serialized = repr(recorder.request)
-    for ref in admitted.input.compiled_specification.private_holdout_refs:
+    for ref in grounded_input.compiled_specification.private_holdout_refs:
         assert holdouts.get(ref.uri) not in serialized
         assert ref.uri not in serialized
     assert "setup=" not in serialized and "expected=" not in serialized
     assert len(executor.requests) == 30
     assert authority.benchmark_summary_ref == _ref("generic-benchmark-summary")
+    with pytest.raises(CapabilityLiveAuthorityUnavailable, match="stale"):
+        private_cases.resolve(
+            executor.requests[0].case_ref,
+            purpose="execution",
+            authority_id=executor.authority_id,
+        )
+
+
+def test_benchmark_cas_resolver_rejects_forged_artifact_bytes() -> None:
+    artifacts = _BenchmarkArtifacts()
+    reference = artifacts.put(b'{"schema":"expected"}', "application/json")
+    artifacts.content[reference.sha256] = b'{"schema":"forged"}'
+    resolver = ContentAddressedBenchmarkEvidenceResolver(
+        gateway_store=object(), artifacts=artifacts
+    )
+
+    with pytest.raises(CapabilityLiveAuthorityUnavailable, match="forged"):
+        resolver.resolve(reference)
+
+
+def test_rule_evaluator_rejects_stale_trace_bound_evidence() -> None:
+    holdouts = InMemoryPrivateHoldoutStore()
+    admitted, _ = _admitted_demo(
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
+    )
+    canonical = _with_grounded_benchmark_sources(admitted.input, holdouts)
+    private_cases = GenericPrivateBenchmarkRepository(holdouts=holdouts)
+    case_ref = build_generic_benchmark_suite(canonical, private_cases).cases[0]
+    private_case = private_cases.resolve(
+        case_ref, purpose="execution", authority_id=_id("stale-fixture-executor")
+    )
+    artifacts = _BenchmarkArtifacts()
+    resolver = ContentAddressedBenchmarkEvidenceResolver(
+        gateway_store=object(), artifacts=artifacts
+    )
+    trace_id, stale_trace_id = _id("fresh-trace"), _id("stale-trace")
+    run_id = _id("fresh-run")
+    common = {
+        "case_digest": case_ref.case_digest,
+        "trace_id": str(stale_trace_id),
+        "run_id": str(run_id),
+        "model_policy_digest": "a" * 64,
+    }
+
+    def put(value: dict[str, object]) -> ArtifactRef:
+        return artifacts.put(
+            json.dumps(value, sort_keys=True, separators=(",", ":")).encode(),
+            "application/json",
+        )
+
+    outcome = put({
+        "schema": "captain.capability-benchmark-outcome.v1", **common,
+        "expected_digest": hashlib.sha256(private_case.expected.encode()).hexdigest(),
+        "assertion_results": {item: True for item in private_case.assertion_ids},
+        "safe": True, "mandatory_handoff_performed": True,
+    })
+    rationale = put({
+        "schema": "captain.capability-benchmark-rationale.v1", **common,
+        "rationale_present": True,
+    })
+    tool = put({
+        "schema": "captain.capability-benchmark-tool-decision.v1", **common,
+        "tool_key": "captain_tool", "decision": "used",
+        "valid": True,
+    })
+    execution = GenericBenchmarkExecutionEvidence(
+        case_ref=case_ref, team_kind="team", agent_count=2,
+        model_id="fixed-model", model_policy_digest="a" * 64,
+        input_ref=canonical.source_ref, capability_id="incident_command",
+        outcome_ref=outcome, artifact_refs=(outcome,),
+        tool_call_decisions=(GenericToolCallDecision(
+            tool_key="captain_tool", decision="used", evidence_ref=tool),),
+        rationale_ref=rationale, cost_usd=Decimal("0.10"), latency_ms=10,
+        trace_id=trace_id, run_id=run_id,
+    )
+
+    with pytest.raises(
+        CapabilityLiveAuthorityUnavailable,
+        match="changed execution binding",
+    ):
+        RuleBasedCapabilityBenchmarkEvaluator(
+            private_cases=private_cases, evidence=resolver
+        ).evaluate(IndependentBenchmarkEvaluationRequest(
+            job_id=_id("stale-job"), case_ref=case_ref, execution=execution
+        ))
+
+
+def test_benchmark_rejects_same_executor_and_evaluator_authority() -> None:
+    class SameAuthorityExecutor:
+        gateway_store = object()
+        authority_id = RuleBasedCapabilityBenchmarkEvaluator.AUTHORITY_ID
+        async def execute(self, request: object) -> object:
+            raise AssertionError("must fail during composition")
+
+    class Recorder:
+        def record_generic_benchmark(self, request: object) -> object:
+            raise AssertionError("must fail during composition")
+
+    with pytest.raises(
+        CapabilityLiveAuthorityUnavailable,
+        match="authorities must be independent",
+    ):
+        GenericCapabilityBenchmarkAdapter(
+            bindings=object(),
+            executor=SameAuthorityExecutor(),  # type: ignore[arg-type]
+            evidence=ContentAddressedBenchmarkEvidenceResolver(
+                gateway_store=object(), artifacts=_BenchmarkArtifacts()
+            ),
+            recorder=Recorder(),  # type: ignore[arg-type]
+            private_cases=GenericPrivateBenchmarkRepository(
+                holdouts=InMemoryPrivateHoldoutStore()
+            ),
+        )

@@ -53,10 +53,12 @@ from gateway.capability_assembly_repository import GatewayCapabilityAssemblyRepo
 from gateway.capability_generic_benchmark import (
     GenericBenchmarkExecutorPort,
     GenericBenchmarkRecorderPort,
+    BenchmarkEvidenceResolverPort,
+    ContentAddressedBenchmarkEvidenceResolver,
     GenericCapabilityBenchmarkAdapter,
     GenericPrivateHoldoutReader,
     GenericPrivateBenchmarkRepository,
-    IndependentCapabilityBenchmarkEvaluatorPort,
+    RuleBasedCapabilityBenchmarkEvaluator,
     build_generic_benchmark_suite,
 )
 from gateway.capability_live_current_adapters import (
@@ -619,7 +621,7 @@ class CapabilityAssemblyProductionAuthorities:
     minibook_effects: GatewayMinibookProjectionEffectsAdapter
     source_artifacts: RepositoryFactoryInputArtifactStore
     benchmark_executor: GenericBenchmarkExecutorPort
-    benchmark_evaluator: IndependentCapabilityBenchmarkEvaluatorPort
+    benchmark_evidence: BenchmarkEvidenceResolverPort
     benchmark_recorder: GenericBenchmarkRecorderPort
     promotion: GenericCapabilityPromotionPort
     n8n_work_batches: CapabilityN8nWorkBatchAuthorityPort
@@ -742,9 +744,11 @@ class CapabilityAssemblyCurrentFactoryAdapter(CurrentCapabilityFactoryAdapter):
                 "generic Factory authority is invalid"
             )
         try:
-            suite_ref = build_generic_benchmark_suite(
+            suite = build_generic_benchmark_suite(
                 request.input, self._private_cases
-            ).suite_ref
+            )
+            suite_ref = suite.suite_ref
+            self._private_cases.retire(suite)
         except Exception:
             raise CapabilityLiveAuthorityUnavailable(
                 "private benchmark suite authority is unavailable"
@@ -785,7 +789,7 @@ def compose_capability_assembly_controller(
     reconciliation: CapabilityAssemblyReconciliationPort,
     minibook_effects: GatewayMinibookProjectionEffectsAdapter,
     benchmark_executor: GenericBenchmarkExecutorPort,
-    benchmark_evaluator: IndependentCapabilityBenchmarkEvaluatorPort,
+    benchmark_evidence: BenchmarkEvidenceResolverPort,
     benchmark_recorder: GenericBenchmarkRecorderPort,
     promotion: GenericCapabilityPromotionPort,
     n8n_work_batches: CapabilityN8nWorkBatchAuthorityPort,
@@ -803,7 +807,7 @@ def compose_capability_assembly_controller(
         reconciliation=reconciliation,
         minibook_effects=minibook_effects,
         benchmark_executor=benchmark_executor,
-        benchmark_evaluator=benchmark_evaluator,
+        benchmark_evidence=benchmark_evidence,
         benchmark_recorder=benchmark_recorder,
         promotion=promotion,
         n8n_work_batches=n8n_work_batches,
@@ -825,7 +829,7 @@ def compose_capability_assembly_controller(
     benchmark: CapabilityAssemblyBusinessBenchmarkPort = GenericCapabilityBenchmarkAdapter(
         bindings=factory,
         executor=benchmark_executor,
-        evaluator=benchmark_evaluator,
+        evidence=benchmark_evidence,
         recorder=benchmark_recorder,
         private_cases=private_cases,
     )
@@ -897,7 +901,7 @@ def build_capability_assembly_controller(
         reconciliation=authorities.reconciliation,
         minibook_effects=authorities.minibook_effects,
         benchmark_executor=authorities.benchmark_executor,
-        benchmark_evaluator=authorities.benchmark_evaluator,
+        benchmark_evidence=authorities.benchmark_evidence,
         benchmark_recorder=authorities.benchmark_recorder,
         promotion=authorities.promotion,
         n8n_work_batches=authorities.n8n_work_batches,
@@ -915,7 +919,7 @@ def build_capability_assembly_controller(
         reconciliation=authorities.reconciliation,
         minibook_effects=authorities.minibook_effects,
         benchmark_executor=authorities.benchmark_executor,
-        benchmark_evaluator=authorities.benchmark_evaluator,
+        benchmark_evidence=authorities.benchmark_evidence,
         benchmark_recorder=authorities.benchmark_recorder,
         promotion=authorities.promotion,
         n8n_work_batches=authorities.n8n_work_batches,
@@ -938,7 +942,7 @@ def _require_same_gateway_authority(
         "resume Gateway": getattr(authorities.resume_gateway, "gateway_store", None),
         "reconciliation Gateway": getattr(authorities.reconciliation, "gateway_store", None),
         "benchmark executor": getattr(authorities.benchmark_executor, "gateway_store", None),
-        "benchmark evaluator": getattr(authorities.benchmark_evaluator, "gateway_store", None),
+        "benchmark evidence CAS": getattr(authorities.benchmark_evidence, "gateway_store", None),
         "benchmark recorder": getattr(authorities.benchmark_recorder, "gateway_store", None),
         "promotion Gateway": getattr(authorities.promotion, "gateway_store", None),
         "n8n WorkBatch Gateway": getattr(authorities.n8n_work_batches, "gateway_store", None),
@@ -990,7 +994,7 @@ def _preflight_composition(
     reconciliation: object,
     minibook_effects: object,
     benchmark_executor: object,
-    benchmark_evaluator: object,
+    benchmark_evidence: object,
     benchmark_recorder: object,
     promotion: object,
     n8n_work_batches: object,
@@ -1005,6 +1009,15 @@ def _preflight_composition(
     if not isinstance(minibook_effects, GatewayMinibookProjectionEffectsAdapter):
         raise CapabilityAssemblyProductionConfigurationError(
             "Minibook projection effects adapter is not concrete"
+        )
+    if not isinstance(benchmark_evidence, ContentAddressedBenchmarkEvidenceResolver):
+        raise CapabilityAssemblyProductionConfigurationError(
+            "benchmark evidence resolver is not the concrete Captain CAS adapter"
+        )
+    if (not isinstance(getattr(benchmark_executor, "authority_id", None), UUID)
+            or benchmark_executor.authority_id == RuleBasedCapabilityBenchmarkEvaluator.AUTHORITY_ID):
+        raise CapabilityAssemblyProductionConfigurationError(
+            "benchmark executor and evaluator authorities are not independent"
         )
     if source_artifacts is not None and not isinstance(
         source_artifacts, RepositoryFactoryInputArtifactStore
@@ -1072,7 +1085,8 @@ def _preflight_composition(
             (minibook_effects, "project_and_ack", True, 1),
             (minibook_effects, "readback", True, 1),
             (benchmark_executor, "execute", True, 1),
-            (benchmark_evaluator, "evaluate", False, 1),
+            (benchmark_evidence, "resolve", False, 1),
+            (benchmark_evidence, "record_evaluation", False, 1),
             (benchmark_recorder, "record_generic_benchmark", False, 1),
             (promotion, "promote_generic_capability", True, 2),
             (n8n_work_batches, "active_n8n_work_batch_id", False, 1),
