@@ -6,9 +6,11 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from decimal import Decimal
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 import pytest
+import asyncio
 
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.contracts import AgentFactoryJobV3
@@ -17,6 +19,7 @@ from gateway.capability_assembly_bootstrap import (
     CaptainBenchmarkToolEvidenceAuthority,
     GatewayCapabilityN8nWorkBatchAuthority,
     GatewayPrivateHoldoutStore,
+    GatewayCapabilityProjectionAuthority,
     build_production_capability_assembly_from_environment,
     load_capability_assembly_bootstrap_settings,
 )
@@ -31,6 +34,8 @@ from gateway.capability_generic_benchmark import (
 from agenten.agent_runtime.captain_production_adapters import ContentAddressedArtifactAdapter
 from gateway.capability_assembly_bootstrap import GatewayGenericBenchmarkRecorder
 from gateway.capability_live_pipeline import CapabilityLiveAuthorityUnavailable
+from agenten.delivery.minibook_events import MinibookProjectionEvent
+from gateway.store import GatewayStore
 
 
 def _ref(payload: bytes) -> ArtifactRef:
@@ -313,6 +318,63 @@ def test_private_holdout_store_uses_gateway_durable_exact_readback() -> None:
     restarted = GatewayPrivateHoldoutStore(gateway_store=gateway)
     assert restarted.get("holdout://holdout-aaaaaaaaaaaa") == "one"
     assert restarted.get("holdout://holdout-bbbbbbbbbbbb") == "two"
+
+
+def test_projection_reads_exact_gateway_issued_generic_promotion_event() -> None:
+    event = MinibookProjectionEvent.model_validate({
+        "schema": "captain.minibook-projection.v2",
+        "event_id": str(uuid4()), "correlation_id": str(uuid4()),
+        "causation_id": str(uuid4()), "occurred_at": "2026-08-09T12:00:00Z",
+        "producer": "captain-gateway", "subject_id": f"subject:{uuid4()}",
+        "subject_version": 1, "event_type": "capability.promoted",
+        "payload": {
+            "view": "validation", "template_id": "factory_capability_ready_to_use",
+            "status_id": "ready_to_use", "actor_role_id": "captain_gateway",
+            "benchmark_disposition": "passed", "benchmark_reason_codes": [],
+            "candidate_correctness_bps": 9000, "baseline_correctness_bps": 8000,
+            "candidate_completion_bps": 9000, "baseline_completion_bps": 8000,
+            "cost_ratio_bps": 9000, "latency_ratio_bps": 9000,
+            "unsafe_tool_uses": 0, "mandatory_handoff_misses": 0,
+            "benchmark_summary_digest": "sha256:" + "a" * 64,
+        },
+    })
+    store = SimpleNamespace(
+        generic_capability_promotion=lambda event_id: (
+            event.model_dump(mode="json", by_alias=True)
+            if event_id == event.event_id else None
+        ),
+        factory_promotion_source=lambda _event_id: (_ for _ in ()).throw(
+            AssertionError("legacy promotion read")
+        ),
+    )
+    authority = GatewayCapabilityProjectionAuthority(gateway_store=store)
+
+    assert asyncio.run(authority.projection_event(event.event_id)) == event
+
+
+def test_gateway_generic_promotion_event_binds_summary_before_feed() -> None:
+    job_id, event_id, correlation_id = uuid4(), uuid4(), uuid4()
+    job = AgentFactoryJobV3.model_construct(
+        job_id=job_id, event_id=uuid4(), correlation_id=correlation_id,
+        subject_version=2,
+    )
+
+    event = GatewayStore._generic_minibook_promotion_event(
+        event_id=event_id, job=job,
+        occurred_at=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
+        summary_sha256="c" * 64,
+        aggregate={
+            "team_quality_count": 14, "baseline_quality_count": 12,
+            "team_cost_usd": "0.8", "baseline_cost_usd": "1.0",
+            "team_latency_ms": 80, "baseline_latency_ms": 100,
+            "unsafe_team_count": 0, "mandatory_handoff_misses": 0,
+        },
+    )
+
+    assert event.event_id == event_id
+    assert event.correlation_id == correlation_id
+    assert event.payload.benchmark_summary_digest == "sha256:" + "c" * 64
+    assert event.payload.cost_ratio_bps == 8000
 
 
 def test_bootstrap_rejects_raw_factory_runtime_before_schema_or_network() -> None:

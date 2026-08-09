@@ -5358,6 +5358,58 @@ class GatewayStore:
     ) -> AppendResult:
         """Persist one exact Factory-to-Minibook acknowledgement as delivery evidence."""
 
+        generic_payload = self.generic_capability_promotion(
+            acknowledgement.projection_event_id
+        )
+        if generic_payload is not None:
+            from agenten.delivery.minibook_events import MinibookProjectionEvent
+            from agenten.delivery.projector import MinibookProjector
+
+            event = MinibookProjectionEvent.model_validate(generic_payload)
+            rendered = MinibookProjector.render(event)
+            expected_post_id = "captain-projection-" + hashlib.sha256(
+                str(event.event_id).encode("utf-8")
+            ).hexdigest()[:32]
+            expected = {
+                "projection_event_id": event.event_id,
+                "correlation_id": event.correlation_id,
+                "subject_id": event.subject_id,
+                "subject_version": event.subject_version,
+                "project_id": MinibookProjector.PROJECTION_PROJECT_ID,
+                "post_id": expected_post_id,
+                "content_sha256": rendered.content_hash,
+                "outcome": "mirrored",
+            }
+            if acknowledgement.model_dump(include=set(expected)) != expected:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Minibook acknowledgement does not match generic promotion",
+                )
+            job_id = UUID(str(event.subject_id).removeprefix("subject:"))
+            job = self.factory_job(job_id).job
+            mirror = DeliveryEventEnvelope.model_validate({
+                "event_id": acknowledgement.acknowledgement_id,
+                "event_type": "registry_mirror",
+                "occurred_at": acknowledgement.acknowledged_at,
+                "actor": "captain-gateway",
+                "trace": {
+                    "project_id": f"factory:{job_id}",
+                    "run_id": "generic-benchmark-promotion",
+                    "trace_id": f"minibook-projection:{event.event_id}",
+                    "artifact_id": acknowledgement.post_id,
+                    "job_id": job_id,
+                    "correlation_id": event.correlation_id,
+                    "subject_version": event.subject_version,
+                },
+                "payload": {
+                    "event_type": "registry_mirror",
+                    "capability_id": job.required_capability,
+                    "capability_version": str(event.subject_version),
+                    "outcome": "mirrored",
+                },
+            })
+            return self.append_delivery_event(mirror)
+
         source = self.factory_promotion_source(
             acknowledgement.projection_event_id
         )
@@ -6292,6 +6344,180 @@ class GatewayStore:
         if hashlib.sha256(body.encode()).hexdigest() != row["body_sha256"]:
             raise HTTPException(status_code=409, detail="private holdout readback mismatch")
         return body
+
+    def record_generic_capability_promotion(
+        self,
+        *,
+        job_id: UUID,
+        suite_sha256: str,
+        occurred_at: datetime,
+    ) -> dict[str, Any]:
+        """Atomically gate and issue one generic benchmark promotion event."""
+
+        if (
+            len(suite_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in suite_sha256)
+            or occurred_at.tzinfo is None
+            or occurred_at.utcoffset() != timezone.utc.utcoffset(occurred_at)
+        ):
+            raise HTTPException(status_code=409, detail="generic promotion binding is invalid")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id",
+                    value=str(job_id), for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="generic promotion job is unavailable")
+                job = parse_factory_job(job_block["data"])
+                if type(job) is not AgentFactoryJobV3:
+                    raise HTTPException(status_code=409, detail="generic promotion job is invalid")
+                projection = self._factory_projection(cursor, job)
+                if (
+                    projection.status is not FactoryLifecycleStatus.RUNNING
+                    or projection.phase is not FactoryPhase.QUALITY_REVIEWED
+                    or any(
+                        block.phase is FactoryPhase.CAPABILITY_PROMOTED
+                        for block in self._factory_blocks(cursor, job_id)
+                    )
+                ):
+                    raise HTTPException(status_code=409, detail="generic promotion is not admissible")
+                cursor.execute(
+                    "SELECT summary_sha256, correlation_id, payload "
+                    "FROM capability_generic_benchmarks "
+                    "WHERE job_id = %s AND suite_sha256 = %s FOR UPDATE",
+                    (str(job_id), suite_sha256),
+                )
+                row = cursor.fetchone()
+                summary = None if row is None else self._decode_json(row["payload"])
+                aggregate = summary.get("aggregate") if isinstance(summary, dict) else None
+                if (
+                    row is None
+                    or not isinstance(summary, dict)
+                    or not isinstance(aggregate, dict)
+                    or summary.get("schema") != "captain.capability-generic-benchmark-summary.v1"
+                    or summary.get("job_id") != str(job_id)
+                    or summary.get("correlation_id") != str(job.correlation_id)
+                    or summary.get("suite_digest") != suite_sha256
+                    or summary.get("passed") is not True
+                    or aggregate.get("case_count") != 15
+                ):
+                    raise HTTPException(status_code=409, detail="generic benchmark promotion gate failed")
+                summary_sha256 = str(row["summary_sha256"])
+                event_id = uuid5(
+                    NAMESPACE_URL,
+                    f"captain:generic-capability-promotion:{job_id}:{suite_sha256}:{summary_sha256}",
+                )
+                event = self._generic_minibook_promotion_event(
+                    event_id=event_id,
+                    job=job,
+                    occurred_at=occurred_at,
+                    summary_sha256=summary_sha256,
+                    aggregate=aggregate,
+                )
+                canonical = event.model_dump(mode="json", by_alias=True)
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_generic_promotions (
+                        event_id CHAR(36) NOT NULL PRIMARY KEY,
+                        job_id CHAR(36) NOT NULL UNIQUE,
+                        suite_sha256 CHAR(64) NOT NULL,
+                        summary_sha256 CHAR(64) NOT NULL,
+                        projection_event JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT suite_sha256, summary_sha256, projection_event "
+                    "FROM capability_generic_promotions WHERE job_id = %s FOR UPDATE",
+                    (str(job_id),),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if (
+                        existing["suite_sha256"] == suite_sha256
+                        and existing["summary_sha256"] == summary_sha256
+                        and self._decode_json(existing["projection_event"]) == canonical
+                    ):
+                        return canonical
+                    raise HTTPException(status_code=409, detail="generic promotion conflicts")
+                cursor.execute(
+                    "INSERT INTO capability_generic_promotions "
+                    "(event_id, job_id, suite_sha256, summary_sha256, projection_event) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (
+                        str(event_id), str(job_id), suite_sha256, summary_sha256,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+                return canonical
+
+    @staticmethod
+    def _generic_minibook_promotion_event(
+        *, event_id: UUID, job: AgentFactoryJobV3, occurred_at: datetime,
+        summary_sha256: str, aggregate: dict[str, Any],
+    ):
+        from agenten.delivery.minibook_events import MinibookProjectionEvent
+
+        def ratio(left: object, right: object) -> int:
+            denominator = Decimal(str(right))
+            numerator = Decimal(str(left))
+            if denominator == 0:
+                return 10000 if numerator == 0 else 1000000
+            return int((numerator * Decimal(10000)) / denominator)
+
+        return MinibookProjectionEvent.model_validate({
+            "schema": "captain.minibook-projection.v2",
+            "event_id": event_id,
+            "correlation_id": job.correlation_id,
+            "causation_id": job.event_id,
+            "occurred_at": occurred_at,
+            "producer": "captain-gateway",
+            "subject_id": f"subject:{job.job_id}",
+            "subject_version": job.subject_version,
+            "event_type": "capability.promoted",
+            "payload": {
+                "view": "validation",
+                "template_id": "factory_capability_ready_to_use",
+                "status_id": "ready_to_use",
+                "actor_role_id": "captain_gateway",
+                "benchmark_disposition": "passed",
+                "benchmark_reason_codes": [],
+                "candidate_correctness_bps": int(aggregate["team_quality_count"]) * 10000 // 15,
+                "baseline_correctness_bps": int(aggregate["baseline_quality_count"]) * 10000 // 15,
+                "candidate_completion_bps": int(aggregate["team_quality_count"]) * 10000 // 15,
+                "baseline_completion_bps": int(aggregate["baseline_quality_count"]) * 10000 // 15,
+                "cost_ratio_bps": ratio(aggregate["team_cost_usd"], aggregate["baseline_cost_usd"]),
+                "latency_ratio_bps": ratio(aggregate["team_latency_ms"], aggregate["baseline_latency_ms"]),
+                "unsafe_tool_uses": int(aggregate["unsafe_team_count"]),
+                "mandatory_handoff_misses": int(aggregate["mandatory_handoff_misses"]),
+                "benchmark_summary_digest": f"sha256:{summary_sha256}",
+            },
+        })
+
+    def generic_capability_promotion(self, event_id: UUID) -> dict[str, Any] | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_generic_promotions (
+                        event_id CHAR(36) NOT NULL PRIMARY KEY,
+                        job_id CHAR(36) NOT NULL UNIQUE,
+                        suite_sha256 CHAR(64) NOT NULL,
+                        summary_sha256 CHAR(64) NOT NULL,
+                        projection_event JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT projection_event FROM capability_generic_promotions "
+                    "WHERE event_id = %s",
+                    (str(event_id),),
+                )
+                row = cursor.fetchone()
+        return None if row is None else dict(self._decode_json(row["projection_event"]))
 
     def capability_n8n_work_batch(self, job_id: UUID) -> str | None:
         with self.storage.transaction() as connection:
