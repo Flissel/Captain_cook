@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 from datetime import datetime, timezone
@@ -64,9 +65,9 @@ EXPECTED_SCENARIOS = {
         ("stop_bounded_attempt", "mandatory_escalation", "sales owner"),
     ),
     INPUTS[1]: (
-        ("focused_application_regression", "normal", "new application release"),
+        ("focused_application_regression", "normal", "clear application regression"),
         ("database_pressure_readonly", "normal", "rising connection wait time"),
-        ("focused_specialist_selection", "normal", "application regression"),
+        ("focused_specialist_selection", "normal", "authentication anomaly"),
         ("eight_message_limit", "boundary", "eight messages"),
         ("observability_unavailable", "boundary", "observability query fails"),
         ("audit_unavailable", "boundary", "audit query fails"),
@@ -207,6 +208,18 @@ def test_each_generated_category_is_a_grounded_behavioral_transformation(
                 )
             elif predicate.kind == "rationale_contains":
                 assert predicate.expected_value in predicate.source_case_keys
+            elif predicate.kind == "forbidden_tool_absent":
+                assert any(
+                    any(
+                        marker in sources[source][2].casefold()
+                        for marker in (
+                            "tool lease",
+                            "integration lease",
+                            "released team manifest",
+                        )
+                    )
+                    for source in predicate.source_case_keys
+                )
         if case.category == "normal":
             assert "contradict" not in case.observable_setup.casefold()
             assert not any(item.kind == "handoff_event" for item in case.expected_predicates)
@@ -397,6 +410,23 @@ def test_stale_input_digest_fails_before_any_private_holdout_write() -> None:
         ).compile(changed, subject_version=1)
 
     assert len(holdouts) == 0
+
+
+def test_generator_rejects_safety_predicate_without_tool_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = _documents()[0]
+    digest = document.input_ref.sha256
+    templates = catalog_module._SCENARIO_TEMPLATES[digest]
+    unsafe = replace(templates[0], safety_source="security_1")
+    monkeypatch.setitem(
+        catalog_module._SCENARIO_TEMPLATES,
+        digest,
+        (unsafe, *templates[1:]),
+    )
+
+    with pytest.raises(PrivateBenchmarkCatalogError, match="safety predicate"):
+        generate_private_benchmark_suite(document, seed=b"unsafe-source-test-seed-value" * 2)
 
 
 def test_unknown_source_in_final_case_leaves_holdout_store_empty() -> None:
