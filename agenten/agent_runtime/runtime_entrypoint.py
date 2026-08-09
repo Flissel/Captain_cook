@@ -21,6 +21,9 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     CapabilityGrant,
     CapabilityGrantRevocation,
+    RuntimeResumeCostAuthorityV1,
+    RuntimeResumeCostSettlementRequestV1,
+    RuntimeResumeCostSettlementV1,
 )
 from agenten.agent_runtime.gateway_client import (
     GatewayRuntimeClient,
@@ -147,6 +150,73 @@ class GatewayBackedRuntimeState:
         return await self._runtime.record_result(result)
 
 
+class GatewayBackedRuntimeCostAuthority:
+    """Worker-authenticated Gateway authority and atomic resume accounting."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        token: str,
+        client: httpx.AsyncClient,
+    ) -> None:
+        if not base_url.strip() or not token:
+            raise ValueError("Gateway cost authority configuration is incomplete")
+        self._base_url = base_url.rstrip("/")
+        self._token = token
+        self._client = client
+
+    async def authorize(
+        self, command: AgentRuntimeCommand
+    ) -> RuntimeResumeCostAuthorityV1:
+        return await self._post(
+            "/v1/capability-resumes/cost-authorities/validate",
+            command.model_dump(mode="json", by_alias=True),
+            RuntimeResumeCostAuthorityV1,
+            operation="validate resume cost authority",
+        )
+
+    async def settle(
+        self,
+        command: AgentRuntimeCommand,
+        result: AgentRuntimeResult,
+        authority: RuntimeResumeCostAuthorityV1,
+    ) -> RuntimeResumeCostSettlementV1:
+        request = RuntimeResumeCostSettlementRequestV1(
+            command=command,
+            result=result,
+            authority=authority,
+        )
+        return await self._post(
+            "/v1/capability-resumes/cost-authorities/settle",
+            request.model_dump(mode="json", by_alias=True),
+            RuntimeResumeCostSettlementV1,
+            operation="settle resume cost authority",
+        )
+
+    async def _post(self, path, payload, model, *, operation):
+        try:
+            response = await self._client.post(
+                f"{self._base_url}{path}",
+                headers={"Authorization": f"Bearer {self._token}"},
+                json=payload,
+            )
+        except httpx.HTTPError:
+            raise GatewayRuntimeError(
+                f"{operation} could not reach the gateway"
+            ) from None
+        if response.status_code != 200:
+            raise GatewayRuntimeError(
+                f"{operation} failed with gateway status {response.status_code}"
+            )
+        try:
+            return model.model_validate(response.json())
+        except (TypeError, ValueError, ValidationError):
+            raise GatewayRuntimeError(
+                f"{operation} returned an invalid response"
+            ) from None
+
+
 class _UtcClock:
     def now(self) -> datetime:
         return datetime.now(timezone.utc)
@@ -193,6 +263,11 @@ def compose_gateway_backed_runtime_app(
         artifacts=artifacts,
         capabilities=_CaptainCapabilityPolicy(),
         clock=_UtcClock(),
+        cost_authority=GatewayBackedRuntimeCostAuthority(
+            base_url=settings.gateway_url,
+            token=gateway_token,
+            client=client,
+        ),
     )
     return create_runtime_app(
         executor=service,

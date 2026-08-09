@@ -21,6 +21,7 @@ from agenten.agent_runtime.contracts import (
     CapabilityProfile,
     IntegrationIntent,
     RuntimeLimits,
+    RuntimeCostEvidenceV1,
     RuntimeOperation,
     RuntimeStatus,
 )
@@ -92,6 +93,30 @@ def _result(
     error: str | None = None,
     label: str = "result",
 ) -> AgentRuntimeResult:
+    cost_evidence = (
+        RuntimeCostEvidenceV1(
+            schema_name="captain.runtime-cost-evidence.v1",
+            receipt_id=_uuid(f"cost:{label}"),
+            command_id=command.event_id,
+            reservation_id=command.payload.budget_reservation_id,
+            job_id=command.payload.cost_job_id,
+            run_id=command.payload.cost_run_id,
+            input_id=command.payload.cost_input_id,
+            correlation_id=command.correlation_id,
+            capability_id=command.payload.cost_capability_id,
+            capability_version=command.payload.cost_capability_version,
+            provider="openai",
+            model="gpt-5.6-terra",
+            input_units=100,
+            output_units=50,
+            actual_cost_usd=Decimal("0.25"),
+            started_at=NOW,
+            ended_at=NOW,
+            evidence_ref=_ref(f"cost-evidence-{label}"),
+        )
+        if command.payload.operation is RuntimeOperation.CODEX_RESUME
+        else None
+    )
     return AgentRuntimeResult(
         schema_name="captain.agent-runtime-result.v1",
         event_id=_uuid(label),
@@ -106,6 +131,7 @@ def _result(
         status=status,
         session_id=f"session-{label}",
         evidence_refs=(_ref(f"evidence-{label}"),),
+        cost_evidence=cost_evidence,
         error=error,
     )
 
@@ -375,6 +401,7 @@ async def test_dispatch_calls_effect_once_and_replays_immutable_terminal_readbac
     assert first == second == readback
     assert first.execution_authority_id == authorization.authorization_receipt_id
     assert first.terminal_status == "succeeded"
+    assert first.resume_actual_spend_usd == Decimal("0.25")
     assert first.replayed is False
 
 
@@ -506,6 +533,57 @@ def test_restart_recovers_terminal_runtime_truth_without_a_second_dispatch() -> 
     recovered = restarted.readback(authorization)
 
     assert recovered.execution_result_id == persisted_result.event_id
+    assert repository.terminal(authorization.authorization_receipt_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_runtime_infrastructure_failure_evidence_recovers_as_restart_stable_dispatch_failure() -> None:
+    from tests.agent_runtime.test_service import (
+        FakeCodex,
+        FakeCostAuthority,
+        FakeHermes,
+        FakeState,
+        batch_for,
+        service_with,
+    )
+
+    repository = PersistentRepository()
+    truth = RuntimeTruth()
+    capability_resume = _service(repository, truth, None)
+    authorization = capability_resume.authorize(_request())
+    record = repository.authorization(authorization.authorization_receipt_id)
+    assert record is not None
+
+    events: list[str] = []
+    released_batch = batch_for(record.resume_command).model_copy(
+        update={
+            "batch_id": record.resume_command.payload.batch_id,
+            "subtask_ids": [record.resume_command.payload.subtask_id],
+        }
+    )
+    runtime_state = FakeState(events, released_batch)
+    codex = FakeCodex(events)
+    codex.fail = True
+    runtime_result = await service_with(
+        runtime_state,
+        events,
+        codex,
+        FakeHermes(events),
+        FakeCostAuthority(disposition="unmetered"),
+    ).execute(record.resume_command)
+    assert runtime_result.status is RuntimeStatus.INFRASTRUCTURE_FAILED
+    assert runtime_result.evidence_refs[0].uri.startswith("artifact://sha256/")
+
+    repository.record_dispatch_started(authorization.authorization_receipt_id)
+    truth.operations[record.resume_command.event_id] = _operation(
+        record.resume_command, runtime_state.results[record.resume_command.event_id]
+    )
+    restarted = _service(repository, truth, None)
+
+    with pytest.raises(CapabilityResumeDispatchFailed) as failure:
+        restarted.readback(authorization)
+
+    assert failure.value.failure.execution.execution_result_id == runtime_result.event_id
     assert repository.terminal(authorization.authorization_receipt_id) is not None
 
 

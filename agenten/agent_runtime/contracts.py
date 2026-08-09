@@ -98,6 +98,11 @@ class AgentRuntimeCommandPayload(_FrozenContract):
     maximum_cost_usd: Decimal | None = None
     budget_reservation_id: UUID | None = None
     cost_authority_ref: str | None = Field(default=None, min_length=1)
+    cost_job_id: UUID | None = None
+    cost_run_id: UUID | None = None
+    cost_input_id: str | None = Field(default=None, min_length=1)
+    cost_capability_id: str | None = Field(default=None, min_length=1)
+    cost_capability_version: int | None = Field(default=None, ge=1, strict=True)
 
     @field_validator("workspace_ref")
     @classmethod
@@ -152,6 +157,11 @@ class AgentRuntimeCommandPayload(_FrozenContract):
             self.maximum_cost_usd,
             self.budget_reservation_id,
             self.cost_authority_ref,
+            self.cost_job_id,
+            self.cost_run_id,
+            self.cost_input_id,
+            self.cost_capability_id,
+            self.cost_capability_version,
         )
         if any(value is not None for value in cost_fields) and not all(
             value is not None for value in cost_fields
@@ -251,6 +261,114 @@ class CapabilityGrantRevocation(_FrozenContract):
         return _require_utc(value)
 
 
+class RuntimeResumeCostAuthorityV1(_FrozenContract):
+    """Authenticated Gateway authority for one bounded resume effect."""
+
+    schema_name: Literal["captain.runtime-resume-cost-authority.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    authorization_receipt_id: UUID
+    cost_authority_ref: str = Field(
+        pattern=r"^gateway://capability-resume-authorizations/"
+    )
+    reservation_id: UUID
+    job_id: UUID
+    run_id: UUID
+    input_id: str = Field(min_length=1)
+    correlation_id: UUID
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    command_id: UUID
+    ceiling_usd: Decimal
+    expires_at: datetime
+    hard_ceiling_enforced: bool = Field(strict=True)
+    metering_mode: Literal["provider_usage_receipt", "unavailable"]
+
+    @field_validator("ceiling_usd", mode="before")
+    @classmethod
+    def require_positive_ceiling(cls, value: object) -> Decimal:
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount <= 0:
+            raise ValueError("resume cost ceiling must be finite and positive")
+        return amount
+
+    @field_validator("expires_at")
+    @classmethod
+    def require_utc_expiry(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+
+class RuntimeCostEvidenceV1(_FrozenContract):
+    """Provider-originated actual usage for one runtime resume command."""
+
+    schema_name: Literal["captain.runtime-cost-evidence.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    receipt_id: UUID
+    command_id: UUID
+    reservation_id: UUID
+    job_id: UUID
+    run_id: UUID
+    input_id: str = Field(min_length=1)
+    correlation_id: UUID
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    input_units: int = Field(ge=0, strict=True)
+    output_units: int = Field(ge=0, strict=True)
+    actual_cost_usd: Decimal
+    started_at: datetime
+    ended_at: datetime
+    evidence_ref: ArtifactRef
+
+    @field_validator("actual_cost_usd", mode="before")
+    @classmethod
+    def require_known_actual_cost(cls, value: object) -> Decimal:
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("actual runtime cost must be finite and non-negative")
+        return amount
+
+    @field_validator("started_at", "ended_at")
+    @classmethod
+    def require_utc_usage_time(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+    @model_validator(mode="after")
+    def require_ordered_usage_time(self) -> "RuntimeCostEvidenceV1":
+        if self.ended_at < self.started_at:
+            raise ValueError("runtime cost evidence times are out of order")
+        return self
+
+
+class RuntimeResumeCostSettlementV1(_FrozenContract):
+    """Atomic Gateway accounting result for a terminal resume attempt."""
+
+    schema_name: Literal["captain.runtime-resume-cost-settlement.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    settlement_id: UUID
+    command_id: UUID
+    reservation_id: UUID
+    disposition: Literal["accounted", "overrun", "unmetered"]
+    actual_cost_usd: Decimal | None = None
+    accounted_cost_usd: Decimal
+    evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+
+    @field_validator("actual_cost_usd", "accounted_cost_usd", mode="before")
+    @classmethod
+    def require_nonnegative_settlement_cost(
+        cls, value: object
+    ) -> Decimal | None:
+        if value is None:
+            return None
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("settlement cost must be finite and non-negative")
+        return amount
+
+
 class AgentRuntimeResult(_FrozenContract):
     schema_name: Literal["captain.agent-runtime-result.v1"] = Field(
         alias="schema",
@@ -269,6 +387,7 @@ class AgentRuntimeResult(_FrozenContract):
     session_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
     artifact_refs: tuple[ArtifactRef, ...] = ()
     evidence_refs: tuple[ArtifactRef, ...] = ()
+    cost_evidence: RuntimeCostEvidenceV1 | None = None
     error: str | None = Field(default=None, min_length=1)
 
     @field_validator("occurred_at")
@@ -288,6 +407,39 @@ class AgentRuntimeResult(_FrozenContract):
         if self.status not in failures and self.error is not None:
             raise ValueError("non-failed runtime results cannot contain an error")
         return self
+
+
+class RuntimeInfrastructureFailureEvidenceV1(_FrozenContract):
+    """Redacted, content-addressed identity for an adapter infrastructure failure."""
+
+    schema_name: Literal["captain.runtime-infrastructure-failure-evidence.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    failure_id: UUID
+    command_id: UUID
+    correlation_id: UUID
+    operation: RuntimeOperation
+    status: Literal["infrastructure_failed"] = "infrastructure_failed"
+    reason_code: Literal["adapter_failed"] = "adapter_failed"
+    occurred_at: datetime
+
+    @field_validator("occurred_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+
+class RuntimeResumeCostSettlementRequestV1(_FrozenContract):
+    """Terminal Runtime truth submitted for atomic Gateway cost accounting."""
+
+    schema_name: Literal["captain.runtime-resume-cost-settlement-request.v1"] = Field(
+        default="captain.runtime-resume-cost-settlement-request.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    command: AgentRuntimeCommand
+    result: AgentRuntimeResult
+    authority: RuntimeResumeCostAuthorityV1
 
 
 class MinibookReference(_FrozenContract):

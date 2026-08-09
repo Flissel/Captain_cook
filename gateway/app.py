@@ -25,6 +25,9 @@ from agenten.agent_runtime.contracts import (
     ArtifactRef,
     CapabilityGrant,
     CapabilityGrantRevocation,
+    RuntimeResumeCostAuthorityV1,
+    RuntimeResumeCostSettlementRequestV1,
+    RuntimeResumeCostSettlementV1,
 )
 from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob, FactoryLease, FactoryPhase
 from agenten.agent_factory.execution_budget import (
@@ -1080,6 +1083,28 @@ def create_app(
             CapabilityResumeDispatchFailed,
         ) as exc:
             raise translate_capability_resume_error(exc) from None
+
+    @app.post("/v1/capability-resumes/cost-authorities/validate")
+    async def validate_capability_resume_cost_authority(
+        command: AgentRuntimeCommand,
+        _: GatewayRole = Depends(require_captain),
+    ) -> RuntimeResumeCostAuthorityV1:
+        return await run_in_threadpool(
+            get_store().validate_capability_resume_cost_authority,
+            command,
+            now=datetime.now(timezone.utc),
+        )
+
+    @app.post("/v1/capability-resumes/cost-authorities/settle")
+    async def settle_capability_resume_cost(
+        request: RuntimeResumeCostSettlementRequestV1,
+        _: GatewayRole = Depends(require_captain),
+    ) -> RuntimeResumeCostSettlementV1:
+        return await run_in_threadpool(
+            get_store().settle_capability_resume_cost,
+            request,
+            now=datetime.now(timezone.utc),
+        )
 
     @app.post("/v1/runtime/commands", status_code=status.HTTP_202_ACCEPTED)
     async def accept_runtime_command(

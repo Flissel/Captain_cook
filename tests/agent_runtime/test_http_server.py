@@ -11,6 +11,8 @@ from uuid import uuid5
 import httpx
 import pytest
 
+import agenten.agent_runtime.runtime_entrypoint as runtime_entrypoint
+
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
@@ -23,6 +25,12 @@ from agenten.agent_runtime.runtime_entrypoint import (
     RuntimeEntrypointSettings,
 )
 from tests.agent_runtime.test_service import batch_for
+from tests.agent_runtime.test_service import (
+    FakeCodex,
+    FakeCostAuthority,
+    FakeCapabilityPolicy,
+    resume_command_with_cost,
+)
 from tests.agent_runtime.test_gateway_client import command, result
 
 
@@ -234,6 +242,55 @@ async def test_gateway_backed_state_loads_the_released_batch_with_captain_auth()
     assert observed == expected
     assert requests[0].url.path == "/batches/batch-1/bundle"
     assert requests[0].headers["authorization"] == "Bearer gateway-state-secret"
+
+
+@pytest.mark.asyncio
+async def test_gateway_backed_cost_authority_uses_authenticated_typed_routes() -> None:
+    adapter_type = getattr(runtime_entrypoint, "GatewayBackedRuntimeCostAuthority", None)
+    assert adapter_type is not None, "authenticated runtime cost port is missing"
+    command = resume_command_with_cost()
+    expected_authority = await FakeCostAuthority().authorize(command)
+    grant = FakeCapabilityPolicy().derive(command, batch_for(command), command.occurred_at)
+    result = await FakeCodex(["command_accepted", "grant_recorded"]).resume(
+        command, grant
+    )
+    expected_settlement = await FakeCostAuthority().settle(
+        command, result, expected_authority
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        response = (
+            expected_authority
+            if request.url.path.endswith("/validate")
+            else expected_settlement
+        )
+        return httpx.Response(
+            200,
+            json=response.model_dump(mode="json", by_alias=True),
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        costs = adapter_type(
+            base_url="http://gateway.test",
+            token="gateway-cost-secret",
+            client=http,
+        )
+        authority = await costs.authorize(command)
+        settlement = await costs.settle(command, result, authority)
+
+    assert authority == expected_authority
+    assert settlement == expected_settlement
+    assert [request.url.path for request in requests] == [
+        "/v1/capability-resumes/cost-authorities/validate",
+        "/v1/capability-resumes/cost-authorities/settle",
+    ]
+    assert all(
+        request.headers["authorization"] == "Bearer gateway-cost-secret"
+        for request in requests
+    )
 
 
 def test_live_demo_service_script_manages_runtime_by_verified_identity() -> None:

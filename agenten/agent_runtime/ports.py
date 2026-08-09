@@ -13,6 +13,8 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     CapabilityGrantRevocation,
     HermesPlanResult,
+    RuntimeResumeCostAuthorityV1,
+    RuntimeResumeCostSettlementV1,
 )
 from agenten.validation.contracts import WorkBatch
 
@@ -42,6 +44,21 @@ class RuntimeStatePort(Protocol):
 @runtime_checkable
 class ArtifactPort(Protocol):
     async def require(self, reference: ArtifactRef) -> None: ...
+
+    async def write(self, content: bytes, media_type: str) -> ArtifactRef: ...
+
+
+class RuntimeCostAuthorityPort(Protocol):
+    async def authorize(
+        self, command: AgentRuntimeCommand
+    ) -> RuntimeResumeCostAuthorityV1: ...
+
+    async def settle(
+        self,
+        command: AgentRuntimeCommand,
+        result: AgentRuntimeResult,
+        authority: RuntimeResumeCostAuthorityV1,
+    ) -> RuntimeResumeCostSettlementV1: ...
 
 
 class CapabilityPolicyPort(Protocol):

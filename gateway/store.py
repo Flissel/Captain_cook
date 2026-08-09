@@ -25,6 +25,11 @@ from agenten.agent_runtime.contracts import (
     ArtifactRef,
     CapabilityGrant,
     CapabilityGrantRevocation,
+    RuntimeCostEvidenceV1,
+    RuntimeOperation,
+    RuntimeResumeCostAuthorityV1,
+    RuntimeResumeCostSettlementRequestV1,
+    RuntimeResumeCostSettlementV1,
 )
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
@@ -2426,6 +2431,240 @@ class GatewayStore:
             ),
         )
 
+    def validate_capability_resume_cost_authority(
+        self,
+        command: AgentRuntimeCommand,
+        *,
+        now: datetime,
+    ) -> RuntimeResumeCostAuthorityV1:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                return self._validate_capability_resume_cost_authority_with_cursor(
+                    cursor, command, now=now
+                )
+
+    def _validate_capability_resume_cost_authority_with_cursor(
+        self,
+        cursor: Any,
+        command: AgentRuntimeCommand,
+        *,
+        now: datetime,
+    ) -> RuntimeResumeCostAuthorityV1:
+        payload = command.payload
+        if (
+            payload.operation is not RuntimeOperation.CODEX_RESUME
+            or payload.cost_authority_ref is None
+            or payload.budget_reservation_id is None
+            or payload.maximum_cost_usd is None
+            or payload.cost_job_id is None
+            or payload.cost_run_id is None
+            or payload.cost_input_id is None
+            or payload.cost_capability_id is None
+            or payload.cost_capability_version is None
+        ):
+            raise HTTPException(
+                status_code=409, detail="runtime resume cost binding is incomplete"
+            )
+        try:
+            receipt_id = UUID(payload.cost_authority_ref.rsplit("/", 1)[-1])
+        except (ValueError, AttributeError):
+            raise HTTPException(
+                status_code=409, detail="runtime resume cost authority is invalid"
+            ) from None
+        cursor.execute(
+            """SELECT payload FROM capability_resume_authorizations
+               WHERE authorization_receipt_id = %s FOR UPDATE""",
+            (str(receipt_id),),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=409, detail="runtime resume cost authority is unavailable"
+            )
+        authorization = self._decode_json(row["payload"])
+        expected_command = AgentRuntimeCommand.model_validate(
+            authorization["resume_command"]
+        )
+        request = authorization["request"]
+        if (
+            expected_command != command
+            or request["reservation_id"] != str(payload.budget_reservation_id)
+            or request["job_id"] != str(payload.cost_job_id)
+            or request["run_id"] != str(payload.cost_run_id)
+            or request["input_id"] != payload.cost_input_id
+            or request["correlation_id"] != str(command.correlation_id)
+            or request["capability_id"] != payload.cost_capability_id
+            or request["capability_version"] != payload.cost_capability_version
+        ):
+            raise HTTPException(
+                status_code=409, detail="runtime resume cost authority binding mismatch"
+            )
+        command_block = self._runtime_block_by_json_value(
+            cursor,
+            block_type="agent_runtime_command",
+            field="event_id",
+            value=str(command.event_id),
+            for_update=True,
+        )
+        reservation = self._factory_reservation(
+            cursor, payload.budget_reservation_id, for_update=True
+        )
+        if (
+            command_block is None
+            or AgentRuntimeCommand.model_validate(command_block["data"]) != command
+            or reservation is None
+            or reservation.job_id != payload.cost_job_id
+            or reservation.correlation_id != command.correlation_id
+            or reservation.requested_usd != payload.maximum_cost_usd
+            or reservation.expires_at <= now
+            or self._reservation_is_closed(cursor, reservation.reservation_id)
+        ):
+            raise HTTPException(
+                status_code=409, detail="runtime resume cost reservation is inactive"
+            )
+        return RuntimeResumeCostAuthorityV1(
+            schema_name="captain.runtime-resume-cost-authority.v1",
+            authorization_receipt_id=receipt_id,
+            cost_authority_ref=payload.cost_authority_ref,
+            reservation_id=reservation.reservation_id,
+            job_id=payload.cost_job_id,
+            run_id=payload.cost_run_id,
+            input_id=payload.cost_input_id,
+            correlation_id=command.correlation_id,
+            capability_id=payload.cost_capability_id,
+            capability_version=payload.cost_capability_version,
+            command_id=command.event_id,
+            ceiling_usd=reservation.requested_usd,
+            expires_at=reservation.expires_at,
+            hard_ceiling_enforced=True,
+            metering_mode="provider_usage_receipt",
+        )
+
+    def settle_capability_resume_cost(
+        self,
+        request: RuntimeResumeCostSettlementRequestV1,
+        *,
+        now: datetime,
+    ) -> RuntimeResumeCostSettlementV1:
+        settlement = self._derive_capability_resume_cost_settlement(request)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                existing = self._factory_budget_event(
+                    cursor, settlement.settlement_id, for_update=True
+                )
+                canonical = settlement.model_dump(mode="json", by_alias=True)
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) != canonical:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="runtime resume cost settlement changed",
+                        )
+                    return settlement
+                current = self._validate_capability_resume_cost_authority_with_cursor(
+                    cursor, request.command, now=now
+                )
+                if current != request.authority:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime resume cost authority changed",
+                    )
+                job, job_block = self._factory_budget_job(
+                    cursor, request.authority.job_id, for_update=True
+                )
+                projection = self._factory_budget_projection(
+                    cursor, job, for_update=True
+                )
+                if request.authority.reservation_id not in projection.active_reservation_ids:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime resume cost reservation is inactive",
+                    )
+                self._insert_factory_budget_event(
+                    cursor,
+                    event_id=settlement.settlement_id,
+                    reservation_id=settlement.reservation_id,
+                    job_id=request.authority.job_id,
+                    event_kind="resume_cost",
+                    digest=self._canonical_model_sha256(settlement),
+                    payload=canonical,
+                    parent_index=job_block["index"],
+                    schema_name=settlement.schema_name,
+                )
+        return settlement
+
+    @staticmethod
+    def _derive_capability_resume_cost_settlement(
+        request: RuntimeResumeCostSettlementRequestV1,
+    ) -> RuntimeResumeCostSettlementV1:
+        command = request.command
+        result = request.result
+        authority = request.authority
+        payload = command.payload
+        if (
+            result.command_id != command.event_id
+            or result.correlation_id != command.correlation_id
+            or result.operation is not RuntimeOperation.CODEX_RESUME
+            or authority.command_id != command.event_id
+            or authority.reservation_id != payload.budget_reservation_id
+            or authority.job_id != payload.cost_job_id
+            or authority.run_id != payload.cost_run_id
+            or authority.input_id != payload.cost_input_id
+            or authority.correlation_id != command.correlation_id
+            or authority.capability_id != payload.cost_capability_id
+            or authority.capability_version != payload.cost_capability_version
+            or authority.ceiling_usd != payload.maximum_cost_usd
+        ):
+            raise HTTPException(
+                status_code=409, detail="runtime resume settlement binding mismatch"
+            )
+        cost: RuntimeCostEvidenceV1 | None = result.cost_evidence
+        references = tuple(
+            dict.fromkeys(
+                (
+                    *result.evidence_refs,
+                    *((cost.evidence_ref,) if cost is not None else ()),
+                )
+            )
+        )
+        if not references:
+            raise HTTPException(
+                status_code=409, detail="runtime resume settlement lacks evidence"
+            )
+        if cost is None:
+            disposition = "unmetered"
+            actual = None
+            accounted = authority.ceiling_usd
+        else:
+            if (
+                cost.command_id != command.event_id
+                or cost.reservation_id != authority.reservation_id
+                or cost.job_id != authority.job_id
+                or cost.run_id != authority.run_id
+                or cost.input_id != authority.input_id
+                or cost.correlation_id != authority.correlation_id
+                or cost.capability_id != authority.capability_id
+                or cost.capability_version != authority.capability_version
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="runtime resume actual usage binding mismatch",
+                )
+            actual = cost.actual_cost_usd
+            disposition = (
+                "accounted" if actual <= authority.ceiling_usd else "overrun"
+            )
+            accounted = min(actual, authority.ceiling_usd)
+        return RuntimeResumeCostSettlementV1(
+            schema_name="captain.runtime-resume-cost-settlement.v1",
+            settlement_id=uuid5(command.event_id, "resume-cost-settlement"),
+            command_id=command.event_id,
+            reservation_id=authority.reservation_id,
+            disposition=disposition,
+            actual_cost_usd=actual,
+            accounted_cost_usd=accounted,
+            evidence_refs=references,
+        )
+
     def record_factory_job(self, job: FactoryJob) -> FactoryWriteReceipt:
         canonical = job.model_dump(mode="json", by_alias=True)
         with self.storage.transaction() as connection:
@@ -4418,7 +4657,7 @@ class GatewayStore:
     @staticmethod
     def _reservation_is_closed(cursor: Any, reservation_id: UUID) -> bool:
         cursor.execute(
-            "SELECT 1 FROM factory_budget_events WHERE reservation_id = %s AND event_kind IN ('usage', 'release') LIMIT 1 FOR UPDATE",
+            "SELECT 1 FROM factory_budget_events WHERE reservation_id = %s AND event_kind IN ('usage', 'release', 'resume_cost') LIMIT 1 FOR UPDATE",
             (str(reservation_id),),
         )
         return cursor.fetchone() is not None
@@ -4466,6 +4705,10 @@ class GatewayStore:
                 receipt = self._factory_usage_receipt(payload)
                 consumed += receipt.cost_usd
                 active.pop(receipt.reservation_id, None)
+            elif row["event_kind"] == "resume_cost":
+                settlement = RuntimeResumeCostSettlementV1.model_validate(payload)
+                consumed += settlement.accounted_cost_usd
+                active.pop(settlement.reservation_id, None)
             else:
                 active.pop(UUID(payload["reservation_id"]), None)
         limit = job.execution_policy.max_cost_usd

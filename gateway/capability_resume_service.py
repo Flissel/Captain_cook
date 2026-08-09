@@ -172,6 +172,11 @@ class CapabilityResumeService:
                     "operation": RuntimeOperation.CODEX_RESUME,
                     "maximum_cost_usd": snapshot.resume_budget_usd,
                     "budget_reservation_id": request.reservation_id,
+                    "cost_job_id": request.job_id,
+                    "cost_run_id": request.run_id,
+                    "cost_input_id": request.input_id,
+                    "cost_capability_id": request.capability_id,
+                    "cost_capability_version": request.capability_version,
                     "cost_authority_ref": (
                         "gateway://capability-resume-authorizations/"
                         f"{authorization_id}"
@@ -271,6 +276,10 @@ class CapabilityResumeService:
                 "persisted resume runtime result has no evidence"
             )
         authorization = record.authorization
+        if result.status is RuntimeStatus.SUCCEEDED and result.cost_evidence is None:
+            raise CapabilityResumeUnavailable(
+                "successful resume runtime result has no actual cost evidence"
+            )
         execution = CapabilityExecutionAuthority(
             job_id=authorization.job_id,
             correlation_id=authorization.correlation_id,
@@ -281,6 +290,11 @@ class CapabilityResumeService:
             execution_result_id=result.event_id,
             evidence_refs=evidence_refs,
             booked_cost_usd=record.booked_cost_usd,
+            resume_actual_spend_usd=(
+                result.cost_evidence.actual_cost_usd
+                if result.cost_evidence is not None
+                else None
+            ),
             terminal_status=_terminal_status(result),
             replayed=False,
         )
@@ -355,6 +369,9 @@ def _authorization_id(request: CapabilityResumeExecutionRequest) -> UUID:
 def _result_evidence(result: AgentRuntimeResult):
     unique = {}
     for reference in (*result.evidence_refs, *result.artifact_refs):
+        unique[(reference.uri, reference.sha256, reference.media_type)] = reference
+    if result.cost_evidence is not None:
+        reference = result.cost_evidence.evidence_ref
         unique[(reference.uri, reference.sha256, reference.media_type)] = reference
     return tuple(unique.values())
 

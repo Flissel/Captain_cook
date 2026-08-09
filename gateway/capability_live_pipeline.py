@@ -104,13 +104,16 @@ class CapabilityExecutionAuthority(_FrozenAuthority):
     execution_result_id: UUID
     evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
     booked_cost_usd: Decimal
+    resume_actual_spend_usd: Decimal | None = None
     terminal_status: Literal["succeeded", "cancelled", "timed_out", "failed"]
     replayed: bool
 
-    @field_validator("booked_cost_usd", mode="before")
+    @field_validator("booked_cost_usd", "resume_actual_spend_usd", mode="before")
     @classmethod
-    def require_known_cost(cls, value: object) -> Decimal:
-        return _nonnegative_decimal(value, "execution booked cost")
+    def require_known_cost(cls, value: object) -> Decimal | None:
+        if value is None:
+            return None
+        return _nonnegative_decimal(value, "execution cost")
 
 
 class CapabilityProjectionAuthority(_FrozenAuthority):

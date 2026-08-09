@@ -80,6 +80,16 @@ class MemoryArtifacts:
         assert hashlib.sha256(content).hexdigest() == reference.sha256
         self.required.append(reference.uri)
 
+    async def write(self, content: bytes, media_type: str) -> ArtifactRef:
+        digest = hashlib.sha256(content).hexdigest()
+        reference = ArtifactRef(
+            uri=f"artifact://sha256/{digest}",
+            sha256=digest,
+            media_type=media_type,
+        )
+        self.values[reference.uri] = content
+        return reference
+
 
 def _hermes_plan(artifacts: MemoryArtifacts) -> HermesPlanResult:
     blueprint = json.dumps(
