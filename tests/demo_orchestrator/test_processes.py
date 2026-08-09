@@ -448,6 +448,92 @@ def test_windows_listener_probe_rejects_multiple_owning_processes(
         WindowsProcessBackend().listener_pid(19000)
 
 
+@pytest.mark.parametrize(
+    "result",
+    (
+        SimpleNamespace(returncode=1, stdout="", stderr="super-secret-stderr"),
+        SimpleNamespace(returncode=0, stdout="not-a-process-tick\n", stderr=""),
+    ),
+)
+def test_windows_identity_probe_rejects_ambiguous_or_malformed_result_redacted(
+    monkeypatch: pytest.MonkeyPatch, result: object
+) -> None:
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: result)
+
+    with pytest.raises(
+        DemoProcessError,
+        match="could not inspect process identity",
+    ) as error:
+        WindowsProcessBackend().is_alive(812, "known-start")
+
+    assert "super-secret-stderr" not in str(error.value)
+
+
+def test_windows_identity_probe_accepts_only_explicit_absent_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = SimpleNamespace(
+        returncode=0,
+        stdout="__CAPTAIN_PROCESS_ABSENT__\n",
+        stderr="",
+    )
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: result)
+
+    assert WindowsProcessBackend().is_alive(812, "known-start") is False
+
+
+def test_windows_identity_probe_redacts_subprocess_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*_: object, **__: object) -> object:
+        raise OSError("secret powershell failure")
+
+    monkeypatch.setattr("subprocess.run", fail)
+
+    with pytest.raises(
+        DemoProcessError,
+        match="could not inspect process identity",
+    ) as error:
+        WindowsProcessBackend().is_alive(812, "known-start")
+
+    assert "secret powershell failure" not in str(error.value)
+
+
+def test_stop_retains_persisted_record_on_windows_identity_probe_ambiguity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configuration = _configuration(tmp_path)
+    fake = FakeBackend()
+    records = ManagedProcessSupervisor(
+        configuration, plan=_plan(configuration), backend=fake
+    ).start_all(timeout_seconds=1)
+    result = SimpleNamespace(
+        returncode=1,
+        stdout="",
+        stderr="secret-inspection-detail",
+    )
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: result)
+
+    with pytest.raises(
+        DemoProcessError,
+        match="could not inspect process identity",
+    ) as error:
+        stop_managed_processes(
+            configuration.repository_root,
+            backend=WindowsProcessBackend(),
+        )
+
+    persisted = json.loads(
+        (configuration.state_root / "managed-processes.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert {item["pid"] for item in persisted["processes"]} == {
+        record.pid for record in records
+    }
+    assert "secret-inspection-detail" not in str(error.value)
+
+
 def test_status_health_timeout_remains_terminal_124(tmp_path: Path) -> None:
     configuration = _configuration(tmp_path)
     backend = FakeBackend()
