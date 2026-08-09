@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from decimal import Decimal
 from uuid import UUID, uuid5
 
 import pytest
+import agenten.agent_factory.private_benchmark_catalog as catalog_module
 
 from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
 from agenten.agent_factory.execution_policy import (
@@ -43,6 +45,59 @@ CATEGORIES = {
     "normal", "boundary", "missing", "conflicting", "mandatory_escalation",
 }
 NAMESPACE = UUID("e9a5fc44-f475-5c40-b1c6-c51257723968")
+EXPECTED_SCENARIOS = {
+    INPUTS[0]: (
+        ("rank_complete_accounts", "normal", "Given three accounts"),
+        ("rank_top_account", "normal", "Given three opportunities"),
+        ("normalize_stale_account", "normal", "older than ninety days"),
+        ("equal_score_tie", "boundary", "equal aggregate score tie"),
+        ("ninety_day_staleness", "boundary", "ninety-day staleness boundary"),
+        ("rules_digest_boundary", "boundary", "digest and version acceptance boundary"),
+        ("missing_champion", "missing", "verified_champion"),
+        ("missing_scoring_rules", "missing", "opportunity_scoring_rules"),
+        ("missing_account_identifiers", "missing", "required_account_identifiers"),
+        ("interest_vs_delay", "conflicting", "product_interest"),
+        ("value_vs_staleness", "conflicting", "reported_amount"),
+        ("discount_vs_authority", "conflicting", "requested_discount"),
+        ("stop_sales_mutation", "mandatory_escalation", "sales owner"),
+        ("stop_human_approval", "mandatory_escalation", "sales owner"),
+        ("stop_bounded_attempt", "mandatory_escalation", "sales owner"),
+    ),
+    INPUTS[1]: (
+        ("focused_application_regression", "normal", "new application release"),
+        ("database_pressure_readonly", "normal", "rising connection wait time"),
+        ("focused_specialist_selection", "normal", "application regression"),
+        ("eight_message_limit", "boundary", "eight messages"),
+        ("observability_unavailable", "boundary", "observability query fails"),
+        ("audit_unavailable", "boundary", "audit query fails"),
+        ("missing_audit_evidence", "missing", "audit_log_evidence"),
+        ("missing_observability_evidence", "missing", "observability_evidence"),
+        ("missing_adapter_digest", "missing", "released_adapter_digest"),
+        ("errors_vs_database", "conflicting", "application_error_rate"),
+        ("auth_vs_audit_gap", "conflicting", "authentication_failures"),
+        ("latency_vs_component", "conflicting", "latency_alert"),
+        ("stop_production_mutation", "mandatory_escalation", "human incident commander"),
+        ("stop_unresolved_severity", "mandatory_escalation", "human incident commander"),
+        ("stop_scope_digest", "mandatory_escalation", "human incident commander"),
+    ),
+    INPUTS[2]: (
+        ("covered_water_loss", "normal", "complete water-loss claim"),
+        ("effective_endorsement", "normal", "water-loss claim with policy"),
+        ("auditable_resolution", "normal", "complete covered-loss scenario"),
+        ("optional_ocr_failure", "boundary", "optional OCR fails"),
+        ("handoff_message_limit", "boundary", "five handoffs"),
+        ("fraud_threshold_boundary", "boundary", "no-fraud threshold"),
+        ("missing_claim_record", "missing", "required_claim_record"),
+        ("missing_policy_version", "missing", "effective_policy_version"),
+        ("missing_specialist_output", "missing", "required_specialist_output"),
+        ("duplicate_vs_chronology", "conflicting", "duplicate_evidence"),
+        ("image_vs_consistency", "conflicting", "reused_image_identifier"),
+        ("coverage_vs_fraud", "conflicting", "coverage_specialist_output"),
+        ("stop_binding_claim_decision", "mandatory_escalation", "authorized human adjuster"),
+        ("stop_conflicting_specialists", "mandatory_escalation", "authorized human adjuster"),
+        ("stop_identity_schema_digest", "mandatory_escalation", "authorized human adjuster"),
+    ),
+}
 
 
 def _documents():
@@ -127,46 +182,49 @@ def test_each_generated_category_is_a_grounded_behavioral_transformation(
         for index, rule in enumerate(document.stop_conditions, 1)
     })
 
-    assert len(suite.cases) == 15
-    for case in suite.cases:
+    expected = EXPECTED_SCENARIOS[relative_path]
+    assert len(suite.cases) == len(expected) == 15
+    for case, (slug, category, marker) in zip(suite.cases, expected, strict=True):
+        assert f"_{slug}_" in case.case_key
+        assert case.category == category
+        assert marker.casefold() in (
+            case.observable_setup + " " + case.observable_action
+        ).casefold()
         assert set(case.source_case_keys) <= set(sources)
-        cited = [sources[key] for key in case.source_case_keys]
-        predicate_values = {
-            predicate.expected_value for predicate in case.expected_predicates
-            if isinstance(predicate.expected_value, str)
+        mapped = {
+            source
+            for predicate in case.expected_predicates
+            for source in predicate.source_case_keys
         }
+        assert mapped == set(case.source_case_keys)
+        assert all(predicate.source_case_keys for predicate in case.expected_predicates)
+        for predicate in case.expected_predicates:
+            assert set(predicate.source_case_keys) <= set(sources)
+            if predicate.kind == "observation_contains":
+                assert any(
+                    predicate.expected_value == sources[source][2]
+                    for source in predicate.source_case_keys
+                )
+            elif predicate.kind == "rationale_contains":
+                assert predicate.expected_value in predicate.source_case_keys
         if case.category == "normal":
-            assert case.observable_setup == cited[0][0]
-            assert case.observable_action == cited[0][1]
-            assert cited[0][2] in predicate_values
+            assert "contradict" not in case.observable_setup.casefold()
+            assert not any(item.kind == "handoff_event" for item in case.expected_predicates)
         elif case.category == "missing":
-            assert "Required evidence is absent" in case.observable_setup
-            assert cited[0][0] in case.observable_setup
-            assert cited[0][1] in case.observable_action
-            assert cited[0][2] in predicate_values
+            absent = next(item for item in case.expected_predicates if item.kind == "observation_absent")
+            assert absent.observed_key != "unsupported_inference"
+            assert absent.observed_key in case.observable_setup
+            assert "unavailable" in case.observable_setup.casefold()
         elif case.category == "conflicting":
-            assert len(cited) >= 3
-            assert f"Declared contradictory fact A: {cited[0][0]}" in case.observable_setup
-            assert f"Declared contradictory fact B: NOT ({cited[0][0]})" in case.observable_setup
-            assert cited[0][2] in predicate_values
-            assert cited[1][2] in predicate_values
+            assert "Named contradictory fields" in case.observable_setup
+            assert "Preserve both" in case.observable_action
             assert any(item.kind == "handoff_event" for item in case.expected_predicates)
         elif case.category == "boundary":
-            assert "Explicit boundary condition" in case.observable_setup
-            assert cited[0][0] in case.observable_setup
-            assert cited[0][2] in predicate_values
-            assert any(token in " ".join(cited[0]).casefold() for token in (
-                "tie", "optional", "unavailable", "threshold", "limit", "ninety", "eight", "seven",
-                "digest mismatch", "five handoffs", "sufficient structured",
-            ))
+            assert "Explicit declared boundary" in case.observable_setup
         else:
-            assert len(cited) == 2
-            assert cited[0][2] in case.observable_setup
-            assert cited[1][2] in case.observable_setup
             handoff = next(
                 item for item in case.expected_predicates if item.kind == "handoff_event"
             )
-            assert handoff.expected_value.casefold() in cited[1][2].casefold()
             assert handoff.expected_value != "captain"
 
 
@@ -287,6 +345,15 @@ def test_parser_rejects_concrete_private_cases_in_worker_visible_input() -> None
     "Private\u00a0Benchmark\u00a0Cases",
     "Ｐｒｉｖａｔｅ Ｂｅｎｃｈｍａｒｋ Ｃａｓｅｓ",
     "private-benchmark_case definitions",
+    "Hidden evaluation fixtures",
+    "Private benchmark expected outcomes",
+    "Benchmark case fixtures",
+    "Evaluation expected answers",
+    "Hidden predicates",
+    "Private evaluation",
+    "Hidden holdout",
+    "PRIVATE benchmark policy",
+    "Private\u00a0benchmark policy",
 ))
 def test_parser_rejects_normalized_private_case_heading_before_extra_sections(
     heading: str,
@@ -297,6 +364,19 @@ def test_parser_rejects_normalized_private_case_heading_before_extra_sections(
 
     with pytest.raises(FactoryInputError, match="must not contain private benchmark cases"):
         parse_factory_input_bytes(source.encode(), logical_name="TO_BE_BUILT.md")
+
+
+@pytest.mark.parametrize("heading", (
+    "Private benchmark policy",
+    "Private holdout policy",
+))
+def test_parser_allows_only_exact_public_private_policy_headings(heading: str) -> None:
+    source = (ROOT / INPUTS[0]).read_text(encoding="utf-8")
+    source = source.replace("## Private holdout policy", f"## {heading}")
+
+    document = parse_factory_input_bytes(source.encode(), logical_name="TO_BE_BUILT.md")
+
+    assert document.benchmark_policy.public_policy_statement is not None
 
 
 def test_stale_input_digest_fails_before_any_private_holdout_write() -> None:
@@ -343,6 +423,9 @@ def test_file_catalog_is_digest_bound_single_open_and_rotation_safe(tmp_path: Pa
     first_bytes = (root / "catalog.json").read_bytes()
     replay_ref = write_private_benchmark_catalog(root, documents, seed=b"d" * 32)
     assert replay_ref == first_ref
+    assert (root / "catalog.json").read_bytes() == first_bytes
+    with pytest.raises(PrivateBenchmarkCatalogError, match="rotate to a new path"):
+        write_private_benchmark_catalog(root, documents, seed=b"e" * 32)
     assert (root / "catalog.json").read_bytes() == first_bytes
 
     catalog = VerifiedFilePrivateBenchmarkCatalog.open(
@@ -433,6 +516,49 @@ def test_catalog_writer_rejects_forbidden_root_before_creating_files(
         )
 
     assert not private_root.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction swap contract")
+def test_catalog_writer_parent_swap_never_writes_plaintext_to_forbidden_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_root = tmp_path / "private"
+    forbidden = tmp_path / "forbidden"
+    forbidden.mkdir()
+    attempted: list[bool] = []
+    original_publish = catalog_module._windows_publish_no_replace
+
+    def racing_publish(source: Path, target: Path) -> bool:
+        attempted.append(True)
+        parent = target.parent
+        displaced = tmp_path / "displaced-parent"
+        swapped = False
+        try:
+            parent.rename(displaced)
+            try:
+                parent.symlink_to(forbidden, target_is_directory=True)
+                swapped = True
+            except OSError:
+                displaced.rename(parent)
+            return original_publish(source, target)
+        except OSError:
+            return original_publish(source, target)
+        finally:
+            if swapped:
+                parent.unlink()
+                displaced.rename(parent)
+
+    monkeypatch.setattr(catalog_module, "_windows_publish_no_replace", racing_publish)
+    try:
+        write_private_benchmark_catalog(
+            private_root, _documents(), seed=b"parent-swap-seed-value-123456789" * 2,
+            forbidden_roots=(forbidden,),
+        )
+    except PrivateBenchmarkCatalogError:
+        pass
+
+    assert attempted == [True]
+    assert list(forbidden.iterdir()) == []
 
 
 def test_file_catalog_revalidation_detects_atomic_manifest_rotation(tmp_path: Path) -> None:

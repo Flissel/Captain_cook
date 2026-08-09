@@ -40,12 +40,9 @@ _SECRET_ASSIGNMENT = re.compile(r"\b(?P<alias>[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET
 _BEARER = re.compile(r"\bBearer\s+\S+", re.I)
 _PRIVATE_KEY = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")
 _CREDENTIAL_URL = re.compile(r"https?://[^\s/:]+:[^\s/@]+@", re.I)
-_RESERVED_PRIVATE_HEADINGS = {
-    "private benchmark cases",
-    "private benchmark case definitions",
-    "private benchmarks",
-    "private holdout cases",
-    "private expected predicates",
+_PUBLIC_PRIVATE_POLICY_HEADINGS = {
+    "private benchmark policy",
+    "private holdout policy",
 }
 
 
@@ -83,7 +80,12 @@ def parse_factory_input_bytes(source: bytes, logical_name: str) -> FactoryInputD
     benchmark_policy_statement: str | None = None
     for name, body in ordered:
         normalized_name = _normalized_heading(name)
-        if normalized_name in _RESERVED_PRIVATE_HEADINGS:
+        if (normalized_name in _PUBLIC_PRIVATE_POLICY_HEADINGS
+                and name not in {"Private benchmark policy", "Private holdout policy"}):
+            raise FactoryInputError(
+                "worker-visible input must not contain private benchmark cases"
+            )
+        if _is_reserved_private_heading(normalized_name):
             raise FactoryInputError(
                 "worker-visible input must not contain private benchmark cases"
             )
@@ -92,7 +94,7 @@ def parse_factory_input_bytes(source: bytes, logical_name: str) -> FactoryInputD
                 raise FactoryInputError(f"duplicate required section: {name}")
             required[name] = body
         else:
-            if name == "Private holdout policy":
+            if normalized_name in _PUBLIC_PRIVATE_POLICY_HEADINGS:
                 if benchmark_policy_statement is not None:
                     raise FactoryInputError("duplicate Private holdout policy section")
                 benchmark_policy_statement = body
@@ -171,6 +173,21 @@ def _normalized_heading(value: str) -> str:
         if unicodedata.category(character) != "Cf"
     )
     return " ".join(visible.split())
+
+
+def _is_reserved_private_heading(normalized: str) -> bool:
+    if normalized in _PUBLIC_PRIVATE_POLICY_HEADINGS:
+        return False
+    tokens = set(normalized.split())
+    authority = bool(tokens & {"private", "hidden"})
+    domain = bool(tokens & {"benchmark", "benchmarks", "holdout", "evaluation"})
+    payload = bool(tokens & {
+        "case", "cases", "fixture", "fixtures", "predicate", "predicates",
+        "answer", "answers",
+    }) or {"expected", "outcome"}.issubset(tokens) or {
+        "expected", "outcomes",
+    }.issubset(tokens)
+    return (authority and (domain or payload)) or (domain and payload)
 
 
 def _level_sections(text: str) -> tuple[str, list[tuple[str, str]]]:

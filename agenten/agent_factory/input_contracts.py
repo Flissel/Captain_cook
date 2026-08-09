@@ -66,6 +66,7 @@ class BenchmarkExpectedPredicate(_FrozenContract):
     ]
     observed_key: str = Field(pattern=IDENTIFIER_PATTERN)
     expected_value: str | bool
+    source_case_keys: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def validate_expected_value_semantics(self) -> "BenchmarkExpectedPredicate":
@@ -110,6 +111,18 @@ class PrivateBenchmarkCaseRequirement(_FrozenContract):
             raise ValueError(
                 "mandatory escalation benchmark case requires a handoff predicate"
             )
+        mapped = tuple(
+            source
+            for predicate in self.expected_predicates
+            for source in predicate.source_case_keys
+        )
+        if mapped:
+            if any(not predicate.source_case_keys for predicate in self.expected_predicates):
+                raise ValueError("all benchmark predicates require source mappings")
+            if set(mapped) != set(self.source_case_keys):
+                raise ValueError(
+                    "benchmark case sources must exactly equal predicate source mappings"
+                )
         return self
 
 
