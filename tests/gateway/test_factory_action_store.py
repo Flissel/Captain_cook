@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event, RLock, Thread
 from uuid import UUID
 
 import pytest
@@ -25,6 +26,7 @@ from gateway.factory_action_store import (
     _normalize_legacy_db_row,
     MariaDBFactoryActionRepository,
 )
+from gateway.portal_store import FactoryCredentialCoordinator
 from tests.support.mariadb import assert_isolated_test_database
 
 
@@ -86,14 +88,21 @@ class TransactionalMemoryActionRepository:
         row.created_at = NOW - timedelta(hours=1)
         return self.rows.setdefault(str(row.request.request_id), row)
 
-    def list_rows(self, *, tenant_id: str, status: str) -> tuple[FactoryActionRow, ...]:
-        return tuple(
+    def list_rows(self, *, tenant_id: str, status: str, after_request_id=None, limit: int = 100) -> tuple[FactoryActionRow, ...]:
+        rows = tuple(
             row for row in self.rows.values()
             if row.tenant_id == tenant_id and row.status == status
+            and (after_request_id is None or str(row.request.request_id) > str(after_request_id))
         )
+        return tuple(sorted(rows, key=lambda row: str(row.request.request_id))[:limit])
 
-    def resume_rows(self) -> tuple[FactoryActionRow, ...]:
-        return tuple(row for row in self.rows.values() if row.status == "answered")
+    def resume_rows(self, *, after_request_id=None, limit: int = 100) -> tuple[FactoryActionRow, ...]:
+        rows = tuple(
+            row for row in self.rows.values()
+            if row.status == "answered"
+            and (after_request_id is None or str(row.request.request_id) > str(after_request_id))
+        )
+        return tuple(sorted(rows, key=lambda row: str(row.request.request_id))[:limit])
 
     @contextmanager
     def locked(self, request_id, *, tenant_id: str):
@@ -110,6 +119,9 @@ class TransactionalMemoryActionRepository:
                 and (request_id is None or row.request.request_id == request_id)
             ):
                 row.status = "expired"
+                row.credential_reservation_key = None
+                row.credential_alias = None
+                row.credential_reserved_at = None
 
 
 def canonical_db_row() -> dict[str, object]:
@@ -700,8 +712,9 @@ def test_schema_migration_backfills_legacy_row_under_one_locked_transaction() ->
         def execute(self, query, parameters=None):
             self.calls.append((" ".join(str(query).split()), parameters))
 
-        def fetchall(self):
-            return [legacy]
+        def fetchmany(self, limit):
+            del limit
+            return [legacy] if not any("UPDATE factory_action_inbox SET" in call[0] for call in self.calls) else []
 
     cursor = Cursor()
 
@@ -740,8 +753,9 @@ def test_schema_migration_backfills_missing_intent_timestamp_only_at_startup() -
         def execute(self, query, parameters=None):
             self.calls.append((" ".join(str(query).split()), parameters))
 
-        def fetchall(self):
-            return [legacy]
+        def fetchmany(self, limit):
+            del limit
+            return [legacy] if not any("UPDATE factory_action_inbox SET" in call[0] for call in self.calls) else []
 
     cursor = Cursor()
 
@@ -961,3 +975,243 @@ def test_credential_reference_is_tenant_bound_and_secret_never_persists(storage:
             cursor.execute("SELECT request_payload, response_payload FROM factory_action_inbox")
             serialized = repr(cursor.fetchall()).lower()
     assert "secret-value" not in serialized
+
+
+def test_list_and_recovery_read_repository_in_bounded_pages_without_loss() -> None:
+    class PagingRepository(TransactionalMemoryActionRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.page_sizes: list[int] = []
+
+        def list_rows(self, **kwargs):
+            self.page_sizes.append(kwargs["limit"])
+            return super().list_rows(**kwargs)
+
+        def resume_rows(self, **kwargs):
+            self.page_sizes.append(kwargs["limit"])
+            return super().resume_rows(**kwargs)
+
+    repository = PagingRepository()
+    store = FactoryActionStore(repository=repository, page_size=2)
+    template = pending_request()
+    expected: list[UUID] = []
+    for offset in range(5):
+        request = template.model_copy(
+            update={"request_id": UUID(f"00000000-0000-0000-0000-{700 + offset:012d}")}
+        )
+        expected.append(request.request_id)
+        store.create(request, tenant_id="tenant-a")
+        store.answer(action_response(request, key=f"{offset + 1:064x}"), tenant_id="tenant-a", now=NOW)
+
+    listed = store.list(tenant_id="tenant-a", status="answered", now=NOW)
+    recovered = store.resume_candidates(now=NOW)
+
+    assert [row.request_id for row in listed] == expected
+    assert [request_id for request_id, _ in recovered] == expected
+    assert repository.page_sizes == [2, 2, 2, 2, 2, 2]
+
+
+def test_credential_reservation_is_version_fenced_idempotent_and_releasable() -> None:
+    repository = TransactionalMemoryActionRepository()
+    store = FactoryActionStore(repository=repository)
+    request = pending_request()
+    store.create(request, tenant_id="tenant-a")
+
+    first = store.reserve_credential(
+        request.request_id, tenant_id="tenant-a",
+        expected_subject_version=request.expected_subject_version,
+        credential_alias="n8n-crm-read", now=NOW,
+    )
+    replay = store.reserve_credential(
+        request.request_id, tenant_id="tenant-a",
+        expected_subject_version=request.expected_subject_version,
+        credential_alias="n8n-crm-read", now=NOW,
+    )
+
+    assert replay == first
+    with pytest.raises(ValueError, match="reservation conflict"):
+        store.reserve_credential(
+            request.request_id, tenant_id="tenant-a",
+            expected_subject_version=request.expected_subject_version,
+            credential_alias="different", now=NOW,
+        )
+    store.release_credential_reservation(
+        request.request_id, tenant_id="tenant-a", reservation_key=first
+    )
+    assert repository.rows[str(request.request_id)].credential_reservation_key is None
+
+
+def test_post_write_deadline_revalidation_expires_without_linking_reference() -> None:
+    repository = TransactionalMemoryActionRepository()
+    store = FactoryActionStore(repository=repository)
+    request = pending_request()
+    before_deadline = request.deadline_at - timedelta(microseconds=1)
+    store.create(request, tenant_id="tenant-a")
+    reservation_key = store.reserve_credential(
+        request.request_id, tenant_id="tenant-a",
+        expected_subject_version=request.expected_subject_version,
+        credential_alias="n8n-crm-read", now=before_deadline,
+    )
+
+    with pytest.raises(TimeoutError, match="expired"):
+        store.complete_credential_reservation(
+            request.request_id, tenant_id="tenant-a",
+            reservation_key=reservation_key,
+            credential_ref="credential://tenant-a/n8n-crm-read",
+            now=request.deadline_at,
+        )
+
+    durable = repository.rows[str(request.request_id)]
+    assert durable.status == "expired"
+    assert durable.response is None
+    assert durable.credential_reservation_key is None
+
+
+def test_blocked_credential_write_that_crosses_deadline_is_revoked_and_not_persisted() -> None:
+    repository = TransactionalMemoryActionRepository()
+    store = FactoryActionStore(repository=repository)
+    request = pending_request()
+    store.create(request, tenant_id="tenant-a")
+    entered = Event()
+    release = Event()
+    revoked: list[tuple[str, str]] = []
+
+    class BlockingAdapter:
+        def store_credential(self, *, reservation_key, **kwargs):
+            del kwargs
+            entered.set()
+            assert release.wait(timeout=5)
+            return "credential://tenant-a/n8n-crm-read"
+
+        def revoke_credential(self, *, reservation_key, credential_ref):
+            revoked.append((reservation_key, credential_ref))
+
+    coordinator = FactoryCredentialCoordinator(
+        store=store, adapter=BlockingAdapter(), clock=lambda: request.deadline_at
+    )
+    errors: list[Exception] = []
+    thread = Thread(
+        target=lambda: _capture_error(
+            errors,
+            lambda: coordinator.store_and_answer(
+                request_id=request.request_id, tenant_id="tenant-a",
+                expected_subject_version=request.expected_subject_version,
+                credential_alias="n8n-crm-read", secret_value="private-fixture-value",
+                reserved_at=request.deadline_at - timedelta(microseconds=1),
+            ),
+        )
+    )
+    thread.start()
+    assert entered.wait(timeout=2)
+    release.set()
+    thread.join(timeout=5)
+
+    assert len(errors) == 1 and isinstance(errors[0], TimeoutError)
+    assert len(revoked) == 1
+    durable = repository.rows[str(request.request_id)]
+    assert durable.status == "expired"
+    assert durable.response is None
+    assert "private-fixture-value" not in repr(durable)
+
+
+def test_credential_adapter_exception_releases_reservation_for_retry() -> None:
+    repository = TransactionalMemoryActionRepository()
+    store = FactoryActionStore(repository=repository)
+    request = pending_request()
+    store.create(request, tenant_id="tenant-a")
+
+    class RetryAdapter:
+        calls = 0
+
+        def store_credential(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("credential boundary unavailable")
+            return "credential://tenant-a/n8n-crm-read"
+
+        def revoke_credential(self, **kwargs):
+            raise AssertionError(f"write did not commit: {kwargs!r}")
+
+    adapter = RetryAdapter()
+    coordinator = FactoryCredentialCoordinator(store=store, adapter=adapter, clock=lambda: NOW)
+    with pytest.raises(RuntimeError, match="boundary unavailable"):
+        coordinator.store_and_answer(
+            request_id=request.request_id, tenant_id="tenant-a",
+            expected_subject_version=request.expected_subject_version,
+            credential_alias="n8n-crm-read", secret_value="private-fixture-value",
+            reserved_at=NOW,
+        )
+    assert repository.rows[str(request.request_id)].credential_reservation_key is None
+
+    assert coordinator.store_and_answer(
+        request_id=request.request_id, tenant_id="tenant-a",
+        expected_subject_version=request.expected_subject_version,
+        credential_alias="n8n-crm-read", secret_value="private-fixture-value",
+        reserved_at=NOW,
+    ) == "credential://tenant-a/n8n-crm-read"
+    assert repository.rows[str(request.request_id)].status == "answered"
+
+
+def test_concurrent_duplicate_credential_submissions_create_one_sink_effect() -> None:
+    class LockedRepository(TransactionalMemoryActionRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.guard = RLock()
+
+        @contextmanager
+        def locked(self, request_id, *, tenant_id):
+            with self.guard:
+                with super().locked(request_id, tenant_id=tenant_id) as row:
+                    yield row
+
+    repository = LockedRepository()
+    store = FactoryActionStore(repository=repository)
+    request = pending_request()
+    store.create(request, tenant_id="tenant-a")
+
+    class IdempotentAdapter:
+        def __init__(self) -> None:
+            self.guard = RLock()
+            self.effects: dict[str, str] = {}
+
+        def store_credential(self, *, reservation_key, **kwargs):
+            del kwargs
+            with self.guard:
+                return self.effects.setdefault(
+                    reservation_key, "credential://tenant-a/n8n-crm-read"
+                )
+
+        def revoke_credential(self, **kwargs):
+            raise AssertionError(f"valid duplicate must not revoke: {kwargs!r}")
+
+    adapter = IdempotentAdapter()
+    coordinator = FactoryCredentialCoordinator(store=store, adapter=adapter, clock=lambda: NOW)
+    results: list[str] = []
+    errors: list[Exception] = []
+
+    def submit() -> None:
+        _capture_error(errors, lambda: results.append(coordinator.store_and_answer(
+            request_id=request.request_id, tenant_id="tenant-a",
+            expected_subject_version=request.expected_subject_version,
+            credential_alias="n8n-crm-read", secret_value="private-fixture-value",
+            reserved_at=NOW,
+        )))
+
+    threads = (Thread(target=submit), Thread(target=submit))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert errors == []
+    assert results == ["credential://tenant-a/n8n-crm-read"] * 2
+    assert len(adapter.effects) == 1
+    assert repository.rows[str(request.request_id)].status == "answered"
+
+
+def _capture_error(errors: list[Exception], operation) -> None:
+    try:
+        operation()
+    except Exception as error:
+        errors.append(error)

@@ -6,13 +6,36 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from threading import Lock
-from typing import Callable, Literal, Protocol
+import hashlib
+import json
+from typing import Callable, Iterable, Literal, Protocol, runtime_checkable
 from uuid import UUID
+
+from pydantic import TypeAdapter
 
 from agenten.agent_factory.forge_contracts import (
     FactoryActionRequestV1,
     FactoryActionResponseV1,
 )
+
+
+@dataclass(frozen=True)
+class FactoryActionEffectReceipt:
+    """Durable sink acknowledgement for one canonical keyed effect."""
+
+    effect_key: str
+    payload_sha256: str
+
+    def __post_init__(self) -> None:
+        for value in (self.effect_key, self.payload_sha256):
+            if len(value) != 64 or any(
+                character not in "0123456789abcdef" for character in value
+            ):
+                raise ValueError("factory action effect receipt is invalid")
+
+
+class FactoryActionEffectConflict(ValueError):
+    """A sink receipt is bound to different canonical effect bytes."""
 
 
 @dataclass(frozen=True)
@@ -58,12 +81,22 @@ class FactoryActionConsumer(Protocol):
     ) -> FactoryActionResumeRecord: ...
 
 
+@runtime_checkable
 class FactoryActionProjection(Protocol):
-    def project_factory_action(self, projection: dict[str, object]) -> None: ...
+    def lookup_receipt(self, effect_key: str) -> FactoryActionEffectReceipt | None: ...
+
+    def project_factory_action(
+        self, *, effect_key: str, payload: dict[str, object], payload_sha256: str
+    ) -> FactoryActionEffectReceipt: ...
 
 
+@runtime_checkable
 class FactoryContinuationScheduler(Protocol):
-    def schedule_factory_continuation(self, **continuation: object) -> None: ...
+    def lookup_receipt(self, effect_key: str) -> FactoryActionEffectReceipt | None: ...
+
+    def schedule_factory_continuation(
+        self, *, effect_key: str, payload: dict[str, object], payload_sha256: str
+    ) -> FactoryActionEffectReceipt: ...
 
 
 class FactoryActionResumeCoordinator:
@@ -89,10 +122,8 @@ class FactoryActionResumeCoordinator:
         )
         request = state.request
         if state.phase == "projection_intent":
-            self._projection.project_factory_action(
-                {
+            projection_payload = {
                     "schema": "minibook.factory-action-projection.v1",
-                    "idempotency_key": state.projection_idempotency_key,
                     "request_id": str(request.request_id),
                     "factory_job_id": str(request.factory_job_id),
                     "creation_job_id": str(request.creation_job_id),
@@ -101,6 +132,11 @@ class FactoryActionResumeCoordinator:
                     "status": "answered",
                     "safe_checkpoint_sha256": request.safe_checkpoint_sha256,
                 }
+            self._reconcile_effect(
+                sink=self._projection,
+                method=self._projection.project_factory_action,
+                effect_key=state.projection_idempotency_key,
+                payload=projection_payload,
             )
             state = self._store.acknowledge_projection(
                 request_id,
@@ -114,16 +150,21 @@ class FactoryActionResumeCoordinator:
             )
         if state.phase == "continuation_intent":
             response = state.response
-            self._scheduler.schedule_factory_continuation(
-                idempotency_key=state.continuation_idempotency_key,
-                factory_job_id=request.factory_job_id,
-                creation_job_id=request.creation_job_id,
-                correlation_id=request.correlation_id,
-                expected_subject_version=request.expected_subject_version,
-                safe_checkpoint_ref=request.safe_checkpoint_ref,
-                approved_scope=response.approved_scope,
-                credential_ref=response.credential_ref,
-                answer_metadata=response.answer_metadata,
+            continuation_payload = {
+                "factory_job_id": request.factory_job_id,
+                "creation_job_id": request.creation_job_id,
+                "correlation_id": request.correlation_id,
+                "expected_subject_version": request.expected_subject_version,
+                "safe_checkpoint_ref": request.safe_checkpoint_ref,
+                "approved_scope": response.approved_scope,
+                "credential_ref": response.credential_ref,
+                "answer_metadata": response.answer_metadata,
+            }
+            self._reconcile_effect(
+                sink=self._scheduler,
+                method=self._scheduler.schedule_factory_continuation,
+                effect_key=state.continuation_idempotency_key,
+                payload=continuation_payload,
             )
             state = self._store.acknowledge_continuation(
                 request_id,
@@ -133,6 +174,29 @@ class FactoryActionResumeCoordinator:
             )
         return state.response
 
+    @staticmethod
+    def _reconcile_effect(
+        *, sink: object, method: Callable[..., FactoryActionEffectReceipt],
+        effect_key: str, payload: dict[str, object]
+    ) -> None:
+        canonical = json.dumps(
+            TypeAdapter(dict[str, object]).dump_python(payload, mode="json"),
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        payload_sha256 = hashlib.sha256(canonical).hexdigest()
+        lookup = getattr(sink, "lookup_receipt")
+        receipt = lookup(effect_key)
+        if receipt is None:
+            receipt = method(
+                effect_key=effect_key,
+                payload=payload,
+                payload_sha256=payload_sha256,
+            )
+        if receipt.effect_key != effect_key or receipt.payload_sha256 != payload_sha256:
+            raise FactoryActionEffectConflict(
+                "factory action effect receipt conflicts with canonical payload"
+            )
+
 
 class FactoryActionResumeService:
     """Submit durable resume work to a dedicated worker without blocking HTTP."""
@@ -141,7 +205,7 @@ class FactoryActionResumeService:
         self,
         *,
         coordinator: FactoryActionResumeCoordinator,
-        recovery_source: Callable[[], tuple[tuple[UUID, str], ...]] | None = None,
+        recovery_source: Callable[[], Iterable[tuple[UUID, str]]] | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._recovery_source = recovery_source or (lambda: ())

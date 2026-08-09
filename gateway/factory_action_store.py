@@ -7,7 +7,7 @@ import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import ContextManager, Literal, Protocol
+from typing import ContextManager, Iterator, Literal, Protocol
 from uuid import UUID
 
 from agenten.agent_factory.forge_contracts import (
@@ -51,16 +51,21 @@ class FactoryActionRow:
     continuation_intent_at: datetime | None = None
     continuation_acknowledged_at: datetime | None = None
     consumed_at: datetime | None = None
+    credential_reservation_key: str | None = None
+    credential_alias: str | None = None
+    credential_reserved_at: datetime | None = None
 
 
 class FactoryActionRepository(Protocol):
     def create(self, row: FactoryActionRow) -> FactoryActionRow: ...
 
     def list_rows(
-        self, *, tenant_id: str, status: str
+        self, *, tenant_id: str, status: str, after_request_id: UUID | None, limit: int
     ) -> tuple[FactoryActionRow, ...]: ...
 
-    def resume_rows(self) -> tuple[FactoryActionRow, ...]: ...
+    def resume_rows(
+        self, *, after_request_id: UUID | None, limit: int
+    ) -> tuple[FactoryActionRow, ...]: ...
 
     def locked(
         self, request_id: UUID, *, tenant_id: str
@@ -83,6 +88,7 @@ class FactoryActionStore:
         storage: MariaDBStorage | None = None,
         *,
         repository: FactoryActionRepository | None = None,
+        page_size: int = 100,
     ) -> None:
         if (storage is None) == (repository is None):
             raise ValueError("exactly one factory action repository is required")
@@ -91,6 +97,9 @@ class FactoryActionStore:
             if repository is not None
             else MariaDBFactoryActionRepository(storage)  # type: ignore[arg-type]
         )
+        if page_size < 1 or page_size > 1000:
+            raise ValueError("factory action page_size is invalid")
+        self._page_size = page_size
 
     def create(self, request: FactoryActionRequestV1, *, tenant_id: str) -> FactoryActionRequestV1:
         if request.status != "pending":
@@ -104,24 +113,42 @@ class FactoryActionStore:
         self, *, tenant_id: str, status: ActionStatus, now: datetime
     ) -> tuple[FactoryActionRequestV1, ...]:
         self._repository.expire(tenant_id=tenant_id, now=_aware_utc(now))
-        return tuple(
-            row.request.model_copy(update={"status": row.status})
-            for row in self._repository.list_rows(tenant_id=tenant_id, status=status)
-        )
+        results: list[FactoryActionRequestV1] = []
+        cursor: UUID | None = None
+        while True:
+            page = self._repository.list_rows(
+                tenant_id=tenant_id, status=status,
+                after_request_id=cursor, limit=self._page_size,
+            )
+            results.extend(
+                row.request.model_copy(update={"status": row.status}) for row in page
+            )
+            if len(page) < self._page_size:
+                return tuple(results)
+            cursor = page[-1].request.request_id
 
     def resume_candidates(self, *, now: datetime) -> tuple[tuple[UUID, str], ...]:
+        return tuple(self.iter_resume_candidates(now=now))
+
+    def iter_resume_candidates(self, *, now: datetime) -> Iterator[tuple[UUID, str]]:
         now_utc = _aware_utc(now)
-        candidates: list[tuple[UUID, str]] = []
-        for row in self._repository.resume_rows():
-            if row.request.deadline_at <= now_utc:
-                self._repository.expire(
-                    tenant_id=row.tenant_id,
-                    now=now_utc,
-                    request_id=row.request.request_id,
-                )
-            else:
-                candidates.append((row.request.request_id, row.tenant_id))
-        return tuple(candidates)
+        cursor: UUID | None = None
+        while True:
+            page = self._repository.resume_rows(
+                after_request_id=cursor, limit=self._page_size
+            )
+            for row in page:
+                if row.request.deadline_at <= now_utc:
+                    self._repository.expire(
+                        tenant_id=row.tenant_id,
+                        now=now_utc,
+                        request_id=row.request.request_id,
+                    )
+                else:
+                    yield row.request.request_id, row.tenant_id
+            if len(page) < self._page_size:
+                break
+            cursor = page[-1].request.request_id
 
     def get(
         self, request_id: UUID, *, tenant_id: str, now: datetime
@@ -191,6 +218,99 @@ class FactoryActionStore:
         if outcome is None:
             raise RuntimeError("factory action answer produced no outcome")
         return outcome
+
+    def reserve_credential(
+        self, request_id: UUID, *, tenant_id: str,
+        expected_subject_version: int, credential_alias: str, now: datetime,
+    ) -> str:
+        now_utc = _aware_utc(now)
+        with self._repository.locked(request_id, tenant_id=tenant_id) as row:
+            if row is None:
+                raise LookupError("factory action not found")
+            if row.status == "expired" or now_utc >= row.request.deadline_at:
+                row.status = "expired"
+                self._clear_credential_reservation(row)
+                raise TimeoutError("factory action expired")
+            if expected_subject_version != row.request.expected_subject_version:
+                raise ValueError("stale subject version")
+            key = hashlib.sha256(json.dumps({
+                "request_id": str(request_id), "tenant_id": tenant_id,
+                "subject_version": expected_subject_version,
+                "deadline_at": row.request.deadline_at.isoformat(),
+                "credential_alias": credential_alias,
+            }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            if row.status == "answered" and row.response is not None:
+                if (
+                    row.response.idempotency_key == key
+                    and row.response.answer_metadata.get("credential_alias") == credential_alias
+                ):
+                    return key
+                raise ValueError("factory credential reservation conflict")
+            if row.status != "pending" or row.request.request_type != "credential_required":
+                raise ValueError("factory action does not accept a credential")
+            if row.credential_reservation_key is not None:
+                if row.credential_reservation_key == key and row.credential_alias == credential_alias:
+                    return key
+                raise ValueError("factory credential reservation conflict")
+            row.credential_reservation_key = key
+            row.credential_alias = credential_alias
+            row.credential_reserved_at = now_utc
+            return key
+
+    def release_credential_reservation(
+        self, request_id: UUID, *, tenant_id: str, reservation_key: str
+    ) -> None:
+        with self._repository.locked(request_id, tenant_id=tenant_id) as row:
+            if row is None:
+                raise LookupError("factory action not found")
+            if row.credential_reservation_key == reservation_key and row.status == "pending":
+                self._clear_credential_reservation(row)
+
+    def complete_credential_reservation(
+        self, request_id: UUID, *, tenant_id: str, reservation_key: str,
+        credential_ref: str, now: datetime,
+    ) -> FactoryActionResponseV1:
+        now_utc = _exact_utc(now, field="answered_at")
+        with self._repository.locked(request_id, tenant_id=tenant_id) as row:
+            if row is None:
+                raise LookupError("factory action not found")
+            if row.status == "expired" or now_utc >= row.request.deadline_at:
+                row.status = "expired"
+                self._clear_credential_reservation(row)
+                raise TimeoutError("factory action expired")
+            if row.status == "answered" and row.response is not None:
+                if row.response.idempotency_key == reservation_key and row.response.credential_ref == credential_ref:
+                    return row.response
+                raise ValueError("factory credential reservation conflict")
+            if row.status != "pending" or row.credential_reservation_key != reservation_key:
+                raise ValueError("factory credential reservation mismatch")
+            if not credential_ref.startswith(f"credential://{tenant_id}/"):
+                raise ValueError("credential adapter returned an invalid reference")
+            alias = row.credential_alias
+            if alias is None:
+                raise FactoryActionDurabilityError("factory credential reservation is incomplete")
+            response = FactoryActionResponseV1(
+                request_id=request_id,
+                expected_subject_version=row.request.expected_subject_version,
+                decision="approve", approved_scope=row.request.required_scope,
+                credential_ref=credential_ref,
+                answer_metadata={"credential_alias": alias},
+                answered_at=now_utc, idempotency_key=reservation_key,
+            )
+            validate_action_response_binding(row.request, response)
+            canonical = _canonical(response)
+            row.response = response
+            row.response_sha256 = hashlib.sha256(canonical).hexdigest()
+            row.status = "answered"
+            row.resume_phase = "answered"
+            self._clear_credential_reservation(row)
+            return response
+
+    @staticmethod
+    def _clear_credential_reservation(row: FactoryActionRow) -> None:
+        row.credential_reservation_key = None
+        row.credential_alias = None
+        row.credential_reserved_at = None
 
     def consume(
         self,
@@ -370,6 +490,9 @@ class MariaDBFactoryActionRepository:
                         continuation_intent_at DATETIME(6) NULL,
                         continuation_acknowledged_at DATETIME(6) NULL,
                         consumed_at DATETIME(6) NULL,
+                        credential_reservation_key CHAR(64) NULL,
+                        credential_alias VARCHAR(128) NULL,
+                        credential_reserved_at DATETIME(6) NULL,
                         created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                         updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
                             ON UPDATE CURRENT_TIMESTAMP(6),
@@ -389,19 +512,29 @@ class MariaDBFactoryActionRepository:
                     "continuation_idempotency_key CHAR(64) NULL",
                     "continuation_intent_at DATETIME(6) NULL",
                     "continuation_acknowledged_at DATETIME(6) NULL",
+                    "credential_reservation_key CHAR(64) NULL",
+                    "credential_alias VARCHAR(128) NULL",
+                    "credential_reserved_at DATETIME(6) NULL",
                 ):
                     cursor.execute(
                         f"ALTER TABLE factory_action_inbox ADD COLUMN IF NOT EXISTS {definition}"
                     )
-                cursor.execute("SELECT * FROM factory_action_inbox FOR UPDATE")
-                for persisted in cursor.fetchall():
-                    normalized = _normalize_legacy_db_row(
-                        persisted, backfill_phase_timestamps=True
-                    )
-                    if normalized == persisted:
-                        continue
+                migration_cursor = ""
+                while True:
                     cursor.execute(
-                        """UPDATE factory_action_inbox SET request_payload = %s,
+                        "SELECT * FROM factory_action_inbox WHERE request_id > %s "
+                        "ORDER BY request_id LIMIT 100 FOR UPDATE",
+                        (migration_cursor,),
+                    )
+                    persisted_page = tuple(cursor.fetchmany(100))
+                    for persisted in persisted_page:
+                        normalized = _normalize_legacy_db_row(
+                            persisted, backfill_phase_timestamps=True
+                        )
+                        if normalized == persisted:
+                            continue
+                        cursor.execute(
+                            """UPDATE factory_action_inbox SET request_payload = %s,
                            request_sha256 = %s, response_payload = %s,
                            response_sha256 = %s, resume_phase = %s,
                            projection_idempotency_key = %s,
@@ -409,18 +542,21 @@ class MariaDBFactoryActionRepository:
                            continuation_idempotency_key = %s,
                            continuation_intent_at = %s, continuation_acknowledged_at = %s
                            WHERE request_id = %s""",
-                        (
-                            normalized["request_payload"], normalized["request_sha256"],
-                            normalized.get("response_payload"), normalized.get("response_sha256"),
-                            normalized.get("resume_phase"), normalized.get("projection_idempotency_key"),
-                            normalized.get("projection_intent_at"),
-                            normalized.get("projection_acknowledged_at"),
-                            normalized.get("continuation_idempotency_key"),
-                            normalized.get("continuation_intent_at"),
-                            normalized.get("continuation_acknowledged_at"),
-                            normalized["request_id"],
-                        ),
-                    )
+                            (
+                                normalized["request_payload"], normalized["request_sha256"],
+                                normalized.get("response_payload"), normalized.get("response_sha256"),
+                                normalized.get("resume_phase"), normalized.get("projection_idempotency_key"),
+                                normalized.get("projection_intent_at"),
+                                normalized.get("projection_acknowledged_at"),
+                                normalized.get("continuation_idempotency_key"),
+                                normalized.get("continuation_intent_at"),
+                                normalized.get("continuation_acknowledged_at"),
+                                normalized["request_id"],
+                            ),
+                        )
+                    if len(persisted_page) < 100:
+                        break
+                    migration_cursor = str(persisted_page[-1]["request_id"])
 
     def create(self, row: FactoryActionRow) -> FactoryActionRow:
         request = row.request
@@ -454,25 +590,29 @@ class MariaDBFactoryActionRepository:
                 return _db_row(persisted)
 
     def list_rows(
-        self, *, tenant_id: str, status: str
+        self, *, tenant_id: str, status: str,
+        after_request_id: UUID | None, limit: int,
     ) -> tuple[FactoryActionRow, ...]:
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT * FROM factory_action_inbox WHERE tenant_id = %s "
-                    "AND status = %s ORDER BY created_at, request_id",
-                    (tenant_id, status),
+                    "AND status = %s AND request_id > %s ORDER BY request_id LIMIT %s",
+                    (tenant_id, status, "" if after_request_id is None else str(after_request_id), limit),
                 )
-                return tuple(_db_row(row) for row in cursor.fetchall())
+                return tuple(_db_row(row) for row in cursor.fetchmany(limit))
 
-    def resume_rows(self) -> tuple[FactoryActionRow, ...]:
+    def resume_rows(
+        self, *, after_request_id: UUID | None, limit: int
+    ) -> tuple[FactoryActionRow, ...]:
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT * FROM factory_action_inbox WHERE status = 'answered' "
-                    "ORDER BY updated_at, request_id"
+                    "AND request_id > %s ORDER BY request_id LIMIT %s",
+                    ("" if after_request_id is None else str(after_request_id), limit),
                 )
-                return tuple(_db_row(row) for row in cursor.fetchall())
+                return tuple(_db_row(row) for row in cursor.fetchmany(limit))
 
     @contextmanager
     def locked(self, request_id: UUID, *, tenant_id: str):
@@ -495,6 +635,8 @@ class MariaDBFactoryActionRepository:
                            continuation_idempotency_key = %s,
                            continuation_intent_at = %s,
                            continuation_acknowledged_at = %s, consumed_at = %s
+                           , credential_reservation_key = %s,
+                           credential_alias = %s, credential_reserved_at = %s
                            WHERE request_id = %s AND tenant_id = %s""",
                         (
                             row.status,
@@ -508,6 +650,9 @@ class MariaDBFactoryActionRepository:
                             None if row.continuation_intent_at is None else _naive_utc(row.continuation_intent_at),
                             None if row.continuation_acknowledged_at is None else _naive_utc(row.continuation_acknowledged_at),
                             None if row.consumed_at is None else _naive_utc(row.consumed_at),
+                            row.credential_reservation_key,
+                            row.credential_alias,
+                            None if row.credential_reserved_at is None else _naive_utc(row.credential_reserved_at),
                             str(request_id), tenant_id,
                         ),
                     )
@@ -520,7 +665,8 @@ class MariaDBFactoryActionRepository:
         request_id: UUID | None = None,
     ) -> None:
         query = (
-            "UPDATE factory_action_inbox SET status = 'expired' WHERE tenant_id = %s "
+            "UPDATE factory_action_inbox SET status = 'expired', credential_reservation_key = NULL, "
+            "credential_alias = NULL, credential_reserved_at = NULL WHERE tenant_id = %s "
             "AND status IN ('pending', 'answered') AND deadline_at <= %s"
         )
         parameters: tuple[object, ...] = (tenant_id, _naive_utc(now))
@@ -770,6 +916,9 @@ def _db_row(row: dict[str, object]) -> FactoryActionRow:
         continuation_intent_at=_optional_aware(row.get("continuation_intent_at")),
         continuation_acknowledged_at=_optional_aware(row.get("continuation_acknowledged_at")),
         consumed_at=(None if consumed is None else _aware_utc(consumed)),  # type: ignore[arg-type]
+        credential_reservation_key=(None if row.get("credential_reservation_key") is None else str(row["credential_reservation_key"])),
+        credential_alias=(None if row.get("credential_alias") is None else str(row["credential_alias"])),
+        credential_reserved_at=_optional_aware(row.get("credential_reserved_at")),
     )
     expected_projection_key = (
         None

@@ -6,7 +6,7 @@ import hashlib
 import json
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Final, Protocol
+from typing import Callable, Final, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from blockchain.mariadb_storage import MariaDBStorage
@@ -21,17 +21,82 @@ from gateway.portal_contracts import (
 _INVALID_TICKET: Final = "invalid portal setup ticket"
 
 
+@runtime_checkable
 class FactoryCredentialAdapter(Protocol):
-    """Dedicated write-only credential boundary used by Action Inbox."""
+    """Dedicated idempotent and reversible credential boundary."""
 
     def store_credential(
         self,
         *,
+        reservation_key: str,
         tenant_id: str,
         request_id: UUID,
         credential_alias: str,
         secret_value: str,
     ) -> str: ...
+
+    def revoke_credential(
+        self, *, reservation_key: str, credential_ref: str
+    ) -> None: ...
+
+
+class FactoryCredentialReservationStore(Protocol):
+    def reserve_credential(
+        self, request_id: UUID, *, tenant_id: str,
+        expected_subject_version: int, credential_alias: str, now: datetime,
+    ) -> str: ...
+
+    def complete_credential_reservation(
+        self, request_id: UUID, *, tenant_id: str, reservation_key: str,
+        credential_ref: str, now: datetime,
+    ) -> object: ...
+
+    def release_credential_reservation(
+        self, request_id: UUID, *, tenant_id: str, reservation_key: str
+    ) -> None: ...
+
+
+class FactoryCredentialCoordinator:
+    """Fence, write, revalidate, and clean up one credential effect."""
+
+    def __init__(
+        self, *, store: FactoryCredentialReservationStore,
+        adapter: FactoryCredentialAdapter, clock: Callable[[], datetime],
+    ) -> None:
+        self._store = store
+        self._adapter = adapter
+        self._clock = clock
+
+    def store_and_answer(
+        self, *, request_id: UUID, tenant_id: str, expected_subject_version: int,
+        credential_alias: str, secret_value: str, reserved_at: datetime,
+    ) -> str:
+        reservation_key = self._store.reserve_credential(
+            request_id, tenant_id=tenant_id,
+            expected_subject_version=expected_subject_version,
+            credential_alias=credential_alias, now=reserved_at,
+        )
+        reference: str | None = None
+        try:
+            reference = self._adapter.store_credential(
+                reservation_key=reservation_key, tenant_id=tenant_id,
+                request_id=request_id, credential_alias=credential_alias,
+                secret_value=secret_value,
+            )
+            self._store.complete_credential_reservation(
+                request_id, tenant_id=tenant_id, reservation_key=reservation_key,
+                credential_ref=reference, now=self._clock(),
+            )
+            return reference
+        except Exception:
+            if reference is not None:
+                self._adapter.revoke_credential(
+                    reservation_key=reservation_key, credential_ref=reference
+                )
+            self._store.release_credential_reservation(
+                request_id, tenant_id=tenant_id, reservation_key=reservation_key
+            )
+            raise
 
 
 class PortalTicketStore:

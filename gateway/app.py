@@ -302,6 +302,18 @@ def create_app(
         raise ValueError("factory action resume dispatcher lifecycle is incomplete")
     if (factory_action_projection is None) != (factory_continuation_scheduler is None):
         raise ValueError("factory action projection and continuation scheduler must be configured together")
+    if factory_action_projection is not None and not isinstance(
+        factory_action_projection, FactoryActionProjection
+    ):
+        raise ValueError("factory action projection receipt protocol is incomplete")
+    if factory_continuation_scheduler is not None and not isinstance(
+        factory_continuation_scheduler, FactoryContinuationScheduler
+    ):
+        raise ValueError("factory action continuation receipt protocol is incomplete")
+    if factory_credential_adapter is not None and not isinstance(
+        factory_credential_adapter, FactoryCredentialAdapter
+    ):
+        raise ValueError("factory credential adapter protocol is incomplete")
     if (
         settings is not None
         and settings.factory_action_inbox_enabled
@@ -438,7 +450,7 @@ def create_app(
                         scheduler=factory_continuation_scheduler,
                         clock=portal_clock,
                     ),
-                    recovery_source=lambda: consumer.resume_candidates(
+                    recovery_source=lambda: consumer.iter_resume_candidates(
                         now=portal_clock()
                     ),
                 )
@@ -812,12 +824,22 @@ def create_app(
         principal: PortalPrincipalV1 = Depends(require_portal_principal),
     ) -> PortalFactoryCredentialReferenceV1:
         try:
+            resume_dispatcher = get_factory_action_resume_dispatcher()
+            if resume_dispatcher is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="factory action resume capability is disabled",
+                )
             reference = await run_in_threadpool(
                 get_store().store_portal_factory_credential,
                 request_id=request_id,
                 principal=principal,
                 request=request,
                 now=portal_clock(),
+            )
+            resume_dispatcher.enqueue(
+                request_id=request_id,
+                tenant_id=principal.organization_id,
             )
             return PortalFactoryCredentialReferenceV1(credential_ref=reference)
         except LookupError:

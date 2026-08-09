@@ -8,6 +8,8 @@ from time import monotonic
 import pytest
 
 from agenten.agent_factory.action_resume import (
+    FactoryActionEffectReceipt,
+    FactoryActionEffectConflict,
     FactoryActionResumeCoordinator,
     FactoryActionResumeService,
 )
@@ -27,16 +29,34 @@ class RecordingProjection:
     def __init__(self) -> None:
         self.values: list[dict[str, object]] = []
 
-    def project_factory_action(self, projection: dict[str, object]) -> None:
+        self.receipts: dict[str, FactoryActionEffectReceipt] = {}
+
+    def lookup_receipt(self, effect_key: str) -> FactoryActionEffectReceipt | None:
+        return self.receipts.get(effect_key)
+
+    def project_factory_action(self, *, effect_key: str, payload: dict[str, object], payload_sha256: str) -> FactoryActionEffectReceipt:
+        projection = payload
         self.values.append(projection)
+        receipt = FactoryActionEffectReceipt(effect_key=effect_key, payload_sha256=payload_sha256)
+        self.receipts[effect_key] = receipt
+        return receipt
 
 
 class RecordingScheduler:
     def __init__(self) -> None:
         self.values: list[dict[str, object]] = []
 
-    def schedule_factory_continuation(self, **continuation: object) -> None:
+        self.receipts: dict[str, FactoryActionEffectReceipt] = {}
+
+    def lookup_receipt(self, effect_key: str) -> FactoryActionEffectReceipt | None:
+        return self.receipts.get(effect_key)
+
+    def schedule_factory_continuation(self, *, effect_key: str, payload: dict[str, object], payload_sha256: str) -> FactoryActionEffectReceipt:
+        continuation = payload
         self.values.append(continuation)
+        receipt = FactoryActionEffectReceipt(effect_key=effect_key, payload_sha256=payload_sha256)
+        self.receipts[effect_key] = receipt
+        return receipt
 
 
 class IdempotentCrashableProjection:
@@ -44,16 +64,22 @@ class IdempotentCrashableProjection:
         self.fail_before = fail_before
         self.crash_after = crash_after
         self.effects: dict[str, dict[str, object]] = {}
+        self.receipts: dict[str, FactoryActionEffectReceipt] = {}
 
-    def project_factory_action(self, projection: dict[str, object]) -> None:
+    def lookup_receipt(self, effect_key: str) -> FactoryActionEffectReceipt | None:
+        return self.receipts.get(effect_key)
+
+    def project_factory_action(self, *, effect_key: str, payload: dict[str, object], payload_sha256: str) -> FactoryActionEffectReceipt:
         if self.fail_before:
             self.fail_before = False
             raise RuntimeError("projection unavailable")
-        key = str(projection["idempotency_key"])
-        self.effects.setdefault(key, projection)
+        self.effects.setdefault(effect_key, payload)
+        receipt = FactoryActionEffectReceipt(effect_key=effect_key, payload_sha256=payload_sha256)
+        self.receipts[effect_key] = receipt
         if self.crash_after:
             self.crash_after = False
             raise RuntimeError("crash after projection")
+        return receipt
 
 
 class IdempotentCrashableScheduler:
@@ -61,16 +87,27 @@ class IdempotentCrashableScheduler:
         self.fail_before = fail_before
         self.crash_after = crash_after
         self.effects: dict[str, dict[str, object]] = {}
+        self.receipts: dict[str, FactoryActionEffectReceipt] = {}
 
-    def schedule_factory_continuation(self, **continuation: object) -> None:
+    def lookup_receipt(self, effect_key: str) -> FactoryActionEffectReceipt | None:
+        return self.receipts.get(effect_key)
+
+    def schedule_factory_continuation(self, *, effect_key: str, payload: dict[str, object], payload_sha256: str) -> FactoryActionEffectReceipt:
         if self.fail_before:
             self.fail_before = False
             raise RuntimeError("scheduler unavailable")
-        key = str(continuation["idempotency_key"])
-        self.effects.setdefault(key, continuation)
+        self.effects.setdefault(effect_key, payload)
+        receipt = FactoryActionEffectReceipt(effect_key=effect_key, payload_sha256=payload_sha256)
+        self.receipts[effect_key] = receipt
         if self.crash_after:
             self.crash_after = False
             raise RuntimeError("crash after schedule")
+        return receipt
+
+
+class ConflictingReceiptProjection(RecordingProjection):
+    def lookup_receipt(self, effect_key: str) -> FactoryActionEffectReceipt | None:
+        return FactoryActionEffectReceipt(effect_key=effect_key, payload_sha256="f" * 64)
 
 
 def test_resume_consumes_exact_checkpoint_projects_redacted_status_and_schedules_once() -> None:
@@ -311,6 +348,31 @@ def test_resume_retries_schedule_after_restart_without_duplicate_effect(
     assert durable.resume_phase == "continuation_acknowledged"
     assert len(projection.effects) == 1
     assert len(scheduler.effects) == 1
+
+
+def test_resume_fails_closed_on_conflicting_projection_receipt() -> None:
+    request = FactoryActionRequestV1.model_validate_json(
+        (FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8")
+    )
+    response = FactoryActionResponseV1.model_validate_json(
+        (FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8")
+    )
+    repository = TransactionalMemoryActionRepository()
+    store = FactoryActionStore(repository=repository)
+    store.create(request, tenant_id="tenant-a")
+    store.answer(response, tenant_id="tenant-a", now=NOW)
+
+    with pytest.raises(FactoryActionEffectConflict, match="receipt"):
+        FactoryActionResumeCoordinator(
+            store=store,
+            projection=ConflictingReceiptProjection(),
+            scheduler=RecordingScheduler(),
+            clock=lambda: NOW,
+        ).resume(request_id=request.request_id, tenant_id="tenant-a")
+
+    durable = repository.rows[str(request.request_id)]
+    assert durable.status == "answered"
+    assert durable.resume_phase == "projection_intent"
 
 
 def test_resume_service_enqueue_returns_without_waiting_for_coordinator() -> None:

@@ -156,7 +156,11 @@ from gateway.portal_contracts import (
     PortalTicketFenceV1,
     PortalTicketAction,
 )
-from gateway.portal_store import FactoryCredentialAdapter, PortalTicketStore
+from gateway.portal_store import (
+    FactoryCredentialAdapter,
+    FactoryCredentialCoordinator,
+    PortalTicketStore,
+)
 from gateway.factory_action_store import ActionStatus, FactoryActionStore
 from agenten.agent_factory.forge_contracts import FactoryActionRequestV1, FactoryActionResponseV1
 from gateway.portal_live_contracts import (
@@ -349,15 +353,18 @@ class GatewayStore:
             raise ValueError("factory action does not accept a credential")
         if self._factory_credential_adapter is None:
             raise RuntimeError("factory credential store unavailable")
-        reference = self._factory_credential_adapter.store_credential(
+        return FactoryCredentialCoordinator(
+            store=self._factory_actions,
+            adapter=self._factory_credential_adapter,
+            clock=_utcnow,
+        ).store_and_answer(
             tenant_id=principal.organization_id,
             request_id=request_id,
+            expected_subject_version=action.expected_subject_version,
             credential_alias=request.credential_alias,
             secret_value=request.secret_value.get_secret_value(),
+            reserved_at=now,
         )
-        if not reference.startswith(f"credential://{principal.organization_id}/"):
-            raise ValueError("credential adapter returned an invalid reference")
-        return reference
 
     def configure_portal_sources(
         self,
