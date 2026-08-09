@@ -45,6 +45,16 @@ async def test_v3_client_methods_narrow_unknown_payloads_to_typed_contracts(
     assert receipt.creation_job_id == job.creation_job_id
     assert captured == [("/v3/creation/jobs", "captain-token")]
 
+    async def empty_get(_session: object, path: str, api_key: str | None = None, **_kwargs: object) -> object:
+        captured.append((path, api_key or ""))
+        return None
+
+    monkeypatch.setattr(api_client, "api_get", empty_get)
+    assert await api_client.next_build_assignment(
+        object(), worker_token="worker-token"
+    ) is None
+    assert captured[-1] == ("/v3/creation/assignments/next", "worker-token")
+
     async def malformed_get(*_args: object, **_kwargs: object) -> object:
         return ["not", "an", "assignment"]
 

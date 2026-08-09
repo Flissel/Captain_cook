@@ -501,6 +501,7 @@ def test_v3_startup_fails_closed_when_required_composition_is_partial(
     monkeypatch.delenv("MINIBOOK_CREATION_V3_VALIDATOR", raising=False)
     monkeypatch.delenv("MINIBOOK_CREATION_WORKER_TOKEN", raising=False)
     monkeypatch.delenv("MINIBOOK_CREATION_WORKER_ID", raising=False)
+    monkeypatch.delenv("MINIBOOK_CREATION_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="V3 creation configuration is incomplete"):
         _reload_main()
 
@@ -530,6 +531,7 @@ def test_v3_startup_constructs_pipeline_only_with_all_explicit_dependencies(
     monkeypatch.setenv("MINIBOOK_CREATION_V3_VALIDATOR", "test_v3_validator:validator")
     monkeypatch.setenv("MINIBOOK_CREATION_WORKER_TOKEN", "worker-secret")
     monkeypatch.setenv("MINIBOOK_CREATION_WORKER_ID", "hermes-factory")
+    monkeypatch.setenv("MINIBOOK_CREATION_API_KEY", "captain-secret")
     module = _reload_main()
     job_payload = json.loads(
         (FIXTURE_ROOT / "minibook_creation_job.v3.json").read_text(encoding="utf-8")
@@ -539,6 +541,40 @@ def test_v3_startup_constructs_pipeline_only_with_all_explicit_dependencies(
     module._creation_store.submit(job)
     runner = module._creation_runner_for(job.creation_job_id)
     assert isinstance(runner.pipeline, V3CreationPipeline)
+
+
+def test_v3_startup_fails_closed_when_creation_caller_credential_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Validator:
+        def build_assignment(self, *_args: object) -> object:
+            raise NotImplementedError
+
+        async def validate_build_effect(self, *_args: object) -> object:
+            raise NotImplementedError
+
+        async def validate(self, *_args: object) -> object:
+            raise NotImplementedError
+
+        def assemble_result(self, *_args: object) -> object:
+            raise NotImplementedError
+
+    validator_module = types.ModuleType("test_v3_missing_caller_validator")
+    validator_module.validator = Validator()
+    monkeypatch.setitem(sys.modules, "test_v3_missing_caller_validator", validator_module)
+    monkeypatch.setenv("MINIBOOK_CREATION_DB", str(tmp_path / "creation.sqlite3"))
+    monkeypatch.setenv("MINIBOOK_CREATION_V3_ENABLED", "1")
+    monkeypatch.setenv("MINIBOOK_CREATION_CAS_ROOT", str(tmp_path / "cas"))
+    monkeypatch.setenv(
+        "MINIBOOK_CREATION_V3_VALIDATOR",
+        "test_v3_missing_caller_validator:validator",
+    )
+    monkeypatch.setenv("MINIBOOK_CREATION_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setenv("MINIBOOK_CREATION_WORKER_ID", "hermes-factory")
+    monkeypatch.delenv("MINIBOOK_CREATION_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="V3 creation configuration is incomplete"):
+        _reload_main()
 
 
 def test_disabled_creation_does_not_import_forge_docker_or_llm_modules(

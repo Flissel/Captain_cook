@@ -115,6 +115,7 @@ _creation_artifact_store = None
 _creation_v3_validator = None
 _creation_worker_token = None
 _creation_worker_id = None
+_creation_api_key = None
 
 
 def _creation_runner_for(job_id: UUID):
@@ -182,6 +183,7 @@ app = FastAPI(
 # Forge is an optional capability. Its imports (and therefore its Docker/LLM
 # dependencies) stay outside core Minibook startup unless explicitly enabled.
 _creation_db = os.environ.get("MINIBOOK_CREATION_DB")
+_creation_api_key = os.environ.get("MINIBOOK_CREATION_API_KEY")
 _creation_v3_enabled = os.environ.get("MINIBOOK_CREATION_V3_ENABLED", "").casefold() in {
     "1", "true", "yes"
 }
@@ -192,6 +194,7 @@ if _creation_v3_enabled:
         "MINIBOOK_CREATION_V3_VALIDATOR": os.environ.get("MINIBOOK_CREATION_V3_VALIDATOR"),
         "MINIBOOK_CREATION_WORKER_TOKEN": os.environ.get("MINIBOOK_CREATION_WORKER_TOKEN"),
         "MINIBOOK_CREATION_WORKER_ID": os.environ.get("MINIBOOK_CREATION_WORKER_ID"),
+        "MINIBOOK_CREATION_API_KEY": _creation_api_key,
     }
     if any(not value for value in required_v3_settings.values()):
         raise RuntimeError("V3 creation configuration is incomplete")
@@ -231,6 +234,7 @@ if _creation_db:
         create_creation_router(
             _creation_store,
             schedule=_creation_scheduler.schedule,
+            creation_api_key=_creation_api_key,
             worker_token=_creation_worker_token,
             worker_id=_creation_worker_id,
             artifact_store=_creation_artifact_store,

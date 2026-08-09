@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import hmac
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -16,6 +16,7 @@ from minibook.swarm.job_store import CreationJobStore
 
 FIXTURE = Path(__file__).parents[2] / "tests/fixtures/contracts/minibook_creation_job.v1.json"
 FIXTURE_ROOT = Path(__file__).parents[2] / "tests/fixtures/contracts"
+CALLER_HEADERS = {"Authorization": "Bearer captain-secret"}
 
 
 def payload() -> dict[str, object]:
@@ -29,6 +30,7 @@ def client(tmp_path: Path) -> tuple[TestClient, list[str]]:
         create_creation_router(
             CreationJobStore(tmp_path / "creation.sqlite3"),
             schedule=lambda job_id: scheduled.append(str(job_id)),
+            creation_api_key="captain-secret",
         )
     )
     return TestClient(app), scheduled
@@ -80,36 +82,37 @@ def v3_client(tmp_path: Path) -> tuple[TestClient, CreationJobStore, list[str], 
     app.include_router(create_creation_router(
         store, schedule=lambda job_id: scheduled.append(str(job_id)), worker_token="worker-secret",
         worker_id="hermes-factory", artifact_store=artifacts,
+        creation_api_key="captain-secret",
     ))
     return TestClient(app), store, scheduled, artifacts
 
 
-def test_post_is_persisted_before_schedule_and_identical_replay_is_200(tmp_path: Path) -> None:
+def test_post_is_persisted_before_schedule_and_identical_replay_reschedules(tmp_path: Path) -> None:
     api, scheduled = client(tmp_path)
-    first = api.post("/api/v1/creation-jobs", json=payload())
-    replay = api.post("/api/v1/creation-jobs", json=payload())
+    first = api.post("/api/v1/creation-jobs", json=payload(), headers=CALLER_HEADERS)
+    replay = api.post("/api/v1/creation-jobs", json=payload(), headers=CALLER_HEADERS)
     assert first.status_code == 202
     assert replay.status_code == 200
-    assert scheduled == [payload()["creation_job_id"]]
+    assert scheduled == [payload()["creation_job_id"], payload()["creation_job_id"]]
 
 
 def test_changed_replay_is_409(tmp_path: Path) -> None:
     api, _ = client(tmp_path)
-    assert api.post("/api/v1/creation-jobs", json=payload()).status_code == 202
+    assert api.post("/api/v1/creation-jobs", json=payload(), headers=CALLER_HEADERS).status_code == 202
     changed = payload() | {"attempt": 2}
-    assert api.post("/api/v1/creation-jobs", json=changed).status_code == 409
+    assert api.post("/api/v1/creation-jobs", json=changed, headers=CALLER_HEADERS).status_code == 409
 
 
 def test_status_cancel_and_result_conflicts_are_typed(tmp_path: Path) -> None:
     api, _ = client(tmp_path)
     job_id = str(payload()["creation_job_id"])
-    assert api.get(f"/api/v1/creation-jobs/{job_id}").status_code == 404
-    api.post("/api/v1/creation-jobs", json=payload())
-    assert api.get(f"/api/v1/creation-jobs/{job_id}").json()["status"] == "queued"
-    assert api.get(f"/api/v1/creation-jobs/{job_id}/result").status_code == 409
-    assert api.post(f"/api/v1/creation-jobs/{job_id}/cancel", json={"expected_version": 2}).status_code == 409
+    assert api.get(f"/api/v1/creation-jobs/{job_id}", headers=CALLER_HEADERS).status_code == 404
+    api.post("/api/v1/creation-jobs", json=payload(), headers=CALLER_HEADERS)
+    assert api.get(f"/api/v1/creation-jobs/{job_id}", headers=CALLER_HEADERS).json()["status"] == "queued"
+    assert api.get(f"/api/v1/creation-jobs/{job_id}/result", headers=CALLER_HEADERS).status_code == 409
+    assert api.post(f"/api/v1/creation-jobs/{job_id}/cancel", json={"expected_version": 2}, headers=CALLER_HEADERS).status_code == 409
     cancelled = api.post(
-        f"/api/v1/creation-jobs/{job_id}/cancel", json={"expected_version": 1}
+        f"/api/v1/creation-jobs/{job_id}/cancel", json={"expected_version": 1}, headers=CALLER_HEADERS
     )
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "cancelled"
@@ -117,25 +120,87 @@ def test_status_cancel_and_result_conflicts_are_typed(tmp_path: Path) -> None:
 
 def test_disabled_forge_exposes_capability_document_without_store() -> None:
     app = FastAPI()
-    app.include_router(create_creation_router(None))
+    app.include_router(create_creation_router(None, creation_api_key="captain-secret"))
     api = TestClient(app)
     capability = api.get("/api/v1/creation-capabilities")
     assert capability.status_code == 200
     assert capability.json() == {"creation_jobs": False, "schema": "minibook.creation-capabilities.v1"}
-    assert api.post("/api/v1/creation-jobs", json=payload()).status_code == 503
+    assert api.post("/api/v1/creation-jobs", json=payload(), headers=CALLER_HEADERS).status_code == 503
 
 
 def test_v3_submit_status_result_and_cancel_are_version_dispatched(tmp_path: Path) -> None:
     api, _, scheduled, _ = v3_client(tmp_path)
     job = v3_job()
-    submitted = api.post("/v3/creation/jobs", json=job.model_dump(mode="json", by_alias=True))
+    submitted = api.post("/v3/creation/jobs", json=job.model_dump(mode="json", by_alias=True), headers=CALLER_HEADERS)
     assert submitted.status_code == 202
-    assert api.get(f"/v3/creation/jobs/{job.creation_job_id}").json()["status"] == "queued"
-    assert api.get(f"/v3/creation/jobs/{job.creation_job_id}/result").status_code == 409
-    cancelled = api.post(f"/v3/creation/jobs/{job.creation_job_id}/cancel", json={"expected_version": 1})
+    assert api.get(f"/v3/creation/jobs/{job.creation_job_id}", headers=CALLER_HEADERS).json()["status"] == "queued"
+    assert api.get(f"/v3/creation/jobs/{job.creation_job_id}/result", headers=CALLER_HEADERS).status_code == 409
+    cancelled = api.post(f"/v3/creation/jobs/{job.creation_job_id}/cancel", json={"expected_version": 1}, headers=CALLER_HEADERS)
     assert cancelled.status_code == 200
     assert scheduled == [str(job.creation_job_id)]
-    assert api.post("/v3/creation/jobs", json=payload()).status_code == 422
+    assert api.post("/v3/creation/jobs", json=payload(), headers=CALLER_HEADERS).status_code == 422
+
+
+def test_lifecycle_routes_require_separate_constant_time_caller_auth_before_lookup(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    api, _, _, _ = v3_client(tmp_path)
+    missing_id = str(uuid4())
+    routes = (
+        ("post", "/api/v1/creation-jobs", payload()),
+        ("get", f"/api/v1/creation-jobs/{missing_id}", None),
+        ("get", f"/api/v1/creation-jobs/{missing_id}/result", None),
+        ("post", f"/api/v1/creation-jobs/{missing_id}/cancel", {"expected_version": 1}),
+        ("post", "/v3/creation/jobs", {}),
+        ("get", f"/v3/creation/jobs/{missing_id}", None),
+        ("get", f"/v3/creation/jobs/{missing_id}/result", None),
+        ("post", f"/v3/creation/jobs/{missing_id}/cancel", {"expected_version": 1}),
+    )
+    comparisons: list[tuple[str, str]] = []
+    original = hmac.compare_digest
+
+    def recording_compare(left: str, right: str) -> bool:
+        comparisons.append((left, right))
+        return original(left, right)
+
+    monkeypatch.setattr("minibook.swarm.api.hmac.compare_digest", recording_compare)
+    for method, path, body in routes:
+        request = getattr(api, method)
+        kwargs = {} if body is None else {"json": body}
+        assert request(path, **kwargs).status_code == 401
+        wrong = request(path, headers={"Authorization": "Bearer wrong"}, **kwargs)
+        assert wrong.status_code == 403
+        worker = request(path, headers={"Authorization": "Bearer worker-secret"}, **kwargs)
+        assert worker.status_code == 403
+        assert wrong.json() == worker.json()
+    assert comparisons
+    assert all(expected == "captain-secret" for _, expected in comparisons)
+
+
+def test_identical_replay_reschedules_when_first_callback_failed_after_persistence(
+    tmp_path: Path,
+) -> None:
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    calls: list[str] = []
+
+    def schedule(job_id) -> None:
+        calls.append(str(job_id))
+        if len(calls) == 1:
+            raise RuntimeError("scheduler temporarily unavailable")
+
+    app = FastAPI()
+    app.include_router(create_creation_router(
+        store, schedule=schedule, creation_api_key="captain-secret",
+    ))
+    api = TestClient(app, raise_server_exceptions=False)
+
+    first = api.post("/api/v1/creation-jobs", json=payload(), headers=CALLER_HEADERS)
+    assert first.status_code == 500
+    assert store.progress(UUID(str(payload()["creation_job_id"]))).status == "queued"
+    replay = api.post("/api/v1/creation-jobs", json=payload(), headers=CALLER_HEADERS)
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert calls == [payload()["creation_job_id"], payload()["creation_job_id"]]
 
 
 def test_worker_auth_uses_constant_time_comparison_and_binds_identity(
@@ -205,6 +270,38 @@ def test_worker_claim_replay_conflict_effect_binding_and_schedule_resume(tmp_pat
         f"/v3/creation/assignments/{assignment.assignment_id}/effect", headers=headers, json={},
     )
     assert malformed.status_code == 422
+
+
+def test_effect_response_captures_validating_before_fast_scheduler_advances(
+    tmp_path: Path,
+) -> None:
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    job = v3_job()
+    store.submit(job)
+    store.transition(job.creation_job_id, "planning", expected_version=1)
+    assignment = store.publish_build_assignment(build_assignment(job))
+    store.claim_build_assignment(assignment.assignment_id, "hermes-factory")
+
+    def advance_immediately(job_id) -> None:
+        acknowledgement = store.progress(job_id)
+        assert acknowledgement.status == "validating"
+        store.transition(job_id, "packaging", expected_version=acknowledgement.version)
+
+    app = FastAPI()
+    app.include_router(create_creation_router(
+        store, schedule=advance_immediately, creation_api_key="captain-secret",
+        worker_token="worker-secret", worker_id="hermes-factory",
+    ))
+    api = TestClient(app)
+    response = api.post(
+        f"/v3/creation/assignments/{assignment.assignment_id}/effect",
+        headers={"Authorization": "Bearer worker-secret"},
+        json=build_effect(assignment).model_dump(mode="json", by_alias=True),
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "validating"
+    assert store.progress(job.creation_job_id).status == "packaging"
 
 
 def test_artifact_metadata_never_returns_local_path(tmp_path: Path) -> None:

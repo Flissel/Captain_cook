@@ -74,3 +74,24 @@ Fresh correction verification:
 - `git diff --check`: exit 0; Git emitted only CRLF normalization notices.
 
 The warning/non-claims remain unchanged: the Starlette `httpx` warning and environment Requests dependency warning are pre-existing; no live provider, Docker, external service, Task 4 packaging, promotion, deployment, or OpenFang behavior was exercised or claimed.
+
+## Quality-review lifecycle-auth, replay-scheduling, and acknowledgement correction
+
+The quality review identified three HTTP-boundary gaps: lifecycle routes lacked a credential separate from the worker token, a callback failure after durable submission stranded identical replays, and the effect route read progress after scheduling so a fast continuation changed the acknowledgement body.
+
+RED evidence was captured in two bounded runs. The three-test run initially reported `3 failed` because the router had no `creation_api_key` composition parameter. With the two scheduling tests isolated from that missing parameter, both failed for their intended behaviors: the identical replay made no second schedule attempt, and the effect response returned `packaging` after the immediate callback instead of the durable post-accept `validating` acknowledgement.
+
+The correction adds `MINIBOOK_CREATION_API_KEY` as a separate Captain/caller credential. Every legacy and V3 submit/status/result/cancel handler authenticates it with `hmac.compare_digest` before parsing input or reading job existence. Missing and incorrect callers return 401 and 403 respectively; a valid worker token remains unauthorized for lifecycle routes. Worker assignment, claim, effect, and artifact operations continue to use only the worker credential. Explicit V3 startup now fails closed if the caller credential is absent, while disabled creation still avoids Forge, Docker, and LLM imports.
+
+Identical canonical submissions now attempt scheduling whenever the durable head is one of the scheduler's resumable states. A changed replay still conflicts before scheduling, and the scheduler remains the idempotent execution authority. Effect acceptance now captures the typed `validating` progress immediately after the durable store transition and before invoking the scheduling callback, so the response is deterministic even if that callback advances the job synchronously.
+
+Fresh correction verification:
+
+- Three quality-review regression tests: `3 passed, 1 warning in 0.92s`.
+- Focused Task 3 suite: `36 passed, 1 warning in 2.71s`.
+- Task 2 state/runner regression: `60 passed in 5.01s`.
+- Entire `minibook/tests`: `205 passed, 1 deselected, 1 warning in 8.59s`.
+- `python -m compileall -q minibook/swarm minibook/src`: exit 0.
+- `git diff --check`: exit 0; Git emitted only CRLF normalization notices.
+
+The warnings and non-claims remain unchanged from the prior sections.
