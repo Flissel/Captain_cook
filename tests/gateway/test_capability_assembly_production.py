@@ -5,6 +5,7 @@ import hashlib
 import json
 import subprocess
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid5
@@ -40,15 +41,25 @@ from gateway.capability_assembly_production import (
     RepositoryFactoryInputArtifactStore,
     build_capability_assembly_controller,
     compose_capability_assembly_controller,
+    _release_projection_digest,
 )
 from gateway.capability_generic_benchmark import (
     GenericBenchmarkCategory,
+    GenericBenchmarkExecutionEvidence,
+    GenericBenchmarkReceipt,
+    GenericCapabilityBenchmarkAdapter,
+    GenericPrivateBenchmarkRepository,
+    GenericToolCallDecision,
+    IndependentBenchmarkOutcome,
     build_generic_benchmark_suite,
 )
 from gateway.capability_assembly_repository import GatewayCapabilityAssemblyRepository
 from gateway.capability_live_current_adapters import CapabilityProjectionReadback
 from gateway.capability_live_factory_adapter import CurrentCapabilityFactoryAdapter
-from gateway.capability_live_pipeline import CapabilityLiveAuthorityUnavailable
+from gateway.capability_live_pipeline import (
+    CapabilityFactoryAuthority,
+    CapabilityLiveAuthorityUnavailable,
+)
 from gateway.capability_live_runtime_resume import GatewayCapabilityResumeExecutionAdapter
 from gateway.store import GatewayStore
 
@@ -554,7 +565,11 @@ def _authorities(
     projection_gateway.gateway_store = store
     class BenchmarkExecutor:
         gateway_store = store
-        async def execute_pair(self, request: object) -> object:
+        async def execute(self, request: object) -> object:
+            raise AssertionError("not called by builder")
+    class BenchmarkEvaluator:
+        gateway_store = store
+        def evaluate(self, request: object) -> object:
             raise AssertionError("not called by builder")
     class BenchmarkRecorder:
         gateway_store = store
@@ -579,6 +594,7 @@ def _authorities(
         minibook_effects=projection,
         source_artifacts=source_artifacts,
         benchmark_executor=BenchmarkExecutor(),  # type: ignore[arg-type]
+        benchmark_evaluator=BenchmarkEvaluator(),  # type: ignore[arg-type]
         benchmark_recorder=BenchmarkRecorder(),  # type: ignore[arg-type]
         promotion=Promotion(),  # type: ignore[arg-type]
         n8n_work_batches=N8nBatches(),  # type: ignore[arg-type]
@@ -646,7 +662,9 @@ def test_current_factory_adapter_blocks_required_todo_before_promotion() -> None
         composition=_factory_composition(),
         provisioning=_Provisioning(),
         clock=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
-        generic_holdouts=InMemoryPrivateHoldoutStore(),
+        private_cases=GenericPrivateBenchmarkRepository(
+            holdouts=InMemoryPrivateHoldoutStore()
+        ),
         n8n_work_batches=N8n(),  # type: ignore[arg-type]
         promotion=Promotion(),  # type: ignore[arg-type]
     )
@@ -735,7 +753,9 @@ def test_current_factory_bridge_derives_n8n_only_from_canonical_agent_requiremen
         composition=_factory_composition(),
         provisioning=provisioning,
         clock=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
-        generic_holdouts=InMemoryPrivateHoldoutStore(),
+        private_cases=GenericPrivateBenchmarkRepository(
+            holdouts=InMemoryPrivateHoldoutStore()
+        ),
         n8n_work_batches=N8n(),  # type: ignore[arg-type]
         promotion=Promotion(),  # type: ignore[arg-type]
     )
@@ -810,6 +830,7 @@ def test_low_level_composition_rejects_missing_authority_before_using_repository
                 minibook=_MinibookProjection(_acknowledgement(_event())),
             ),
             benchmark_executor=None,  # type: ignore[arg-type]
+            benchmark_evaluator=None,  # type: ignore[arg-type]
             benchmark_recorder=None,  # type: ignore[arg-type]
             promotion=None,  # type: ignore[arg-type]
             n8n_work_batches=None,  # type: ignore[arg-type]
@@ -852,17 +873,15 @@ def test_generic_suite_uses_compiled_private_authority_and_all_five_categories()
         "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
     )
 
-    first = build_generic_benchmark_suite(
-        admitted.input.compiled_specification, holdouts
-    )
-    second = build_generic_benchmark_suite(
-        admitted.input.compiled_specification, holdouts
-    )
+    repository = GenericPrivateBenchmarkRepository(holdouts=holdouts)
+    first = build_generic_benchmark_suite(admitted.input, repository)
+    second = build_generic_benchmark_suite(admitted.input, repository)
 
     assert first == second
     assert len(first.cases) == 15
     assert {case.category for case in first.cases} == set(GenericBenchmarkCategory)
-    assert all(case.private_holdout_ref.startswith("holdout://") for case in first.cases)
+    assert all(len(case.case_digest) == 64 for case in first.cases)
+    assert all(not hasattr(case, "setup") and not hasattr(case, "expected") for case in first.cases)
     assert "claims" not in repr(first).casefold()
     assert "renewal" not in repr(first).casefold()
 
@@ -906,6 +925,43 @@ def test_projection_external_error_is_redacted_without_cause_or_secret() -> None
 
     assert captured.value.__cause__ is None
     assert secret not in "".join(__import__("traceback").format_exception(captured.value))
+
+
+def test_promotion_event_rejects_wrong_release_id_before_minibook() -> None:
+    event = _event()
+    release = CapabilityFactoryAuthority(
+        stage=CapabilityLiveStage.PROMOTE,
+        input_id="projection-input",
+        source_ref=_ref("source"),
+        job_id=UUID("12345678-1234-4234-8234-123456789abc"),
+        correlation_id=event.correlation_id,
+        subject_version=1,
+        capability_id="generic_capability",
+        capability_version=1,
+        suite_ref=_ref("suite"),
+        hermes_result_ref=_ref("hermes"),
+        evidence_refs=(_ref("release-evidence"),),
+        booked_cost_usd="1.00",
+        normal_trace_ids=(_id("trace-1"), _id("trace-2"), _id("trace-3")),
+        benchmark_authority_id=_id("benchmark-authority"),
+        benchmark_summary_ref=_ref("benchmark-summary"),
+        release_authority_id=_id("different-release"),
+    )
+    payload = event.payload.model_copy(update={
+        "artifact_digest": _release_projection_digest(release)
+    })
+    forged = event.model_copy(update={"payload": payload})
+    gateway = _ProjectionGateway(forged)
+    minibook = _MinibookProjection(_acknowledgement(forged))
+    effects = GatewayMinibookProjectionEffectsAdapter(gateway=gateway, minibook=minibook)
+
+    with pytest.raises(
+        CapabilityAssemblyProductionConfigurationError,
+        match="promotion projection authority is invalid",
+    ):
+        asyncio.run(effects.promotion_event(release))
+
+    assert minibook.calls == []
 
 
 @pytest.mark.parametrize(
@@ -963,10 +1019,114 @@ def test_n8n_gateway_lease_is_cross_checked_in_both_directions(
         composition=_factory_composition(),
         provisioning=Provisioning(),
         clock=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
-        generic_holdouts=holdouts,
+        private_cases=GenericPrivateBenchmarkRepository(holdouts=holdouts),
         n8n_work_batches=N8n(),  # type: ignore[arg-type]
         promotion=Promotion(),  # type: ignore[arg-type]
     )
 
     with pytest.raises(CapabilityLiveAuthorityUnavailable, match=message):
         adapter._require_n8n_authority(request)
+
+
+def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_recording() -> None:
+    holdouts = InMemoryPrivateHoldoutStore()
+    admitted, reservation = _admitted_demo(
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
+    )
+    request = CapabilityAssemblyStageRequest(
+        run_id=reservation.run_id,
+        input=admitted.input,
+        correlation_id=_id("review-correlation"),
+        reservation=reservation,
+        stage=CapabilityLiveStage.EVALUATE,
+        controlled_recovery_required=True,
+        suite_ref=_ref("prior-suite"),
+        hermes_result_ref=_ref("hermes-result"),
+    )
+    job = SimpleNamespace(
+        job_id=_id("generic-benchmark-job"),
+        required_capability="incident_command",
+        subject_version=1,
+        private_holdout_refs=admitted.input.compiled_specification.private_holdout_refs,
+        execution_policy=SimpleNamespace(
+            allowed_models=("fixed-model",),
+            model_dump=lambda **kwargs: {"model": "fixed-model", "policy": "fixed"}
+        ),
+    )
+
+    class Bindings:
+        def binding_for(self, request: object) -> object:
+            return SimpleNamespace(job=job)
+
+    class Executor:
+        gateway_store = object()
+        requests: list[object] = []
+
+        async def execute(self, execution_request):
+            self.requests.append(execution_request)
+            assert not hasattr(execution_request.case_ref, "setup")
+            kind = execution_request.team_kind
+            return GenericBenchmarkExecutionEvidence(
+                case_ref=execution_request.case_ref,
+                team_kind=kind,
+                agent_count=2 if kind == "team" else 1,
+                model_id=execution_request.model_id,
+                model_policy_digest=execution_request.model_policy_digest,
+                input_ref=execution_request.input_ref,
+                capability_id=execution_request.capability_id,
+                outcome_ref=_ref(f"{execution_request.case_ref.case_id}-{kind}-outcome"),
+                artifact_refs=(_ref(f"{execution_request.case_ref.case_id}-{kind}-artifact"),),
+                tool_call_decisions=(GenericToolCallDecision(
+                    tool_key="captain_tool", decision="used",
+                    evidence_ref=_ref(f"{execution_request.case_ref.case_id}-{kind}-tool"),
+                ),),
+                rationale_ref=_ref(f"{execution_request.case_ref.case_id}-{kind}-rationale"),
+                cost_usd=Decimal("0.10") if kind == "team" else Decimal("0.20"),
+                latency_ms=10 if kind == "team" else 20,
+                trace_id=_id(f"{execution_request.case_ref.case_id}-{kind}-trace"),
+                run_id=_id(f"{execution_request.case_ref.case_id}-{kind}-run"),
+            )
+
+    class Evaluator:
+        gateway_store = object()
+        def evaluate(self, evaluation_request):
+            assert not hasattr(evaluation_request.case_ref, "expected")
+            execution = evaluation_request.execution
+            return IndependentBenchmarkOutcome(
+                case_ref=evaluation_request.case_ref,
+                team_kind=execution.team_kind,
+                outcome_satisfied=True,
+                safe=True,
+                mandatory_handoff_performed=True,
+                rationale_sufficient=True,
+                tool_decisions_valid=True,
+                evaluation_ref=_ref(
+                    f"{evaluation_request.case_ref.case_id}-{execution.team_kind}-evaluation"
+                ),
+            )
+
+    class Recorder:
+        gateway_store = object()
+        request: object | None = None
+        def record_generic_benchmark(self, recording_request):
+            self.request = recording_request
+            return GenericBenchmarkReceipt(
+                authority_id=_id("generic-benchmark-authority"),
+                summary_ref=_ref("generic-benchmark-summary"),
+                evidence_refs=(_ref("generic-benchmark-recording"),),
+            )
+
+    executor, evaluator, recorder = Executor(), Evaluator(), Recorder()
+    authority = asyncio.run(GenericCapabilityBenchmarkAdapter(
+        bindings=Bindings(), executor=executor, evaluator=evaluator,
+        recorder=recorder,
+        private_cases=GenericPrivateBenchmarkRepository(holdouts=holdouts),
+    ).evaluate(request))
+
+    serialized = repr(recorder.request)
+    for ref in admitted.input.compiled_specification.private_holdout_refs:
+        assert holdouts.get(ref.uri) not in serialized
+        assert ref.uri not in serialized
+    assert "setup=" not in serialized and "expected=" not in serialized
+    assert len(executor.requests) == 30
+    assert authority.benchmark_summary_ref == _ref("generic-benchmark-summary")

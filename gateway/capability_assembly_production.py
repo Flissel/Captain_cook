@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import json
 import re
+import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -54,6 +55,8 @@ from gateway.capability_generic_benchmark import (
     GenericBenchmarkRecorderPort,
     GenericCapabilityBenchmarkAdapter,
     GenericPrivateHoldoutReader,
+    GenericPrivateBenchmarkRepository,
+    IndependentCapabilityBenchmarkEvaluatorPort,
     build_generic_benchmark_suite,
 )
 from gateway.capability_live_current_adapters import (
@@ -319,14 +322,22 @@ class GatewayMinibookProjectionEffectsAdapter:
             ) from None
         if (
             not isinstance(event, MinibookProjectionEvent)
+            or event.event_id != release.release_authority_id
             or event.correlation_id != release.correlation_id
+            or event.subject_id != _factory_subject_reference(release.job_id)
             or event.subject_version != release.capability_version
+            or event.schema_name != "captain.minibook-projection.v2"
+            or event.event_type != "capability.promoted"
+            or event.payload.view != "validation"
+            or event.payload.template_id != "factory_capability_ready_to_use"
+            or event.payload.status_id != "ready_to_use"
+            or event.payload.actor_role_id != "captain_gateway"
+            or event.payload.artifact_digest != _release_projection_digest(release)
         ):
             raise CapabilityAssemblyProductionConfigurationError(
                 "Gateway promotion projection authority is invalid"
             )
         return event
-
     async def project_and_ack(
         self,
         event: MinibookProjectionEvent,
@@ -426,6 +437,28 @@ class GatewayMinibookProjectionEffectsAdapter:
                 "Gateway projection acknowledgement read-back is unavailable"
             )
         return readback
+
+
+def _factory_subject_reference(job_id: UUID) -> str:
+    if job_id.version == 4:
+        return f"subject:{job_id}"
+    subject_digest = bytearray(
+        hashlib.sha256(f"captain-factory-subject:{job_id}".encode()).digest()[:16]
+    )
+    subject_digest[6] = (subject_digest[6] & 0x0F) | 0x40
+    subject_digest[8] = (subject_digest[8] & 0x3F) | 0x80
+    return f"subject:{UUID(bytes=bytes(subject_digest))}"
+
+
+def _release_projection_digest(release: CapabilityFactoryAuthority) -> str:
+    if release.release_authority_id is None:
+        return "sha256:" + "0" * 64
+    material = "|".join((
+        str(release.job_id), release.capability_id, str(release.capability_version),
+        str(release.release_authority_id),
+        "" if release.benchmark_summary_ref is None else release.benchmark_summary_ref.sha256,
+    ))
+    return f"sha256:{hashlib.sha256(material.encode()).hexdigest()}"
 
 
 class GenericGatewayMinibookCapabilityProjectionAdapter:
@@ -586,6 +619,7 @@ class CapabilityAssemblyProductionAuthorities:
     minibook_effects: GatewayMinibookProjectionEffectsAdapter
     source_artifacts: RepositoryFactoryInputArtifactStore
     benchmark_executor: GenericBenchmarkExecutorPort
+    benchmark_evaluator: IndependentCapabilityBenchmarkEvaluatorPort
     benchmark_recorder: GenericBenchmarkRecorderPort
     promotion: GenericCapabilityPromotionPort
     n8n_work_batches: CapabilityN8nWorkBatchAuthorityPort
@@ -615,11 +649,11 @@ class _CurrentStageRequestView:
 class CapabilityAssemblyCurrentFactoryAdapter(CurrentCapabilityFactoryAdapter):
     """Adapt canonical assembly input semantics to the current Factory seam."""
 
-    def __init__(self, *, generic_holdouts: GenericPrivateHoldoutReader,
+    def __init__(self, *, private_cases: GenericPrivateBenchmarkRepository,
                  n8n_work_batches: CapabilityN8nWorkBatchAuthorityPort,
                  promotion: GenericCapabilityPromotionPort, **kwargs: object) -> None:
         super().__init__(**kwargs)
-        self._generic_holdouts = generic_holdouts
+        self._private_cases = private_cases
         self._n8n_work_batches = n8n_work_batches
         self._promotion = promotion
 
@@ -709,7 +743,7 @@ class CapabilityAssemblyCurrentFactoryAdapter(CurrentCapabilityFactoryAdapter):
             )
         try:
             suite_ref = build_generic_benchmark_suite(
-                request.input.compiled_specification, self._generic_holdouts
+                request.input, self._private_cases
             ).suite_ref
         except Exception:
             raise CapabilityLiveAuthorityUnavailable(
@@ -751,6 +785,7 @@ def compose_capability_assembly_controller(
     reconciliation: CapabilityAssemblyReconciliationPort,
     minibook_effects: GatewayMinibookProjectionEffectsAdapter,
     benchmark_executor: GenericBenchmarkExecutorPort,
+    benchmark_evaluator: IndependentCapabilityBenchmarkEvaluatorPort,
     benchmark_recorder: GenericBenchmarkRecorderPort,
     promotion: GenericCapabilityPromotionPort,
     n8n_work_batches: CapabilityN8nWorkBatchAuthorityPort,
@@ -768,12 +803,14 @@ def compose_capability_assembly_controller(
         reconciliation=reconciliation,
         minibook_effects=minibook_effects,
         benchmark_executor=benchmark_executor,
+        benchmark_evaluator=benchmark_evaluator,
         benchmark_recorder=benchmark_recorder,
         promotion=promotion,
         n8n_work_batches=n8n_work_batches,
         holdout_store=holdout_store,
         clock=clock,
     )
+    private_cases = GenericPrivateBenchmarkRepository(holdouts=holdout_store)
     resume = GatewayCapabilityResumeExecutionAdapter(
         gateway=cast(CapabilityResumeGatewayPort, _SanitizedResumeGateway(resume_gateway))
     )
@@ -781,15 +818,16 @@ def compose_capability_assembly_controller(
         composition=factory_composition,
         provisioning=provisioning,
         clock=clock,
-        generic_holdouts=holdout_store,
+        private_cases=private_cases,
         n8n_work_batches=n8n_work_batches,
         promotion=promotion,
     )
     benchmark: CapabilityAssemblyBusinessBenchmarkPort = GenericCapabilityBenchmarkAdapter(
         bindings=factory,
         executor=benchmark_executor,
+        evaluator=benchmark_evaluator,
         recorder=benchmark_recorder,
-        holdouts=holdout_store,
+        private_cases=private_cases,
     )
     execution: CapabilityAssemblyExecutionPort = RecordedFactoryCapabilityExecutionAdapter(
         composition=factory_composition,
@@ -859,6 +897,7 @@ def build_capability_assembly_controller(
         reconciliation=authorities.reconciliation,
         minibook_effects=authorities.minibook_effects,
         benchmark_executor=authorities.benchmark_executor,
+        benchmark_evaluator=authorities.benchmark_evaluator,
         benchmark_recorder=authorities.benchmark_recorder,
         promotion=authorities.promotion,
         n8n_work_batches=authorities.n8n_work_batches,
@@ -876,6 +915,7 @@ def build_capability_assembly_controller(
         reconciliation=authorities.reconciliation,
         minibook_effects=authorities.minibook_effects,
         benchmark_executor=authorities.benchmark_executor,
+        benchmark_evaluator=authorities.benchmark_evaluator,
         benchmark_recorder=authorities.benchmark_recorder,
         promotion=authorities.promotion,
         n8n_work_batches=authorities.n8n_work_batches,
@@ -898,6 +938,7 @@ def _require_same_gateway_authority(
         "resume Gateway": getattr(authorities.resume_gateway, "gateway_store", None),
         "reconciliation Gateway": getattr(authorities.reconciliation, "gateway_store", None),
         "benchmark executor": getattr(authorities.benchmark_executor, "gateway_store", None),
+        "benchmark evaluator": getattr(authorities.benchmark_evaluator, "gateway_store", None),
         "benchmark recorder": getattr(authorities.benchmark_recorder, "gateway_store", None),
         "promotion Gateway": getattr(authorities.promotion, "gateway_store", None),
         "n8n WorkBatch Gateway": getattr(authorities.n8n_work_batches, "gateway_store", None),
@@ -949,6 +990,7 @@ def _preflight_composition(
     reconciliation: object,
     minibook_effects: object,
     benchmark_executor: object,
+    benchmark_evaluator: object,
     benchmark_recorder: object,
     promotion: object,
     n8n_work_batches: object,
@@ -1029,7 +1071,8 @@ def _preflight_composition(
             (reconciliation, "reconcile", True, 1, "reconciliation.reconcile"),
             (minibook_effects, "project_and_ack", True, 1),
             (minibook_effects, "readback", True, 1),
-            (benchmark_executor, "execute_pair", True, 1),
+            (benchmark_executor, "execute", True, 1),
+            (benchmark_evaluator, "evaluate", False, 1),
             (benchmark_recorder, "record_generic_benchmark", False, 1),
             (promotion, "promote_generic_capability", True, 2),
             (n8n_work_batches, "active_n8n_work_batch_id", False, 1),
