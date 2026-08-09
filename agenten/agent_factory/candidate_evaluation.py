@@ -911,6 +911,13 @@ class ForgeCandidateArtifactStore(Protocol):
 
     def read_bytes(self, reference: ArtifactRef) -> bytes: ...
 
+    def read_bytes_bounded(
+        self,
+        reference: ArtifactRef,
+        *,
+        max_bytes: int,
+    ) -> bytes: ...
+
     def local_path(self, reference: ArtifactRef) -> Path: ...
 
 
@@ -1342,15 +1349,18 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
         return resolved
 
     def _read_v3_exact(self, reference: ArtifactRef) -> bytes:
-        try:
-            content = self._artifacts.read_bytes(reference)
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise FactoryDispatchError("Captain CAS readback digest mismatch") from exc
         maximum_bytes = (
             16 * 1024 * 1024
             if reference.media_type == "application/zip"
             else 2 * 1024 * 1024
         )
+        try:
+            content = self._artifacts.read_bytes_bounded(
+                reference,
+                max_bytes=maximum_bytes,
+            )
+        except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+            raise FactoryDispatchError("Captain CAS readback digest mismatch") from exc
         if (
             not content
             or len(content) > maximum_bytes

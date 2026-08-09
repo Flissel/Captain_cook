@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from agenten.agent_runtime.contracts import ArtifactRef
@@ -23,6 +24,47 @@ class GatewayMinibookCreationArtifactStore:
             return self._store.read_bytes(self._convert(reference))
         except CreationArtifactStoreError as exc:
             raise ValueError(str(exc)) from exc
+
+    def read_bytes_bounded(
+        self,
+        reference: ArtifactRef,
+        *,
+        max_bytes: int,
+    ) -> bytes:
+        if (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or max_bytes < 1
+        ):
+            raise ValueError("creation artifact read limit is invalid")
+        converted = self._convert(reference)
+        try:
+            path = self._store.local_path(converted)
+            size = path.stat().st_size
+            if isinstance(size, int) and size > max_bytes:
+                raise ValueError("creation artifact exceeds its read size limit")
+            digest = hashlib.sha256()
+            content = bytearray()
+            with path.open("rb") as stream:
+                while len(content) <= max_bytes:
+                    chunk = stream.read(
+                        min(64 * 1024, max_bytes + 1 - len(content))
+                    )
+                    if not chunk:
+                        break
+                    content.extend(chunk)
+                    digest.update(chunk)
+                    if len(content) > max_bytes:
+                        raise ValueError(
+                            "creation artifact exceeds its read size limit"
+                        )
+        except CreationArtifactStoreError as exc:
+            raise ValueError(str(exc)) from exc
+        except OSError as exc:
+            raise ValueError("creation artifact is unavailable") from exc
+        if digest.hexdigest() != reference.sha256:
+            raise ValueError("creation artifact digest changed")
+        return bytes(content)
 
     def local_path(self, reference: ArtifactRef) -> Path:
         try:

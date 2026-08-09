@@ -288,6 +288,12 @@ class _GatewayCas:
     def read_bytes(self, ref):
         return self._store.read_bytes(self._ref(ref))
 
+    def read_bytes_bounded(self, ref, *, max_bytes: int):
+        content = self._store.read_bytes(self._ref(ref))
+        if len(content) > max_bytes:
+            raise ValueError("artifact exceeds bound")
+        return content
+
     def local_path(self, ref):
         return self._store.local_path(self._ref(ref))
 
@@ -414,6 +420,15 @@ def test_v3_package_validation_never_uses_local_source_path(tmp_path: Path) -> N
     package_source_sha256 = result.source_archive_ref.sha256
 
     class PublicReadOnlyPackageCas(_GatewayCas):
+        def read_bytes(self, _ref):
+            raise AssertionError("V3 readback used unbounded read_bytes")
+
+        def read_bytes_bounded(self, ref, *, max_bytes: int):
+            content = self._store.read_bytes(self._ref(ref))
+            if len(content) > max_bytes:
+                raise ValueError("artifact exceeds bound")
+            return content
+
         def local_path(self, ref):
             if ref.sha256 == package_source_sha256:
                 raise AssertionError("package validation reopened the local path")
