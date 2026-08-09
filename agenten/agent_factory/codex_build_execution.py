@@ -26,6 +26,7 @@ from agenten.agent_factory.codex_build_provenance import (
 )
 from agenten.agent_factory.hermes_factory_worker import (
     HermesFactoryCodexBuild,
+    HermesFactoryRetryAuthorization,
     HermesFactoryWorkerCheckpoint,
 )
 from agenten.agent_factory.codex_build_recovery import (
@@ -600,6 +601,21 @@ class FactoryCodexRuntimeAuthority:
     maximum_provider_cost_usd: float
 
 
+_CAPTAIN_FACTORY_RUNTIME_SEAL = object()
+
+
+class _CaptainSealedFactoryCodexRunner:
+    """Captain-owned trust marker; no production sealer exists before Task10.
+
+    Candidate runners cannot opt into this boundary. A future Captain runtime
+    gate must implement the capabilities externally and construct this wrapper
+    inside this module before V3 execution can become available.
+    """
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("Captain Factory runtime enforcement is unavailable")
+
+
 class FactoryCodexProcessInspectorPort(Protocol):
     async def inspect(
         self,
@@ -1171,23 +1187,31 @@ class CaptainCodexAssignmentBuilder:
             build_evidence_refs=evidence_refs or (typed_receipt_ref,),
         )
 
-    def allows_retry(
+    def retry_authorization(
         self,
         assignment: FactoryBuildAssignmentV2,
         checkpoint: HermesFactoryWorkerCheckpoint,
-    ) -> bool:
+    ) -> HermesFactoryRetryAuthorization | None:
         if (
             checkpoint.assignment_id != assignment.assignment_id
             or checkpoint.effect_key != assignment.effect_key
             or checkpoint.attempt != assignment.attempt
             or checkpoint.codex_attempts > assignment.limits.max_retries
         ):
-            return False
+            return None
         mapped = self._mapper.map_assignment(
             assignment,
             settings=self._settings.narrowed_for_assignment(assignment),
         )
-        return mapped.request.runtime_retry_authorization is not None
+        runtime_retry = mapped.request.runtime_retry_authorization
+        if runtime_retry is None:
+            return None
+        return HermesFactoryRetryAuthorization(
+            assignment_id=assignment.assignment_id,
+            attempt=assignment.attempt,
+            expected_revision=checkpoint.revision,
+            authorization_sha256=runtime_retry.authorization_ref.sha256,
+        )
 
 
 class GitDetachedFactoryWorkspacePreparer:
@@ -2173,7 +2197,6 @@ class CodexCliFactoryBuildExecutor:
             deadline_at=authority_deadline,
         )
         if self._settings.enforce_assignment_budgets:
-            binder = getattr(runner, "bind_factory_authority", None)
             authority = FactoryCodexRuntimeAuthority(
                 workspace_root=prepared.root.resolve(),
                 writable_roots=tuple(
@@ -2186,7 +2209,12 @@ class CodexCliFactoryBuildExecutor:
                     self._settings.maximum_provider_cost_usd
                 ),
             )
-            if not callable(binder) or binder(authority) != authority:
+            if (
+                not isinstance(runner, _CaptainSealedFactoryCodexRunner)
+                or getattr(runner, "_captain_runtime_seal", None)
+                is not _CAPTAIN_FACTORY_RUNTIME_SEAL
+                or getattr(runner, "authority", None) != authority
+            ):
                 raise FactoryDispatchError(
                     "Factory Codex runner cannot enforce assignment capabilities"
                 )

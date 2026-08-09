@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import asyncio
+import multiprocessing
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -20,6 +21,7 @@ from agenten.agent_factory.hermes_factory_worker import (
     FilesystemHermesFactoryWorkerCheckpointStore,
     AuthenticatedMinibookV3WorkerClient,
     HermesFactoryAssignmentScope,
+    HermesFactoryRetryAuthorization,
     HermesFactoryCodexBuild,
     HermesFactoryWorker,
 )
@@ -145,6 +147,58 @@ class _SkillVerifier:
         self.calls.append((skill_name, released_skill_sha256))
 
 
+def _run_retry_worker_process(
+    assignment_json: str,
+    build_json: str,
+    checkpoint_root: str,
+    cas_root: str,
+    barrier,
+    codex_calls,
+    outcomes,
+) -> None:
+    assignment = FactoryBuildAssignmentV2.model_validate_json(assignment_json)
+    build = HermesFactoryCodexBuild.model_validate_json(build_json)
+
+    class ProcessCodex:
+        async def build(self, _assignment):
+            with codex_calls.get_lock():
+                codex_calls.value += 1
+            await asyncio.sleep(0.2)
+            return build
+
+    class RetryAuthority:
+        def retry_authorization(self, assigned, checkpoint):
+            return HermesFactoryRetryAuthorization(
+                assignment_id=assigned.assignment_id,
+                attempt=assigned.attempt,
+                expected_revision=checkpoint.revision,
+                authorization_sha256="4" * 64,
+            )
+
+    worker = HermesFactoryWorker(
+        minibook=_Minibook(assignment),
+        codex=ProcessCodex(),
+        skill_verifier=_SkillVerifier(),
+        worker_id="hermes-factory-v3",
+        released_skill_name="captain-agent-factory-loop",
+        released_skill_sha256="a" * 64,
+        checkpoint_store=FilesystemHermesFactoryWorkerCheckpointStore(
+            Path(checkpoint_root)
+        ),
+        codex_receipts=CaptainCodexBuildReceiptIssuer(
+            CodexBuildArtifactCas(Path(cas_root))
+        ),
+        retry_authority=RetryAuthority(),
+    )
+    barrier.wait()
+    try:
+        asyncio.run(worker.run_once())
+    except ValueError:
+        outcomes.put("fenced")
+    else:
+        outcomes.put("effect")
+
+
 @pytest.mark.asyncio
 async def test_worker_replay_returns_effect_without_second_codex_session(tmp_path: Path) -> None:
     assignment = _assignment()
@@ -210,6 +264,216 @@ async def test_concurrent_workers_start_exactly_one_codex_session(tmp_path: Path
     assert calls == 1
     assert sum(isinstance(item, FactoryBuildEffectV2) for item in results) == 1
     assert sum(isinstance(item, ValueError) for item in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_authorized_retries_start_one_codex_session(
+    tmp_path: Path,
+) -> None:
+    assignment = _assignment()
+    build, issuer = _build(assignment, tmp_path)
+    root = tmp_path / "worker"
+    store = FilesystemHermesFactoryWorkerCheckpointStore(root)
+    failing = HermesFactoryWorker(
+        minibook=_Minibook(assignment),
+        codex=_Codex(None, error=TimeoutError()),
+        skill_verifier=_SkillVerifier(),
+        worker_id="hermes-factory-v3",
+        released_skill_name="captain-agent-factory-loop",
+        released_skill_sha256="a" * 64,
+        checkpoint_store=store,
+        codex_receipts=issuer,
+    )
+    with pytest.raises(TimeoutError):
+        await failing.run_once()
+    calls = 0
+
+    class RecoveringCodex:
+        async def build(self, _assignment):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.02)
+            return build
+
+    class RetryAuthority:
+        def retry_authorization(self, assigned, checkpoint):
+            return HermesFactoryRetryAuthorization(
+                assignment_id=assigned.assignment_id,
+                attempt=assigned.attempt,
+                expected_revision=checkpoint.revision,
+                authorization_sha256="6" * 64,
+            )
+
+    workers = tuple(
+        HermesFactoryWorker(
+            minibook=_Minibook(assignment),
+            codex=RecoveringCodex(),
+            skill_verifier=_SkillVerifier(),
+            worker_id="hermes-factory-v3",
+            released_skill_name="captain-agent-factory-loop",
+            released_skill_sha256="a" * 64,
+            checkpoint_store=FilesystemHermesFactoryWorkerCheckpointStore(root),
+            codex_receipts=issuer,
+            retry_authority=RetryAuthority(),
+        )
+        for _ in range(2)
+    )
+
+    results = await asyncio.gather(
+        *(worker.run_once() for worker in workers),
+        return_exceptions=True,
+    )
+
+    assert calls == 1
+    assert sum(isinstance(item, FactoryBuildEffectV2) for item in results) == 1
+    assert sum(isinstance(item, ValueError) for item in results) == 1
+
+
+def test_two_processes_share_one_revision_bound_retry_execution_lease(
+    tmp_path: Path,
+) -> None:
+    assignment = _assignment()
+    build, _issuer = _build(assignment, tmp_path)
+    checkpoint_root = tmp_path / "worker"
+    store = FilesystemHermesFactoryWorkerCheckpointStore(checkpoint_root)
+    started = store.start(
+        assignment,
+        worker_id="hermes-factory-v3",
+        retry_authorization=None,
+    )
+    store.failed(
+        assignment,
+        started,
+        failure_kind="timeout",
+    )
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Event()
+    codex_calls = context.Value("i", 0)
+    outcomes = context.Queue()
+    arguments = (
+        assignment.model_dump_json(by_alias=True),
+        build.model_dump_json(by_alias=True),
+        str(checkpoint_root),
+        str(tmp_path / "cas"),
+        barrier,
+        codex_calls,
+        outcomes,
+    )
+    processes = tuple(
+        context.Process(target=_run_retry_worker_process, args=arguments)
+        for _ in range(2)
+    )
+    for process in processes:
+        process.start()
+    barrier.set()
+    for process in processes:
+        process.join(timeout=10)
+
+    assert all(not process.is_alive() for process in processes)
+    assert all(process.exitcode == 0 for process in processes)
+    assert codex_calls.value == 1
+    assert sorted(outcomes.get(timeout=1) for _ in processes) == [
+        "effect",
+        "fenced",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_crashed_started_checkpoint_requires_revision_bound_retry(
+    tmp_path: Path,
+) -> None:
+    assignment = _assignment()
+    build, issuer = _build(assignment, tmp_path)
+    root = tmp_path / "worker"
+    store = FilesystemHermesFactoryWorkerCheckpointStore(root)
+    started = store.start(
+        assignment,
+        worker_id="hermes-factory-v3",
+        retry_authorization=None,
+    )
+    assert started.state == "started"
+
+    without_authority = HermesFactoryWorker(
+        minibook=_Minibook(assignment),
+        codex=_Codex(build),
+        skill_verifier=_SkillVerifier(),
+        worker_id="hermes-factory-v3",
+        released_skill_name="captain-agent-factory-loop",
+        released_skill_sha256="a" * 64,
+        checkpoint_store=store,
+        codex_receipts=issuer,
+    )
+    with pytest.raises(ValueError, match="retry authority"):
+        await without_authority.run_once()
+
+    class RetryAuthority:
+        def retry_authorization(self, assigned, checkpoint):
+            assert checkpoint.revision == started.revision
+            return HermesFactoryRetryAuthorization(
+                assignment_id=assigned.assignment_id,
+                attempt=assigned.attempt,
+                expected_revision=checkpoint.revision,
+                authorization_sha256="5" * 64,
+            )
+
+    codex = _Codex(build)
+    effect = await HermesFactoryWorker(
+        minibook=_Minibook(assignment),
+        codex=codex,
+        skill_verifier=_SkillVerifier(),
+        worker_id="hermes-factory-v3",
+        released_skill_name="captain-agent-factory-loop",
+        released_skill_sha256="a" * 64,
+        checkpoint_store=store,
+        codex_receipts=issuer,
+        retry_authority=RetryAuthority(),
+    ).run_once()
+
+    assert effect is not None
+    assert codex.calls == 1
+    final = store.load(assignment)
+    assert final is not None
+    assert final.consumed_retry_authorizations == ("5" * 64,)
+
+
+@pytest.mark.asyncio
+async def test_consumed_retry_authorization_cannot_be_reused(
+    tmp_path: Path,
+) -> None:
+    assignment = _assignment()
+    _build_result, issuer = _build(assignment, tmp_path)
+    root = tmp_path / "worker"
+    store = FilesystemHermesFactoryWorkerCheckpointStore(root)
+    first = store.start(
+        assignment,
+        worker_id="hermes-factory-v3",
+        retry_authorization=None,
+    )
+    failed = store.failed(assignment, first, failure_kind="timeout")
+    authorization = HermesFactoryRetryAuthorization(
+        assignment_id=assignment.assignment_id,
+        attempt=assignment.attempt,
+        expected_revision=failed.revision,
+        authorization_sha256="3" * 64,
+    )
+    retried = store.start(
+        assignment,
+        worker_id="hermes-factory-v3",
+        retry_authorization=authorization,
+    )
+    failed_again = store.failed(assignment, retried, failure_kind="timeout")
+    reused = authorization.model_copy(
+        update={"expected_revision": failed_again.revision}
+    )
+
+    with pytest.raises(ValueError, match="binding changed"):
+        store.start(
+            assignment,
+            worker_id="hermes-factory-v3",
+            retry_authorization=reused,
+        )
+
+    assert store.load(assignment) == failed_again
 
 
 @pytest.mark.asyncio
@@ -419,9 +683,16 @@ async def test_worker_retries_once_only_with_explicit_authority(tmp_path: Path) 
             return build
 
     class RetryAuthority:
-        def allows_retry(self, assigned, checkpoint) -> bool:
+        def retry_authorization(self, assigned, checkpoint):
             assert assigned == assignment
-            return checkpoint.status == "codex_failed"
+            if checkpoint.status != "codex_failed":
+                return None
+            return HermesFactoryRetryAuthorization(
+                assignment_id=assigned.assignment_id,
+                attempt=assigned.attempt,
+                expected_revision=checkpoint.revision,
+                authorization_sha256="7" * 64,
+            )
 
     codex = RecoveringCodex()
     minibook = _Minibook(assignment)

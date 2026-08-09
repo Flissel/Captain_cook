@@ -1270,7 +1270,7 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
     assert launcher.index('ArgumentList.Add("--sandbox")') < launcher.index(
         'ArgumentList.Add("exec")'
     )
-    assert launcher.count('ArgumentList.Add("workspace-write")') == 1
+    assert launcher.count('ArgumentList.Add($Sandbox)') == 1
     assert launcher.count('ArgumentList.Add("never")') == 1
     assert launcher.count(
         'ArgumentList.Add("sandbox_workspace_write.network_access=false")'

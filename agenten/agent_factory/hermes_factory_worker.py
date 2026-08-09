@@ -8,6 +8,7 @@ import os
 import subprocess
 from collections.abc import Callable
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol
@@ -30,6 +31,10 @@ from agenten.agent_factory.forge_contracts import (
 _WORKER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SKILL_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_HELD_EXECUTION_LOCKS: ContextVar[frozenset[UUID]] = ContextVar(
+    "hermes_factory_held_execution_locks",
+    default=frozenset(),
+)
 
 
 class HermesFactoryMinibookPort(Protocol):
@@ -123,11 +128,22 @@ class HermesFactoryAssignmentScope(BaseModel):
 
 
 class HermesFactoryRetryAuthorityPort(Protocol):
-    def allows_retry(
+    def retry_authorization(
         self,
         assignment: FactoryBuildAssignmentV2,
         checkpoint: "HermesFactoryWorkerCheckpoint",
-    ) -> bool: ...
+    ) -> "HermesFactoryRetryAuthorization | None": ...
+
+
+class HermesFactoryRetryAuthorization(BaseModel):
+    """One-use binding from Captain retry authority to one failed revision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    assignment_id: UUID
+    attempt: int
+    expected_revision: int = Field(ge=1)
+    authorization_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class HermesFactoryWorkerCheckpoint(BaseModel):
@@ -163,6 +179,7 @@ class HermesFactoryWorkerCheckpoint(BaseModel):
         "exception",
     ] | None = None
     failure_exit_code: int | None = Field(default=None, ge=-32768, le=32767)
+    consumed_retry_authorizations: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def require_effect_state_binding(self) -> "HermesFactoryWorkerCheckpoint":
@@ -188,7 +205,7 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
         self,
         assignment: FactoryBuildAssignmentV2,
     ) -> HermesFactoryWorkerCheckpoint | None:
-        with self._assignment_lock(assignment.assignment_id):
+        with self._guard(assignment.assignment_id):
             return self._load_unlocked(assignment)
 
     def _load_unlocked(
@@ -217,9 +234,9 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
         assignment: FactoryBuildAssignmentV2,
         *,
         worker_id: str,
-        retry_authorized: bool,
+        retry_authorization: HermesFactoryRetryAuthorization | None,
     ) -> HermesFactoryWorkerCheckpoint:
-        with self._assignment_lock(assignment.assignment_id):
+        with self._guard(assignment.assignment_id):
             previous = self._load_unlocked(assignment)
             if previous is None:
                 checkpoint = HermesFactoryWorkerCheckpoint(
@@ -236,8 +253,16 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
                 return previous
             if previous.worker_id != worker_id:
                 raise ValueError("Hermes Factory checkpoint worker identity changed")
-            if not retry_authorized:
+            if retry_authorization is None:
                 raise ValueError("Hermes Factory Codex retry authority is required")
+            if (
+                retry_authorization.assignment_id != assignment.assignment_id
+                or retry_authorization.attempt != assignment.attempt
+                or retry_authorization.expected_revision != previous.revision
+                or retry_authorization.authorization_sha256
+                in previous.consumed_retry_authorizations
+            ):
+                raise ValueError("Hermes Factory Codex retry authority binding changed")
             if previous.codex_attempts > assignment.limits.max_retries:
                 raise ValueError("Hermes Factory assignment retry limit is exhausted")
             checkpoint = previous.model_copy(
@@ -249,6 +274,10 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
                     "effect": None,
                     "failure_kind": None,
                     "failure_exit_code": None,
+                    "consumed_retry_authorizations": (
+                        *previous.consumed_retry_authorizations,
+                        retry_authorization.authorization_sha256,
+                    ),
                 }
             )
             return self._replace(previous, checkpoint)
@@ -278,7 +307,7 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
                 "revision": previous.revision + 1,
             }
         )
-        with self._assignment_lock(assignment.assignment_id):
+        with self._guard(assignment.assignment_id):
             return self._replace(previous, failed)
 
     def pending_effect(
@@ -295,7 +324,7 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
                 "revision": previous.revision + 1,
             }
         )
-        with self._assignment_lock(assignment.assignment_id):
+        with self._guard(assignment.assignment_id):
             return self._replace(previous, pending)
 
     def submitted(
@@ -309,7 +338,7 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
                 "revision": previous.revision + 1,
             }
         )
-        with self._assignment_lock(previous.assignment_id):
+        with self._guard(previous.assignment_id):
             return self._replace(previous, submitted)
 
     def _create(
@@ -370,7 +399,25 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
         return self._root / f"{assignment_id.hex}.json"
 
     @contextmanager
-    def _assignment_lock(self, assignment_id: UUID):
+    def execution_lease(self, assignment_id: UUID):
+        with self._assignment_lock(assignment_id, blocking=False):
+            held = _HELD_EXECUTION_LOCKS.get()
+            token = _HELD_EXECUTION_LOCKS.set(held | {assignment_id})
+            try:
+                yield
+            finally:
+                _HELD_EXECUTION_LOCKS.reset(token)
+
+    @contextmanager
+    def _guard(self, assignment_id: UUID):
+        if assignment_id in _HELD_EXECUTION_LOCKS.get():
+            yield
+            return
+        with self._assignment_lock(assignment_id, blocking=True):
+            yield
+
+    @contextmanager
+    def _assignment_lock(self, assignment_id: UUID, *, blocking: bool):
         self._root.mkdir(parents=True, exist_ok=True)
         path = self._root / f"{assignment_id.hex}.lock"
         with path.open("a+b") as stream:
@@ -383,7 +430,16 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
             if os.name == "nt":
                 import msvcrt
 
-                msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    msvcrt.locking(
+                        stream.fileno(),
+                        msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK,
+                        1,
+                    )
+                except OSError as exc:
+                    raise ValueError(
+                        "Hermes Factory assignment execution lease is active"
+                    ) from exc
                 try:
                     yield
                 finally:
@@ -392,7 +448,15 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
             else:
                 import fcntl
 
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                try:
+                    fcntl.flock(
+                        stream.fileno(),
+                        fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB),
+                    )
+                except BlockingIOError as exc:
+                    raise ValueError(
+                        "Hermes Factory assignment execution lease is active"
+                    ) from exc
                 try:
                     yield
                 finally:
@@ -582,97 +646,101 @@ class HermesFactoryWorker:
         )
         if claimed != assignment:
             raise ValueError("Minibook assignment claim changed immutable content")
-        replay = await self._minibook.accepted_effect(assignment.assignment_id)
-        if replay is not None:
-            validate_build_effect_binding(assignment, replay)
-            return replay
-        if now >= assignment.deadline_at:
-            raise ValueError("Hermes Factory assignment deadline expired")
+        with self._checkpoint_store.execution_lease(assignment.assignment_id):
+            replay = await self._minibook.accepted_effect(assignment.assignment_id)
+            if replay is not None:
+                validate_build_effect_binding(assignment, replay)
+                return replay
+            if now >= assignment.deadline_at:
+                raise ValueError("Hermes Factory assignment deadline expired")
 
-        checkpoint = self._checkpoint_store.load(assignment)
-        if checkpoint is not None and checkpoint.effect is not None:
-            accepted = await self._minibook.submit_effect(checkpoint.effect)
-            if accepted != checkpoint.effect:
-                raise ValueError("Minibook accepted a different build effect")
-            self._checkpoint_store.submitted(checkpoint)
-            return accepted
+            checkpoint = self._checkpoint_store.load(assignment)
+            if checkpoint is not None and checkpoint.effect is not None:
+                effect = checkpoint.effect
+            else:
+                retry_authorization = (
+                    self._retry_authority.retry_authorization(
+                        assignment,
+                        checkpoint,
+                    )
+                    if checkpoint is not None
+                    and checkpoint.state in {"failed", "started"}
+                    and self._retry_authority is not None
+                    else None
+                )
+                checkpoint = self._checkpoint_store.start(
+                    assignment,
+                    worker_id=self._worker_id,
+                    retry_authorization=retry_authorization,
+                )
 
-        retry_authorized = (
-            checkpoint is not None
-            and self._retry_authority is not None
-            and self._retry_authority.allows_retry(assignment, checkpoint)
-        )
-        checkpoint = self._checkpoint_store.start(
-            assignment,
-            worker_id=self._worker_id,
-            retry_authorized=retry_authorized,
-        )
-
-        try:
-            build = await self._codex.build(assignment)
-            if not isinstance(build, HermesFactoryCodexBuild):
-                self._checkpoint_store.failed(
+                try:
+                    build = await self._codex.build(assignment)
+                    if not isinstance(build, HermesFactoryCodexBuild):
+                        self._checkpoint_store.failed(
+                            assignment,
+                            checkpoint,
+                            failure_kind="null_or_untyped",
+                        )
+                        raise ValueError(
+                            "Hermes Factory requires a typed Codex build result"
+                        )
+                    build.validate_for(assignment)
+                    readback = self._codex_receipts.read_receipt(
+                        build.codex_build_receipt_ref
+                    )
+                    if readback != build.codex_build_receipt:
+                        raise ValueError("Codex build receipt CAS readback changed")
+                except Exception as exc:
+                    current = self._checkpoint_store.load(assignment)
+                    if current is not None and current.state != "failed":
+                        if isinstance(exc, TimeoutError):
+                            failure_kind = "timeout"
+                            exit_code = None
+                        elif isinstance(exc, subprocess.CalledProcessError):
+                            failure_kind = "process_exit"
+                            exit_code = max(-32768, min(32767, int(exc.returncode)))
+                        elif isinstance(exc, ValueError):
+                            failure_kind = "validation_error"
+                            exit_code = None
+                        elif isinstance(exc, RuntimeError):
+                            failure_kind = "runtime_error"
+                            exit_code = None
+                        else:
+                            failure_kind = "exception"
+                            exit_code = None
+                        self._checkpoint_store.failed(
+                            assignment,
+                            checkpoint,
+                            failure_kind=failure_kind,
+                            failure_exit_code=exit_code,
+                        )
+                    raise
+                receipt = build.codex_build_receipt
+                effect = FactoryBuildEffectV2(
+                    assignment_id=assignment.assignment_id,
+                    creation_job_id=assignment.creation_job_id,
+                    factory_job_id=assignment.factory_job_id,
+                    correlation_id=assignment.correlation_id,
+                    subject_version=assignment.subject_version,
+                    checkpoint_version=assignment.checkpoint_version,
+                    attempt=assignment.attempt,
+                    effect_key=assignment.effect_key,
+                    hermes_usage_receipt_ref=build.hermes_usage_receipt_ref,
+                    codex_build_receipt_ref=build.codex_build_receipt_ref,
+                    codex_session_ref=receipt.codex_session_ref,
+                    workspace_snapshot_ref=receipt.workspace_snapshot_ref,
+                    source_archive_ref=receipt.source_archive_ref,
+                    preliminary_team_manifest_ref=receipt.candidate_manifest_ref,
+                    build_evidence_refs=build.build_evidence_refs,
+                    test_evidence_refs=receipt.test_evidence_refs,
+                    tool_gaps=build.tool_gaps,
+                )
+                checkpoint = self._checkpoint_store.pending_effect(
                     assignment,
                     checkpoint,
-                    failure_kind="null_or_untyped",
+                    effect,
                 )
-                raise ValueError("Hermes Factory requires a typed Codex build result")
-            build.validate_for(assignment)
-            readback = self._codex_receipts.read_receipt(
-                build.codex_build_receipt_ref
-            )
-            if readback != build.codex_build_receipt:
-                raise ValueError("Codex build receipt CAS readback changed")
-        except Exception as exc:
-            current = self._checkpoint_store.load(assignment)
-            if current is not None and current.state != "failed":
-                if isinstance(exc, TimeoutError):
-                    failure_kind = "timeout"
-                    exit_code = None
-                elif isinstance(exc, subprocess.CalledProcessError):
-                    failure_kind = "process_exit"
-                    exit_code = max(-32768, min(32767, int(exc.returncode)))
-                elif isinstance(exc, ValueError):
-                    failure_kind = "validation_error"
-                    exit_code = None
-                elif isinstance(exc, RuntimeError):
-                    failure_kind = "runtime_error"
-                    exit_code = None
-                else:
-                    failure_kind = "exception"
-                    exit_code = None
-                self._checkpoint_store.failed(
-                    assignment,
-                    checkpoint,
-                    failure_kind=failure_kind,
-                    failure_exit_code=exit_code,
-                )
-            raise
-        receipt = build.codex_build_receipt
-        effect = FactoryBuildEffectV2(
-            assignment_id=assignment.assignment_id,
-            creation_job_id=assignment.creation_job_id,
-            factory_job_id=assignment.factory_job_id,
-            correlation_id=assignment.correlation_id,
-            subject_version=assignment.subject_version,
-            checkpoint_version=assignment.checkpoint_version,
-            attempt=assignment.attempt,
-            effect_key=assignment.effect_key,
-            hermes_usage_receipt_ref=build.hermes_usage_receipt_ref,
-            codex_build_receipt_ref=build.codex_build_receipt_ref,
-            codex_session_ref=receipt.codex_session_ref,
-            workspace_snapshot_ref=receipt.workspace_snapshot_ref,
-            source_archive_ref=receipt.source_archive_ref,
-            preliminary_team_manifest_ref=receipt.candidate_manifest_ref,
-            build_evidence_refs=build.build_evidence_refs,
-            test_evidence_refs=receipt.test_evidence_refs,
-            tool_gaps=build.tool_gaps,
-        )
-        checkpoint = self._checkpoint_store.pending_effect(
-            assignment,
-            checkpoint,
-            effect,
-        )
         accepted = await self._minibook.submit_effect(effect)
         if accepted != effect:
             raise ValueError("Minibook accepted a different build effect")
@@ -684,6 +752,7 @@ __all__ = [
     "AuthenticatedMinibookV3WorkerClient",
     "HermesFactoryCodexBuild",
     "HermesFactoryAssignmentScope",
+    "HermesFactoryRetryAuthorization",
     "FilesystemHermesFactoryWorkerCheckpointStore",
     "HermesFactoryCodexPort",
     "HermesFactoryMinibookPort",

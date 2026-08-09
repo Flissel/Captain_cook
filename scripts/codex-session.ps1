@@ -176,7 +176,7 @@ $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
 $startInfo.ArgumentList.Add("--sandbox")
-$startInfo.ArgumentList.Add("workspace-write")
+$startInfo.ArgumentList.Add($Sandbox)
 $startInfo.ArgumentList.Add("--ask-for-approval")
 $startInfo.ArgumentList.Add("never")
 $startInfo.ArgumentList.Add("--config")

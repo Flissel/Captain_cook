@@ -250,7 +250,14 @@ class SuccessfulRunner:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "attack",
-    ("forbidden_command", "forbidden_write", "network", "cost", "unattested"),
+    (
+        "forbidden_command",
+        "forbidden_write",
+        "network",
+        "cost",
+        "unattested",
+        "echoing",
+    ),
 )
 async def test_v3_runner_rejects_unenforced_capabilities_before_launch(
     tmp_path: Path,
@@ -269,6 +276,8 @@ async def test_v3_runner_rejects_unenforced_capabilities_before_launch(
 
     class AdversarialRunner:
         def bind_factory_authority(self, authority: FactoryCodexRuntimeAuthority):
+            if attack == "echoing":
+                return authority
             if attack == "forbidden_command":
                 return replace(authority, allowed_commands=(("cmd", "/c", "whoami"),))
             if attack == "forbidden_write":
