@@ -909,8 +909,18 @@ def test_gateway_claims_hard_ceiling_only_for_exact_active_proxy_binding() -> No
         def execute(self, *_args): return None
         def fetchone(self):
             return {"payload": {"resume_command": command.model_dump(mode="json", by_alias=True), "request": request}}
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+
+    class Connection:
+        def cursor(self): return Cursor()
+
+    class Storage:
+        @contextmanager
+        def transaction(self): yield Connection()
 
     store = GatewayStore.__new__(GatewayStore)
+    store.storage = Storage()
     store._runtime_provider_proxy_bindings = frozenset({(
         "http://127.0.0.1:18091/v1", policy_sha, price_sha,
     )})
@@ -930,6 +940,15 @@ def test_gateway_claims_hard_ceiling_only_for_exact_active_proxy_binding() -> No
 
     assert authority.hard_ceiling_enforced is True
     assert authority.provider_context_sha256 == context.sha256
+    assert store.validate_provider_proxy_authority(
+        context, now=datetime(2026, 8, 9, tzinfo=timezone.utc)
+    ) == context
+
+    with pytest.raises(HTTPException, match="provider authority is unavailable"):
+        store.validate_provider_proxy_authority(
+            context.model_copy(update={"session_id": "forged-session"}),
+            now=datetime(2026, 8, 9, tzinfo=timezone.utc),
+        )
 
 
 @pytest.mark.parametrize("mutation", ["valid", "forged_zero", "unknown_model", "digest"])
