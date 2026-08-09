@@ -74,11 +74,10 @@ class CreationRunner:
             return existing
         job = self.store.job(job_id)
         progress = self.store.progress(job_id)
-        if progress.status == "awaiting_user_input":
-            return None
         if progress.status == "cancelled":
             return self.store.finish(
-                self._terminal(job, "cancelled", CreationFailure(code="cancelled", summary="creation cancelled"))
+                self._terminal(job, "cancelled", CreationFailure(code="cancelled", summary="creation cancelled")),
+                expected_version=progress.version,
             )
         if datetime.now(timezone.utc) >= job.deadline_at:
             return self.store.finish(
@@ -86,8 +85,11 @@ class CreationRunner:
                     job,
                     "blocked",
                     CreationFailure(code="deadline_expired", summary="creation deadline expired"),
-                )
+                ),
+                expected_version=progress.version,
             )
+        if progress.status == "awaiting_user_input":
+            return None
         completed = self.store.completed_steps(job_id)
         snapshot = self.store.snapshot(job_id)
         for step in self.pipeline.steps:
@@ -109,9 +111,15 @@ class CreationRunner:
                 return None
             if step in self.pipeline.effectful_steps and outcome.effect_receipt is not None:
                 self.store.record_external_effect(job_id, effect_key, outcome.effect_receipt)
-            self.store.complete_step(job_id, step, effect_key, outcome.snapshot)
+            self.store.complete_step(
+                job_id, step, effect_key, outcome.snapshot,
+                expected_version=self.store.progress(job_id).version,
+            )
             snapshot = outcome.snapshot
-        return self.store.finish(self.pipeline.assemble_result(job, snapshot))
+        return self.store.finish(
+            self.pipeline.assemble_result(job, snapshot),
+            expected_version=self.store.progress(job_id).version,
+        )
 
     def cancel(self, job_id: UUID, expected_version: int):
         return self.store.cancel(job_id, expected_version)

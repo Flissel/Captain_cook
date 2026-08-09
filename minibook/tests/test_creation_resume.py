@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from minibook.swarm.contracts import CreationFailure, CreationJobV1, CreationResultV1
+from minibook.swarm.contracts import CreationFailure, CreationJobV1, CreationJobV3, CreationResultV1
 from minibook.swarm.job_store import CreationConflictError, CreationJobStore
 from minibook.swarm.runner import CreationRunner, StepOutcome
 
@@ -103,6 +103,21 @@ async def test_expired_job_finishes_blocked_before_any_effect(tmp_path: Path) ->
     assert result.status == "blocked"
     assert result.failure == CreationFailure(code="deadline_expired", summary="creation deadline expired")
     assert pipeline.calls == {"tool_resolution": 0, "codex_build": 0}
+
+
+@pytest.mark.asyncio
+async def test_expired_paused_v3_job_is_blocked_before_pause_return(tmp_path: Path) -> None:
+    payload = json.loads((Path(__file__).parents[2] / "tests/fixtures/contracts/minibook_creation_job.v3.json").read_text(encoding="utf-8"))
+    payload["deadline_at"] = "2020-01-01T00:00:00Z"
+    job = CreationJobV3.model_validate(payload)
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    store.submit(job)
+    store.transition(job.creation_job_id, "planning", expected_version=1)
+    store.transition(job.creation_job_id, "awaiting_user_input", expected_version=2)
+    result = await CreationRunner(store, ScriptedPipeline(store)).run_slice(job.creation_job_id)
+    assert result is not None
+    assert result.schema_name == "minibook.creation-result.v2"
+    assert result.status == "blocked"
 
 
 @pytest.mark.asyncio

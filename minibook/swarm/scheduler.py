@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Callable
 from uuid import UUID
 
-from .contracts import CreationFailure, CreationResultV1
+from .contracts import CreationFailure, CreationJobV3, CreationResultV1, CreationResultV2
 from .job_store import CreationJobStore
 from .runner import CreationRunner
 
@@ -99,19 +99,34 @@ class CreationScheduler:
         if self._store.result(job_id) is not None:
             return
         job = self._store.job(job_id)
-        self._store.finish(
-            CreationResultV1(
+        failure = CreationFailure(
+            code="internal_error",
+            summary="creation step failed",
+            exception_type=type(exc).__name__,
+        )
+        result = (
+            CreationResultV2(
+                creation_job_id=job.creation_job_id,
+                factory_job_id=job.factory_job_id,
+                correlation_id=job.correlation_id,
+                subject_version=job.subject_version,
+                attempt=job.attempt,
+                status="failed",
+                failure=failure,
+            )
+            if isinstance(job, CreationJobV3)
+            else CreationResultV1(
                 creation_job_id=job.creation_job_id,
                 correlation_id=job.correlation_id,
                 subject_version=job.subject_version,
                 attempt=job.attempt,
                 status="failed",
-                failure=CreationFailure(
-                    code="internal_error",
-                    summary="creation step failed",
-                    exception_type=type(exc).__name__,
-                ),
+                failure=failure,
             )
+        )
+        self._store.finish(
+            result,
+            expected_version=self._store.progress(job_id).version,
         )
 
 

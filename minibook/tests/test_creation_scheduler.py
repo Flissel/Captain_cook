@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from minibook.swarm.contracts import CreationJobV1, CreationResultV1
+from minibook.swarm.contracts import CreationJobV1, CreationJobV3, CreationResultV1
 from minibook.swarm.job_store import CreationJobStore
 from minibook.swarm.runner import CreationRunner, StepOutcome
 from minibook.swarm.scheduler import CreationScheduler
@@ -141,13 +141,31 @@ def test_store_lists_only_resumable_jobs_in_submission_order(tmp_path: Path) -> 
         "inspect",
         "effect",
         {"creation_job_id": str(running.creation_job_id)},
+        expected_version=1,
     )
-    store.finish(_successful_result(terminal))
+    store.finish(_successful_result(terminal), expected_version=1)
 
     assert store.resumable_job_ids() == (
         queued.creation_job_id,
         running.creation_job_id,
     )
+
+
+def test_store_does_not_busy_poll_external_v3_wait_states(tmp_path: Path) -> None:
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    payload = json.loads((Path(__file__).parents[2] / "tests/fixtures/contracts/minibook_creation_job.v3.json").read_text(encoding="utf-8"))
+    payload["deadline_at"] = "2099-08-09T12:00:00Z"
+    awaiting_build = CreationJobV3.model_validate(payload | {"creation_job_id": str(uuid4())})
+    awaiting_user = CreationJobV3.model_validate(payload | {"creation_job_id": str(uuid4())})
+    building = CreationJobV3.model_validate(payload | {"creation_job_id": str(uuid4())})
+    for item in (awaiting_build, awaiting_user, building):
+        store.submit(item)
+        store.transition(item.creation_job_id, "planning", expected_version=1)
+    store.transition(awaiting_build.creation_job_id, "awaiting_build", expected_version=2)
+    store.transition(awaiting_user.creation_job_id, "awaiting_user_input", expected_version=2)
+    store.transition(building.creation_job_id, "awaiting_build", expected_version=2)
+    store.transition(building.creation_job_id, "building", expected_version=3)
+    assert store.resumable_job_ids() == ()
 
 
 @pytest.mark.asyncio
@@ -239,6 +257,24 @@ async def test_scheduler_persists_a_redacted_typed_failure_from_pipeline_excepti
     assert result.failure.summary == "creation step failed"
     assert result.failure.exception_type == "RuntimeError"
     assert "authorization" not in result.model_dump_json().lower()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_persists_v2_failure_for_v3_job(tmp_path: Path) -> None:
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    payload = json.loads((Path(__file__).parents[2] / "tests/fixtures/contracts/minibook_creation_job.v3.json").read_text(encoding="utf-8"))
+    payload["deadline_at"] = "2099-08-09T12:00:00Z"
+    job = CreationJobV3.model_validate(payload)
+    store.submit(job)
+    pipeline = ControlledPipeline(failure=RuntimeError("private detail"))
+    scheduler = CreationScheduler(store=store, runner_for=lambda job_id: CreationRunner(store, pipeline))
+    await scheduler.start()
+    await scheduler.join()
+    await scheduler.stop()
+    result = store.result(job.creation_job_id)
+    assert result is not None
+    assert result.schema_name == "minibook.creation-result.v2"
+    assert result.status == "failed"
 
 
 @pytest.mark.asyncio
