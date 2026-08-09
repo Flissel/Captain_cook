@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -40,9 +41,12 @@ from agenten.agent_factory.candidate_evaluation import (
     ResolvedFactoryCandidate,
 )
 from agenten.agent_factory.contracts import AgentFactoryJobV3
+from agenten.agent_factory.contracts import FactoryRole
 from agenten.agent_factory.codex_build_execution import (
+    CaptainCodexAssignmentBuilder,
     CaptainCodexBuildSealer,
     CaptainFactoryCodexResumeAuthorizer,
+    CaptainV3CodexRequestMapper,
     CodexCliFactoryBuildExecutor,
     CodexCliFactoryBuildSettings,
     GitDetachedFactoryWorkspacePreparer,
@@ -59,7 +63,11 @@ from agenten.agent_factory.codex_build_provenance import (
 )
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.hermes_cli import HermesCliSettings
-from agenten.agent_factory.hermes_factory_worker import HermesFactoryWorker
+from agenten.agent_factory.hermes_factory_worker import (
+    AuthenticatedMinibookV3WorkerClient,
+    FilesystemHermesFactoryWorkerCheckpointStore,
+    HermesFactoryWorker,
+)
 from agenten.agent_factory.minibook_forge import (
     CaptainCreationJobMapper,
     MinibookForgeSettings,
@@ -81,6 +89,7 @@ from agenten.execution.codex_supervisor import PowerShellCodexRunner
 from gateway.agent_factory_live_composition import (
     AgentFactoryLiveComposition,
     GatewayTechnicalTeamExecutionPortsProvider,
+    HermesFactoryWorkerRuntime,
     compose_agent_factory_live,
     select_technical_business_holdout,
 )
@@ -88,7 +97,11 @@ from gateway.business_benchmark_live_composition import (
     GatewayForgeBusinessBenchmarkCandidateAuthority,
     GatewayBusinessBenchmarkLiveCompositionLoader,
 )
-from gateway.factory_repository import GatewayFactoryBudgetLedger, GatewayFactoryRepository
+from gateway.factory_repository import (
+    GatewayFactoryBudgetLedger,
+    GatewayFactoryLeases,
+    GatewayFactoryRepository,
+)
 from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
 from gateway.factory_runtime_retry_authority import (
     FilesystemFactoryRuntimeRetryAuthority,
@@ -398,11 +411,19 @@ def compose_business_demo_factory_operator(
     n8n_client: httpx.AsyncClient,
     clock: Callable[[], datetime] | None = None,
     hermes_factory_worker: HermesFactoryWorker | None = None,
+    minibook_client: httpx.AsyncClient | None = None,
 ) -> AgentFactoryLiveComposition:
     """Compose every real port without dispatching Hermes, Forge, n8n, or OpenAI."""
 
     current_time = clock or (lambda: datetime.now(timezone.utc))
-    if settings.factory_v3_enabled != (hermes_factory_worker is not None):
+    if (
+        settings.factory_v3_enabled
+        and hermes_factory_worker is None
+        and minibook_client is None
+    ) or (
+        not settings.factory_v3_enabled
+        and (hermes_factory_worker is not None or minibook_client is not None)
+    ):
         raise ValueError("Factory V3 worker configuration is incomplete")
     workspace = settings.workspace_root.resolve()
     authority_root = (
@@ -546,42 +567,59 @@ def compose_business_demo_factory_operator(
     codex_build_cas = CodexBuildArtifactCas(
         workspace / ".captain-cook" / "private" / "codex-build-cas"
     )
-    codex_sealer = CaptainCodexBuildSealer(
-        executor=CodexCliFactoryBuildExecutor(
-            settings=CodexCliFactoryBuildSettings(
-                state_root=codex_state_root,
-                maximum_runtime_seconds=900,
-            ),
-            workspace_preparer=GitDetachedFactoryWorkspacePreparer(
-                repository_root=workspace,
-                workspaces_root=codex_workspace_root,
-            ),
-            artifact_reader=_FactoryCodexArtifactReader(
-                benchmark_artifacts=benchmark_cas,
-                minibook_creation_artifacts=creation_artifacts,
-            ),
-            authorizer=codex_authorizer,
-            runner_factory=codex_runner_factory,
-            checkpoint_store=FilesystemFactoryCodexBuildCheckpointStore(
-                codex_state_root / "checkpoints"
-            ),
-            scaffold_manifest_store=FilesystemFactoryCodexScaffoldManifestStore(
-                codex_state_root / "scaffold-manifests"
-            ),
-            sealed_evidence_store=FilesystemFactoryCodexSealedEvidenceStore(
-                codex_state_root / "sealed-evidence"
-            ),
-            resume_authorizer=CaptainFactoryCodexResumeAuthorizer(
-                clock=current_time
-            ),
-            process_inspector=PowerShellFactoryCodexProcessInspector(
-                pwsh_path=pwsh_executable,
-                script_path=codex_session_script,
-            ),
-            clock=current_time,
+    codex_cli_settings = CodexCliFactoryBuildSettings(
+        state_root=codex_state_root,
+        maximum_runtime_seconds=900,
+        maximum_files=4_096,
+        maximum_provider_cost_usd=float(
+            settings.hermes_maximum_total_cost_usd
         ),
-        issuer=CaptainCodexBuildReceiptIssuer(codex_build_cas),
+        supported_output_roots=("output",),
+        supported_commands=(
+            ("python", "-m", "pytest"),
+            ("pytest",),
+            ("python", "-m", "compileall", "output"),
+        ),
     )
+    codex_receipt_issuer = CaptainCodexBuildReceiptIssuer(codex_build_cas)
+    def codex_sealer_for(
+        execution_settings: CodexCliFactoryBuildSettings,
+    ) -> CaptainCodexBuildSealer:
+        return CaptainCodexBuildSealer(
+            executor=CodexCliFactoryBuildExecutor(
+                settings=execution_settings,
+                workspace_preparer=GitDetachedFactoryWorkspacePreparer(
+                    repository_root=workspace,
+                    workspaces_root=codex_workspace_root,
+                ),
+                artifact_reader=_FactoryCodexArtifactReader(
+                    benchmark_artifacts=benchmark_cas,
+                    minibook_creation_artifacts=creation_artifacts,
+                ),
+                authorizer=codex_authorizer,
+                runner_factory=codex_runner_factory,
+                checkpoint_store=FilesystemFactoryCodexBuildCheckpointStore(
+                    codex_state_root / "checkpoints"
+                ),
+                scaffold_manifest_store=FilesystemFactoryCodexScaffoldManifestStore(
+                    codex_state_root / "scaffold-manifests"
+                ),
+                sealed_evidence_store=FilesystemFactoryCodexSealedEvidenceStore(
+                    codex_state_root / "sealed-evidence"
+                ),
+                resume_authorizer=CaptainFactoryCodexResumeAuthorizer(
+                    clock=current_time
+                ),
+                process_inspector=PowerShellFactoryCodexProcessInspector(
+                    pwsh_path=pwsh_executable,
+                    script_path=codex_session_script,
+                ),
+                clock=current_time,
+            ),
+            issuer=codex_receipt_issuer,
+        )
+
+    codex_sealer = codex_sealer_for(codex_cli_settings)
     forge = MinibookSwarmForge(
         materializer=_FactoryInputMaterializer(
             benchmark_artifacts=benchmark_cas,
@@ -637,6 +675,79 @@ def compose_business_demo_factory_operator(
         for item in aggregate.selections
         if item.profile == "renewal"
     }
+    codex_prompt_store = _BenchmarkCodexPromptArtifactStore(benchmark_cas)
+    worker_runtime: HermesFactoryWorkerRuntime | None = None
+    if settings.factory_v3_enabled and hermes_factory_worker is None:
+        assert minibook_client is not None
+        configured_minibook_url = _required(
+            environment,
+            "CAPTAIN_FACTORY_V3_MINIBOOK_URL",
+        ).rstrip("/")
+        if str(minibook_client.base_url).rstrip("/") != configured_minibook_url:
+            raise ValueError("Factory V3 Minibook client URL does not match")
+        worker_id = _required(environment, "CAPTAIN_FACTORY_V3_WORKER_ID")
+        runtime_skill_name = _required(
+            environment,
+            "CAPTAIN_FACTORY_V3_RELEASED_SKILL_NAME",
+        )
+        runtime_skill_sha256 = _required(
+            environment,
+            "CAPTAIN_FACTORY_V3_RELEASED_SKILL_SHA256",
+        )
+        checkpoint_store = FilesystemHermesFactoryWorkerCheckpointStore(
+            codex_state_root / "hermes-worker-checkpoints"
+        )
+        minibook = AuthenticatedMinibookV3WorkerClient(
+            client=minibook_client,
+            worker_token=_required(
+                environment,
+                "CAPTAIN_FACTORY_V3_WORKER_TOKEN",
+            ),
+            worker_id=worker_id,
+            checkpoint_store=checkpoint_store,
+        )
+        leases = GatewayFactoryLeases(store)
+        assignment_mapper = CaptainV3CodexRequestMapper(
+            job_for=lambda job_id: repository.job(job_id),
+            lease_for=lambda job, attempt, now: leases.active(
+                job,
+                FactoryRole.TOOL_INTEGRATOR,
+                attempt,
+                now,
+            ),
+            released_skill_for=lambda job, step: repository.released_for(
+                job,
+                step,
+            ),
+            prompt_store=codex_prompt_store,
+            artifact_cas=codex_build_cas,
+            worker_id=worker_id,
+            runtime_skill_sha256=runtime_skill_sha256,
+            clock=current_time,
+            runtime_retry_for=lambda job, action, now: (
+                runtime_retry_authority.active(
+                    job,
+                    action,
+                    store.factory_job(job.job_id),  # type: ignore[arg-type]
+                    now,
+                )
+            ),
+        )
+        codex_builder = CaptainCodexAssignmentBuilder(
+            sealer_for=codex_sealer_for,
+            mapper=assignment_mapper,
+            settings=codex_cli_settings,
+        )
+        worker_runtime = HermesFactoryWorkerRuntime(
+            minibook=minibook,
+            codex=codex_builder,
+            checkpoint_store=checkpoint_store,
+            codex_receipts=codex_receipt_issuer,
+            worker_id=worker_id,
+            released_skill_name=runtime_skill_name,
+            released_skill_sha256=runtime_skill_sha256,
+            retry_authority=codex_builder,
+        )
     return compose_agent_factory_live(
         store=store,
         forge=forge,
@@ -674,15 +785,14 @@ def compose_business_demo_factory_operator(
         n8n_work_batches=n8n_work_batches,
         holdout_selector=select_technical_business_holdout,
         codex_build_sealer=codex_sealer,
-        codex_prompt_artifact_store=_BenchmarkCodexPromptArtifactStore(
-            benchmark_cas
-        ),
+        codex_prompt_artifact_store=codex_prompt_store,
         improvements=improvement_authority,
         runtime_retries=runtime_retry_authority,
         hermes_retry_authority=hermes_retry_authority,
         technical_revalidation_validator=validate_technical_revalidation,
         factory_v3_enabled=settings.factory_v3_enabled,
         hermes_factory_worker=hermes_factory_worker,
+        hermes_factory_worker_runtime=worker_runtime,
     )
 
 
@@ -696,11 +806,26 @@ async def run_business_demo_factory_jobs(
         if settings.stop_before_quality_warden
         else None
     )
-    async with httpx.AsyncClient(timeout=30.0) as n8n_client:
+    async with AsyncExitStack() as stack:
+        n8n_client = await stack.enter_async_context(
+            httpx.AsyncClient(timeout=30.0)
+        )
+        minibook_client = None
+        if getattr(settings, "factory_v3_enabled", False):
+            minibook_client = await stack.enter_async_context(
+                httpx.AsyncClient(
+                    timeout=30.0,
+                    base_url=_required(
+                        environment,
+                        "CAPTAIN_FACTORY_V3_MINIBOOK_URL",
+                    ),
+                )
+            )
         composition = compose_business_demo_factory_operator(
             settings,
             environment=environment,
             n8n_client=n8n_client,
+            minibook_client=minibook_client,
         )
         results = tuple(
             [

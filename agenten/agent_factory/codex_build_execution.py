@@ -10,18 +10,23 @@ import re
 import shutil
 import stat
 import subprocess
+import math
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Literal, Protocol
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
+    CodexBuildArtifactCas,
 )
-from agenten.agent_factory.hermes_factory_worker import HermesFactoryCodexBuild
+from agenten.agent_factory.hermes_factory_worker import (
+    HermesFactoryCodexBuild,
+    HermesFactoryWorkerCheckpoint,
+)
 from agenten.agent_factory.codex_build_recovery import (
     FactoryCodexBuildCheckpointV1,
     FactoryCodexBuildPhase,
@@ -38,17 +43,21 @@ from agenten.agent_factory.codex_build_recovery import (
     MAX_FACTORY_CODEX_OUTPUT_BYTES,
     canonical_factory_codex_model,
 )
-from agenten.agent_factory.contracts import AgentFactoryJobV3
+from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryLease, FactoryRole
 from agenten.agent_factory.forge_contracts import (
     ArtifactRef as ForgeArtifactRef,
     CodexBuildReceiptV1,
+    DocumentationQuery,
+    FactoryBuildAssignmentV1,
     FactoryBuildAssignmentV2,
+    ReleasedSkillRefV1,
 )
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_sequence import (
     FactoryRuntimeRetryAuthorizationV1,
     validate_factory_runtime_retry_authorization,
 )
+from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import (
     CodexBuildBriefV1,
     CodexBuildEvidenceV1,
@@ -56,6 +65,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillStep,
     factory_runtime_retry_evidence_binding,
 )
+from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.execution.codex_policy import AuthorizedCodexRun
 from agenten.execution.codex_supervisor import (
@@ -341,6 +351,14 @@ class CodexCliFactoryBuildSettings:
     )
     maximum_json_artifact_bytes: int = MAX_FACTORY_CODEX_JSON_ARTIFACT_BYTES
     maximum_output_bytes: int = MAX_FACTORY_CODEX_OUTPUT_BYTES
+    maximum_files: int = 4_096
+    maximum_provider_cost_usd: float = 100.0
+    supported_output_roots: tuple[str, ...] = ("output",)
+    supported_commands: tuple[tuple[str, ...], ...] = (
+        ("python", "-m", "pytest"),
+        ("pytest",),
+    )
+    deadline_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.maximum_runtime_seconds < 1 or self.maximum_runtime_seconds > 900:
@@ -357,6 +375,21 @@ class CodexCliFactoryBuildSettings:
             <= MAX_FACTORY_CODEX_OUTPUT_BYTES
         ):
             raise ValueError("Factory Codex output size bound is invalid")
+        if self.maximum_files < 1:
+            raise ValueError("Factory Codex file-count bound is invalid")
+        if (
+            not math.isfinite(self.maximum_provider_cost_usd)
+            or self.maximum_provider_cost_usd <= 0
+        ):
+            raise ValueError("Factory Codex provider-cost bound is invalid")
+        if not self.supported_output_roots or not self.supported_commands:
+            raise ValueError("Factory Codex path and command confinement is empty")
+        if self.deadline_at is not None and (
+            self.deadline_at.tzinfo is None
+            or self.deadline_at.utcoffset()
+            != timezone.utc.utcoffset(self.deadline_at)
+        ):
+            raise ValueError("Factory Codex execution deadline must be UTC")
 
     def narrowed_for_assignment(
         self,
@@ -366,6 +399,12 @@ class CodexCliFactoryBuildSettings:
 
         if not isinstance(assignment, FactoryBuildAssignmentV2):
             raise TypeError("Factory Codex execution requires a V2 assignment")
+        if not set(assignment.allowed_output_roots).issubset(
+            self.supported_output_roots
+        ):
+            raise ValueError("Factory Codex assignment output roots broaden authority")
+        if not set(assignment.allowed_commands).issubset(self.supported_commands):
+            raise ValueError("Factory Codex assignment commands broaden authority")
         return CodexCliFactoryBuildSettings(
             state_root=self.state_root,
             maximum_runtime_seconds=min(
@@ -375,6 +414,18 @@ class CodexCliFactoryBuildSettings:
             maximum_candidate_archive_bytes=self.maximum_candidate_archive_bytes,
             maximum_json_artifact_bytes=self.maximum_json_artifact_bytes,
             maximum_output_bytes=self.maximum_output_bytes,
+            maximum_files=min(self.maximum_files, assignment.limits.max_files),
+            maximum_provider_cost_usd=min(
+                self.maximum_provider_cost_usd,
+                assignment.limits.max_provider_cost_usd,
+            ),
+            supported_output_roots=assignment.allowed_output_roots,
+            supported_commands=assignment.allowed_commands,
+            deadline_at=(
+                assignment.deadline_at
+                if self.deadline_at is None
+                else min(self.deadline_at, assignment.deadline_at)
+            ),
         )
 
 
@@ -776,17 +827,279 @@ class HermesFactoryCodexAssignmentMapperPort(Protocol):
     ) -> MappedHermesFactoryCodexAssignment: ...
 
 
+class CaptainV3CodexPromptStorePort(Protocol):
+    def persist(self, job_id: UUID, content: bytes) -> ArtifactRef: ...
+
+
+class CaptainV3CodexRequestMapper:
+    """Map one V2 assignment into the existing typed Captain Codex path."""
+
+    def __init__(
+        self,
+        *,
+        job_for: Callable[[UUID], AgentFactoryJobV3],
+        lease_for: Callable[[AgentFactoryJobV3, int, datetime], FactoryLease],
+        released_skill_for: Callable[
+            [AgentFactoryJobV3, FactorySkillStep], ReleasedHermesSkill
+        ],
+        prompt_store: CaptainV3CodexPromptStorePort,
+        artifact_cas: CodexBuildArtifactCas,
+        worker_id: str,
+        runtime_skill_sha256: str,
+        clock: Callable[[], datetime] | None = None,
+        runtime_retry_for: Callable[
+            [AgentFactoryJobV3, FactoryAction, datetime],
+            FactoryRuntimeRetryAuthorizationV1 | None,
+        ]
+        | None = None,
+    ) -> None:
+        self._job_for = job_for
+        self._lease_for = lease_for
+        self._released_skill_for = released_skill_for
+        self._prompt_store = prompt_store
+        self._artifact_cas = artifact_cas
+        self._worker_id = worker_id
+        self._runtime_skill_sha256 = runtime_skill_sha256
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._runtime_retry_for = runtime_retry_for
+
+    def map_assignment(
+        self,
+        assignment: FactoryBuildAssignmentV2,
+        *,
+        settings: CodexCliFactoryBuildSettings,
+    ) -> MappedHermesFactoryCodexAssignment:
+        narrowed = settings.narrowed_for_assignment(assignment)
+        now = self._clock()
+        job = self._job_for(assignment.factory_job_id)
+        if not isinstance(job, AgentFactoryJobV3):
+            raise FactoryDispatchError("V3 assignment requires a V3 Captain job")
+        lease = self._lease_for(job, assignment.attempt, now)
+        lease_digest = hashlib.sha256(
+            canonical_factory_codex_model(lease)
+        ).hexdigest()
+        if (
+            assignment.factory_job_id != job.job_id
+            or assignment.correlation_id != job.correlation_id
+            or assignment.subject_version != job.subject_version
+            or assignment.workspace_ref != lease.workspace_ref
+            or lease.job_id != job.job_id
+            or lease.correlation_id != job.correlation_id
+            or lease.subject_version != job.subject_version
+            or lease.attempt != assignment.attempt
+            or lease.role is not FactoryRole.TOOL_INTEGRATOR
+            or assignment.lease_ref.sha256 != lease_digest
+            or now < lease.issued_at
+            or now >= min(
+                lease.expires_at,
+                assignment.deadline_at,
+                job.deadline_at,
+                narrowed.deadline_at or assignment.deadline_at,
+            )
+        ):
+            raise FactoryDispatchError("V3 assignment lease or deadline is invalid")
+        brief_release = self._released_skill_for(job, FactorySkillStep.BRIEF_CODEX)
+        seal_release = self._released_skill_for(job, FactorySkillStep.SEAL_CODEX_BUILD)
+        brief_invocation = self._invocation(
+            assignment=assignment,
+            job=job,
+            lease=lease,
+            released=brief_release,
+            step=FactorySkillStep.BRIEF_CODEX,
+            input_ref=job.input_ref,
+        )
+        legacy_assignment = FactoryBuildAssignmentV1(
+            assignment_id=assignment.assignment_id,
+            creation_job_id=assignment.creation_job_id,
+            correlation_id=assignment.correlation_id,
+            subject_version=assignment.subject_version,
+            attempt=assignment.attempt,
+            idempotency_key=assignment.effect_key,
+            released_skill=self._forge_release(brief_release),
+            compiled_spec_ref=ForgeArtifactRef.model_validate(
+                job.compiled_spec_ref.model_dump(mode="json")
+            ),
+            dependency_graph_ref=ForgeArtifactRef.model_validate(
+                job.dependency_graph_ref.model_dump(mode="json")
+            ),
+            workspace_ref=assignment.workspace_ref,
+            documentation_queries=(
+                DocumentationQuery(
+                    ecosystem="autogen",
+                    package_id="autogen-agentchat",
+                    installed_version="0.7.5",
+                    query="Implement the exact compiled Factory assignment",
+                    required=True,
+                ),
+            ),
+            public_assertion_ids=job.acceptance_assertion_ids,
+            deadline_at=min(assignment.deadline_at, lease.expires_at, job.deadline_at),
+        )
+        prompt_content = json.dumps(
+            {
+                "schema": "captain.factory-v3-codex-policy.v1",
+                "assignment_id": str(assignment.assignment_id),
+                "effect_key": assignment.effect_key,
+                "allowed_output_roots": list(narrowed.supported_output_roots),
+                "allowed_commands": [list(item) for item in narrowed.supported_commands],
+                "limits": {
+                    "max_files": narrowed.maximum_files,
+                    "max_provider_cost_usd": narrowed.maximum_provider_cost_usd,
+                    "max_wall_clock_seconds": narrowed.maximum_runtime_seconds,
+                },
+                "deadline_at": (narrowed.deadline_at or assignment.deadline_at).isoformat(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        prompt_ref = self._prompt_store.persist(job.job_id, prompt_content)
+        compiled_ref = ArtifactRef.model_validate(
+            job.compiled_spec_ref.model_dump(mode="json")
+        )
+        dependency_ref = ArtifactRef.model_validate(
+            job.dependency_graph_ref.model_dump(mode="json")
+        )
+        command_ids = tuple(
+            f"argv.{hashlib.sha256(chr(0).join(command).encode()).hexdigest()[:24]}"
+            for command in narrowed.supported_commands
+        )
+        brief = CodexBuildBriefV1(
+            schema="hermes.factory-codex-build-assignment.v1",
+            invocation=brief_invocation,
+            invocation_id=brief_invocation.invocation_id,
+            job_id=job.job_id,
+            correlation_id=job.correlation_id,
+            subject_version=job.subject_version,
+            attempt=assignment.attempt,
+            occurred_at=now,
+            producer="hermes",
+            artifact_ref=prompt_ref,
+            evidence_refs=(compiled_ref, dependency_ref),
+            acceptance_assertion_ids=job.acceptance_assertion_ids,
+            build_assignment=legacy_assignment,
+            prompt_ref=prompt_ref,
+            context_refs=(compiled_ref, dependency_ref),
+            authorized_path_roots=tuple(
+                f"{assignment.workspace_ref.rstrip('/')}/{root}"
+                for root in narrowed.supported_output_roots
+            ),
+            required_test_command_ids=command_ids,
+            forbidden_effect_ids=(
+                "captain.ledger.write",
+                "git.push",
+                "holdout.read",
+                "secret.read",
+            ),
+        )
+        seal_invocation = self._invocation(
+            assignment=assignment,
+            job=job,
+            lease=lease,
+            released=seal_release,
+            step=FactorySkillStep.SEAL_CODEX_BUILD,
+            input_ref=brief.artifact_ref,
+        )
+        action = FactoryAction(
+            kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+            attempt=assignment.attempt,
+        )
+        runtime_retry = (
+            self._runtime_retry_for(job, action, now)
+            if self._runtime_retry_for is not None
+            else None
+        )
+        usage_content = json.dumps(
+            {
+                "schema": "hermes.factory-worker-usage.v1",
+                "assignment_id": str(assignment.assignment_id),
+                "effect_key": assignment.effect_key,
+                "attempt": assignment.attempt,
+                "worker_id": self._worker_id,
+                "released_skill_sha256": self._runtime_skill_sha256,
+                "status": "validated",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        usage_ref = self._artifact_cas.put_bytes(
+            usage_content,
+            media_type="application/json",
+            namespace="hermes-usage",
+        )
+        return MappedHermesFactoryCodexAssignment(
+            request=FactoryDispatch(
+                job=job,
+                action=action,
+                role=FactoryRole.TOOL_INTEGRATOR,
+                lease=lease,
+                runtime_retry_authorization=runtime_retry,
+            ),
+            invocation=seal_invocation,
+            brief=brief,
+            hermes_usage_receipt_ref=ArtifactRef.model_validate(
+                usage_ref.model_dump(mode="json")
+            ),
+        )
+
+    @staticmethod
+    def _forge_release(released: ReleasedHermesSkill) -> ReleasedSkillRefV1:
+        return ReleasedSkillRefV1(
+            skill_id=released.skill_id,
+            version=released.version,
+            content_ref=ForgeArtifactRef.model_validate(
+                released.content_ref.model_dump(mode="json")
+            ),
+            content_sha256=released.content_sha256,
+        )
+
+    @staticmethod
+    def _invocation(
+        *,
+        assignment: FactoryBuildAssignmentV2,
+        job: AgentFactoryJobV3,
+        lease: FactoryLease,
+        released: ReleasedHermesSkill,
+        step: FactorySkillStep,
+        input_ref: ArtifactRef,
+    ) -> FactorySkillInvocationV1:
+        return FactorySkillInvocationV1(
+            schema="captain.factory-skill-invocation.v1",
+            invocation_id=uuid5(
+                NAMESPACE_URL,
+                f"captain.factory-v3:{assignment.effect_key}:{step.value}",
+            ),
+            job_id=job.job_id,
+            correlation_id=job.correlation_id,
+            subject_version=job.subject_version,
+            attempt=assignment.attempt,
+            step=step,
+            released_skill=released,
+            input_ref=input_ref,
+            input_sha256=input_ref.sha256,
+            lease=lease,
+            idempotency_key=assignment.effect_key,
+            acceptance_assertion_ids=job.acceptance_assertion_ids,
+        )
+
+
 class CaptainCodexAssignmentBuilder:
     """Adapt V2 assignments to the existing detached-workspace Captain sealer."""
 
     def __init__(
         self,
         *,
-        sealer: CaptainCodexBuildSealer,
+        sealer: CaptainCodexBuildSealer | None = None,
+        sealer_for: Callable[
+            [CodexCliFactoryBuildSettings], CaptainCodexBuildSealer
+        ]
+        | None = None,
         mapper: HermesFactoryCodexAssignmentMapperPort,
         settings: CodexCliFactoryBuildSettings,
     ) -> None:
+        if (sealer is None) == (sealer_for is None):
+            raise ValueError("exactly one Captain Codex sealer source is required")
         self._sealer = sealer
+        self._sealer_for = sealer_for
         self._mapper = mapper
         self._settings = settings
 
@@ -816,7 +1129,13 @@ class CaptainCodexAssignmentBuilder:
             raise FactoryDispatchError(
                 "V2 assignment does not match the mapped Captain Codex authority"
             )
-        evidence = await self._sealer.seal(request, invocation, brief)
+        sealer = (
+            self._sealer_for(narrowed)
+            if self._sealer_for is not None
+            else self._sealer
+        )
+        assert sealer is not None
+        evidence = await sealer.seal(request, invocation, brief)
         receipt = evidence.build_receipt
         receipt_ref = evidence.build_receipt_ref
         if not isinstance(receipt, CodexBuildReceiptV1):
@@ -837,6 +1156,24 @@ class CaptainCodexAssignmentBuilder:
             codex_build_receipt=receipt,
             build_evidence_refs=evidence_refs or (typed_receipt_ref,),
         )
+
+    def allows_retry(
+        self,
+        assignment: FactoryBuildAssignmentV2,
+        checkpoint: HermesFactoryWorkerCheckpoint,
+    ) -> bool:
+        if (
+            checkpoint.assignment_id != assignment.assignment_id
+            or checkpoint.effect_key != assignment.effect_key
+            or checkpoint.attempt != assignment.attempt
+            or checkpoint.codex_attempts > assignment.limits.max_retries
+        ):
+            return False
+        mapped = self._mapper.map_assignment(
+            assignment,
+            settings=self._settings.narrowed_for_assignment(assignment),
+        )
+        return mapped.request.runtime_retry_authorization is not None
 
 
 class GitDetachedFactoryWorkspacePreparer:
@@ -1457,6 +1794,7 @@ class CodexCliFactoryBuildExecutor:
         authority_deadline = self._authority_deadline(
             request,
             invocation,
+            brief,
             authorized_resume=authorized_resume_ordinal is not None,
         )
         remaining_seconds = (authority_deadline - started_at).total_seconds()
@@ -1617,10 +1955,11 @@ class CodexCliFactoryBuildExecutor:
         self,
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
         *,
         authorized_resume: bool,
     ) -> datetime:
-        deadlines = [request.job.deadline_at]
+        deadlines = [request.job.deadline_at, brief.build_assignment.deadline_at]
         if authorized_resume:
             authorization = request.runtime_retry_authorization
             if authorization is None:
@@ -1774,6 +2113,7 @@ class CodexCliFactoryBuildExecutor:
         authority_deadline = self._authority_deadline(
             request,
             invocation,
+            brief,
             authorized_resume=authorized_resume_ordinal is not None,
         )
         before_run = self._clock()
@@ -1821,6 +2161,7 @@ class CodexCliFactoryBuildExecutor:
         authority_deadline = self._authority_deadline(
             request,
             invocation,
+            brief,
             authorized_resume=authorized_resume_ordinal is not None,
         )
         before_runner_run = self._clock()
@@ -2391,6 +2732,7 @@ class CodexCliFactoryBuildExecutor:
         authority_deadline = self._authority_deadline(
             request,
             invocation,
+            brief,
             authorized_resume=authorized_resume,
         )
         authority_start = invocation.lease.issued_at
@@ -3070,6 +3412,34 @@ class CodexCliFactoryBuildExecutor:
                 "Codex output workspace is unavailable",
                 reason="required_output_invalid",
             ) from None
+        confined_files = 0
+        for allowed_root in self._settings.supported_output_roots:
+            candidate = (root / allowed_root).resolve()
+            if not _is_relative_to(candidate, root):
+                raise FactoryCodexOutputCaptureError(
+                    "Codex output root escaped assignment confinement",
+                    reason="required_output_invalid",
+                )
+            if not candidate.exists():
+                continue
+            if candidate.is_symlink() or not candidate.is_dir():
+                raise FactoryCodexOutputCaptureError(
+                    "Codex output root is invalid",
+                    reason="required_output_invalid",
+                )
+            for path in candidate.rglob("*"):
+                if path.is_symlink():
+                    raise FactoryCodexOutputCaptureError(
+                        "Codex output root contains a symlink",
+                        reason="required_output_invalid",
+                    )
+                if path.is_file():
+                    confined_files += 1
+                    if confined_files > self._settings.maximum_files:
+                        raise FactoryCodexOutputCaptureError(
+                            "Codex output file-count limit exceeded",
+                            reason="output_size_limit_exceeded",
+                        )
         artifacts: list[FactoryCodexOutputArtifactV1] = []
         aggregate_size = 0
         for relative in sorted(_OUTPUT_PATHS):

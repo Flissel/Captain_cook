@@ -59,6 +59,13 @@ from agenten.agent_factory.hermes_cli import (
     ReleasedFactorySkillCatalog,
 )
 from agenten.agent_factory.hermes_factory_worker import HermesFactoryWorker
+from agenten.agent_factory.hermes_factory_worker import (
+    FilesystemHermesFactoryWorkerCheckpointStore,
+    HermesFactoryCodexPort,
+    HermesFactoryCodexReceiptReaderPort,
+    HermesFactoryMinibookPort,
+    HermesFactoryRetryAuthorityPort,
+)
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.orchestration import (
     FactoryClock,
@@ -457,6 +464,18 @@ class ProductionFactoryTeamExecutionPort(FactoryTeamExecutionPort):
 
 
 @dataclass(frozen=True)
+class HermesFactoryWorkerRuntime:
+    minibook: HermesFactoryMinibookPort
+    codex: HermesFactoryCodexPort
+    checkpoint_store: FilesystemHermesFactoryWorkerCheckpointStore
+    codex_receipts: HermesFactoryCodexReceiptReaderPort
+    worker_id: str
+    released_skill_name: str
+    released_skill_sha256: str
+    retry_authority: HermesFactoryRetryAuthorityPort | None = None
+
+
+@dataclass(frozen=True)
 class AgentFactoryLiveComposition:
     """Inspectable graph; Captain-only transitions remain outside ``run``."""
 
@@ -479,6 +498,8 @@ class AgentFactoryLiveComposition:
         maximum_dispatches: int = 12,
         stop_before_action: FactoryActionKind | None = None,
     ) -> ProductionFactoryDispatchResult:
+        if self.hermes_factory_worker is not None:
+            await self.hermes_factory_worker.run_once()
         return await self.runner.run(
             job_id,
             maximum_dispatches=maximum_dispatches,
@@ -508,6 +529,7 @@ def compose_agent_factory_live(
     technical_revalidation_validator: Callable[[FactoryDispatch], None] | None = None,
     factory_v3_enabled: bool = False,
     hermes_factory_worker: HermesFactoryWorker | None = None,
+    hermes_factory_worker_runtime: HermesFactoryWorkerRuntime | None = None,
 ) -> AgentFactoryLiveComposition:
     """Wire production ports without executing Hermes, providers, n8n, or Forge."""
 
@@ -521,7 +543,11 @@ def compose_agent_factory_live(
         raise ValueError("business benchmark production inputs are required")
     if not callable(clock):
         raise ValueError("Factory live clock is required")
-    if factory_v3_enabled != (hermes_factory_worker is not None):
+    configured_v3_workers = sum(
+        item is not None
+        for item in (hermes_factory_worker, hermes_factory_worker_runtime)
+    )
+    if factory_v3_enabled != (configured_v3_workers == 1):
         raise ValueError("Factory V3 worker configuration is incomplete")
 
     repository = GatewayFactoryRepository(
@@ -545,6 +571,18 @@ def compose_agent_factory_live(
         workflow_artifacts=repository,
         clock=clock,
     )
+    if hermes_factory_worker_runtime is not None:
+        runtime = hermes_factory_worker_runtime
+        hermes_factory_worker = hermes.factory_worker(
+            minibook=runtime.minibook,
+            codex=runtime.codex,
+            worker_id=runtime.worker_id,
+            released_skill_name=runtime.released_skill_name,
+            released_skill_sha256=runtime.released_skill_sha256,
+            checkpoint_store=runtime.checkpoint_store,
+            codex_receipts=runtime.codex_receipts,
+            retry_authority=runtime.retry_authority,
+        )
     team_execution = ProductionFactoryTeamExecutionPort(
         evidence_store=evidence_store,
         ports_for=team_execution_ports_for,
@@ -639,6 +677,7 @@ __all__ = [
     "FactoryLiveTeamExecutionPortsProvider",
     "ForgeCandidateBindingPort",
     "GatewayTechnicalTeamExecutionPortsProvider",
+    "HermesFactoryWorkerRuntime",
     "GatewayBoundBusinessBenchmarkInputPort",
     "ProductionFactoryTeamExecutionPort",
     "compose_agent_factory_live",

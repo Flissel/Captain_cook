@@ -14,6 +14,7 @@ import pytest
 from agenten.agent_factory import codex_build_execution
 from agenten.agent_factory.codex_build_execution import (
     CaptainCodexBuildSealer,
+    CaptainV3CodexRequestMapper,
     CaptainFactoryCodexResumeAuthorizer,
     CodexCliFactoryBuildExecutor,
     CodexCliFactoryBuildSettings,
@@ -48,6 +49,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
     CodexBuildBriefV1,
     CodexBuildEvidenceV1,
     FactorySkillInvocationV1,
+    FactorySkillStep,
     factory_runtime_retry_evidence_binding,
     factory_runtime_retry_evidence_binding_sha256,
 )
@@ -80,6 +82,10 @@ def test_codex_settings_are_only_narrowed_by_v3_assignment() -> None:
     defaults = CodexCliFactoryBuildSettings(
         state_root=Path("state"),
         maximum_runtime_seconds=900,
+        maximum_files=25,
+        maximum_provider_cost_usd=5.0,
+        supported_output_roots=("output",),
+        supported_commands=(("python", "-m", "pytest"),),
     )
 
     narrowed = defaults.narrowed_for_assignment(assignment)
@@ -91,6 +97,29 @@ def test_codex_settings_are_only_narrowed_by_v3_assignment() -> None:
     assert narrowed.maximum_candidate_archive_bytes == defaults.maximum_candidate_archive_bytes
     assert narrowed.maximum_json_artifact_bytes == defaults.maximum_json_artifact_bytes
     assert narrowed.maximum_output_bytes == defaults.maximum_output_bytes
+    assert narrowed.maximum_files == 25
+    assert narrowed.maximum_provider_cost_usd == 5.0
+    assert narrowed.supported_output_roots == assignment.allowed_output_roots
+    assert narrowed.supported_commands == assignment.allowed_commands
+
+
+def test_codex_settings_reject_assignment_outside_existing_confinement() -> None:
+    assignment = FactoryBuildAssignmentV2.model_validate_json(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "contracts"
+            / "hermes_factory_assignment.v2.json"
+        ).read_text()
+    )
+    defaults = CodexCliFactoryBuildSettings(
+        state_root=Path("state"),
+        supported_output_roots=("different-root",),
+        supported_commands=(("python", "-m", "compileall", "different-root"),),
+    )
+
+    with pytest.raises(ValueError, match="output roots|commands"):
+        defaults.narrowed_for_assignment(assignment)
 
 
 class FakeBuildExecutor:
@@ -299,6 +328,95 @@ def _dispatch(job, invocation: FactorySkillInvocationV1) -> FactoryDispatch:
         ),
         role=invocation.lease.role,
         lease=invocation.lease,
+    )
+
+
+def test_concrete_v3_mapper_binds_lease_and_propagates_confinement(
+    tmp_path: Path,
+) -> None:
+    job, existing_brief = _bound_job_and_brief()
+    seal_invocation = _seal_invocation(job, existing_brief)
+    lease = seal_invocation.lease
+    lease_sha256 = hashlib.sha256(
+        canonical_factory_codex_model(lease)
+    ).hexdigest()
+    assignment = FactoryBuildAssignmentV2.model_validate_json(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "contracts"
+            / "hermes_factory_assignment.v2.json"
+        ).read_text()
+    ).model_copy(
+        update={
+            "assignment_id": existing_brief.build_assignment.assignment_id,
+            "creation_job_id": existing_brief.build_assignment.creation_job_id,
+            "factory_job_id": job.job_id,
+            "correlation_id": job.correlation_id,
+            "subject_version": job.subject_version,
+            "attempt": existing_brief.attempt,
+            "effect_key": existing_brief.build_assignment.idempotency_key,
+            "workspace_ref": lease.workspace_ref,
+            "lease_ref": ForgeArtifactRef(
+                uri=f"artifact://captain/lease/{lease_sha256}",
+                sha256=lease_sha256,
+                media_type="application/json",
+            ),
+            "deadline_at": lease.expires_at,
+        }
+    )
+
+    class PromptStore:
+        def __init__(self) -> None:
+            self.content = b""
+
+        def persist(self, _job_id, content: bytes) -> ArtifactRef:
+            self.content = content
+            digest = hashlib.sha256(content).hexdigest()
+            return ArtifactRef(
+                uri=f"artifact://factory/prompt/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
+
+    prompt_store = PromptStore()
+    mapper = CaptainV3CodexRequestMapper(
+        job_for=lambda _job_id: job,
+        lease_for=lambda _job, _attempt, _now: lease,
+        released_skill_for=lambda _job, step: (
+            existing_brief.invocation.released_skill
+            if step is FactorySkillStep.BRIEF_CODEX
+            else seal_invocation.released_skill
+        ),
+        prompt_store=prompt_store,
+        artifact_cas=CodexBuildArtifactCas(tmp_path / "cas"),
+        worker_id="hermes-factory-v3",
+        runtime_skill_sha256="a" * 64,
+        clock=lambda: NOW,
+    )
+    settings = CodexCliFactoryBuildSettings(
+        state_root=tmp_path / "state",
+        maximum_runtime_seconds=900,
+        maximum_files=25,
+        maximum_provider_cost_usd=5.0,
+        supported_output_roots=("output",),
+        supported_commands=(("python", "-m", "pytest"),),
+    )
+
+    mapped = mapper.map_assignment(assignment, settings=settings)
+
+    policy = json.loads(prompt_store.content)
+    assert policy["allowed_output_roots"] == ["output"]
+    assert policy["allowed_commands"] == [["python", "-m", "pytest"]]
+    assert policy["limits"] == {
+        "max_files": 25,
+        "max_provider_cost_usd": 5.0,
+        "max_wall_clock_seconds": 600,
+    }
+    assert mapped.request.lease == lease
+    assert mapped.invocation.lease == lease
+    assert mapped.brief.authorized_path_roots == (
+        f"{assignment.workspace_ref}/output",
     )
 
 

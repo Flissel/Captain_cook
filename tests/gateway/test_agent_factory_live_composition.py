@@ -26,6 +26,7 @@ from agenten.agent_factory.production_dispatch_runner import (
 )
 from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
 from gateway.agent_factory_live_composition import (
+    AgentFactoryLiveComposition,
     CaptainImprovementAuthorityRequired,
     GatewayTechnicalTeamExecutionPortsProvider,
     GatewayBoundBusinessBenchmarkInputPort,
@@ -152,6 +153,37 @@ def test_v3_worker_requires_explicit_complete_enablement(tmp_path: Path) -> None
         hermes_factory_worker=worker,
     )
     assert enabled.hermes_factory_worker is worker
+
+
+def test_normal_composition_run_executes_enabled_v3_worker_once() -> None:
+    calls = {"worker": 0, "runner": 0}
+
+    class Worker:
+        async def run_once(self):
+            calls["worker"] += 1
+
+    class Runner:
+        async def run(self, job_id, **_kwargs):
+            calls["runner"] += 1
+            return job_id
+
+    composition = AgentFactoryLiveComposition(
+        repository=object(),
+        lease_issuer=object(),
+        hermes=object(),
+        team_execution=object(),
+        candidate_validator=object(),
+        business_benchmark=object(),
+        dispatcher=object(),
+        runner=Runner(),
+        improvement_authority=object(),
+        runtime_retry_authority=None,
+        hermes_factory_worker=Worker(),
+    )
+    job_id = __import__("uuid").uuid4()
+
+    assert asyncio.run(composition.run(job_id)) == job_id
+    assert calls == {"worker": 1, "runner": 1}
 
 
 def test_gateway_technical_ports_bind_candidate_private_holdout_and_no_tools(
