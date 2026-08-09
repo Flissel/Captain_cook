@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -144,6 +145,17 @@ class FakeBackend:
             self.listeners = {port: owner for port, owner in self.listeners.items() if owner != pid}
         return True
 
+    def kill(self, pid: int, start_identity: str) -> bool:
+        self.events.append(f"kill:{pid}:{start_identity}")
+        if self.processes.get(pid) != start_identity:
+            return False
+        if not self.leave_process_alive:
+            del self.processes[pid]
+            self.listeners = {
+                port: owner for port, owner in self.listeners.items() if owner != pid
+            }
+        return True
+
     def wait_until_gone(
         self, pid: int, start_identity: str, timeout_seconds: float
     ) -> bool:
@@ -284,6 +296,23 @@ def test_stop_uses_persisted_identity_even_when_d11_bundle_is_unavailable(tmp_pa
     assert not backend.processes
 
 
+def test_stop_fails_when_exact_managed_process_remains_alive(tmp_path: Path) -> None:
+    configuration = _configuration(tmp_path)
+    backend = FakeBackend()
+    ManagedProcessSupervisor(
+        configuration, plan=_plan(configuration), backend=backend
+    ).start_all(timeout_seconds=1)
+    backend.leave_process_alive = True
+
+    with pytest.raises(
+        DemoProcessError,
+        match="managed process termination could not be verified",
+    ):
+        stop_managed_processes(configuration.repository_root, backend=backend)
+
+    assert backend.processes
+
+
 def test_missing_service_executable_fails_before_compose_or_process_mutation(
     tmp_path: Path,
 ) -> None:
@@ -390,3 +419,70 @@ def test_windows_listener_probe_rejects_multiple_owning_processes(
 
     with pytest.raises(DemoProcessError, match="multiple listeners"):
         WindowsProcessBackend().listener_pid(19000)
+
+
+def test_status_health_timeout_remains_terminal_124(tmp_path: Path) -> None:
+    configuration = _configuration(tmp_path)
+    backend = FakeBackend()
+    supervisor = ManagedProcessSupervisor(
+        configuration, plan=_plan(configuration), backend=backend
+    )
+    supervisor.start_all(timeout_seconds=1)
+    backend.health_result = False
+
+    with pytest.raises(DemoProcessTimeout, match="authenticated health timed out"):
+        supervisor.status(timeout_seconds=1)
+
+
+def test_windows_spawn_reaps_popen_handle_when_identity_capture_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+
+    class FakePopen:
+        pid = 812
+        returncode: int | None = None
+
+        def terminate(self) -> None:
+            events.append("handle:terminate")
+
+        def wait(self, timeout: float) -> int:
+            events.append(f"handle:wait:{timeout}")
+            if events.count(f"handle:wait:{timeout}") == 1:
+                raise subprocess.TimeoutExpired("fake", timeout)
+            self.returncode = -9
+            return self.returncode
+
+        def kill(self) -> None:
+            events.append("handle:kill")
+
+        def poll(self) -> int | None:
+            events.append("handle:poll")
+            return self.returncode
+
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: FakePopen())
+    monkeypatch.setattr(
+        WindowsProcessBackend,
+        "_start_identity",
+        staticmethod(lambda _: None),
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    with pytest.raises(DemoProcessError, match="started process identity is unavailable"):
+        WindowsProcessBackend().spawn(
+            (sys.executable, "-c", "pass"),
+            tmp_path,
+            {},
+            tmp_path / "spawn.log",
+        )
+
+    assert events == [
+        "handle:terminate",
+        "handle:wait:2.0",
+        "handle:kill",
+        "handle:wait:2.0",
+        "handle:poll",
+    ]

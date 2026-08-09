@@ -88,6 +88,8 @@ class ProcessBackend(Protocol):
 
     def terminate(self, pid: int, start_identity: str) -> bool: ...
 
+    def kill(self, pid: int, start_identity: str) -> bool: ...
+
     def wait_until_gone(
         self, pid: int, start_identity: str, timeout_seconds: float
     ) -> bool: ...
@@ -282,16 +284,19 @@ class ManagedProcessSupervisor:
             if service is None or expected.get(record.service) != record:
                 continue
             environment = self._service_authority(service)
-            if (
-                self._backend.is_alive(record.pid, record.start_identity)
-                and self._backend.listener_pid(record.port) == record.pid
-                and self._backend.wait_authenticated_health(
-                    service.health_url,
-                    environment[service.health_token_env],
-                    timeout_seconds,
-                )
+            if not self._backend.is_alive(record.pid, record.start_identity):
+                continue
+            if self._backend.listener_pid(record.port) != record.pid:
+                continue
+            if not self._backend.wait_authenticated_health(
+                service.health_url,
+                environment[service.health_token_env],
+                timeout_seconds,
             ):
-                healthy.append(record)
+                raise DemoProcessTimeout(
+                    f"authenticated health timed out for {service.name}"
+                )
+            healthy.append(record)
         return tuple(healthy)
 
     def stop(self) -> tuple[ManagedProcessRecord, ...]:
@@ -552,10 +557,46 @@ class WindowsProcessBackend:
                 stderr=subprocess.STDOUT,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        identity = self._start_identity(process.pid)
-        if identity is None:
-            raise DemoProcessError("started process identity is unavailable")
+        try:
+            identity = self._start_identity(process.pid)
+            if identity is None:
+                raise DemoProcessError("started process identity is unavailable")
+        except Exception as original:
+            if not self._reap_unidentified_process(process):
+                raise DemoProcessError(
+                    "unidentified started process could not be reaped"
+                ) from original
+            if isinstance(original, DemoProcessError):
+                raise
+            raise DemoProcessError(
+                "started process identity is unavailable"
+            ) from original
         return SpawnedProcess(pid=process.pid, start_identity=identity)
+
+    @staticmethod
+    def _reap_unidentified_process(process: subprocess.Popen[bytes]) -> bool:
+        try:
+            process.terminate()
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            try:
+                process.kill()
+                process.wait(timeout=2.0)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+        except OSError:
+            try:
+                process.kill()
+                process.wait(timeout=2.0)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+        return process.poll() is not None
 
     def wait_authenticated_health(self, url: str, token: str, timeout_seconds: float) -> bool:
         import time
@@ -586,6 +627,9 @@ class WindowsProcessBackend:
             check=False,
         )
         return result.returncode == 0
+
+    def kill(self, pid: int, start_identity: str) -> bool:
+        return self.terminate(pid, start_identity)
 
     def wait_until_gone(
         self, pid: int, start_identity: str, timeout_seconds: float
@@ -635,13 +679,21 @@ def stop_managed_processes(
     remaining: list[ManagedProcessRecord] = []
     for record in reversed(records):
         selected_backend.terminate(record.pid, record.start_identity)
-        if selected_backend.wait_until_gone(
-            record.pid, record.start_identity, 5.0
-        ):
+        gone = selected_backend.wait_until_gone(
+            record.pid, record.start_identity, 2.5
+        )
+        if not gone:
+            selected_backend.kill(record.pid, record.start_identity)
+            gone = selected_backend.wait_until_gone(
+                record.pid, record.start_identity, 2.5
+            )
+        if gone:
             stopped.append(record)
         else:
             remaining.append(record)
     _write_managed_records(state_path, tuple(reversed(remaining)))
+    if remaining:
+        raise DemoProcessError("managed process termination could not be verified")
     return tuple(stopped)
 
 
