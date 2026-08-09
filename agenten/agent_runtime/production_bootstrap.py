@@ -274,12 +274,14 @@ def _require_committed_repository_bytes(
             "runtime adapter module is not repository-owned"
         ) from None
 
-    def git_output(*arguments: str, input_bytes: bytes | None = None) -> bytes:
+    def git_output(
+        *arguments: str,
+        allowed_returncodes: tuple[int, ...] = (0,),
+    ) -> bytes:
         try:
             result = subprocess.run(
                 ["git", "-C", str(repository_root), *arguments],
                 check=False,
-                input=input_bytes,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
@@ -287,23 +289,90 @@ def _require_committed_repository_bytes(
             raise RuntimeAdapterManifestError(
                 "runtime adapter module committed bytes could not be verified"
             ) from None
-        if result.returncode != 0:
+        if result.returncode not in allowed_returncodes:
             raise RuntimeAdapterManifestError(
                 "runtime adapter module is not committed and repository-owned"
             )
         return result.stdout
 
-    head_identity = git_output("rev-parse", f"HEAD:{relative_path}").strip()
-    index_identity = git_output("rev-parse", f":{relative_path}").strip()
-    opened_identity = git_output(
-        "hash-object",
-        f"--path={relative_path}",
-        "--stdin",
-        input_bytes=content,
-    ).strip()
+    external_attributes = git_output(
+        "config",
+        "--get",
+        "core.attributesfile",
+        allowed_returncodes=(0, 1),
+    )
+    if external_attributes.strip():
+        raise RuntimeAdapterManifestError(
+            "runtime adapter external Git attributes are not allowed"
+        )
+    git_attributes_path = Path(
+        os.fsdecode(git_output("rev-parse", "--git-path", "info/attributes").strip())
+    )
+    if not git_attributes_path.is_absolute():
+        git_attributes_path = repository_root / git_attributes_path
+    try:
+        if git_attributes_path.is_file() and git_attributes_path.read_bytes().strip():
+            raise RuntimeAdapterManifestError(
+                "runtime adapter external Git attributes are not allowed"
+            )
+    except OSError:
+        raise RuntimeAdapterManifestError(
+            "runtime adapter Git attributes could not be verified"
+        ) from None
+
+    attribute_output = git_output(
+        "check-attr",
+        "-z",
+        "filter",
+        "working-tree-encoding",
+        "ident",
+        "--",
+        relative_path,
+    )
+    attribute_parts = attribute_output.split(b"\0")
+    if attribute_parts and attribute_parts[-1] == b"":
+        attribute_parts.pop()
+    if len(attribute_parts) % 3 != 0:
+        raise RuntimeAdapterManifestError(
+            "runtime adapter Git attributes could not be verified"
+        )
+    for index in range(0, len(attribute_parts), 3):
+        attribute_name = attribute_parts[index + 1]
+        attribute_value = attribute_parts[index + 2]
+        if attribute_value not in {b"unspecified", b"unset"}:
+            raise RuntimeAdapterManifestError(
+                "runtime adapter Git attribute "
+                f"{os.fsdecode(attribute_name)} is not allowed"
+            )
+
+    dirty_attributes = git_output(
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--",
+        ".gitattributes",
+        ":(glob)**/.gitattributes",
+    )
+    if dirty_attributes.strip():
+        raise RuntimeAdapterManifestError(
+            "runtime adapter Git attributes are dirty"
+        )
+
+    head_content = git_output("show", f"HEAD:{relative_path}")
+    index_content = git_output("show", f":{relative_path}")
+
+    def normalize_eol(value: bytes) -> bytes:
+        normalized = value.replace(b"\r\n", b"\n")
+        if b"\r" in normalized:
+            raise RuntimeAdapterManifestError(
+                "runtime adapter module contains unsupported line endings"
+            )
+        return normalized
+
+    normalized_content = normalize_eol(content)
     if not (
-        hmac.compare_digest(opened_identity, head_identity)
-        and hmac.compare_digest(opened_identity, index_identity)
+        hmac.compare_digest(normalized_content, normalize_eol(head_content))
+        and hmac.compare_digest(normalized_content, normalize_eol(index_content))
     ):
         raise RuntimeAdapterManifestError(
             "runtime adapter module is dirty or differs from committed bytes"

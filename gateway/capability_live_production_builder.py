@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -54,7 +54,7 @@ class CapabilityLiveAuthorityAdapterContext:
     """Verified local context supplied to the configured authority factory."""
 
     repository_root: Path
-    settings: "CapabilityLiveProductionSettings"
+    settings: "CapabilityLiveProductionSettings" = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -62,11 +62,11 @@ class CapabilityLiveProductionSettings:
     """Redacted configuration aliases required before provider-bearing ports."""
 
     gateway_url: str
-    gateway_token: str
+    gateway_token: str = field(repr=False)
     benchmark_provider: str
     benchmark_model: str
     minibook_backend_url: str
-    minibook_projection_api_key: str
+    minibook_projection_api_key: str = field(repr=False)
 
     @classmethod
     def from_environment(
@@ -169,10 +169,10 @@ def build_current_authority_capability_live_runner_from_environment(
                 settings=settings,
             )
         )
-    except Exception as exc:
+    except Exception:
         raise CapabilityLiveProductionConfigurationError(
             "current capability live authority adapter could not compose"
-        ) from exc
+        ) from None
     if not isinstance(authorities, CapabilityLiveCurrentAuthorities):
         raise CapabilityLiveProductionConfigurationError(
             "current capability live authority adapter returned invalid authorities"
@@ -233,6 +233,15 @@ def _validate_authority_bindings(
     method_contracts = (
         (authorities.factory, "factory.run", 1, True),
         (authorities.factory, "factory.projection", 1, False),
+        (authorities.factory, "factory.snapshot", 1, False),
+        (authorities.factory, "factory.workflow_artifacts", 1, False),
+        (authorities.factory, "factory.workflow_budget_projection", 1, False),
+        (
+            authorities.factory,
+            "factory.business_benchmark_summary_by_artifact",
+            1,
+            False,
+        ),
         (authorities.provisioning, "provisioning.provision", 1, False),
         (authorities.provisioning, "provisioning.binding_for", 1, False),
         (authorities.minibook_effects, "minibook_effects.project_and_ack", 1, True),

@@ -13,6 +13,9 @@ from uuid import UUID
 from autogen_core.models import ChatCompletionClient
 
 from agenten.agent_factory.business_benchmark import BusinessBenchmarkEvaluator
+from agenten.agent_factory.business_benchmark_contracts import (
+    BusinessBenchmarkSummaryV1,
+)
 from agenten.agent_factory.capability_live_runner import (
     CapabilityLiveReservationAuthority,
     CapabilityLiveRunner,
@@ -52,7 +55,10 @@ from agenten.agent_factory.candidate_evaluation import (
 from agenten.agent_factory.codex_brief import CodexPromptArtifactStore
 from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryJob
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
-from agenten.agent_factory.execution_budget import FactoryBudgetPort
+from agenten.agent_factory.execution_budget import (
+    FactoryBudgetPort,
+    FactoryBudgetProjection,
+)
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
 from agenten.agent_factory.hermes_cli import (
     CaptainCodexBuildSealerPort,
@@ -105,6 +111,7 @@ from gateway.capability_live_pipeline import (
     GatewayCapabilityLivePipeline,
     PromotedCapabilityExecutionPort,
 )
+from gateway.contracts import FactoryJobProjection, FactoryWorkflowArtifact
 from gateway.factory_repository import GatewayFactoryBudgetLedger, GatewayFactoryRepository
 from gateway.store import GatewayStore
 
@@ -491,6 +498,26 @@ class AgentFactoryLiveComposition:
         """Expose Captain's derived state without recreating lifecycle decisions."""
 
         return self.coordinator.projection(job_id)
+
+    def snapshot(self, job_id: UUID) -> FactoryJobProjection:
+        """Expose the authoritative Gateway job snapshot without mutation."""
+
+        return self.repository.snapshot(job_id)
+
+    def workflow_artifacts(
+        self,
+        job_id: UUID,
+    ) -> tuple[FactoryWorkflowArtifact, ...]:
+        return self.repository.workflow_artifacts(job_id)
+
+    def workflow_budget_projection(self, job_id: UUID) -> FactoryBudgetProjection:
+        return self.repository.workflow_budget_projection(job_id)
+
+    def business_benchmark_summary_by_artifact(
+        self,
+        reference: ArtifactRef,
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        return self.repository.business_benchmark_summary_by_artifact(reference)
 
     async def run(
         self,

@@ -42,10 +42,11 @@ from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from gateway.store import GatewayStore
 from gateway.contracts import (
     FactoryBudgetReleaseRequest,
+    FactoryJobProjection,
     FactorySkillAssignmentV1,
     FactoryUsageSubmissionV2,
+    FactoryWorkflowArtifact,
 )
-from gateway.contracts import FactoryWorkflowArtifact
 
 
 class FactorySkillAssignmentSource(Protocol):
@@ -83,6 +84,11 @@ class GatewayFactoryRepository(FactoryRepository):
 
     def job(self, job_id: UUID) -> FactoryJob:
         return self._translate(lambda: self._store.factory_job(job_id).job)
+
+    def snapshot(self, job_id: UUID) -> FactoryJobProjection:
+        """Return the authoritative read-only Gateway projection for one job."""
+
+        return self._translate(lambda: self._store.factory_job(job_id))
 
     def append(self, block: FactoryEvidenceBlock) -> bool:
         runtime_retry = None
