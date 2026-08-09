@@ -589,13 +589,15 @@ class WindowsProcessBackend:
                 process.kill()
                 process.wait(timeout=2.0)
             except (OSError, subprocess.TimeoutExpired):
-                return False
+                pass
         except OSError:
+            if process.poll() is not None:
+                return True
             try:
                 process.kill()
                 process.wait(timeout=2.0)
             except (OSError, subprocess.TimeoutExpired):
-                return False
+                pass
         return process.poll() is not None
 
     def wait_authenticated_health(self, url: str, token: str, timeout_seconds: float) -> bool:

@@ -486,3 +486,45 @@ def test_windows_spawn_reaps_popen_handle_when_identity_capture_fails(
         "handle:wait:2.0",
         "handle:poll",
     ]
+
+
+def test_windows_spawn_verifies_handle_already_exited_after_cleanup_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+
+    class ExitedPopen:
+        pid = 813
+        returncode = 0
+
+        def terminate(self) -> None:
+            events.append("handle:terminate")
+            raise OSError("already exited")
+
+        def wait(self, timeout: float) -> int:
+            raise AssertionError("wait must not run after failed terminate")
+
+        def kill(self) -> None:
+            events.append("handle:kill")
+            raise OSError("already exited")
+
+        def poll(self) -> int | None:
+            events.append("handle:poll")
+            return self.returncode
+
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: ExitedPopen())
+    monkeypatch.setattr(
+        WindowsProcessBackend,
+        "_start_identity",
+        staticmethod(lambda _: (_ for _ in ()).throw(RuntimeError("identity failed"))),
+    )
+
+    with pytest.raises(DemoProcessError, match="started process identity is unavailable"):
+        WindowsProcessBackend().spawn(
+            (sys.executable, "-c", "pass"),
+            tmp_path,
+            {},
+            tmp_path / "spawn-exited.log",
+        )
+
+    assert events[-1] == "handle:poll"
