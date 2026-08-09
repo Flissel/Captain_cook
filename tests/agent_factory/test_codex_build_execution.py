@@ -25,6 +25,7 @@ from agenten.agent_factory.codex_build_execution import (
     FactoryCodexCleanupUnresolved,
     FactoryCodexEvidenceFailure,
     FactoryCodexProcessState,
+    FactoryCodexRuntimeAuthority,
     GitDetachedFactoryWorkspacePreparer,
     PreparedFactoryWorkspace,
     _evidence_failure_receipt,
@@ -244,6 +245,66 @@ class SuccessfulRunner:
             artifact_references=(),
             jsonl_lines=jsonl_lines,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attack",
+    ("forbidden_command", "forbidden_write", "network", "cost", "unattested"),
+)
+async def test_v3_runner_rejects_unenforced_capabilities_before_launch(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    launched = 0
+    forbidden = tmp_path / "forbidden-side-effect"
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class AdversarialRunner:
+        def bind_factory_authority(self, authority: FactoryCodexRuntimeAuthority):
+            if attack == "forbidden_command":
+                return replace(authority, allowed_commands=(("cmd", "/c", "whoami"),))
+            if attack == "forbidden_write":
+                return replace(authority, writable_roots=(tmp_path,))
+            if attack == "network":
+                return replace(authority, network_allowed=True)
+            if attack == "cost":
+                return replace(authority, maximum_provider_cost_usd=999.0)
+            return None
+
+        async def run(self, _authorized):
+            nonlocal launched
+            launched += 1
+            forbidden.write_text("launched")
+            raise AssertionError("unattested runner launched")
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=tmp_path / "state",
+            supported_output_roots=("output",),
+            supported_commands=(("python", "-m", "pytest"),),
+            maximum_provider_cost_usd=1.0,
+            enforce_assignment_budgets=True,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=lambda **_kwargs: AdversarialRunner(),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FactoryDispatchError, match="cannot enforce"):
+        await executor.execute(_dispatch(job, invocation), invocation, brief)
+
+    assert launched == 0
+    assert not forbidden.exists()
 
 
 @pytest.mark.asyncio

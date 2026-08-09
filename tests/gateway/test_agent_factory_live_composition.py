@@ -156,19 +156,34 @@ def test_v3_worker_requires_explicit_complete_enablement(tmp_path: Path) -> None
 
 
 def test_normal_composition_run_executes_enabled_v3_worker_once() -> None:
-    calls = {"worker": 0, "runner": 0}
+    calls: list[tuple[str, object]] = []
+    job_id = __import__("uuid").uuid4()
+    correlation_id = __import__("uuid").uuid4()
 
     class Worker:
-        async def run_once(self):
-            calls["worker"] += 1
+        async def run_once(self, scope):
+            assert any(name == "assignment_produced" for name, _ in calls)
+            calls.append(("worker", scope))
+            return object()
 
     class Runner:
         async def run(self, job_id, **_kwargs):
-            calls["runner"] += 1
+            calls.append(("runner", job_id))
+            if sum(name == "runner" for name, _ in calls) == 1:
+                calls.append(("assignment_produced", job_id))
             return job_id
 
+    class Repository:
+        def job(self, requested_job_id):
+            assert requested_job_id == job_id
+            return type(
+                "Job",
+                (),
+                {"job_id": job_id, "correlation_id": correlation_id},
+            )()
+
     composition = AgentFactoryLiveComposition(
-        repository=object(),
+        repository=Repository(),
         lease_issuer=object(),
         hermes=object(),
         team_execution=object(),
@@ -180,10 +195,16 @@ def test_normal_composition_run_executes_enabled_v3_worker_once() -> None:
         runtime_retry_authority=None,
         hermes_factory_worker=Worker(),
     )
-    job_id = __import__("uuid").uuid4()
-
     assert asyncio.run(composition.run(job_id)) == job_id
-    assert calls == {"worker": 1, "runner": 1}
+    assert [name for name, _value in calls] == [
+        "runner",
+        "assignment_produced",
+        "worker",
+        "runner",
+    ]
+    scope = calls[2][1]
+    assert scope.factory_job_id == job_id
+    assert scope.correlation_id == correlation_id
 
 
 def test_gateway_technical_ports_bind_candidate_private_holdout_and_no_tools(

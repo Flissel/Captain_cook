@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -18,6 +19,7 @@ from agenten.agent_factory.forge_contracts import (
 from agenten.agent_factory.hermes_factory_worker import (
     FilesystemHermesFactoryWorkerCheckpointStore,
     AuthenticatedMinibookV3WorkerClient,
+    HermesFactoryAssignmentScope,
     HermesFactoryCodexBuild,
     HermesFactoryWorker,
 )
@@ -169,6 +171,71 @@ async def test_worker_replay_returns_effect_without_second_codex_session(tmp_pat
     assert minibook.claims == 2
     assert minibook.submissions == 1
     assert verifier.calls == [("captain-agent-factory-loop", "a" * 64)] * 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_workers_start_exactly_one_codex_session(tmp_path: Path) -> None:
+    assignment = _assignment()
+    build, issuer = _build(assignment, tmp_path)
+    calls = 0
+
+    class SlowCodex:
+        async def build(self, _assignment):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.02)
+            return build
+
+    workers = tuple(
+        HermesFactoryWorker(
+            minibook=_Minibook(assignment),
+            codex=SlowCodex(),
+            skill_verifier=_SkillVerifier(),
+            worker_id="hermes-factory-v3",
+            released_skill_name="captain-agent-factory-loop",
+            released_skill_sha256="a" * 64,
+            checkpoint_store=FilesystemHermesFactoryWorkerCheckpointStore(
+                tmp_path / "worker"
+            ),
+            codex_receipts=issuer,
+        )
+        for _ in range(2)
+    )
+
+    results = await asyncio.gather(
+        *(worker.run_once() for worker in workers),
+        return_exceptions=True,
+    )
+
+    assert calls == 1
+    assert sum(isinstance(item, FactoryBuildEffectV2) for item in results) == 1
+    assert sum(isinstance(item, ValueError) for item in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_checkpoint_temp_does_not_block_restart(tmp_path: Path) -> None:
+    assignment = _assignment()
+    build, issuer = _build(assignment, tmp_path)
+    root = tmp_path / "worker"
+    root.mkdir()
+    (root / f"{assignment.assignment_id.hex}.json.crashed.tmp").write_text(
+        "partial secret payload"
+    )
+    codex = _Codex(build)
+
+    effect = await HermesFactoryWorker(
+        minibook=_Minibook(assignment),
+        codex=codex,
+        skill_verifier=_SkillVerifier(),
+        worker_id="hermes-factory-v3",
+        released_skill_name="captain-agent-factory-loop",
+        released_skill_sha256="a" * 64,
+        checkpoint_store=FilesystemHermesFactoryWorkerCheckpointStore(root),
+        codex_receipts=issuer,
+    ).run_once()
+
+    assert effect is not None
+    assert codex.calls == 1
 
 
 @pytest.mark.asyncio
@@ -458,3 +525,111 @@ async def test_authenticated_minibook_client_uses_typed_v3_worker_routes(
         "/v3/creation/assignments/next",
         f"/v3/creation/assignments/{assignment.assignment_id}/claim",
     ]
+
+
+@pytest.mark.asyncio
+async def test_scoped_worker_ignores_unrelated_assignment_without_claim(
+    tmp_path: Path,
+) -> None:
+    assignment = _assignment()
+    unrelated_scope = HermesFactoryAssignmentScope(
+        factory_job_id=uuid4(),
+        correlation_id=uuid4(),
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json=assignment.model_dump(mode="json", by_alias=True),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://minibook.invalid",
+    ) as session:
+        minibook = AuthenticatedMinibookV3WorkerClient(
+            client=session,
+            worker_token="worker-secret",
+            worker_id="hermes-factory-v3",
+            checkpoint_store=FilesystemHermesFactoryWorkerCheckpointStore(
+                tmp_path / "worker"
+            ),
+        )
+        worker = HermesFactoryWorker(
+            minibook=minibook,
+            codex=_Codex(None),
+            skill_verifier=_SkillVerifier(),
+            worker_id="hermes-factory-v3",
+            released_skill_name="captain-agent-factory-loop",
+            released_skill_sha256="a" * 64,
+            checkpoint_store=FilesystemHermesFactoryWorkerCheckpointStore(
+                tmp_path / "worker"
+            ),
+            codex_receipts=CaptainCodexBuildReceiptIssuer(
+                CodexBuildArtifactCas(tmp_path / "cas")
+            ),
+        )
+
+        assert await worker.run_once(unrelated_scope) is None
+
+    assert len(requests) == 1
+    assert requests[0].url.params["factory_job_id"] == str(
+        unrelated_scope.factory_job_id
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_mode", ("empty", "malformed", "conflicting"))
+async def test_typed_effect_response_failure_leaves_checkpoint_pending(
+    tmp_path: Path,
+    response_mode: str,
+) -> None:
+    assignment = _assignment()
+    build, issuer = _build(assignment, tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/next") or request.url.path.endswith("/claim"):
+            return httpx.Response(
+                200,
+                json=assignment.model_dump(mode="json", by_alias=True),
+            )
+        if response_mode == "empty":
+            return httpx.Response(202, content=b"")
+        if response_mode == "malformed":
+            return httpx.Response(202, content=b"not-json")
+        payload = json.loads(request.content)
+        payload["hermes_usage_receipt_ref"] = _ref("conflict").model_dump(
+            mode="json"
+        )
+        return httpx.Response(200, json=payload)
+
+    store = FilesystemHermesFactoryWorkerCheckpointStore(tmp_path / "worker")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://minibook.invalid",
+    ) as session:
+        minibook = AuthenticatedMinibookV3WorkerClient(
+            client=session,
+            worker_token="worker-secret",
+            worker_id="hermes-factory-v3",
+            checkpoint_store=store,
+        )
+        worker = HermesFactoryWorker(
+            minibook=minibook,
+            codex=_Codex(build),
+            skill_verifier=_SkillVerifier(),
+            worker_id="hermes-factory-v3",
+            released_skill_name="captain-agent-factory-loop",
+            released_skill_sha256="a" * 64,
+            checkpoint_store=store,
+            codex_receipts=issuer,
+        )
+
+        with pytest.raises(ValueError, match="effect response|different build effect"):
+            await worker.run_once()
+
+    checkpoint = store.load(assignment)
+    assert checkpoint is not None
+    assert checkpoint.state == "pending_effect"

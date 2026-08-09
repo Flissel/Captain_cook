@@ -7,10 +7,11 @@ import json
 import os
 import subprocess
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import httpx
@@ -32,7 +33,10 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class HermesFactoryMinibookPort(Protocol):
-    async def next_assignment(self) -> FactoryBuildAssignmentV2 | None: ...
+    async def next_assignment(
+        self,
+        scope: "HermesFactoryAssignmentScope | None" = None,
+    ) -> FactoryBuildAssignmentV2 | None: ...
 
     async def claim(
         self,
@@ -109,6 +113,15 @@ class HermesFactoryCodexReceiptReaderPort(Protocol):
     def read_receipt(self, reference: ArtifactRef) -> CodexBuildReceiptV1: ...
 
 
+class HermesFactoryAssignmentScope(BaseModel):
+    """Identity fence for assignments produced by one live invocation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    factory_job_id: UUID
+    correlation_id: UUID
+
+
 class HermesFactoryRetryAuthorityPort(Protocol):
     def allows_retry(
         self,
@@ -131,6 +144,7 @@ class HermesFactoryWorkerCheckpoint(BaseModel):
     effect_key: str
     attempt: int
     worker_id: str
+    revision: int = Field(default=1, ge=1)
     state: Literal["started", "failed", "pending_effect", "effect_submitted"]
     codex_attempts: int = Field(ge=1)
     status: Literal[
@@ -174,6 +188,13 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
         self,
         assignment: FactoryBuildAssignmentV2,
     ) -> HermesFactoryWorkerCheckpoint | None:
+        with self._assignment_lock(assignment.assignment_id):
+            return self._load_unlocked(assignment)
+
+    def _load_unlocked(
+        self,
+        assignment: FactoryBuildAssignmentV2,
+    ) -> HermesFactoryWorkerCheckpoint | None:
         path = self._path(assignment.assignment_id)
         if not path.exists():
             return None
@@ -198,37 +219,39 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
         worker_id: str,
         retry_authorized: bool,
     ) -> HermesFactoryWorkerCheckpoint:
-        previous = self.load(assignment)
-        if previous is None:
-            checkpoint = HermesFactoryWorkerCheckpoint(
-                assignment_id=assignment.assignment_id,
-                effect_key=assignment.effect_key,
-                attempt=assignment.attempt,
-                worker_id=worker_id,
-                state="started",
-                codex_attempts=1,
-                status="codex_started",
+        with self._assignment_lock(assignment.assignment_id):
+            previous = self._load_unlocked(assignment)
+            if previous is None:
+                checkpoint = HermesFactoryWorkerCheckpoint(
+                    assignment_id=assignment.assignment_id,
+                    effect_key=assignment.effect_key,
+                    attempt=assignment.attempt,
+                    worker_id=worker_id,
+                    state="started",
+                    codex_attempts=1,
+                    status="codex_started",
+                )
+                return self._create(checkpoint)
+            if previous.state not in {"started", "failed"}:
+                return previous
+            if previous.worker_id != worker_id:
+                raise ValueError("Hermes Factory checkpoint worker identity changed")
+            if not retry_authorized:
+                raise ValueError("Hermes Factory Codex retry authority is required")
+            if previous.codex_attempts > assignment.limits.max_retries:
+                raise ValueError("Hermes Factory assignment retry limit is exhausted")
+            checkpoint = previous.model_copy(
+                update={
+                    "state": "started",
+                    "status": "codex_started",
+                    "codex_attempts": previous.codex_attempts + 1,
+                    "revision": previous.revision + 1,
+                    "effect": None,
+                    "failure_kind": None,
+                    "failure_exit_code": None,
+                }
             )
-            return self._create(checkpoint)
-        if previous.state not in {"started", "failed"}:
-            return previous
-        if previous.worker_id != worker_id:
-            raise ValueError("Hermes Factory checkpoint worker identity changed")
-        if not retry_authorized:
-            raise ValueError("Hermes Factory Codex retry authority is required")
-        if previous.codex_attempts > assignment.limits.max_retries:
-            raise ValueError("Hermes Factory assignment retry limit is exhausted")
-        checkpoint = previous.model_copy(
-            update={
-                "state": "started",
-                "status": "codex_started",
-                "codex_attempts": previous.codex_attempts + 1,
-                "effect": None,
-                "failure_kind": None,
-                "failure_exit_code": None,
-            }
-        )
-        return self._replace(previous, checkpoint)
+            return self._replace(previous, checkpoint)
 
     def failed(
         self,
@@ -252,9 +275,11 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
                 "effect": None,
                 "failure_kind": failure_kind,
                 "failure_exit_code": failure_exit_code,
+                "revision": previous.revision + 1,
             }
         )
-        return self._replace(previous, failed)
+        with self._assignment_lock(assignment.assignment_id):
+            return self._replace(previous, failed)
 
     def pending_effect(
         self,
@@ -262,24 +287,30 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
         previous: HermesFactoryWorkerCheckpoint,
         effect: FactoryBuildEffectV2,
     ) -> HermesFactoryWorkerCheckpoint:
-        del assignment
         pending = previous.model_copy(
             update={
                 "state": "pending_effect",
                 "status": "effect_pending",
                 "effect": effect,
+                "revision": previous.revision + 1,
             }
         )
-        return self._replace(previous, pending)
+        with self._assignment_lock(assignment.assignment_id):
+            return self._replace(previous, pending)
 
     def submitted(
         self,
         previous: HermesFactoryWorkerCheckpoint,
     ) -> HermesFactoryWorkerCheckpoint:
         submitted = previous.model_copy(
-            update={"state": "effect_submitted", "status": "effect_submitted"}
+            update={
+                "state": "effect_submitted",
+                "status": "effect_submitted",
+                "revision": previous.revision + 1,
+            }
         )
-        return self._replace(previous, submitted)
+        with self._assignment_lock(previous.assignment_id):
+            return self._replace(previous, submitted)
 
     def _create(
         self,
@@ -310,7 +341,7 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
         path = self._path(checkpoint.assignment_id)
         if path.read_bytes() != self._content(previous):
             raise ValueError("Hermes Factory worker checkpoint changed concurrently")
-        temporary = path.with_suffix(".tmp")
+        temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
         try:
             descriptor = os.open(
                 temporary,
@@ -338,6 +369,35 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
     def _path(self, assignment_id: UUID) -> Path:
         return self._root / f"{assignment_id.hex}.json"
 
+    @contextmanager
+    def _assignment_lock(self, assignment_id: UUID):
+        self._root.mkdir(parents=True, exist_ok=True)
+        path = self._root / f"{assignment_id.hex}.lock"
+        with path.open("a+b") as stream:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
+                os.fsync(stream.fileno())
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
 
 class AuthenticatedMinibookV3WorkerClient:
     """Typed authenticated client for Minibook's V3 assignment boundary."""
@@ -360,14 +420,30 @@ class AuthenticatedMinibookV3WorkerClient:
         self._checkpoint_store = checkpoint_store
         self._assignments: dict[UUID, FactoryBuildAssignmentV2] = {}
 
-    async def next_assignment(self) -> FactoryBuildAssignmentV2 | None:
+    async def next_assignment(
+        self,
+        scope: HermesFactoryAssignmentScope | None = None,
+    ) -> FactoryBuildAssignmentV2 | None:
         response = await self._client.get(
             "/v3/creation/assignments/next",
             headers=self._headers(),
+            params=(
+                {
+                    "factory_job_id": str(scope.factory_job_id),
+                    "correlation_id": str(scope.correlation_id),
+                }
+                if scope is not None
+                else None
+            ),
         )
         if response.status_code == 204:
             return None
         assignment = self._assignment_response(response)
+        if scope is not None and (
+            assignment.factory_job_id != scope.factory_job_id
+            or assignment.correlation_id != scope.correlation_id
+        ):
+            return None
         self._assignments[assignment.assignment_id] = assignment
         return assignment
 
@@ -414,7 +490,17 @@ class AuthenticatedMinibookV3WorkerClient:
             raise ValueError(
                 f"Minibook V3 effect submission failed with status {response.status_code}"
             )
-        return effect
+        try:
+            accepted = FactoryBuildEffectV2.model_validate(response.json())
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Minibook V3 effect response is invalid") from exc
+        assignment = self._assignments.get(effect.assignment_id)
+        if assignment is None:
+            raise ValueError("Minibook V3 effect assignment is not scoped")
+        validate_build_effect_binding(assignment, accepted)
+        if accepted != effect:
+            raise ValueError("Minibook accepted a different build effect")
+        return accepted
 
     def _assignment_response(
         self,
@@ -467,9 +553,21 @@ class HermesFactoryWorker:
         self._retry_authority = retry_authority
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
-    async def run_once(self) -> FactoryBuildEffectV2 | None:
-        assignment = await self._minibook.next_assignment()
+    async def run_once(
+        self,
+        scope: HermesFactoryAssignmentScope | None = None,
+    ) -> FactoryBuildEffectV2 | None:
+        assignment = (
+            await self._minibook.next_assignment()
+            if scope is None
+            else await self._minibook.next_assignment(scope)
+        )
         if assignment is None:
+            return None
+        if scope is not None and (
+            assignment.factory_job_id != scope.factory_job_id
+            or assignment.correlation_id != scope.correlation_id
+        ):
             return None
         now = self._clock()
         if now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
@@ -585,6 +683,7 @@ class HermesFactoryWorker:
 __all__ = [
     "AuthenticatedMinibookV3WorkerClient",
     "HermesFactoryCodexBuild",
+    "HermesFactoryAssignmentScope",
     "FilesystemHermesFactoryWorkerCheckpointStore",
     "HermesFactoryCodexPort",
     "HermesFactoryMinibookPort",

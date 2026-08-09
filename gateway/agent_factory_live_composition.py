@@ -58,7 +58,10 @@ from agenten.agent_factory.hermes_cli import (
     HermesCliSettings,
     ReleasedFactorySkillCatalog,
 )
-from agenten.agent_factory.hermes_factory_worker import HermesFactoryWorker
+from agenten.agent_factory.hermes_factory_worker import (
+    HermesFactoryAssignmentScope,
+    HermesFactoryWorker,
+)
 from agenten.agent_factory.hermes_factory_worker import (
     FilesystemHermesFactoryWorkerCheckpointStore,
     HermesFactoryCodexPort,
@@ -498,8 +501,22 @@ class AgentFactoryLiveComposition:
         maximum_dispatches: int = 12,
         stop_before_action: FactoryActionKind | None = None,
     ) -> ProductionFactoryDispatchResult:
-        if self.hermes_factory_worker is not None:
-            await self.hermes_factory_worker.run_once()
+        dispatched = await self.runner.run(
+            job_id,
+            maximum_dispatches=maximum_dispatches,
+            stop_before_action=stop_before_action,
+        )
+        if self.hermes_factory_worker is None:
+            return dispatched
+        job = self.repository.job(job_id)
+        effect = await self.hermes_factory_worker.run_once(
+            HermesFactoryAssignmentScope(
+                factory_job_id=job.job_id,
+                correlation_id=job.correlation_id,
+            )
+        )
+        if effect is None:
+            return dispatched
         return await self.runner.run(
             job_id,
             maximum_dispatches=maximum_dispatches,

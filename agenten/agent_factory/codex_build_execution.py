@@ -589,6 +589,17 @@ class FactoryCodexRunnerFactory(Protocol):
     ) -> CodexRunner: ...
 
 
+@dataclass(frozen=True)
+class FactoryCodexRuntimeAuthority:
+    """Exact capabilities a runner must enforce independently of the prompt."""
+
+    workspace_root: Path
+    writable_roots: tuple[Path, ...]
+    allowed_commands: tuple[tuple[str, ...], ...]
+    network_allowed: bool
+    maximum_provider_cost_usd: float
+
+
 class FactoryCodexProcessInspectorPort(Protocol):
     async def inspect(
         self,
@@ -2161,6 +2172,24 @@ class CodexCliFactoryBuildExecutor:
             maximum_runtime_seconds=runtime_seconds,
             deadline_at=authority_deadline,
         )
+        if self._settings.enforce_assignment_budgets:
+            binder = getattr(runner, "bind_factory_authority", None)
+            authority = FactoryCodexRuntimeAuthority(
+                workspace_root=prepared.root.resolve(),
+                writable_roots=tuple(
+                    (prepared.root / relative).resolve()
+                    for relative in self._settings.supported_output_roots
+                ),
+                allowed_commands=self._settings.supported_commands,
+                network_allowed=False,
+                maximum_provider_cost_usd=(
+                    self._settings.maximum_provider_cost_usd
+                ),
+            )
+            if not callable(binder) or binder(authority) != authority:
+                raise FactoryDispatchError(
+                    "Factory Codex runner cannot enforce assignment capabilities"
+                )
         authority_deadline = self._authority_deadline(
             request,
             invocation,
@@ -4509,6 +4538,7 @@ __all__ = [
     "FactoryCodexProcessState",
     "FactoryBuildArtifactReaderPort",
     "FactoryCodexRunnerFactory",
+    "FactoryCodexRuntimeAuthority",
     "FactoryCodexResumeAuthorizerPort",
     "FactoryCodexWorkspacePreparerPort",
     "GitDetachedFactoryWorkspacePreparer",

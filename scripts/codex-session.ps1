@@ -175,7 +175,12 @@ $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
-$startInfo.ArgumentList.Add("--dangerously-bypass-approvals-and-sandbox")
+$startInfo.ArgumentList.Add("--sandbox")
+$startInfo.ArgumentList.Add("workspace-write")
+$startInfo.ArgumentList.Add("--ask-for-approval")
+$startInfo.ArgumentList.Add("never")
+$startInfo.ArgumentList.Add("--config")
+$startInfo.ArgumentList.Add("sandbox_workspace_write.network_access=false")
 if ($ResumeThreadId) {
     # Every value is a distinct ArgumentList entry so neither thread names nor
     # prompts cross a shell parsing boundary.
