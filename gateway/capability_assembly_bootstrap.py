@@ -75,8 +75,10 @@ from gateway.capability_benchmark_process_executor import (
 from gateway.capability_generic_benchmark import (
     BenchmarkToolEvidenceVerificationRequest,
     ContentAddressedBenchmarkEvidenceResolver,
+    GenericBenchmarkCategory,
     GenericBenchmarkReceipt,
     GenericBenchmarkRecordingRequest,
+    generic_benchmark_passes,
 )
 from gateway.capability_live_current_adapters import CapabilityProjectionReadback
 from gateway.capability_live_factory_adapter import CurrentCapabilityFactoryAdapter
@@ -616,6 +618,7 @@ class GatewayGenericBenchmarkRecorder:
     def record_generic_benchmark(
         self, request: GenericBenchmarkRecordingRequest
     ) -> GenericBenchmarkReceipt:
+        self._require_recording_binding(request)
         self._ensure_schema()
         payload = _benchmark_payload(request)
         body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -664,6 +667,68 @@ class GatewayGenericBenchmarkRecorder:
             summary_ref=summary,
             evidence_refs=(summary, *evidence),
         )
+
+    def _require_recording_binding(
+        self, request: GenericBenchmarkRecordingRequest
+    ) -> None:
+        cases = request.case_receipts
+        categories = {
+            category: sum(item.category is category for item in cases)
+            for category in GenericBenchmarkCategory
+        }
+        identities = tuple(
+            (trace_id, run_id)
+            for item in cases
+            for trace_id, run_id in (
+                (item.team_trace_id, item.team_run_id),
+                (item.baseline_trace_id, item.baseline_run_id),
+            )
+        )
+        refs = tuple(
+            ref
+            for item in cases
+            for ref in (item.team_evaluation_ref, item.baseline_evaluation_ref)
+        )
+        if (
+            request.suite_digest != request.suite_ref.sha256
+            or request.suite_ref.media_type != "application/json"
+            or not request.suite_ref.uri.endswith("/" + request.suite_digest)
+            or len(cases) != 15
+            or request.aggregate.case_count != 15
+            or any(count != 3 for count in categories.values())
+            or len({item.case_id for item in cases}) != 15
+            or len({item.case_digest for item in cases}) != 15
+            or len(identities) != 30
+            or len(set(identities)) != 30
+            or len({trace for trace, _ in identities}) != 30
+            or len({run for _, run in identities}) != 30
+            or any(
+                ref.media_type != "application/json"
+                or not ref.uri.endswith("/" + ref.sha256)
+                for ref in refs
+            )
+            or request.passed is not generic_benchmark_passes(request.aggregate)
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "generic benchmark recording binding is invalid"
+            )
+        try:
+            projection = self.gateway_store.factory_job(request.job_id)
+            job = projection.job
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "generic benchmark Factory job is unavailable"
+            ) from None
+        if (
+            type(job) is not AgentFactoryJobV3
+            or job.job_id != request.job_id
+            or job.correlation_id != request.correlation_id
+            or job.input_ref.media_type != "text/markdown"
+            or not job.input_ref.uri.endswith("/" + job.input_ref.sha256)
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "generic benchmark Factory binding is invalid"
+            )
 
     def receipt_for(self, *, job_id: UUID, suite_sha256: str) -> GenericBenchmarkReceipt:
         self._ensure_schema()

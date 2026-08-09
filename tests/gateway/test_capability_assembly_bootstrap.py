@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_factory.contracts import AgentFactoryJobV3
 from gateway.capability_assembly_bootstrap import (
     CapabilityAssemblyBootstrapConfigurationError,
     CaptainBenchmarkToolEvidenceAuthority,
@@ -406,32 +407,46 @@ class _BenchmarkStorage:
 def test_generic_benchmark_recorder_is_append_only_and_replay_stable(
     tmp_path: Path,
 ) -> None:
-    store = SimpleNamespace(storage=_BenchmarkStorage())
+    evaluation_ref = _ref(b"evaluation")
+    categories = tuple(GenericBenchmarkCategory)
+    cases = tuple(
+        GenericBenchmarkCaseReceipt(
+            case_id=f"case-{index}",
+            category=categories[index // 3],
+            case_digest=f"{index + 1:064x}",
+            team_trace_id=uuid4(), team_run_id=uuid4(),
+            baseline_trace_id=uuid4(), baseline_run_id=uuid4(),
+            team_evaluation_ref=evaluation_ref,
+            baseline_evaluation_ref=evaluation_ref,
+        )
+        for index in range(15)
+    )
+    job_id, correlation_id = uuid4(), uuid4()
+    input_ref = ArtifactRef(
+        uri="artifact://sha256/" + "f" * 64,
+        sha256="f" * 64,
+        media_type="text/markdown",
+    )
+    job = AgentFactoryJobV3.model_construct(
+        job_id=job_id, correlation_id=correlation_id, input_ref=input_ref
+    )
+    store = SimpleNamespace(
+        storage=_BenchmarkStorage(),
+        factory_job=lambda _: SimpleNamespace(job=job),
+    )
     recorder = GatewayGenericBenchmarkRecorder(
         gateway_store=store,  # type: ignore[arg-type]
         artifacts=ContentAddressedArtifactAdapter(tmp_path / "cas"),
     )
-    evaluation_ref = _ref(b"evaluation")
-    case = GenericBenchmarkCaseReceipt(
-        case_id="case-a",
-        category=GenericBenchmarkCategory.NORMAL,
-        case_digest="a" * 64,
-        team_trace_id=uuid4(),
-        team_run_id=uuid4(),
-        baseline_trace_id=uuid4(),
-        baseline_run_id=uuid4(),
-        team_evaluation_ref=evaluation_ref,
-        baseline_evaluation_ref=evaluation_ref,
-    )
     request = GenericBenchmarkRecordingRequest(
-        job_id=uuid4(),
-        correlation_id=uuid4(),
+        job_id=job_id,
+        correlation_id=correlation_id,
         suite_ref=_ref(b"suite"),
         suite_digest=hashlib.sha256(b"suite").hexdigest(),
         aggregate=GenericBenchmarkAggregate(
-            case_count=1,
-            team_quality_count=1,
-            baseline_quality_count=0,
+            case_count=15,
+            team_quality_count=15,
+            baseline_quality_count=14,
             unsafe_team_count=0,
             mandatory_handoff_misses=0,
             team_cost_usd=Decimal("0.10"),
@@ -439,7 +454,7 @@ def test_generic_benchmark_recorder_is_append_only_and_replay_stable(
             team_latency_ms=10,
             baseline_latency_ms=12,
         ),
-        case_receipts=(case,),
+        case_receipts=cases,
         passed=True,
     )
 
@@ -448,10 +463,51 @@ def test_generic_benchmark_recorder_is_append_only_and_replay_stable(
 
     assert replay == first
     changed = GenericBenchmarkRecordingRequest(
-        **{**request.__dict__, "passed": False}
+        **{
+            **request.__dict__,
+            "aggregate": GenericBenchmarkAggregate(
+                **{**request.aggregate.__dict__, "team_latency_ms": 9}
+            ),
+        }
     )
     with pytest.raises(CapabilityLiveAuthorityUnavailable, match="conflicts"):
         recorder.record_generic_benchmark(changed)
+
+
+def test_generic_benchmark_recorder_rejects_incomplete_suite_before_cas_write(
+    tmp_path: Path,
+) -> None:
+    store = SimpleNamespace(storage=_BenchmarkStorage())
+    recorder = GatewayGenericBenchmarkRecorder(
+        gateway_store=store,  # type: ignore[arg-type]
+        artifacts=ContentAddressedArtifactAdapter(tmp_path / "cas"),
+    )
+    evaluation_ref = _ref(b"evaluation")
+    request = GenericBenchmarkRecordingRequest(
+        job_id=uuid4(),
+        correlation_id=uuid4(),
+        suite_ref=_ref(b"suite"),
+        suite_digest=hashlib.sha256(b"suite").hexdigest(),
+        aggregate=GenericBenchmarkAggregate(
+            case_count=1, team_quality_count=1, baseline_quality_count=0,
+            unsafe_team_count=0, mandatory_handoff_misses=0,
+            team_cost_usd=Decimal("0.10"), baseline_cost_usd=Decimal("0.05"),
+            team_latency_ms=10, baseline_latency_ms=12,
+        ),
+        case_receipts=(GenericBenchmarkCaseReceipt(
+            case_id="case-a", category=GenericBenchmarkCategory.NORMAL,
+            case_digest="a" * 64, team_trace_id=uuid4(), team_run_id=uuid4(),
+            baseline_trace_id=uuid4(), baseline_run_id=uuid4(),
+            team_evaluation_ref=evaluation_ref,
+            baseline_evaluation_ref=evaluation_ref,
+        ),),
+        passed=True,
+    )
+
+    with pytest.raises(CapabilityLiveAuthorityUnavailable, match="binding is invalid"):
+        recorder.record_generic_benchmark(request)
+
+    assert tuple((tmp_path / "cas").rglob("*")) == ()
 
 
 def test_recorder_constructor_has_no_schema_effect(tmp_path: Path) -> None:
