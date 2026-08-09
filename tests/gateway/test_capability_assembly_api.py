@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import UUID, uuid5
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
 from gateway.app import create_app
+from gateway.capability_assembly_api import create_capability_assembly_router
 from gateway.capability_assembly_contracts import CapabilityAssemblyAdvanceRequest
+from gateway.capability_assembly_production import (
+    CapabilityAssemblyProductionSettings,
+    build_capability_assembly_controller,
+)
 from gateway.settings import GatewaySettings
 from tests.gateway.test_capability_assembly_controller import (
     ASSEMBLY_ID,
@@ -15,6 +23,11 @@ from tests.gateway.test_capability_assembly_controller import (
     _controller,
     _id,
     _submission,
+)
+from tests.gateway.test_capability_assembly_production import (
+    _GatewayStore,
+    _authorities,
+    _settings_environment,
 )
 
 
@@ -141,12 +154,76 @@ def _headers(token: str = CAPTAIN_TOKEN) -> dict[str, str]:
 
 
 def _client(controller_factory=None) -> TestClient:
-    return TestClient(
-        create_app(
-            settings=_settings(),
-            capability_assembly_controller_factory=controller_factory,
+    app = FastAPI()
+    app.state.gateway_settings = _settings()
+    app.include_router(
+        create_capability_assembly_router(
+            controller_factory
+            or (lambda: (_ for _ in ()).throw(RuntimeError("unavailable")))
         )
     )
+    return TestClient(app)
+
+
+def test_gateway_app_rejects_raw_controller_factory_as_production() -> None:
+    controller, repository, *_ = _controller()
+    app = create_app(
+        settings=_settings(),
+        capability_assembly_composition_factory=lambda: controller,
+    )
+
+    with TestClient(app) as client:
+        health = client.get(
+            "/v1/capability-assemblies/health",
+            headers=_headers(),
+        )
+
+    assert health.status_code == 503
+    assert health.json() == {
+        "detail": "capability assembly service unavailable"
+    }
+    assert repository.history(ASSEMBLY_ID) == ()
+
+
+def test_gateway_app_reattests_sealed_production_composition(
+    tmp_path: Path,
+) -> None:
+    store = _GatewayStore()
+    settings = CapabilityAssemblyProductionSettings.from_environment(
+        _settings_environment(tmp_path)
+    )
+    authorities = _authorities(store=store)
+    composition = build_capability_assembly_controller(
+        repository_root=tmp_path,
+        settings=settings,
+        authorities=authorities,
+        holdout_store=InMemoryPrivateHoldoutStore(),
+    )
+    app = create_app(
+        settings=_settings(),
+        capability_assembly_composition_factory=lambda: composition,
+    )
+
+    with TestClient(app) as client:
+        ready = client.get(
+            "/v1/capability-assemblies/health",
+            headers=_headers(),
+        )
+        object.__setattr__(
+            authorities.benchmark_executor,
+            "_endpoint",
+            "http://127.0.0.1:8765/v1/substituted",
+        )
+        drifted = client.get(
+            "/v1/capability-assemblies/health",
+            headers=_headers(),
+        )
+
+    assert ready.status_code == 200
+    assert drifted.status_code == 503
+    assert drifted.json() == {
+        "detail": "capability assembly service unavailable"
+    }
 
 
 def _submit_payload(*, assembly_id: UUID = ASSEMBLY_ID) -> dict[str, object]:

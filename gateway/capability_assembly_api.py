@@ -23,6 +23,10 @@ from gateway.capability_assembly_controller import (
     CapabilityAssemblyIncomplete,
     CapabilityAssemblyNotFound,
 )
+from gateway.capability_assembly_production import (
+    ProductionCapabilityAssemblyComposition,
+    require_production_capability_assembly,
+)
 
 
 class CapabilityAssemblyControllerPort(Protocol):
@@ -42,6 +46,9 @@ class CapabilityAssemblyControllerPort(Protocol):
 
 
 CapabilityAssemblyControllerFactory = Callable[[], CapabilityAssemblyControllerPort]
+CapabilityAssemblyCompositionFactory = Callable[
+    [], ProductionCapabilityAssemblyComposition
+]
 ContractT = TypeVar("ContractT", bound=BaseModel)
 
 
@@ -61,6 +68,13 @@ def unavailable_capability_assembly_controller() -> CapabilityAssemblyController
     """Fail closed until a production composition explicitly injects D4."""
 
     raise RuntimeError("capability assembly controller is not configured")
+
+
+def unavailable_capability_assembly_composition(
+) -> ProductionCapabilityAssemblyComposition:
+    """Fail closed until the sealed production composition is injected."""
+
+    raise RuntimeError("capability assembly composition is not configured")
 
 
 def _translate_error(error: Exception) -> HTTPException:
@@ -126,39 +140,39 @@ def _accepts_exactly_one_argument(method: object) -> bool:
     return True
 
 
+def _controller_contract_is_valid(controller: object) -> bool:
+    for method_name in ("submit", "projection", "final_evidence"):
+        method = getattr(controller, method_name, None)
+        if (
+            not _accepts_exactly_one_argument(method)
+            or iscoroutinefunction(method)
+        ):
+            return False
+    advance = getattr(controller, "advance", None)
+    return bool(
+        _accepts_exactly_one_argument(advance)
+        and iscoroutinefunction(advance)
+    )
+
+
 def _validated_controller(
     controller_factory: CapabilityAssemblyControllerFactory,
 ) -> CapabilityAssemblyControllerPort | None:
     try:
         controller = controller_factory()
-        for method_name in ("submit", "projection", "final_evidence"):
-            method = getattr(controller, method_name, None)
-            if (
-                not _accepts_exactly_one_argument(method)
-                or iscoroutinefunction(method)
-            ):
-                return None
-        advance = getattr(controller, "advance", None)
-        if (
-            not _accepts_exactly_one_argument(advance)
-            or not iscoroutinefunction(advance)
-        ):
-            return None
-        return controller
+        return controller if _controller_contract_is_valid(controller) else None
     except Exception:
         return None
 
 
-def create_capability_assembly_router(
-    controller_factory: CapabilityAssemblyControllerFactory,
+def _create_capability_assembly_router(
+    resolve_controller: Callable[[], CapabilityAssemblyControllerPort | None],
 ) -> APIRouter:
-    """Create a transport-only router around an explicitly bound controller."""
-
     router = APIRouter(prefix="/v1/capability-assemblies")
-    controller = _validated_controller(controller_factory)
     ready_health = CapabilityAssemblyApiHealth()
 
     def get_controller() -> CapabilityAssemblyControllerPort:
+        controller = resolve_controller()
         if controller is None:
             raise _translate_error(
                 RuntimeError("capability assembly controller is unavailable")
@@ -169,10 +183,7 @@ def create_capability_assembly_router(
     async def health(
         _: GatewayRole = Depends(require_captain),
     ) -> CapabilityAssemblyApiHealth:
-        if controller is None:
-            raise _translate_error(
-                RuntimeError("capability assembly controller is unavailable")
-            ) from None
+        get_controller()
         return ready_health
 
     @router.post("", response_model=CapabilityAssemblyCheckpoint)
@@ -245,3 +256,36 @@ def create_capability_assembly_router(
             raise _translate_error(exc) from None
 
     return router
+
+
+def create_capability_assembly_router(
+    controller_factory: CapabilityAssemblyControllerFactory,
+) -> APIRouter:
+    """Create a non-production transport test seam around a raw controller."""
+
+    controller = _validated_controller(controller_factory)
+    return _create_capability_assembly_router(lambda: controller)
+
+
+def create_production_capability_assembly_router(
+    composition_factory: CapabilityAssemblyCompositionFactory,
+) -> APIRouter:
+    """Keep and attest the sealed production composition at every boundary."""
+
+    try:
+        composition: object = composition_factory()
+    except Exception:
+        composition = None
+
+    def resolve_controller() -> CapabilityAssemblyControllerPort | None:
+        try:
+            controller = require_production_capability_assembly(composition)
+            return (
+                controller
+                if _controller_contract_is_valid(controller)
+                else None
+            )
+        except Exception:
+            return None
+
+    return _create_capability_assembly_router(resolve_controller)

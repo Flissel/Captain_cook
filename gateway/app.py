@@ -141,9 +141,9 @@ from gateway.capability_resume_service import (
     CapabilityResumeUnavailable,
 )
 from gateway.capability_assembly_api import (
-    CapabilityAssemblyControllerFactory,
-    create_capability_assembly_router,
-    unavailable_capability_assembly_controller,
+    CapabilityAssemblyCompositionFactory,
+    create_production_capability_assembly_router,
+    unavailable_capability_assembly_composition,
 )
 from gateway.portal_live_contracts import (
     PortalLiveEvidenceQueryV1,
@@ -310,8 +310,8 @@ def create_app(
     portal_clock: Callable[[], datetime] | None = None,
     capability_resume_service: CapabilityResumeService | None = None,
     capability_resume_executor: CapabilityResumeExecutor | None = None,
-    capability_assembly_controller_factory: (
-        CapabilityAssemblyControllerFactory | None
+    capability_assembly_composition_factory: (
+        CapabilityAssemblyCompositionFactory | None
     ) = None,
     runtime_usage_artifacts: ContentAddressedArtifactAdapter | None = None,
     runtime_usage_pricing_snapshots: tuple[
@@ -394,9 +394,9 @@ def create_app(
     app.state.gateway_settings_lock = Lock()
     initialize_portal_auth(app)
     app.include_router(
-        create_capability_assembly_router(
-            capability_assembly_controller_factory
-            or unavailable_capability_assembly_controller
+        create_production_capability_assembly_router(
+            capability_assembly_composition_factory
+            or unavailable_capability_assembly_composition
         )
     )
 
