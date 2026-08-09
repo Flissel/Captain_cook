@@ -18,6 +18,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Literal, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
+from zipfile import BadZipFile, ZipFile
 
 from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
@@ -359,6 +360,7 @@ class CodexCliFactoryBuildSettings:
         ("pytest",),
     )
     deadline_at: datetime | None = None
+    enforce_assignment_budgets: bool = False
 
     def __post_init__(self) -> None:
         if self.maximum_runtime_seconds < 1 or self.maximum_runtime_seconds > 900:
@@ -426,6 +428,7 @@ class CodexCliFactoryBuildSettings:
                 if self.deadline_at is None
                 else min(self.deadline_at, assignment.deadline_at)
             ),
+            enforce_assignment_budgets=True,
         )
 
 
@@ -3461,7 +3464,82 @@ class CodexCliFactoryBuildExecutor:
                 aggregate_size=aggregate_size,
             )
             artifacts.append(artifact)
+        if self._settings.enforce_assignment_budgets:
+            archive_members = self._count_source_archive_members(root / "candidate.zip")
+            if (
+                confined_files + len(_OUTPUT_PATHS) + archive_members
+                > self._settings.maximum_files
+            ):
+                raise FactoryCodexOutputCaptureError(
+                    "Codex output file-count limit exceeded",
+                    reason="output_size_limit_exceeded",
+                )
+            self._require_assignment_execution_evidence(root / "test-evidence.json")
         return tuple(artifacts)
+
+    @staticmethod
+    def _count_source_archive_members(path: Path) -> int:
+        try:
+            with ZipFile(path, "r") as archive:
+                return sum(1 for item in archive.infolist() if not item.is_dir())
+        except (OSError, BadZipFile):
+            raise FactoryCodexOutputCaptureError(
+                "Codex source archive is invalid",
+                reason="required_output_invalid",
+            ) from None
+
+    def _require_assignment_execution_evidence(self, path: Path) -> None:
+        try:
+            content = path.read_bytes()
+            if len(content) > self._settings.maximum_json_artifact_bytes:
+                raise ValueError
+            evidence = json.loads(content)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise FactoryCodexOutputCaptureError(
+                "Codex assignment execution evidence is invalid",
+                reason="required_output_invalid",
+            ) from None
+        if not isinstance(evidence, dict):
+            raise FactoryCodexOutputCaptureError(
+                "Codex assignment execution evidence is invalid",
+                reason="required_output_invalid",
+            )
+        commands = evidence.get("executed_commands")
+        allowed = set(self._settings.supported_commands)
+        if (
+            not isinstance(commands, list)
+            or not commands
+            or any(
+                not isinstance(command, list)
+                or not command
+                or any(
+                    not isinstance(argument, str)
+                    or not argument
+                    or "/" in argument
+                    or "\\" in argument
+                    or re.match(r"^[A-Za-z]:", argument) is not None
+                    for argument in command
+                )
+                or tuple(command) not in allowed
+                for command in commands
+            )
+        ):
+            raise FactoryCodexOutputCaptureError(
+                "Codex command evidence exceeds assignment authority",
+                reason="required_output_invalid",
+            )
+        cost = evidence.get("provider_cost_usd")
+        if (
+            isinstance(cost, bool)
+            or not isinstance(cost, (int, float))
+            or not math.isfinite(float(cost))
+            or float(cost) < 0
+            or float(cost) > self._settings.maximum_provider_cost_usd
+        ):
+            raise FactoryCodexOutputCaptureError(
+                "Codex provider cost exceeds assignment authority",
+                reason="required_output_invalid",
+            )
 
     def _stream_output_artifact(
         self,

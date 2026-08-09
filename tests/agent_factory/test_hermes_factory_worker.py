@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -223,6 +224,10 @@ async def test_worker_rejects_null_codex_result_without_retry_or_effect(tmp_path
 
     assert codex.calls == 1
     assert minibook.submissions == 0
+    checkpoint = json.loads(next((tmp_path / "worker").glob("*.json")).read_text())
+    assert checkpoint["worker_id"] == "hermes-factory-v3"
+    assert checkpoint["failure_kind"] == "null_or_untyped"
+    assert checkpoint["failure_exit_code"] is None
 
 
 @pytest.mark.asyncio
@@ -286,12 +291,18 @@ async def test_worker_rejects_receipt_identity_drift(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "error",
-    (TimeoutError(), RuntimeError("process exited without a sealed receipt")),
+    ("error", "failure_kind", "exit_code"),
+    (
+        (TimeoutError("secret C:\\private\\prompt.txt"), "timeout", None),
+        (subprocess.CalledProcessError(23, ["secret-command"]), "process_exit", 23),
+        (RuntimeError("provider response with credential"), "runtime_error", None),
+    ),
 )
 async def test_worker_durable_failure_never_restarts_codex_without_retry_authority(
     tmp_path: Path,
     error: Exception,
+    failure_kind: str,
+    exit_code: int | None,
 ) -> None:
     assignment = _assignment()
     minibook = _Minibook(assignment)
@@ -314,6 +325,15 @@ async def test_worker_durable_failure_never_restarts_codex_without_retry_authori
 
     assert codex.calls == 1
     assert minibook.submissions == 0
+    content = next((tmp_path / "worker").glob("*.json")).read_text()
+    checkpoint = json.loads(content)
+    assert checkpoint["worker_id"] == "hermes-factory-v3"
+    assert checkpoint["failure_kind"] == failure_kind
+    assert checkpoint["failure_exit_code"] == exit_code
+    assert "secret" not in content
+    assert "private" not in content
+    assert "credential" not in content
+    assert "provider response" not in content
 
 
 @pytest.mark.asyncio

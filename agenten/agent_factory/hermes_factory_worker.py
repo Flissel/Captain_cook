@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import json
 import os
+import subprocess
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -129,6 +130,7 @@ class HermesFactoryWorkerCheckpoint(BaseModel):
     assignment_id: UUID
     effect_key: str
     attempt: int
+    worker_id: str
     state: Literal["started", "failed", "pending_effect", "effect_submitted"]
     codex_attempts: int = Field(ge=1)
     status: Literal[
@@ -138,12 +140,27 @@ class HermesFactoryWorkerCheckpoint(BaseModel):
         "effect_submitted",
     ]
     effect: FactoryBuildEffectV2 | None = None
+    failure_kind: Literal[
+        "timeout",
+        "process_exit",
+        "null_or_untyped",
+        "validation_error",
+        "runtime_error",
+        "exception",
+    ] | None = None
+    failure_exit_code: int | None = Field(default=None, ge=-32768, le=32767)
 
     @model_validator(mode="after")
     def require_effect_state_binding(self) -> "HermesFactoryWorkerCheckpoint":
         requires_effect = self.state in {"pending_effect", "effect_submitted"}
         if requires_effect != (self.effect is not None):
             raise ValueError("Hermes Factory checkpoint effect state is invalid")
+        if (self.state == "failed") != (self.failure_kind is not None):
+            raise ValueError("Hermes Factory checkpoint failure state is invalid")
+        if (self.failure_kind == "process_exit") != (
+            self.failure_exit_code is not None
+        ):
+            raise ValueError("Hermes Factory checkpoint process exit is invalid")
         return self
 
 
@@ -178,6 +195,7 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
         self,
         assignment: FactoryBuildAssignmentV2,
         *,
+        worker_id: str,
         retry_authorized: bool,
     ) -> HermesFactoryWorkerCheckpoint:
         previous = self.load(assignment)
@@ -186,6 +204,7 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
                 assignment_id=assignment.assignment_id,
                 effect_key=assignment.effect_key,
                 attempt=assignment.attempt,
+                worker_id=worker_id,
                 state="started",
                 codex_attempts=1,
                 status="codex_started",
@@ -193,6 +212,8 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
             return self._create(checkpoint)
         if previous.state not in {"started", "failed"}:
             return previous
+        if previous.worker_id != worker_id:
+            raise ValueError("Hermes Factory checkpoint worker identity changed")
         if not retry_authorized:
             raise ValueError("Hermes Factory Codex retry authority is required")
         if previous.codex_attempts > assignment.limits.max_retries:
@@ -203,6 +224,8 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
                 "status": "codex_started",
                 "codex_attempts": previous.codex_attempts + 1,
                 "effect": None,
+                "failure_kind": None,
+                "failure_exit_code": None,
             }
         )
         return self._replace(previous, checkpoint)
@@ -211,9 +234,25 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
         self,
         assignment: FactoryBuildAssignmentV2,
         previous: HermesFactoryWorkerCheckpoint,
+        *,
+        failure_kind: Literal[
+            "timeout",
+            "process_exit",
+            "null_or_untyped",
+            "validation_error",
+            "runtime_error",
+            "exception",
+        ],
+        failure_exit_code: int | None = None,
     ) -> HermesFactoryWorkerCheckpoint:
         failed = previous.model_copy(
-            update={"state": "failed", "status": "codex_failed", "effect": None}
+            update={
+                "state": "failed",
+                "status": "codex_failed",
+                "effect": None,
+                "failure_kind": failure_kind,
+                "failure_exit_code": failure_exit_code,
+            }
         )
         return self._replace(previous, failed)
 
@@ -467,12 +506,18 @@ class HermesFactoryWorker:
         )
         checkpoint = self._checkpoint_store.start(
             assignment,
+            worker_id=self._worker_id,
             retry_authorized=retry_authorized,
         )
 
         try:
             build = await self._codex.build(assignment)
             if not isinstance(build, HermesFactoryCodexBuild):
+                self._checkpoint_store.failed(
+                    assignment,
+                    checkpoint,
+                    failure_kind="null_or_untyped",
+                )
                 raise ValueError("Hermes Factory requires a typed Codex build result")
             build.validate_for(assignment)
             readback = self._codex_receipts.read_receipt(
@@ -480,8 +525,30 @@ class HermesFactoryWorker:
             )
             if readback != build.codex_build_receipt:
                 raise ValueError("Codex build receipt CAS readback changed")
-        except Exception:
-            self._checkpoint_store.failed(assignment, checkpoint)
+        except Exception as exc:
+            current = self._checkpoint_store.load(assignment)
+            if current is not None and current.state != "failed":
+                if isinstance(exc, TimeoutError):
+                    failure_kind = "timeout"
+                    exit_code = None
+                elif isinstance(exc, subprocess.CalledProcessError):
+                    failure_kind = "process_exit"
+                    exit_code = max(-32768, min(32767, int(exc.returncode)))
+                elif isinstance(exc, ValueError):
+                    failure_kind = "validation_error"
+                    exit_code = None
+                elif isinstance(exc, RuntimeError):
+                    failure_kind = "runtime_error"
+                    exit_code = None
+                else:
+                    failure_kind = "exception"
+                    exit_code = None
+                self._checkpoint_store.failed(
+                    assignment,
+                    checkpoint,
+                    failure_kind=failure_kind,
+                    failure_exit_code=exit_code,
+                )
             raise
         receipt = build.codex_build_receipt
         effect = FactoryBuildEffectV2(
