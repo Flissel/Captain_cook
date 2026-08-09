@@ -165,7 +165,12 @@ def _reject_credentials(text: str) -> None:
 
 def _normalized_heading(value: str) -> str:
     compatible = unicodedata.normalize("NFKC", value).casefold()
-    return " ".join(re.sub(r"[-_]", " ", compatible).split())
+    visible = "".join(
+        character if character.isalnum() else " "
+        for character in compatible
+        if unicodedata.category(character) != "Cf"
+    )
+    return " ".join(visible.split())
 
 
 def _level_sections(text: str) -> tuple[str, list[tuple[str, str]]]:

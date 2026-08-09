@@ -29,6 +29,7 @@ from agenten.agent_factory.input_document import FactoryInputError, load_factory
 from agenten.agent_factory.private_benchmark_catalog import (
     InMemoryPrivateBenchmarkCatalog,
     generate_private_benchmark_suite,
+    repository_forbidden_roots,
     write_private_benchmark_catalog,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
@@ -1023,6 +1024,58 @@ def test_production_builder_uses_gateway_repository_and_current_authority_adapte
         require_production_capability_assembly(composition)
 
 
+def test_production_composition_attests_catalog_identity_and_rotation_invalidates_it(
+    tmp_path: Path,
+) -> None:
+    environment = _settings_environment(tmp_path)
+    settings = CapabilityAssemblyProductionSettings.from_environment(environment)
+    composition = build_capability_assembly_controller(
+        repository_root=tmp_path,
+        settings=settings,
+        authorities=_authorities(store=_GatewayStore()),
+        holdout_store=InMemoryPrivateHoldoutStore(),
+    )
+
+    assert composition.private_benchmark_manifest_sha256 == environment[
+        "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256"
+    ]
+    assert len(composition.private_benchmark_suite_identity_sha256) == 64
+    rotated_root = tmp_path.parent / f"{tmp_path.name}-rotated-private-benchmarks"
+    repository_root = Path(__file__).resolve().parents[2]
+    documents = tuple(load_factory_input(repository_root / relative) for relative in (
+        "demo_inputs/agent_factory/sales_pipeline_brief/TO_BE_BUILT.md",
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md",
+        "demo_inputs/agent_factory/claims_resolution/TO_BE_BUILT.md",
+    ))
+    write_private_benchmark_catalog(
+        rotated_root, documents, seed=b"rotated-production-catalog-seed!" * 2,
+    )
+    Path(environment["CAPTAIN_PRIVATE_BENCHMARK_ROOT"]).joinpath(
+        "catalog.json"
+    ).write_bytes((rotated_root / "catalog.json").read_bytes())
+
+    with pytest.raises(
+        CapabilityAssemblyProductionConfigurationError, match="attestation"
+    ):
+        require_production_capability_assembly(composition)
+
+
+def test_private_catalog_forbidden_roots_include_actual_git_worktrees() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    observed = repository_forbidden_roots(repository_root)
+    porcelain = subprocess.run(
+        ("git", "-C", str(repository_root), "worktree", "list", "--porcelain"),
+        check=True, capture_output=True, text=True,
+    ).stdout
+    expected = {
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in porcelain.splitlines() if line.startswith("worktree ")
+    }
+
+    assert repository_root.resolve() in observed
+    assert expected <= set(observed)
+
+
 def test_low_level_composition_rejects_missing_authority_before_using_repository() -> None:
     class ExplodingRepository:
         def history(self, assembly_id: object) -> tuple[object, ...]:
@@ -1680,7 +1733,7 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                 "schema": "captain.capability-benchmark-handoff.v1",
                 **common,
                 "from_agent": "worker",
-                "to_agent": "captain",
+                    "to_agent": "human incident commander",
                 "reason_code": "mandatory_stop",
             })
             tool_calls = []

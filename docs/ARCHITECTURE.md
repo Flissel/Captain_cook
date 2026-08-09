@@ -84,7 +84,11 @@ generates those definitions from a secret local seed and stores them in a
 digest-pinned private catalog. Production opens that catalog once from a
 dedicated root outside every repository/worktree and binds it to the exact
 admitted input SHA-256 values before any Gateway schema or provider effect.
-Jobs and public compiler output contain only content-addressed holdout refs.
+The final opened handle is link/junction checked and its manifest SHA plus
+canonical suite identity are part of the sealed production attestation;
+readiness revalidates that same handle. Jobs and public compiler output contain
+only content-addressed holdout refs. The compiler validates the complete suite
+and source map before one atomic holdout-store write.
 
 The summary is committed before the evaluation so the evaluation can reference
 an exact, resolvable artifact. Captain/Gateway alone accepts that summary,

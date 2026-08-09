@@ -4,12 +4,17 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
-import os
+from datetime import datetime, timezone
+from decimal import Decimal
 from uuid import UUID, uuid5
 
 import pytest
 
 from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
+from agenten.agent_factory.execution_policy import (
+    FactoryExecutionMode, FactoryExecutionPolicyV1, FactoryLiveCapability,
+)
+from agenten.agent_factory.job_builder import build_factory_job_v3
 from agenten.agent_factory.input_compiler import FactoryInputCompiler
 from agenten.agent_factory.input_document import FactoryInputError, load_factory_input, parse_factory_input_bytes
 from agenten.agent_factory.private_benchmark_catalog import (
@@ -141,8 +146,8 @@ def test_each_generated_category_is_a_grounded_behavioral_transformation(
             assert cited[0][2] in predicate_values
         elif case.category == "conflicting":
             assert len(cited) >= 3
-            assert cited[0][2] in case.observable_setup
-            assert cited[1][2] in case.observable_setup
+            assert f"Declared contradictory fact A: {cited[0][0]}" in case.observable_setup
+            assert f"Declared contradictory fact B: NOT ({cited[0][0]})" in case.observable_setup
             assert cited[0][2] in predicate_values
             assert cited[1][2] in predicate_values
             assert any(item.kind == "handoff_event" for item in case.expected_predicates)
@@ -215,7 +220,9 @@ def test_real_repository_admission_compiler_and_suite_cover_each_canonical_input
     assert len(holdouts) == 15
 
 
-def test_private_catalog_compiles_only_opaque_refs_and_never_enters_public_input() -> None:
+def test_private_catalog_compiles_only_opaque_refs_and_never_enters_worker_bytes(
+    tmp_path: Path,
+) -> None:
     document = _documents()[1]
     sentinel = "CAPTAIN-PRIVATE-EXPECTED-SENTINEL"
     suite = generate_private_benchmark_suite(document, seed=b"c" * 32)
@@ -232,12 +239,38 @@ def test_private_catalog_compiles_only_opaque_refs_and_never_enters_public_input
         holdout_store=holdouts,
         private_benchmark_catalog=catalog,
     ).compile(document, subject_version=1)
+    job = build_factory_job_v3(
+        compiled,
+        correlation_id=_id("private-worker-byte-boundary"),
+        now=datetime(2026, 8, 9, tzinfo=timezone.utc),
+        execution_policy=FactoryExecutionPolicyV1(
+            schema="captain.factory-execution-policy.v1",
+            mode=FactoryExecutionMode.RELEASE,
+            live_execution=True,
+            max_cost_usd=Decimal("1.00"),
+            max_runtime_seconds=900,
+            required_live_runs=3,
+            allowed_models=("fixed-model",),
+            live_capabilities=(FactoryLiveCapability.MODEL_INVOKE,),
+        ),
+    )
+    worker_workspace = tmp_path / "worker"
+    worker_workspace.mkdir()
+    (worker_workspace / "TO_BE_BUILT.md").write_bytes(
+        (ROOT / INPUTS[1]).read_bytes()
+    )
+    (worker_workspace / "job-input.json").write_text(
+        job.model_dump_json(), encoding="utf-8",
+    )
 
     public_bytes = (ROOT / INPUTS[1]).read_bytes()
     public_projection = document.model_dump_json() + compiled.model_dump_json()
     assert b"Private benchmark cases" not in public_bytes
     assert b"expected_predicates" not in public_bytes
     assert sentinel not in public_projection
+    assert sentinel not in b"".join(
+        path.read_bytes() for path in worker_workspace.iterdir()
+    ).decode("utf-8")
     assert len(compiled.private_holdout_refs) == 15
     assert sentinel in "".join(holdouts.get(ref.uri) for ref in compiled.private_holdout_refs)
 
@@ -324,6 +357,13 @@ def test_file_catalog_is_digest_bound_single_open_and_rotation_safe(tmp_path: Pa
     rotated_root = tmp_path / "rotated"
     rotated_ref = write_private_benchmark_catalog(rotated_root, documents, seed=b"e" * 32)
     assert rotated_ref.sha256 != first_ref.sha256
+    rotated_catalog = VerifiedFilePrivateBenchmarkCatalog.open(
+        private_root=rotated_root,
+        manifest_path="catalog.json",
+        expected_sha256=rotated_ref.sha256,
+        expected_input_sha256s=tuple(doc.input_ref.sha256 for doc in documents),
+    )
+    assert rotated_catalog.suite_identity_sha256 != catalog.suite_identity_sha256
 
 
 @pytest.mark.parametrize("mutation", ("digest", "escape", "link"))

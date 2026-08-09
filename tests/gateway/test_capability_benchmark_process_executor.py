@@ -143,7 +143,7 @@ def test_isolated_executor_sends_only_canonical_execution_dto() -> None:
     assert set(payload["execution_case"]) == {"setup", "action", "opaque_source_refs"}
     assert all(item not in serialized for item in (
         "expected_predicates", "private_holdout", "repository", "evaluator",
-        "captain-private-assertion",
+        "captain-private-assertion", "CAPTAIN-PRIVATE-EXPECTED-SENTINEL",
     ))
     assert evidence.request_nonce == request.request_nonce
     assert evidence.request_digest == request.request_digest

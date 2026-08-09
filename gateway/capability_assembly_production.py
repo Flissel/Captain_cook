@@ -32,6 +32,7 @@ from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_factory.private_benchmark_catalog import (
     PrivateBenchmarkCatalogError,
     VerifiedFilePrivateBenchmarkCatalog,
+    repository_forbidden_roots,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.delivery.minibook_events import (
@@ -833,12 +834,15 @@ class ProductionCapabilityAssemblyComposition:
     __slots__ = (
         "__controller", "__attestation_digest", "__executor_client",
         "__executor_configuration_digest", "__seal", "__sealed", "__weakref__",
+        "__private_catalog", "__private_catalog_configuration_digest",
     )
 
     def __init__(self, *, controller: CapabilityAssemblyController,
                  attestation_digest: str,
                  executor_client: GatewayIsolatedBenchmarkExecutorClient,
-                 executor_configuration_digest: str, _seal: object) -> None:
+                 executor_configuration_digest: str, _seal: object,
+                 private_catalog: VerifiedFilePrivateBenchmarkCatalog | None = None,
+                 private_catalog_configuration_digest: str | None = None) -> None:
         if (_seal is not _PRODUCTION_COMPOSITION_SEAL
                 or type(controller) is not CapabilityAssemblyController
                 or type(executor_client) is not GatewayIsolatedBenchmarkExecutorClient
@@ -848,6 +852,8 @@ class ProductionCapabilityAssemblyComposition:
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__attestation_digest", attestation_digest)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__executor_client", executor_client)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__executor_configuration_digest", executor_configuration_digest)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__private_catalog", private_catalog)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__private_catalog_configuration_digest", private_catalog_configuration_digest)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__seal", _seal)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__sealed", True)
 
@@ -864,11 +870,27 @@ class ProductionCapabilityAssemblyComposition:
     def attestation_digest(self) -> str:
         return self.__attestation_digest
 
+    @property
+    def private_benchmark_manifest_sha256(self) -> str:
+        if self.__private_catalog is None:
+            raise AttributeError("production private benchmark authority is absent")
+        return self.__private_catalog.manifest_sha256
+
+    @property
+    def private_benchmark_suite_identity_sha256(self) -> str:
+        if self.__private_catalog is None:
+            raise AttributeError("production private benchmark authority is absent")
+        return self.__private_catalog.suite_identity_sha256
+
     def is_sealed(self) -> bool:
         try:
             current_executor_digest = (
                 self.__executor_client.sealed_configuration_digest()
             )
+            if self.__private_catalog is None:
+                return False
+            self.__private_catalog.revalidate()
+            current_catalog_digest = self.__private_catalog.configuration_digest
         except Exception:
             return False
         return (
@@ -877,6 +899,7 @@ class ProductionCapabilityAssemblyComposition:
             and type(self.__controller) is CapabilityAssemblyController
             and re.fullmatch(r"[0-9a-f]{64}", self.__attestation_digest) is not None
             and current_executor_digest == self.__executor_configuration_digest
+            and current_catalog_digest == self.__private_catalog_configuration_digest
         )
 
 
@@ -1008,7 +1031,7 @@ def build_capability_assembly_controller(
             manifest_path=settings.private_benchmark_manifest_path,
             expected_sha256=settings.private_benchmark_manifest_sha256,
             expected_input_sha256s=tuple(settings.expected_sha256_by_path.values()),
-            forbidden_roots=(root,),
+            forbidden_roots=repository_forbidden_roots(root),
         )
     except PrivateBenchmarkCatalogError as exc:
         raise CapabilityAssemblyProductionConfigurationError(str(exc)) from None
@@ -1067,12 +1090,17 @@ def build_capability_assembly_controller(
     executor_configuration_digest = (
         authorities.benchmark_executor.sealed_configuration_digest()
     )
+    private_catalog.revalidate()
+    private_catalog_configuration_digest = private_catalog.configuration_digest
     attestation_payload = {
         "schema": "captain.capability-assembly-production-attestation.v1",
         "repository_revision": settings.expected_repository_revision,
         "source_digests": sorted(settings.expected_sha256_by_path.items()),
         "subject_version": settings.subject_version,
         "benchmark_executor_configuration_digest": executor_configuration_digest,
+        "private_benchmark_manifest_sha256": private_catalog.manifest_sha256,
+        "private_benchmark_suite_identity_sha256": private_catalog.suite_identity_sha256,
+        "private_benchmark_configuration_digest": private_catalog_configuration_digest,
     }
     attestation_digest = hashlib.sha256(json.dumps(
         attestation_payload, sort_keys=True, separators=(",", ":"),
@@ -1081,6 +1109,8 @@ def build_capability_assembly_controller(
         controller=controller, attestation_digest=attestation_digest,
         executor_client=authorities.benchmark_executor,
         executor_configuration_digest=executor_configuration_digest,
+        private_catalog=private_catalog,
+        private_catalog_configuration_digest=private_catalog_configuration_digest,
         _seal=_PRODUCTION_COMPOSITION_SEAL,
     )
     _ISSUED_PRODUCTION_COMPOSITIONS.add(composition)
@@ -1273,6 +1303,7 @@ def _preflight_composition(
             (promotion, "promote_generic_capability", True, 2),
             (n8n_work_batches, "active_n8n_work_batch_id", False, 1),
             (holdout_store, "get", False, 1),
+            (holdout_store, "put_many", False, 1),
             *(
                 (
                     (source_artifacts, "put_factory_input", False, 1),

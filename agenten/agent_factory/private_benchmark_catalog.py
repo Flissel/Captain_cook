@@ -113,7 +113,14 @@ class VerifiedFilePrivateBenchmarkCatalog(InMemoryPrivateBenchmarkCatalog):
         self._forbidden_roots = forbidden_roots
         self.manifest_sha256 = expected_sha256
         identity_payload = tuple(sorted(
-            (suite.input_sha256, suite.policy_sha256) for suite in suites
+            (
+                suite.input_sha256,
+                suite.policy_sha256,
+                hashlib.sha256(_canonical_bytes(
+                    suite.model_dump(mode="json")
+                )).hexdigest(),
+            )
+            for suite in suites
         ))
         self.suite_identity_sha256 = hashlib.sha256(
             _canonical_bytes(identity_payload)
@@ -300,17 +307,14 @@ def generate_private_benchmark_suite(
                 setup = f"Explicit boundary condition from {source_key}: {source.setup}"
                 action = source.action
             elif category == "conflicting":
-                conflict_group = source_groups["conflicting"]
-                other_key = conflict_group[(offset + ordinal + 1) % len(conflict_group)]
-                if other_key == source_key:
-                    other_key = conflict_group[(offset + ordinal + 2) % len(conflict_group)]
-                other = rules[other_key]
                 stop_key, role_key, human_role = _escalation_semantics(document, ordinal)
                 stop = rules[stop_key]
-                source_case_keys = [source_key, other_key, stop_key, role_key]
+                source_case_keys = list(dict.fromkeys((
+                    source_key, stop_key, role_key,
+                )))
                 setup = (
-                    f"Declared contradictory fact A: {source.expected} "
-                    f"Declared contradictory fact B: {other.expected}"
+                    f"Declared contradictory fact A: {source.setup} "
+                    f"Declared contradictory fact B: NOT ({source.setup})"
                 )
                 action = (
                     f"Preserve both declared facts while applying: {stop.expected}"
@@ -320,8 +324,8 @@ def generate_private_benchmark_suite(
                     "expected_value": source.expected,
                 })
                 predicates.append(BenchmarkExpectedPredicate(
-                    predicate_key=f"outcome_b_{nonce}", kind="observation_contains",
-                    observed_key="business_outcome", expected_value=other.expected,
+                    predicate_key=f"stop_{nonce}", kind="observation_contains",
+                    observed_key="business_outcome", expected_value=stop.expected,
                 ))
                 predicates.append(BenchmarkExpectedPredicate(
                     predicate_key=f"handoff_{nonce}", kind="handoff_event",
@@ -491,11 +495,23 @@ def _source_groups(
             _public_source_rules(document)[key].expected,
         )).casefold() for term in boundary_terms)
     )
+    conflicting_terms = (
+        "conflict", "contradict", "inconsistent", "uncertainty", "unavailable",
+        "missing", "tie", "duplicate", "unresolved",
+    )
+    conflicting = tuple(
+        key for key in (*acceptance, *real, *agent_real, *failure)
+        if any(term in " ".join((
+            _public_source_rules(document)[key].setup,
+            _public_source_rules(document)[key].action,
+            _public_source_rules(document)[key].expected,
+        )).casefold() for term in conflicting_terms)
+    )
     candidates = {
         "normal": (*acceptance, *real, *agent_real, *success),
         "boundary": boundary,
         "missing": (*acceptance, *agent_real, *failure, *security),
-        "conflicting": (*authority, *security, *failure),
+        "conflicting": conflicting,
         "mandatory_escalation": (*stops, *authority, *security),
     }
     allowed = set(all_keys)
@@ -515,10 +531,14 @@ def _escalation_semantics(
             "human", "owner", "adjuster",
         )):
             human_roles.append((f"authority_{index}", match.group("role")))
-    stops = tuple(
+    priority_stops = tuple(
         f"stop_{index}" for index, rule in enumerate(document.stop_conditions, 1)
         if any(term in rule.casefold() for term in ("human", "escalat", "approval"))
-    ) or tuple(f"stop_{index}" for index, _ in enumerate(document.stop_conditions, 1))
+    )
+    stops = tuple(dict.fromkeys((
+        *priority_stops,
+        *(f"stop_{index}" for index, _ in enumerate(document.stop_conditions, 1)),
+    )))
     if not human_roles or not stops:
         raise PrivateBenchmarkCatalogError(
             "mandatory escalation requires declared human authority and stop semantics"
@@ -529,18 +549,38 @@ def _escalation_semantics(
 
 def repository_forbidden_roots(repository_root: Path) -> tuple[Path, ...]:
     root = repository_root.resolve(strict=True)
+    discovery_root = root
     try:
         output = subprocess.run(
-            ("git", "-C", str(root), "worktree", "list", "--porcelain"),
-            check=True, capture_output=True, text=True,
+            ("git", "-C", str(discovery_root), "worktree", "list", "--porcelain"),
+            check=True, capture_output=True, text=True, env=_clean_git_environment(),
         ).stdout
     except (OSError, subprocess.CalledProcessError):
-        raise PrivateBenchmarkCatalogError("cannot enumerate repository worktrees") from None
+        discovery_root = Path(__file__).resolve().parents[2]
+        try:
+            output = subprocess.run(
+                ("git", "-C", str(discovery_root), "worktree", "list", "--porcelain"),
+                check=True, capture_output=True, text=True, env=_clean_git_environment(),
+            ).stdout
+        except (OSError, subprocess.CalledProcessError):
+            raise PrivateBenchmarkCatalogError(
+                "cannot enumerate repository worktrees"
+            ) from None
     worktrees = tuple(
         Path(line.removeprefix("worktree ")).resolve(strict=True)
         for line in output.splitlines() if line.startswith("worktree ")
     )
     return tuple(dict.fromkeys((root, *worktrees)))
+
+
+def _clean_git_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    for name in (
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_COUNT",
+    ):
+        environment.pop(name, None)
+    return environment
 
 
 def _read_descriptor(descriptor: int) -> bytes:
