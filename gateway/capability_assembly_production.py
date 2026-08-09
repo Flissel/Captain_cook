@@ -191,6 +191,17 @@ class _SanitizedReconciliation:
                 "Gateway reconciliation authority is unavailable"
             ) from None
 
+    def record_terminal(self, request: object, outcome: object) -> None:
+        recorder = getattr(self._reconciliation, "record_terminal", None)
+        if recorder is None:
+            return
+        try:
+            recorder(request, outcome)
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway reconciliation authority is unavailable"
+            ) from None
+
 
 class RepositoryFactoryInputArtifactStore:
     """Expose canonical Factory refs over the existing SHA-256 artifact CAS."""

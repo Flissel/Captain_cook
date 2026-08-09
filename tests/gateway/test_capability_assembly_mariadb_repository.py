@@ -17,9 +17,14 @@ from tests.gateway.test_capability_assembly_controller import (
     _controller,
     _crash_first_slice,
     _id,
+    _scaffold_readback,
     _submission,
 )
-from gateway.capability_assembly_contracts import CapabilityAssemblyAdvanceRequest
+from gateway.capability_assembly_contracts import (
+    CapabilityAssemblyAdvanceRequest,
+    CapabilityAssemblyReconciliationOutcome,
+    CapabilityAssemblyReconciliationRequest,
+)
 from tests.support.mariadb import assert_isolated_test_database
 
 
@@ -30,9 +35,54 @@ pytestmark = pytest.mark.skipif(not TEST_DSN, reason="TEST_MARIADB_DSN is not co
 def _clean_assembly_tables(storage: MariaDBStorage) -> None:
     with storage.transaction() as connection:
         with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM capability_assembly_terminal_readbacks")
             cursor.execute("DELETE FROM capability_assembly_retry_authorizations")
             cursor.execute("DELETE FROM capability_assembly_checkpoints")
             cursor.execute("DELETE FROM capability_assembly_heads")
+
+
+def test_mariadb_terminal_readback_survives_a_second_gateway_connection() -> None:
+    assert TEST_DSN is not None
+    assert_isolated_test_database(TEST_DSN)
+    first_storage = MariaDBStorage(TEST_DSN)
+    first_repository = GatewayCapabilityAssemblyRepository(GatewayStore(first_storage))
+    _clean_assembly_tables(first_storage)
+    controller, _, _, factory, *_ = _controller(first_repository)
+    controller.submit(_submission())
+    advance = CapabilityAssemblyAdvanceRequest(
+        assembly_id=ASSEMBLY_ID,
+        operation_id=_id("mariadb-terminal-readback"),
+        request_sha256=controller.projection(ASSEMBLY_ID).request_sha256,
+        maximum_slices=1,
+    )
+    _crash_first_slice(controller, factory, advance)
+    checkpoint = controller.projection(ASSEMBLY_ID)
+    record = first_repository.history(ASSEMBLY_ID)[-1]
+    assert checkpoint.started_slice is not None
+    request = CapabilityAssemblyReconciliationRequest(
+        assembly_id=ASSEMBLY_ID,
+        operation_id=advance.operation_id,
+        request_sha256=advance.request_sha256,
+        started_slice=checkpoint.started_slice,
+        started_checkpoint_ref=record.artifact_ref,
+    )
+    outcome = CapabilityAssemblyReconciliationOutcome(
+        assembly_id=request.assembly_id,
+        operation_id=request.operation_id,
+        request_sha256=request.request_sha256,
+        started_slice=request.started_slice,
+        started_checkpoint_ref=request.started_checkpoint_ref,
+        disposition="terminal_readback",
+        factory_authority=_scaffold_readback(checkpoint),
+    )
+
+    first_repository.record_terminal_readback(request, outcome)
+    restarted = GatewayCapabilityAssemblyRepository(
+        GatewayStore(MariaDBStorage(TEST_DSN))
+    )
+
+    assert restarted.terminal_readback(request) == outcome
+    _clean_assembly_tables(first_storage)
 
 
 def test_mariadb_retry_receipt_is_atomic_across_independent_connections() -> None:

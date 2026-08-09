@@ -929,19 +929,26 @@ class GatewayGenericCapabilityPromotion:
 
 
 class GatewayCapabilityReconciliation:
-    """Conservative readback: absence is never upgraded into retry authority."""
+    """Durable Gateway readback; absence is never upgraded into retry authority."""
 
     def __init__(self, *, gateway_store: GatewayStore) -> None:
         self.gateway_store = gateway_store
 
+    def record_terminal(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> None:
+        GatewayCapabilityAssemblyRepository(
+            self.gateway_store
+        ).record_terminal_readback(request, outcome)
+
     async def reconcile(
         self, request: CapabilityAssemblyReconciliationRequest
     ) -> CapabilityAssemblyReconciliationOutcome | None:
-        # The stage-specific adapters already replay terminal Gateway facts.  A
-        # reconciliation miss therefore stays pending until a future bounded
-        # advance observes a typed terminal authority; no receipt is minted here.
-        del request
-        return None
+        return GatewayCapabilityAssemblyRepository(
+            self.gateway_store
+        ).terminal_readback(request)
 
 
 class StoreBoundGatewayCapabilityResumeClient(GatewayCapabilityResumeClient):

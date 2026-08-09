@@ -461,6 +461,37 @@ class _Reconciliation:
         return self.outcome
 
 
+class _TerminalJournalReconciliation(_Reconciliation):
+    def __init__(self) -> None:
+        super().__init__()
+        self.terminal: dict[tuple[UUID, UUID, str, int, str], CapabilityAssemblyReconciliationOutcome] = {}
+
+    @staticmethod
+    def _key(request: CapabilityAssemblyReconciliationRequest):
+        return (
+            request.assembly_id,
+            request.operation_id,
+            request.request_sha256,
+            request.started_slice.ordinal,
+            request.started_checkpoint_ref.sha256,
+        )
+
+    def record_terminal(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> None:
+        key = self._key(request)
+        existing = self.terminal.get(key)
+        if existing is not None and existing != outcome:
+            raise CapabilityAssemblyWriteConflict("terminal authority conflict")
+        self.terminal[key] = outcome
+
+    async def reconcile(self, request: CapabilityAssemblyReconciliationRequest):
+        self.calls.append(request)
+        return self.terminal.get(self._key(request))
+
+
 class _SharedReceiptReconciliation(_Reconciliation):
     def __init__(self, receipt_id: UUID, *, barrier: Barrier | None = None) -> None:
         super().__init__()
@@ -1124,6 +1155,43 @@ def test_started_slice_without_terminal_never_replays_the_effect_after_restart()
     with pytest.raises(CapabilityAssemblyIncomplete, match="started slice"):
         asyncio.run(restarted.advance(request))
     assert restarted_factory.calls == []
+
+
+def test_validated_terminal_authority_survives_crash_before_checkpoint_append() -> None:
+    reconciliation = _TerminalJournalReconciliation()
+    controller, repo, _, factory, *_ = _controller(reconciliation=reconciliation)
+    controller.submit(_submission())
+    request = CapabilityAssemblyAdvanceRequest(
+        assembly_id=ASSEMBLY_ID,
+        operation_id=_id("journalled-terminal-slice"),
+        request_sha256=controller.projection(ASSEMBLY_ID).request_sha256,
+        maximum_slices=1,
+    )
+    original_append = repo.append
+    failed = False
+
+    def crash_after_terminal(checkpoint, *, expected_revision):
+        nonlocal failed
+        if not failed and checkpoint.last_slice is not None:
+            failed = True
+            raise RuntimeError("simulated checkpoint interruption")
+        return original_append(checkpoint, expected_revision=expected_revision)
+
+    repo.append = crash_after_terminal  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="checkpoint interruption"):
+        asyncio.run(controller.advance(request))
+    assert factory.calls == [("scaffold", "input-1")]
+    assert len(reconciliation.terminal) == 1
+
+    repo.append = original_append  # type: ignore[method-assign]
+    restarted, _, _, restarted_factory, *_ = _controller(
+        repo, reconciliation=reconciliation
+    )
+    receipt = asyncio.run(restarted.advance(request))
+
+    assert receipt.executed_slices == 1
+    assert restarted_factory.calls == []
+    assert len(reconciliation.calls) == 1
 
 
 def _scaffold_readback(checkpoint: CapabilityAssemblyCheckpoint) -> CapabilityFactoryAuthority:
