@@ -387,7 +387,7 @@ def create_app(
     portal_clock = portal_clock or (lambda: datetime.now(timezone.utc))
     selected_capability_assembly_factory = capability_assembly_composition_factory
     production_composition = None
-    if selected_capability_assembly_factory is None and all(
+    production_requested = selected_capability_assembly_factory is None and all(
         value is not None
         for value in (
             store,
@@ -396,23 +396,13 @@ def create_app(
             capability_assembly_private_catalog,
             capability_assembly_repository_root,
         )
-    ):
-        # Compose once for this app instance.  Importing ``gateway.app`` and
-        # hitting health on an unconfigured deployment remain side-effect free.
-        assert store is not None
-        assert capability_assembly_environment is not None
-        assert capability_assembly_factory_runtime is not None
-        assert capability_assembly_private_catalog is not None
-        assert capability_assembly_repository_root is not None
-        production_composition = build_production_capability_assembly_from_environment(
-            repository_root=capability_assembly_repository_root,
-            environment=capability_assembly_environment,
-            store=store,
-            runtime=capability_assembly_factory_runtime,
-            private_benchmark_catalog=capability_assembly_private_catalog,
-            clock=portal_clock,
-        )
-        selected_capability_assembly_factory = lambda: production_composition
+    )
+    if production_requested:
+        def selected_production_composition():
+            if production_composition is None:
+                return unavailable_capability_assembly_composition()
+            return production_composition
+        selected_capability_assembly_factory = selected_production_composition
     resume_service = capability_resume_service
     runtime_http_client: httpx.AsyncClient | None = None
     resume_service_lock = Lock()
@@ -421,7 +411,22 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        nonlocal production_composition
         load_gateway_settings(app)
+        if production_requested:
+            assert store is not None
+            assert capability_assembly_environment is not None
+            assert capability_assembly_factory_runtime is not None
+            assert capability_assembly_private_catalog is not None
+            assert capability_assembly_repository_root is not None
+            production_composition = build_production_capability_assembly_from_environment(
+                repository_root=capability_assembly_repository_root,
+                environment=capability_assembly_environment,
+                store=store,
+                runtime=capability_assembly_factory_runtime,
+                private_benchmark_catalog=capability_assembly_private_catalog,
+                clock=portal_clock,
+            )
         start = getattr(mirror, "start", None)
         if start:
             await start()

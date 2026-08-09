@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import asyncio
+from fastapi.testclient import TestClient
 
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.contracts import AgentFactoryJobV3
@@ -375,6 +376,37 @@ def test_gateway_generic_promotion_event_binds_summary_before_feed() -> None:
     assert event.correlation_id == correlation_id
     assert event.payload.benchmark_summary_digest == "sha256:" + "c" * 64
     assert event.payload.cost_ratio_bps == 8000
+
+
+def test_app_composes_injected_production_bundle_once_at_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gateway.app as gateway_app
+
+    calls: list[str] = []
+    composition = SimpleNamespace()
+    monkeypatch.setattr(
+        gateway_app, "build_production_capability_assembly_from_environment",
+        lambda **_kwargs: calls.append("build") or composition,
+    )
+    async def close(_composition: object) -> None:
+        calls.append("close")
+    monkeypatch.setattr(gateway_app, "close_production_capability_assembly", close)
+    monkeypatch.setattr(
+        gateway_app, "load_gateway_settings", lambda _app: SimpleNamespace()
+    )
+    app = gateway_app.create_app(
+        gateway_store=SimpleNamespace(),
+        capability_assembly_environment={},
+        capability_assembly_factory_runtime=SimpleNamespace(),
+        capability_assembly_private_catalog=SimpleNamespace(),
+        capability_assembly_repository_root=tmp_path,
+    )
+
+    assert calls == []
+    with TestClient(app):
+        assert calls == ["build"]
+    assert calls == ["build", "close"]
 
 
 def test_bootstrap_rejects_raw_factory_runtime_before_schema_or_network() -> None:
