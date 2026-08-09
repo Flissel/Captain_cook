@@ -150,6 +150,7 @@ class FactoryInputCompiler:
             assertions_by_source = {
                 item.source_path[-1]: item.assertion_id for item in assertions
             }
+            entries: list[tuple[str, str]] = []
             for case in suite.cases:
                 try:
                     assertion_ids = tuple(
@@ -177,10 +178,11 @@ class FactoryInputCompiler:
                     digest,
                 )
                 uri = f"holdout://{holdout_id}"
-                self._holdout_store.put(uri, body)
+                entries.append((uri, body))
                 refs.append(PrivateHoldoutRef(
                     holdout_id=holdout_id, uri=uri, sha256=digest
                 ))
+            self._holdout_store.put_many(tuple(entries))
             return tuple(refs)
         cases = list(document.real_cases)
         for index, stop in enumerate(document.stop_conditions):

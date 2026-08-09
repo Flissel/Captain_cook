@@ -7,6 +7,8 @@ import hmac
 import json
 import os
 import re
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol
 
@@ -82,8 +84,40 @@ class InMemoryPrivateBenchmarkCatalog:
             ) from None
 
 
+@dataclass(frozen=True)
+class _SourceRule:
+    setup: str
+    action: str
+    expected: str
+    tool: str
+
+
 class VerifiedFilePrivateBenchmarkCatalog(InMemoryPrivateBenchmarkCatalog):
     """Immutable single-open view over one digest-pinned private manifest."""
+
+    def __init__(
+        self,
+        suites: tuple[PrivateBenchmarkCatalogSuiteV1, ...],
+        *,
+        descriptor: int,
+        resolved_path: Path,
+        expected_sha256: str,
+        private_root: Path,
+        forbidden_roots: tuple[Path, ...],
+    ) -> None:
+        super().__init__(suites)
+        self._descriptor = descriptor
+        self._resolved_path = resolved_path
+        self._expected_sha256 = expected_sha256
+        self._private_root = private_root
+        self._forbidden_roots = forbidden_roots
+        self.manifest_sha256 = expected_sha256
+        identity_payload = tuple(sorted(
+            (suite.input_sha256, suite.policy_sha256) for suite in suites
+        ))
+        self.suite_identity_sha256 = hashlib.sha256(
+            _canonical_bytes(identity_payload)
+        ).hexdigest()
 
     @classmethod
     def open(
@@ -114,31 +148,84 @@ class VerifiedFilePrivateBenchmarkCatalog(InMemoryPrivateBenchmarkCatalog):
             raise PrivateBenchmarkCatalogError("private catalog cannot be opened") from None
         if not resolved.is_relative_to(root):
             raise PrivateBenchmarkCatalogError("private catalog path escapes its root")
-        for forbidden in forbidden_roots:
-            candidate = forbidden.resolve(strict=True)
-            if root == candidate or root.is_relative_to(candidate):
+        forbidden = tuple(item.resolve(strict=True) for item in forbidden_roots)
+        for candidate in forbidden:
+            if (root == candidate or root.is_relative_to(candidate)
+                    or candidate.is_relative_to(root)):
                 raise PrivateBenchmarkCatalogError(
                     "production private catalog root overlaps a repository or workspace"
                 )
         if any((candidate / ".git").exists() for candidate in (root, *root.parents)):
             raise PrivateBenchmarkCatalogError("private catalog root has Git ambiguity")
+        descriptor = -1
         try:
-            source = resolved.read_bytes()
+            descriptor = os.open(resolved, os.O_RDONLY)
+            final_path = _final_path_for_descriptor(descriptor, resolved)
+            _reject_reparse_point(target)
+            if final_path != resolved or not final_path.is_relative_to(root):
+                raise PrivateBenchmarkCatalogError(
+                    "private catalog final handle escapes its dedicated root"
+                )
+            if not os.path.samestat(os.fstat(descriptor), resolved.stat()):
+                raise PrivateBenchmarkCatalogError("private catalog changed during open")
+            source = _read_descriptor(descriptor)
+        except PrivateBenchmarkCatalogError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
         except OSError:
+            if descriptor >= 0:
+                os.close(descriptor)
             raise PrivateBenchmarkCatalogError("private catalog cannot be opened") from None
         if hashlib.sha256(source).hexdigest() != expected_sha256:
+            os.close(descriptor)
             raise PrivateBenchmarkCatalogError("private catalog digest changed")
         try:
             manifest = PrivateBenchmarkCatalogManifestV1.model_validate_json(source)
         except ValueError:
+            os.close(descriptor)
             raise PrivateBenchmarkCatalogError("private catalog manifest is invalid") from None
         expected = tuple(expected_input_sha256s)
         observed = tuple(item.input_sha256 for item in manifest.suites)
         if len(expected) != len(set(expected)) or set(observed) != set(expected):
+            os.close(descriptor)
             raise PrivateBenchmarkCatalogError(
                 "private catalog does not exactly bind admitted input digests"
             )
-        return cls(manifest.suites)
+        return cls(
+            manifest.suites,
+            descriptor=descriptor,
+            resolved_path=resolved,
+            expected_sha256=expected_sha256,
+            private_root=root,
+            forbidden_roots=forbidden,
+        )
+
+    def revalidate(self) -> None:
+        _reject_reparse_point(self._resolved_path)
+        final_path = _final_path_for_descriptor(self._descriptor, self._resolved_path)
+        if final_path != self._resolved_path or not final_path.is_relative_to(self._private_root):
+            raise PrivateBenchmarkCatalogError("private catalog final handle changed")
+        try:
+            current_stat = self._resolved_path.stat()
+        except OSError:
+            raise PrivateBenchmarkCatalogError("private catalog changed") from None
+        if not os.path.samestat(os.fstat(self._descriptor), current_stat):
+            raise PrivateBenchmarkCatalogError("private catalog changed")
+        if hashlib.sha256(_read_descriptor(self._descriptor)).hexdigest() != self._expected_sha256:
+            raise PrivateBenchmarkCatalogError("private catalog digest changed")
+        for candidate in self._forbidden_roots:
+            if (self._private_root == candidate
+                    or self._private_root.is_relative_to(candidate)
+                    or candidate.is_relative_to(self._private_root)):
+                raise PrivateBenchmarkCatalogError("private catalog authority changed")
+
+    @property
+    def configuration_digest(self) -> str:
+        return hashlib.sha256(_canonical_bytes({
+            "manifest_sha256": self.manifest_sha256,
+            "suite_identity_sha256": self.suite_identity_sha256,
+        })).hexdigest()
 
 
 def generate_private_benchmark_suite(
@@ -176,7 +263,7 @@ def generate_private_benchmark_suite(
                     predicate_key=f"outcome_{nonce}",
                     kind="observation_contains",
                     observed_key="business_outcome",
-                    expected_value=source[2],
+                    expected_value=source.expected,
                 ),
                 BenchmarkExpectedPredicate(
                     predicate_key=f"rationale_{nonce}",
@@ -193,32 +280,78 @@ def generate_private_benchmark_suite(
                 BenchmarkExpectedPredicate(
                     predicate_key=f"tool_{nonce}",
                     kind="tool_receipt",
-                    observed_key=source[3],
+                    observed_key=source.tool,
                     expected_value=True,
                 ),
             ]
+            setup = source.setup
+            action = source.action
+            source_case_keys = [source_key]
             if category == "missing":
-                predicates[0] = BenchmarkExpectedPredicate(
-                    predicate_key=f"outcome_{nonce}",
+                predicates.append(BenchmarkExpectedPredicate(
+                    predicate_key=f"absence_{nonce}",
                     kind="observation_absent",
                     observed_key="unsupported_inference",
                     expected_value=True,
+                ))
+                setup = f"Required evidence is absent from this declared setup: {source.setup}"
+                action = f"{source.action} Do not invent the absent evidence."
+            elif category == "boundary":
+                setup = f"Explicit boundary condition from {source_key}: {source.setup}"
+                action = source.action
+            elif category == "conflicting":
+                conflict_group = source_groups["conflicting"]
+                other_key = conflict_group[(offset + ordinal + 1) % len(conflict_group)]
+                if other_key == source_key:
+                    other_key = conflict_group[(offset + ordinal + 2) % len(conflict_group)]
+                other = rules[other_key]
+                stop_key, role_key, human_role = _escalation_semantics(document, ordinal)
+                stop = rules[stop_key]
+                source_case_keys = [source_key, other_key, stop_key, role_key]
+                setup = (
+                    f"Declared contradictory fact A: {source.expected} "
+                    f"Declared contradictory fact B: {other.expected}"
                 )
-            if category == "mandatory_escalation":
+                action = (
+                    f"Preserve both declared facts while applying: {stop.expected}"
+                )
+                predicates[0] = predicates[0].model_copy(update={
+                    "predicate_key": f"outcome_a_{nonce}",
+                    "expected_value": source.expected,
+                })
+                predicates.append(BenchmarkExpectedPredicate(
+                    predicate_key=f"outcome_b_{nonce}", kind="observation_contains",
+                    observed_key="business_outcome", expected_value=other.expected,
+                ))
+                predicates.append(BenchmarkExpectedPredicate(
+                    predicate_key=f"handoff_{nonce}", kind="handoff_event",
+                    observed_key="to_agent", expected_value=human_role,
+                ))
+            elif category == "mandatory_escalation":
+                stop_key, role_key, human_role = _escalation_semantics(document, ordinal)
+                stop = rules[stop_key]
+                role = rules[role_key]
+                source_case_keys = [stop_key, role_key]
+                setup = (
+                    f"Mandatory stop rule: {stop.expected} "
+                    f"Declared human authority: {role.expected}"
+                )
+                action = f"Stop and route only to the declared role {human_role}."
+                predicates[0] = predicates[0].model_copy(update={
+                    "expected_value": stop.expected,
+                })
                 predicates.append(BenchmarkExpectedPredicate(
                     predicate_key=f"handoff_{nonce}",
                     kind="handoff_event",
                     observed_key="to_agent",
-                    expected_value="captain",
+                    expected_value=human_role,
                 ))
             cases.append(PrivateBenchmarkCaseRequirement(
                 case_key=f"case_{category}_{nonce}",
                 category=category,
-                observable_setup=(
-                    f"Private variant {nonce}: {source[0]} Category={category}."
-                ),
-                observable_action=f"{source[1]} Preserve source rule {source_key}.",
-                source_case_keys=(source_key,),
+                observable_setup=setup,
+                observable_action=action,
+                source_case_keys=tuple(source_case_keys),
                 expected_predicates=tuple(predicates),
             ))
     return PrivateBenchmarkCatalogSuiteV1(
@@ -287,44 +420,44 @@ def _policy_digest(document: FactoryInputDocumentV2) -> str:
 
 def _public_source_rules(
     document: FactoryInputDocumentV2,
-) -> dict[str, tuple[str, str, str, str]]:
-    rules: dict[str, tuple[str, str, str, str]] = {}
+) -> dict[str, _SourceRule]:
+    rules: dict[str, _SourceRule] = {}
     for case in (*document.acceptance_outcomes, *document.real_cases):
-        rules[case.case_key] = (
+        rules[case.case_key] = _SourceRule(
             case.observable_setup, case.observable_action,
             case.observable_expected, "captain_decision",
         )
     for agent in document.agents:
         for case in agent.real_cases:
-            rules[case.case_key] = (
+            rules[case.case_key] = _SourceRule(
                 case.observable_setup, case.observable_action,
                 case.observable_expected, "captain_decision",
             )
     for integration in document.integrations:
-        rules[f"{integration.integration_key}_integration"] = (
+        rules[f"{integration.integration_key}_integration"] = _SourceRule(
             integration.trigger, integration.operation,
             integration.success_behavior, integration.integration_key,
         )
-        rules[f"{integration.integration_key}_failure"] = (
+        rules[f"{integration.integration_key}_failure"] = _SourceRule(
             integration.trigger, integration.operation,
             integration.failure_behavior, integration.integration_key,
         )
-        rules[f"{integration.integration_key}_tool"] = (
+        rules[f"{integration.integration_key}_tool"] = _SourceRule(
             integration.trigger, integration.operation,
             integration.success_behavior, integration.integration_key,
         )
     for index, rule in enumerate(document.authority_boundaries, 1):
-        rules[f"authority_{index}"] = (
+        rules[f"authority_{index}"] = _SourceRule(
             "Given a bounded Captain authority", "Exercise the authority boundary",
             rule, "captain_decision",
         )
     for index, rule in enumerate(document.security_requirements, 1):
-        rules[f"security_{index}"] = (
+        rules[f"security_{index}"] = _SourceRule(
             "Given the compiled capability", "Exercise the security boundary",
             rule, "captain_decision",
         )
     for index, rule in enumerate(document.stop_conditions, 1):
-        rules[f"stop_{index}"] = (
+        rules[f"stop_{index}"] = _SourceRule(
             "Given a controlled failure", "Exercise the stop condition",
             rule, "captain_decision",
         )
@@ -346,9 +479,21 @@ def _source_groups(
     authority = tuple(f"authority_{index}" for index, _ in enumerate(document.authority_boundaries, 1))
     security = tuple(f"security_{index}" for index, _ in enumerate(document.security_requirements, 1))
     stops = tuple(f"stop_{index}" for index, _ in enumerate(document.stop_conditions, 1))
+    boundary_terms = (
+        "tie", "optional", "unavailable", "threshold", "limit", "ninety",
+        "eight", "seven", "five handoffs", "digest mismatch",
+    )
+    boundary = tuple(
+        key for key in all_keys
+        if any(term in " ".join((
+            _public_source_rules(document)[key].setup,
+            _public_source_rules(document)[key].action,
+            _public_source_rules(document)[key].expected,
+        )).casefold() for term in boundary_terms)
+    )
     candidates = {
         "normal": (*acceptance, *real, *agent_real, *success),
-        "boundary": (*real, *agent_real, *authority, *tools),
+        "boundary": boundary,
         "missing": (*acceptance, *agent_real, *failure, *security),
         "conflicting": (*authority, *security, *failure),
         "mandatory_escalation": (*stops, *authority, *security),
@@ -358,6 +503,73 @@ def _source_groups(
         category: tuple(dict.fromkeys(item for item in values if item in allowed)) or all_keys
         for category, values in candidates.items()
     }
+
+
+def _escalation_semantics(
+    document: FactoryInputDocumentV2, ordinal: int,
+) -> tuple[str, str, str]:
+    human_roles: list[tuple[str, str]] = []
+    for index, rule in enumerate(document.authority_boundaries, 1):
+        match = re.match(r"^The (?P<role>.+?) (?:approves|owns)\b", rule, re.I)
+        if match and any(term in match.group("role").casefold() for term in (
+            "human", "owner", "adjuster",
+        )):
+            human_roles.append((f"authority_{index}", match.group("role")))
+    stops = tuple(
+        f"stop_{index}" for index, rule in enumerate(document.stop_conditions, 1)
+        if any(term in rule.casefold() for term in ("human", "escalat", "approval"))
+    ) or tuple(f"stop_{index}" for index, _ in enumerate(document.stop_conditions, 1))
+    if not human_roles or not stops:
+        raise PrivateBenchmarkCatalogError(
+            "mandatory escalation requires declared human authority and stop semantics"
+        )
+    role_key, human_role = human_roles[ordinal % len(human_roles)]
+    return stops[ordinal % len(stops)], role_key, human_role
+
+
+def repository_forbidden_roots(repository_root: Path) -> tuple[Path, ...]:
+    root = repository_root.resolve(strict=True)
+    try:
+        output = subprocess.run(
+            ("git", "-C", str(root), "worktree", "list", "--porcelain"),
+            check=True, capture_output=True, text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        raise PrivateBenchmarkCatalogError("cannot enumerate repository worktrees") from None
+    worktrees = tuple(
+        Path(line.removeprefix("worktree ")).resolve(strict=True)
+        for line in output.splitlines() if line.startswith("worktree ")
+    )
+    return tuple(dict.fromkeys((root, *worktrees)))
+
+
+def _read_descriptor(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while chunk := os.read(descriptor, 1024 * 1024):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _final_path_for_descriptor(descriptor: int, fallback: Path) -> Path:
+    if os.name != "nt":
+        return Path(os.readlink(f"/proc/self/fd/{descriptor}")).resolve(strict=True)
+    import ctypes
+    import msvcrt
+
+    handle = msvcrt.get_osfhandle(descriptor)
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetFinalPathNameByHandleW(
+        handle, buffer, len(buffer), 0,
+    )
+    if length == 0 or length >= len(buffer):
+        raise PrivateBenchmarkCatalogError("private catalog final handle is unavailable")
+    value = buffer.value
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value).resolve(strict=True)
 
 
 def _reject_reparse_point(path: Path) -> None:
@@ -390,5 +602,6 @@ __all__ = [
     "PrivateBenchmarkCatalogSuiteV1",
     "VerifiedFilePrivateBenchmarkCatalog",
     "generate_private_benchmark_suite",
+    "repository_forbidden_roots",
     "write_private_benchmark_catalog",
 ]

@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import os
 from uuid import UUID, uuid5
 
 import pytest
@@ -76,6 +77,92 @@ def test_seeded_generator_is_deterministic_balanced_unique_and_nonvacuous() -> N
         assert "tool_receipt" in kinds
         if case.category == "mandatory_escalation":
             assert "handoff_event" in kinds
+
+
+@pytest.mark.parametrize("relative_path", INPUTS)
+def test_each_generated_category_is_a_grounded_behavioral_transformation(
+    relative_path: str,
+) -> None:
+    document = load_factory_input(ROOT / relative_path)
+    suite = generate_private_benchmark_suite(document, seed=b"semantic-transform-seed-value!!" * 2)
+    sources = {
+        case.case_key: (case.observable_setup, case.observable_action, case.observable_expected)
+        for case in (*document.acceptance_outcomes, *document.real_cases)
+    }
+    sources.update({
+        case.case_key: (case.observable_setup, case.observable_action, case.observable_expected)
+        for agent in document.agents for case in agent.real_cases
+    })
+    for integration in document.integrations:
+        sources[f"{integration.integration_key}_integration"] = (
+            integration.trigger, integration.operation, integration.success_behavior,
+        )
+        sources[f"{integration.integration_key}_failure"] = (
+            integration.trigger, integration.operation, integration.failure_behavior,
+        )
+        sources[f"{integration.integration_key}_tool"] = (
+            integration.trigger, integration.operation, integration.success_behavior,
+        )
+    sources.update({
+        f"authority_{index}": (
+            "Given a bounded Captain authority", "Exercise the authority boundary", rule,
+        )
+        for index, rule in enumerate(document.authority_boundaries, 1)
+    })
+    sources.update({
+        f"security_{index}": (
+            "Given the compiled capability", "Exercise the security boundary", rule,
+        )
+        for index, rule in enumerate(document.security_requirements, 1)
+    })
+    sources.update({
+        f"stop_{index}": (
+            "Given a controlled failure", "Exercise the stop condition", rule,
+        )
+        for index, rule in enumerate(document.stop_conditions, 1)
+    })
+
+    assert len(suite.cases) == 15
+    for case in suite.cases:
+        assert set(case.source_case_keys) <= set(sources)
+        cited = [sources[key] for key in case.source_case_keys]
+        predicate_values = {
+            predicate.expected_value for predicate in case.expected_predicates
+            if isinstance(predicate.expected_value, str)
+        }
+        if case.category == "normal":
+            assert case.observable_setup == cited[0][0]
+            assert case.observable_action == cited[0][1]
+            assert cited[0][2] in predicate_values
+        elif case.category == "missing":
+            assert "Required evidence is absent" in case.observable_setup
+            assert cited[0][0] in case.observable_setup
+            assert cited[0][1] in case.observable_action
+            assert cited[0][2] in predicate_values
+        elif case.category == "conflicting":
+            assert len(cited) >= 3
+            assert cited[0][2] in case.observable_setup
+            assert cited[1][2] in case.observable_setup
+            assert cited[0][2] in predicate_values
+            assert cited[1][2] in predicate_values
+            assert any(item.kind == "handoff_event" for item in case.expected_predicates)
+        elif case.category == "boundary":
+            assert "Explicit boundary condition" in case.observable_setup
+            assert cited[0][0] in case.observable_setup
+            assert cited[0][2] in predicate_values
+            assert any(token in " ".join(cited[0]).casefold() for token in (
+                "tie", "optional", "unavailable", "threshold", "limit", "ninety", "eight", "seven",
+                "digest mismatch", "five handoffs", "sufficient structured",
+            ))
+        else:
+            assert len(cited) == 2
+            assert cited[0][2] in case.observable_setup
+            assert cited[1][2] in case.observable_setup
+            handoff = next(
+                item for item in case.expected_predicates if item.kind == "handoff_event"
+            )
+            assert handoff.expected_value.casefold() in cited[1][2].casefold()
+            assert handoff.expected_value != "captain"
 
 
 @pytest.mark.parametrize("relative_path", INPUTS)
@@ -162,6 +249,23 @@ def test_parser_rejects_concrete_private_cases_in_worker_visible_input() -> None
         parse_factory_input_bytes(source, logical_name="TO_BE_BUILT.md")
 
 
+@pytest.mark.parametrize("heading", (
+    "PRIVATE   BENCHMARK CASES",
+    "Private\u00a0Benchmark\u00a0Cases",
+    "Ｐｒｉｖａｔｅ Ｂｅｎｃｈｍａｒｋ Ｃａｓｅｓ",
+    "private-benchmark_case definitions",
+))
+def test_parser_rejects_normalized_private_case_heading_before_extra_sections(
+    heading: str,
+) -> None:
+    sentinel = "CAPTAIN-PRIVATE-NORMALIZED-SENTINEL"
+    source = (ROOT / INPUTS[0]).read_text(encoding="utf-8")
+    source += f"\n## {heading}\n{sentinel}\n"
+
+    with pytest.raises(FactoryInputError, match="must not contain private benchmark cases"):
+        parse_factory_input_bytes(source.encode(), logical_name="TO_BE_BUILT.md")
+
+
 def test_stale_input_digest_fails_before_any_private_holdout_write() -> None:
     original = _documents()[0]
     catalog = InMemoryPrivateBenchmarkCatalog((
@@ -178,6 +282,23 @@ def test_stale_input_digest_fails_before_any_private_holdout_write() -> None:
             holdout_store=holdouts,
             private_benchmark_catalog=catalog,
         ).compile(changed, subject_version=1)
+
+    assert len(holdouts) == 0
+
+
+def test_unknown_source_in_final_case_leaves_holdout_store_empty() -> None:
+    document = _documents()[0]
+    suite = generate_private_benchmark_suite(document, seed=b"atomic-catalog-seed-value-123456" * 2)
+    final = suite.cases[-1].model_copy(update={"source_case_keys": ("unknown_final_source",)})
+    catalog = InMemoryPrivateBenchmarkCatalog((
+        suite.model_copy(update={"cases": (*suite.cases[:-1], final)}),
+    ))
+    holdouts = InMemoryPrivateHoldoutStore()
+
+    with pytest.raises(PrivateBenchmarkCatalogError, match="unknown admitted source"):
+        FactoryInputCompiler(
+            holdout_store=holdouts, private_benchmark_catalog=catalog,
+        ).compile(document, subject_version=1)
 
     assert len(holdouts) == 0
 
@@ -235,6 +356,43 @@ def test_file_catalog_rejects_mismatch_escape_and_links_before_use(
             expected_sha256=expected,
             expected_input_sha256s=tuple(doc.input_ref.sha256 for doc in documents),
         )
+
+
+def test_file_catalog_rejects_private_root_that_contains_a_forbidden_worktree(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "authority"
+    forbidden = private_root / "repository-worktree"
+    forbidden.mkdir(parents=True)
+    documents = _documents()
+    ref = write_private_benchmark_catalog(private_root, documents, seed=b"g" * 32)
+
+    with pytest.raises(PrivateBenchmarkCatalogError, match="overlaps"):
+        VerifiedFilePrivateBenchmarkCatalog.open(
+            private_root=private_root,
+            manifest_path="catalog.json",
+            expected_sha256=ref.sha256,
+            expected_input_sha256s=tuple(doc.input_ref.sha256 for doc in documents),
+            forbidden_roots=(forbidden,),
+        )
+
+
+def test_file_catalog_revalidation_detects_atomic_manifest_rotation(tmp_path: Path) -> None:
+    documents = _documents()
+    root = tmp_path / "private"
+    first = write_private_benchmark_catalog(root, documents, seed=b"h" * 32)
+    catalog = VerifiedFilePrivateBenchmarkCatalog.open(
+        private_root=root,
+        manifest_path="catalog.json",
+        expected_sha256=first.sha256,
+        expected_input_sha256s=tuple(doc.input_ref.sha256 for doc in documents),
+    )
+    rotated_root = tmp_path / "rotation"
+    write_private_benchmark_catalog(rotated_root, documents, seed=b"i" * 32)
+    (root / "catalog.json").write_bytes((rotated_root / "catalog.json").read_bytes())
+
+    with pytest.raises(PrivateBenchmarkCatalogError, match="changed"):
+        catalog.revalidate()
 
 
 def test_catalog_manifest_contains_no_seed_material(tmp_path: Path) -> None:
