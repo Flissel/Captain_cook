@@ -405,10 +405,11 @@ def load_capability_production_bundle_manifest(
     minibook = _allowed_service_url(raw["MINIBOOK_BACKEND_URL"], allowed_hosts=allowed_hosts, label="Minibook")
     provider = _allowed_service_url(raw["CAPTAIN_PROVIDER_PROXY_URL"], allowed_hosts=allowed_hosts, label="provider proxy")
     benchmark = _allowed_endpoint(raw["CAPTAIN_CAPABILITY_BENCHMARK_URL"], allowed_hosts=allowed_hosts, label="benchmark")
-    if not benchmark.endswith("/v1/execute") or not provider.endswith("/v1"):
+    if not benchmark.endswith("/v1/execute"):
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly operator endpoint contract is invalid"
         )
+    provider_root = provider.removesuffix("/v1")
     material: dict[str, object] = {
         "schema": "captain.capability-production-bundle-manifest.v1",
         "provider_supervisor_mode": "dynamic_gateway_context_v1",
@@ -429,7 +430,7 @@ def load_capability_production_bundle_manifest(
             credential_env="CAPTAIN_RUNTIME_TOKEN",
         ),
         "provider_proxy": _process_binding(
-            "provider_proxy", provider, f"{provider}/healthz",
+            "provider_proxy", provider_root, f"{provider_root}/v1/healthz",
             credential_env="CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
         ),
         "minibook": _process_binding(

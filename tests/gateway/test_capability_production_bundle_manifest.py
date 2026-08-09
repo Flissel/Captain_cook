@@ -18,7 +18,7 @@ def _environment() -> dict[str, str]:
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-token-value",
         "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-token-value",
-        "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091/v1",
+        "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "provider-token-value",
         "CAPTAIN_PROVIDER_POLICY_SHA256": "a" * 64,
         "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "b" * 64,
