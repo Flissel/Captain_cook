@@ -25,13 +25,30 @@ def _repository(tmp_path: Path) -> Path:
 
 
 def _manifest(**updates: object) -> object:
+    credential_names = {
+        "gateway": "CAPTAIN_GATEWAY_TOKEN",
+        "benchmark": "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+        "runtime": "CAPTAIN_RUNTIME_TOKEN",
+        "provider_proxy": "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
+        "minibook": "MINIBOOK_API_KEY",
+    }
+
     def binding(service: str, *, execute: bool = False) -> object:
+        base = f"http://127.0.0.1/{service}"
+        health_suffix = {
+            "gateway": "/v1/capability-assemblies/health",
+            "runtime": "/health",
+            "minibook": "/health",
+            "provider_proxy": "/healthz",
+            "benchmark": "/healthz",
+        }[service]
         return SimpleNamespace(
             service=service,
-            base_url=f"http://127.0.0.1/{service}",
-            health_url=f"http://127.0.0.1/{service}/healthz",
-            execute_url=(f"http://127.0.0.1/{service}/v1/execute" if execute else None),
+            base_url=base,
+            health_url=f"{base}{health_suffix}",
+            execute_url=(f"{base}/v1/execute" if execute else None),
             authentication="bearer",
+            credential_env=credential_names[service],
         )
 
     values = {
@@ -133,6 +150,39 @@ def test_load_rejects_non_dynamic_provider_contract(
             repository,
             revision_reader=lambda _: "b" * 40,
             production_manifest_loader=lambda *, environment: _manifest(**updates),
+        )
+
+
+@pytest.mark.parametrize(
+    ("service", "field", "value"),
+    (
+        ("gateway", "health_url", "http://127.0.0.1/gateway/healthz"),
+        ("runtime", "health_url", "http://127.0.0.1/runtime/healthz"),
+        ("minibook", "health_url", "http://127.0.0.1/minibook/healthz"),
+        ("provider_proxy", "credential_env", "CAPTAIN_GATEWAY_TOKEN"),
+    ),
+)
+def test_load_rejects_noncanonical_authenticated_health_binding(
+    tmp_path: Path, service: str, field: str, value: str
+) -> None:
+    repository = _repository(tmp_path)
+    manifest = _manifest()
+    changed_binding = SimpleNamespace(
+        **{
+            **vars(getattr(manifest, service)),
+            field: value,
+        }
+    )
+    setattr(manifest, service, changed_binding)
+
+    with pytest.raises(
+        DemoConfigurationError,
+        match="D11 production bundle manifest is invalid",
+    ):
+        load_demo_configuration(
+            repository,
+            revision_reader=lambda _: "b" * 40,
+            production_manifest_loader=lambda *, environment: manifest,
         )
 
 
