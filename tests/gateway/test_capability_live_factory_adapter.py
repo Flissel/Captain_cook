@@ -526,7 +526,7 @@ def test_adapter_advances_only_current_factory_stage_boundaries_and_replays() ->
         FactoryActionKind.SUBMIT_FORGE_JOB,
         FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
     ]
-    assert provisioning.provision_calls == 2
+    assert provisioning.provision_calls == 1
     assert provisioning.lookup_calls >= 3
 
 

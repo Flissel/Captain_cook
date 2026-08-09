@@ -554,9 +554,9 @@ def test_entrypoint_binds_three_repository_sources_and_revalidates_output(
     paths = tuple(
         repository / relative
         for relative in (
-            "examples/live-demo/sequential-n8n/TO_BE_BUILT.md",
-            "examples/live-demo/selector-review/TO_BE_BUILT.md",
-            "examples/live-demo/swarm-api-gap/TO_BE_BUILT.md",
+            "incoming/service-desk/TO_BE_BUILT.md",
+            "incoming/security-review/TO_BE_BUILT.md",
+            "incoming/operations-gap/TO_BE_BUILT.md",
         )
     )
     for index, path in enumerate(paths):
@@ -606,6 +606,73 @@ def test_entrypoint_binds_three_repository_sources_and_revalidates_output(
         path.read_bytes() for path in paths
     )
     assert all("C:\\Users" not in item.source_ref.uri for item in inputs)
+
+
+def test_entrypoint_main_runs_all_seven_stages_with_typed_offline_fakes(
+    tmp_path: Path,
+) -> None:
+    entrypoint = importlib.import_module(
+        "agenten.agent_factory.capability_live_entrypoint"
+    )
+    runner_module = _module()
+    repository = tmp_path / "repository"
+    paths = tuple(
+        repository / relative
+        for relative in (
+            "incoming/team-a/TO_BE_BUILT.md",
+            "incoming/team-b/TO_BE_BUILT.md",
+            "incoming/team-c/TO_BE_BUILT.md",
+        )
+    )
+    for index, path in enumerate(paths):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# generic input {index}\n", encoding="utf-8")
+    pipeline = _Pipeline(runner_module)
+
+    def runner_factory(root: Path) -> object:
+        assert root == repository
+        return runner_module.CapabilityLiveRunner(
+            pipeline=pipeline,
+            budget=_Budget(runner_module),
+            checkpoints=runner_module.FilesystemCapabilityLiveCheckpointStore(
+                root / ".captain-cook/live-demo/checkpoints"
+            ),
+            clock=lambda: NOW,
+        )
+
+    evidence_path = repository / ".captain-cook/live-demo/current/final.json"
+    result = entrypoint.main(
+        [
+            "--repository-root",
+            str(repository),
+            "--input",
+            str(paths[0]),
+            "--input",
+            str(paths[1]),
+            "--input",
+            str(paths[2]),
+            "--pattern",
+            "sequential",
+            "--pattern",
+            "selector_group_chat",
+            "--pattern",
+            "swarm",
+            "--max-cost-usd",
+            "1.00",
+            "--evidence-path",
+            str(evidence_path),
+            "--run-id",
+            str(RUN_ID),
+        ],
+        runner_factory=runner_factory,
+    )
+
+    assert result == 0
+    assert len(pipeline.calls) == 21
+    assert tuple(
+        call.stage for call in pipeline.calls[:7]
+    ) == runner_module.CAPABILITY_LIVE_STAGES
+    assert entrypoint.verify_capability_live_evidence(evidence_path).run_id == RUN_ID
 
 
 def test_entrypoint_rejects_foreign_source_before_runner(tmp_path: Path) -> None:

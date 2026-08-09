@@ -29,23 +29,11 @@ from agenten.agent_runtime.captain_production_adapters import (
 
 
 _RUN_NAMESPACE = UUID("ba04703e-9ff1-55ff-95a3-da23f5ba7c06")
-_CANONICAL_INPUTS = (
-    (
-        "examples/live-demo/sequential-n8n/TO_BE_BUILT.md",
-        "sequential-n8n",
-        "sequential",
-    ),
-    (
-        "examples/live-demo/selector-review/TO_BE_BUILT.md",
-        "selector-review",
-        "selector_group_chat",
-    ),
-    (
-        "examples/live-demo/swarm-api-gap/TO_BE_BUILT.md",
-        "swarm-api-gap",
-        "swarm",
-    ),
-)
+_CAPABILITY_INPUTS_BY_PATTERN = {
+    "sequential": "sequential-n8n",
+    "selector_group_chat": "selector-review",
+    "swarm": "swarm-api-gap",
+}
 
 
 class CapabilityLiveEntrypointError(RuntimeError):
@@ -80,21 +68,18 @@ def load_capability_live_inputs(
     if len(input_paths) != 3 or len(patterns) != 3:
         raise ValueError("capability live entrypoint requires exactly three inputs")
 
-    resolved: list[tuple[Path, str]] = []
-    for path, pattern in zip(input_paths, patterns, strict=True):
+    resolved: list[Path] = []
+    for path in input_paths:
         candidate = path.resolve(strict=True)
-        if not candidate.is_file():
+        if not candidate.is_file() or candidate.name != "TO_BE_BUILT.md":
             raise ValueError("canonical capability live input is unavailable")
         try:
-            relative = candidate.relative_to(root).as_posix()
+            candidate.relative_to(root)
         except ValueError:
             raise ValueError("capability live inputs must be repository-owned") from None
-        resolved.append((candidate, relative))
+        resolved.append(candidate)
 
-    expected_relatives = tuple(item[0] for item in _CANONICAL_INPUTS)
-    if tuple(relative for _, relative in resolved) != expected_relatives:
-        raise ValueError("capability live inputs are not the canonical repository suite")
-    expected_patterns = tuple(item[2] for item in _CANONICAL_INPUTS)
+    expected_patterns = tuple(_CAPABILITY_INPUTS_BY_PATTERN)
     if tuple(patterns) != expected_patterns:
         raise ValueError("capability live conversation patterns are not canonical")
 
@@ -102,9 +87,9 @@ def load_capability_live_inputs(
         root / ".captain-cook" / "artifacts" / "sha256"
     )
     result: list[CapabilityLiveInput] = []
-    for (path, _relative), (_expected, input_id, pattern) in zip(
+    for path, pattern in zip(
         resolved,
-        _CANONICAL_INPUTS,
+        patterns,
         strict=True,
     ):
         content = path.read_bytes()
@@ -131,7 +116,7 @@ def load_capability_live_inputs(
         }[pattern]
         result.append(
             CapabilityLiveInput(
-                input_id=input_id,
+                input_id=_CAPABILITY_INPUTS_BY_PATTERN[pattern],
                 conversation_pattern=cast(ConversationPattern, pattern),
                 source_ref=source_ref,
                 **semantics,

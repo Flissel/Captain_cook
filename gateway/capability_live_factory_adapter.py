@@ -86,11 +86,9 @@ class CurrentCapabilityFactoryAdapter:
     async def scaffold(
         self, request: CapabilityLiveStageRequest
     ) -> CapabilityFactoryAuthority | None:
-        binding = self._binding(request, provision=False)
-        if not self._has_phase(
-            self._blocks(binding.job.job_id), FactoryPhase.BLUEPRINT_CREATED
-        ):
-            binding = self._binding(request, provision=True)
+        # The first stage is the only admission point: it may create the
+        # current Captain V3 binding, while later stages only replay it.
+        binding = self._binding_or_provision(request)
         self._require_released_skills(binding.job)
         await self._advance(
             binding,
@@ -103,6 +101,20 @@ class CurrentCapabilityFactoryAdapter:
             CapabilityLiveStage.SCAFFOLD_AND_TEST_HARNESS,
             FactoryPhase.BLUEPRINT_CREATED,
         )
+
+    def _binding_or_provision(
+        self,
+        request: CapabilityLiveStageRequest,
+    ) -> CapabilityFactoryJobBinding:
+        binding = self._provisioning.binding_for(request)
+        if binding is None:
+            binding = self._provisioning.provision(request)
+        if binding is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Factory provisioning binding is unavailable"
+            )
+        self._require_binding(request, binding)
+        return binding
 
     async def implement(
         self, request: CapabilityLiveStageRequest
