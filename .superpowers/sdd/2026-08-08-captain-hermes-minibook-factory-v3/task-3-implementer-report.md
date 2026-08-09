@@ -95,3 +95,28 @@ Fresh correction verification:
 - `git diff --check`: exit 0; Git emitted only CRLF normalization notices.
 
 The warnings and non-claims remain unchanged from the prior sections.
+
+## Quality re-review pre-validation credential boundary correction
+
+The quality re-review demonstrated that handler-local lifecycle authentication did not run before FastAPI parsed request bodies and typed UUID path parameters. Consequently, an unauthenticated malformed request could receive a detailed 422 response before caller authentication. It also found that composition did not reject a caller credential equal to the worker credential.
+
+RED command:
+
+```powershell
+$env:PYTHONPATH=(Resolve-Path minibook).Path
+python -m pytest minibook/tests/test_creation_api.py -q --no-cov
+```
+
+RED result: `8 failed, 12 passed`. Seven representative legacy/V3 submit, status, result, and cancel requests returned 422 instead of 401 when malformed and unauthenticated, and equal caller/worker credentials did not raise. A first route-dependency pass fixed UUID-path ordering but intentionally remained RED for three malformed JSON-body cases, proving that ordinary FastAPI dependencies were not an adequate pre-body-parse boundary.
+
+The correction places legacy and V3 lifecycle routes behind a dedicated `APIRoute` handler that authenticates the raw Authorization header before invoking FastAPI's parsing/validation handler. Missing authentication therefore returns 401 before malformed JSON or UUID details are processed; an authenticated malformed request still receives the normal typed 422. Authentication also necessarily precedes store lookup. Worker routes remain on the separate worker credential boundary. Router construction now uses `hmac.compare_digest` to reject equal configured caller and worker credentials before registering routes.
+
+Fresh correction verification:
+
+- Focused Task 3 suite: `44 passed, 1 warning in 3.35s`.
+- Task 2 state/runner regression: `60 passed in 6.41s`.
+- Entire `minibook/tests`: `213 passed, 1 deselected, 1 warning in 9.99s`.
+- `python -m compileall -q minibook/swarm minibook/src`: exit 0.
+- `git diff --check`: exit 0; Git emitted only CRLF normalization notices.
+
+The warnings and non-claims remain unchanged from the prior sections. The earlier quality-review wording that handler-local auth ran before parsing is superseded by this behavioral correction and evidence.

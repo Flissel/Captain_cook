@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
 from minibook.swarm.api import create_creation_router
 from minibook.swarm.artifact_store import FilesystemCreationArtifactStore
@@ -175,6 +176,53 @@ def test_lifecycle_routes_require_separate_constant_time_caller_auth_before_look
         assert wrong.json() == worker.json()
     assert comparisons
     assert all(expected == "captain-secret" for _, expected in comparisons)
+
+
+@pytest.mark.parametrize("path", ("/api/v1/creation-jobs", "/v3/creation/jobs"))
+def test_lifecycle_auth_precedes_malformed_submit_body_validation(
+    tmp_path: Path, path: str,
+) -> None:
+    api, _, _, _ = v3_client(tmp_path)
+    malformed = {"content": "{", "headers": {"Content-Type": "application/json"}}
+
+    assert api.post(path, **malformed).status_code == 401
+    authorized = malformed | {"headers": CALLER_HEADERS | malformed["headers"]}
+    assert api.post(path, **authorized).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/api/v1/creation-jobs/not-a-uuid",
+        "/api/v1/creation-jobs/not-a-uuid/result",
+        "/v3/creation/jobs/not-a-uuid",
+        "/v3/creation/jobs/not-a-uuid/result",
+    ),
+)
+def test_lifecycle_auth_precedes_invalid_path_validation(tmp_path: Path, path: str) -> None:
+    api, _, _, _ = v3_client(tmp_path)
+
+    assert api.get(path).status_code == 401
+    assert api.get(path, headers=CALLER_HEADERS).status_code == 422
+
+
+def test_lifecycle_auth_precedes_cancel_body_and_path_validation(tmp_path: Path) -> None:
+    api, _, _, _ = v3_client(tmp_path)
+    malformed = {"content": "{", "headers": {"Content-Type": "application/json"}}
+
+    assert api.post("/v3/creation/jobs/not-a-uuid/cancel", **malformed).status_code == 401
+    authorized = malformed | {"headers": CALLER_HEADERS | malformed["headers"]}
+    assert api.post("/v3/creation/jobs/not-a-uuid/cancel", **authorized).status_code == 422
+
+
+def test_router_rejects_shared_lifecycle_and_worker_credentials(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="must differ"):
+        create_creation_router(
+            CreationJobStore(tmp_path / "creation.sqlite3"),
+            creation_api_key="shared-secret",
+            worker_token="shared-secret",
+            worker_id="hermes-factory",
+        )
 
 
 def test_identical_replay_reschedules_when_first_callback_failed_after_persistence(

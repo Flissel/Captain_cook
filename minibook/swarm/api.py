@@ -1,13 +1,14 @@
 """Optional HTTP boundary for persisted creation jobs."""
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 import hashlib
 import hmac
 import re
 from uuid import UUID
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -51,6 +52,12 @@ def create_creation_router(
     worker_id: str | None = None,
     artifact_store: FilesystemCreationArtifactStore | None = None,
 ) -> APIRouter:
+    if (
+        creation_api_key is not None
+        and worker_token is not None
+        and hmac.compare_digest(creation_api_key, worker_token)
+    ):
+        raise ValueError("Creation API key and worker token must differ")
     router = APIRouter()
 
     def require_store() -> CreationJobStore:
@@ -66,6 +73,18 @@ def create_creation_router(
         supplied = authorization.removeprefix("Bearer ")
         if not hmac.compare_digest(supplied, creation_api_key):
             raise HTTPException(403, "Creation caller authorization failed")
+
+    class CallerAuthenticatedRoute(APIRoute):
+        def get_route_handler(self) -> Callable[[Request], Awaitable[Response]]:
+            route_handler = super().get_route_handler()
+
+            async def authenticated_route_handler(request: Request) -> Response:
+                require_caller(request.headers.get("Authorization"))
+                return await route_handler(request)
+
+            return authenticated_route_handler
+
+    lifecycle_router = APIRouter(route_class=CallerAuthenticatedRoute)
 
     def require_worker(authorization: str | None) -> str:
         if worker_token is None or worker_id is None:
@@ -93,12 +112,8 @@ def create_creation_router(
             "creation_jobs": store is not None,
         }
 
-    @router.post("/api/v1/creation-jobs")
-    def submit(
-        payload: dict[str, object],
-        authorization: str | None = Header(default=None),
-    ):
-        require_caller(authorization)
+    @lifecycle_router.post("/api/v1/creation-jobs")
+    def submit(payload: dict[str, object]):
         current_store = require_store()
         job = _parse_job(payload)
         if isinstance(job, CreationJobV3) and (worker_token is None or worker_id is None):
@@ -116,20 +131,15 @@ def create_creation_router(
             receipt.model_dump(mode="json"), status_code=200 if receipt.replayed else 202
         )
 
-    @router.post("/v3/creation/jobs")
-    def submit_v3(
-        payload: dict[str, object],
-        authorization: str | None = Header(default=None),
-    ):
-        require_caller(authorization)
+    @lifecycle_router.post("/v3/creation/jobs")
+    def submit_v3(payload: dict[str, object]):
         job = _parse_job(payload)
         if not isinstance(job, CreationJobV3):
             raise HTTPException(422, "V3 creation endpoint requires a V3 job")
-        return submit(payload, authorization)
+        return submit(payload)
 
-    @router.get("/api/v1/creation-jobs/{job_id}")
-    def status(job_id: UUID, authorization: str | None = Header(default=None)):
-        require_caller(authorization)
+    @lifecycle_router.get("/api/v1/creation-jobs/{job_id}")
+    def status(job_id: UUID):
         if store is None:
             raise HTTPException(503, "Creation jobs are not configured")
         try:
@@ -137,19 +147,16 @@ def create_creation_router(
         except CreationNotFoundError as exc:
             raise HTTPException(404, "Creation job not found") from exc
 
-    @router.get("/v3/creation/jobs/{job_id}")
-    def status_v3(job_id: UUID, authorization: str | None = Header(default=None)):
-        require_caller(authorization)
+    @lifecycle_router.get("/v3/creation/jobs/{job_id}")
+    def status_v3(job_id: UUID):
         require_v3_job(job_id)
-        return status(job_id, authorization)
+        return status(job_id)
 
-    @router.post("/api/v1/creation-jobs/{job_id}/cancel")
+    @lifecycle_router.post("/api/v1/creation-jobs/{job_id}/cancel")
     def cancel(
         job_id: UUID,
         request: CancelRequest,
-        authorization: str | None = Header(default=None),
     ):
-        require_caller(authorization)
         if store is None:
             raise HTTPException(503, "Creation jobs are not configured")
         try:
@@ -161,19 +168,16 @@ def create_creation_router(
         except CreationConflictError as exc:
             raise HTTPException(409, str(exc)) from exc
 
-    @router.post("/v3/creation/jobs/{job_id}/cancel")
+    @lifecycle_router.post("/v3/creation/jobs/{job_id}/cancel")
     def cancel_v3(
         job_id: UUID,
         request: CancelRequest,
-        authorization: str | None = Header(default=None),
     ):
-        require_caller(authorization)
         require_v3_job(job_id)
-        return cancel(job_id, request, authorization)
+        return cancel(job_id, request)
 
-    @router.get("/api/v1/creation-jobs/{job_id}/result")
-    def result(job_id: UUID, authorization: str | None = Header(default=None)):
-        require_caller(authorization)
+    @lifecycle_router.get("/api/v1/creation-jobs/{job_id}/result")
+    def result(job_id: UUID):
         if store is None:
             raise HTTPException(503, "Creation jobs are not configured")
         try:
@@ -184,11 +188,10 @@ def create_creation_router(
             raise HTTPException(409, "Creation result is not available")
         return value.model_dump(mode="json", by_alias=True)
 
-    @router.get("/v3/creation/jobs/{job_id}/result")
-    def result_v3(job_id: UUID, authorization: str | None = Header(default=None)):
-        require_caller(authorization)
+    @lifecycle_router.get("/v3/creation/jobs/{job_id}/result")
+    def result_v3(job_id: UUID):
         require_v3_job(job_id)
-        return result(job_id, authorization)
+        return result(job_id)
 
     @router.get("/v3/creation/assignments/next")
     def next_assignment(authorization: str | None = Header(default=None)):
@@ -264,4 +267,5 @@ def create_creation_router(
             raise HTTPException(409, "Creation artifact digest changed")
         return {"sha256": sha256, "size_bytes": len(content)}
 
+    router.include_router(lifecycle_router)
     return router
