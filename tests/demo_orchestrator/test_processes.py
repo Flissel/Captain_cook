@@ -54,7 +54,11 @@ def _configuration(tmp_path: Path) -> DemoConfiguration:
                 "argv": ["{python}", "-m", f"demo_{name}"],
                 "working_directory": ".",
                 "port": 19000 + offset,
-                "health_url": f"http://127.0.0.1:{19000 + offset}/health",
+                "health_url": (
+                    "http://127.0.0.1:19000/v1/capability-assemblies/health"
+                    if name == "gateway"
+                    else f"http://127.0.0.1:{19000 + offset}/health"
+                ),
                 "health_token_env": tokens[name],
                 "environment": environment,
                 "artifact_paths": ["service.py"],
