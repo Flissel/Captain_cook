@@ -140,6 +140,11 @@ from gateway.capability_resume_service import (
     CapabilityResumeService,
     CapabilityResumeUnavailable,
 )
+from gateway.capability_assembly_api import (
+    CapabilityAssemblyControllerFactory,
+    create_capability_assembly_router,
+    unavailable_capability_assembly_controller,
+)
 from gateway.portal_live_contracts import (
     PortalLiveEvidenceQueryV1,
     PortalLiveEvidenceV1,
@@ -305,6 +310,9 @@ def create_app(
     portal_clock: Callable[[], datetime] | None = None,
     capability_resume_service: CapabilityResumeService | None = None,
     capability_resume_executor: CapabilityResumeExecutor | None = None,
+    capability_assembly_controller_factory: (
+        CapabilityAssemblyControllerFactory | None
+    ) = None,
     runtime_usage_artifacts: ContentAddressedArtifactAdapter | None = None,
     runtime_usage_pricing_snapshots: tuple[
         RuntimeUsagePricingSnapshotV1, ...
@@ -385,6 +393,12 @@ def create_app(
     app.state.gateway_settings = settings
     app.state.gateway_settings_lock = Lock()
     initialize_portal_auth(app)
+    app.include_router(
+        create_capability_assembly_router(
+            capability_assembly_controller_factory
+            or unavailable_capability_assembly_controller
+        )
+    )
 
     @app.exception_handler(RequestValidationError)
     async def sanitized_review_validation_error(
@@ -408,6 +422,11 @@ def create_app(
             return JSONResponse(
                 status_code=422,
                 content={"detail": "invalid capability resume request"},
+            )
+        if path.startswith("/v1/capability-assemblies"):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "invalid capability assembly request"},
             )
         if (
             request.method == "POST"
