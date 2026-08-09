@@ -8,7 +8,7 @@ receipts before the generic live runner can persist a successful checkpoint.
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -104,6 +104,8 @@ class CapabilityExecutionAuthority(_FrozenAuthority):
     execution_result_id: UUID
     evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
     booked_cost_usd: Decimal
+    terminal_status: Literal["succeeded", "cancelled", "timed_out", "failed"]
+    replayed: bool
 
     @field_validator("booked_cost_usd", mode="before")
     @classmethod
@@ -123,6 +125,30 @@ class CapabilityProjectionAuthority(_FrozenAuthority):
     projection_event_id: UUID
     projection_readback_id: UUID
     evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+
+
+class CapabilityResumeAuthorization(_FrozenAuthority):
+    """Current Gateway receipt permitting one exact fresh resume dispatch."""
+
+    job_id: UUID
+    reservation_id: UUID
+    correlation_id: UUID
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    authorization_receipt_id: UUID
+    evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+
+
+class CapabilityResumeExecutionRequest(_FrozenAuthority):
+    """Stable original identity submitted to Gateway for resume authorization."""
+
+    job_id: UUID
+    reservation_id: UUID
+    correlation_id: UUID
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    original_execution_command_id: UUID
+    original_execution_result_id: UUID
 
 
 class CapabilityFactoryPort(Protocol):
@@ -174,7 +200,7 @@ class PromotedCapabilityExecutionPort(Protocol):
 
     async def restart_and_resume(
         self,
-        capability: CapabilityLiveCapabilityEvidence,
+        request: CapabilityLiveRestartRequest,
         release: CapabilityFactoryAuthority,
     ) -> CapabilityExecutionAuthority | None: ...
 
@@ -296,6 +322,7 @@ class GatewayCapabilityLivePipeline(CapabilityLivePipelinePort):
             capability = CapabilityLiveCapabilityEvidence(
                 input_id=request.input.input_id,
                 conversation_pattern=request.input.conversation_pattern,
+                job_id=release.job_id,
                 correlation_id=request.correlation_id,
                 capability_id=release.capability_id,
                 capability_version=release.capability_version,
@@ -345,7 +372,16 @@ class GatewayCapabilityLivePipeline(CapabilityLivePipelinePort):
             retry_number=0,
         )
         release = await self._released(stage_request)
-        execution = await self._execution.restart_and_resume(capability, release)
+        if (
+            capability.job_id != release.job_id
+            or capability.correlation_id != release.correlation_id
+            or capability.capability_id != release.capability_id
+            or capability.capability_version != release.capability_version
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart capability changed the stable release binding"
+            )
+        execution = await self._execution.restart_and_resume(request, release)
         if execution is None:
             raise CapabilityLiveAuthorityUnavailable(
                 "restart execution authority is unavailable"
@@ -359,36 +395,39 @@ class GatewayCapabilityLivePipeline(CapabilityLivePipelinePort):
         if projection is None:
             raise CapabilityLiveAuthorityUnavailable(
                 "restart Minibook projection read-back is unavailable"
-            )
+        )
         self._require_projection(release, execution, projection)
-        identity = (
-            release.correlation_id,
-            release.capability_id,
-            release.capability_version,
-            execution.execution_command_id,
-            execution.execution_result_id,
-            projection.projection_event_id,
-            projection.projection_readback_id,
-        )
-        expected = (
-            capability.correlation_id,
-            capability.capability_id,
-            capability.capability_version,
-            capability.execution_command_id,
-            capability.execution_result_id,
-            capability.projection_event_id,
-            capability.projection_readback_id,
-        )
-        if identity != expected:
+        if execution.replayed:
             raise CapabilityLiveAuthorityUnavailable(
-                "restart authority changed the released capability identity"
+                "restart execution cannot count an evidence replay as a new run"
+            )
+        if execution.execution_command_id == capability.execution_command_id:
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart execution reused original command"
+            )
+        if execution.execution_result_id == capability.execution_result_id:
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart execution reused original result"
+            )
+        if (
+            projection.projection_event_id != capability.projection_event_id
+            or projection.projection_readback_id != capability.projection_readback_id
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart projection changed after resume"
             )
         return CapabilityLiveRestartEvidence(
+            run_id=request.run_id,
+            job_id=release.job_id,
+            reservation_id=request.reservation.reservation_id,
             correlation_id=release.correlation_id,
             capability_id=release.capability_id,
             capability_version=release.capability_version,
-            execution_command_id=execution.execution_command_id,
-            execution_result_id=execution.execution_result_id,
+            original_execution_command_id=capability.execution_command_id,
+            original_execution_result_id=capability.execution_result_id,
+            resumed_execution_authority_id=execution.execution_authority_id,
+            resumed_execution_command_id=execution.execution_command_id,
+            resumed_execution_result_id=execution.execution_result_id,
             projection_event_id=projection.projection_event_id,
             projection_readback_id=projection.projection_readback_id,
         )
@@ -470,6 +509,7 @@ class GatewayCapabilityLivePipeline(CapabilityLivePipelinePort):
             or execution.capability_version != release.capability_version
             or execution.booked_cost_usd != release.booked_cost_usd
             or execution.booked_cost_usd > request.reservation.maximum_cost_usd
+            or execution.terminal_status != "succeeded"
         ):
             raise CapabilityLiveAuthorityUnavailable(
                 "execution authority does not match the promoted capability"
@@ -529,6 +569,8 @@ __all__ = [
     "CapabilityLiveAuthorityUnavailable",
     "CapabilityProjectionAuthority",
     "CapabilityProjectionPort",
+    "CapabilityResumeAuthorization",
+    "CapabilityResumeExecutionRequest",
     "GatewayCapabilityLivePipeline",
     "PromotedCapabilityExecutionPort",
 ]

@@ -659,6 +659,7 @@ def compose_gateway_capability_live_runner(
     factory_composition: AgentFactoryLiveComposition | None = None,
     factory_provisioning: object | None = None,
     minibook_effects: object | None = None,
+    resume_execution: object | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> CapabilityLiveRunner:
     """Compose Task 6 from either a tested port set or current authorities.
@@ -675,7 +676,12 @@ def compose_gateway_capability_live_runner(
             "capability live repository root is unavailable"
         )
     selected_clock = clock or (lambda: datetime.now(timezone.utc))
-    concrete = (factory_composition, factory_provisioning, minibook_effects)
+    concrete = (
+        factory_composition,
+        factory_provisioning,
+        minibook_effects,
+        resume_execution,
+    )
     generic = (factory, benchmark, execution, projection)
     if any(item is not None for item in concrete):
         if any(item is not None for item in generic):
@@ -684,7 +690,7 @@ def compose_gateway_capability_live_runner(
             )
         if any(item is None for item in concrete):
             raise GatewayCapabilityLiveCompositionError(
-                "current capability live composition requires Factory, provisioning, and Minibook effects"
+                "current capability live composition requires Factory, provisioning, Minibook effects, and resume execution authority"
             )
         from gateway.capability_live_current_adapters import (
             GatewayCapabilityBusinessBenchmarkAdapter,
@@ -696,6 +702,7 @@ def compose_gateway_capability_live_runner(
         assert factory_composition is not None
         assert factory_provisioning is not None
         assert minibook_effects is not None
+        assert resume_execution is not None
         factory = CurrentCapabilityFactoryAdapter(
             composition=factory_composition,
             provisioning=cast(object, factory_provisioning),
@@ -707,6 +714,7 @@ def compose_gateway_capability_live_runner(
         )
         execution = RecordedFactoryCapabilityExecutionAdapter(
             composition=cast(object, factory_composition),
+            resume_execution=cast(object, resume_execution),
         )
         projection = GatewayMinibookCapabilityProjectionAdapter(
             composition=cast(object, factory_composition),

@@ -122,6 +122,7 @@ class CapabilityLiveCapabilityEvidence(_FrozenModel):
 
     input_id: str = Field(pattern=IDENTIFIER_PATTERN)
     conversation_pattern: Literal["sequential", "selector_group_chat", "swarm"]
+    job_id: UUID
     correlation_id: UUID
     capability_id: str = Field(min_length=1)
     capability_version: int = Field(ge=1, strict=True)
@@ -145,13 +146,19 @@ class CapabilityLiveCapabilityEvidence(_FrozenModel):
 
 
 class CapabilityLiveRestartEvidence(_FrozenModel):
-    """Identity returned after the first capability is restarted and resumed."""
+    """Immutable original and resumed execution identities for one restart."""
 
+    run_id: UUID
+    job_id: UUID
+    reservation_id: UUID
     correlation_id: UUID
     capability_id: str = Field(min_length=1)
     capability_version: int = Field(ge=1, strict=True)
-    execution_command_id: UUID | None
-    execution_result_id: UUID | None
+    original_execution_command_id: UUID
+    original_execution_result_id: UUID
+    resumed_execution_authority_id: UUID
+    resumed_execution_command_id: UUID
+    resumed_execution_result_id: UUID
     projection_event_id: UUID | None
     projection_readback_id: UUID | None
 
@@ -347,6 +354,16 @@ class CapabilityLiveRestartRequest(_FrozenModel):
     input: CapabilityLiveInput
     reservation: CapabilityLiveReservation
     capability: CapabilityLiveCapabilityEvidence
+
+    @model_validator(mode="after")
+    def require_stable_resume_scope(self) -> "CapabilityLiveRestartRequest":
+        if (
+            self.reservation.run_id != self.run_id
+            or self.reservation.input_id != self.input.input_id
+            or self.capability.input_id != self.input.input_id
+        ):
+            raise ValueError("restart request changed its run, input, or reservation")
+        return self
 
 
 class CapabilityLiveCheckpointPort(Protocol):
@@ -784,26 +801,35 @@ def validate_live_demo_evidence(
             )
 
     first = evidence.capabilities[0]
-    restart_identity = (
-        evidence.restart.correlation_id,
-        evidence.restart.capability_id,
-        evidence.restart.capability_version,
-        evidence.restart.execution_command_id,
-        evidence.restart.execution_result_id,
-        evidence.restart.projection_event_id,
-        evidence.restart.projection_readback_id,
+    first_reservation = next(
+        (item for item in evidence.reservations if item.input_id == first.input_id),
+        None,
     )
-    first_identity = (
-        first.correlation_id,
-        first.capability_id,
-        first.capability_version,
-        first.execution_command_id,
-        first.execution_result_id,
-        first.projection_event_id,
-        first.projection_readback_id,
-    )
-    if restart_identity != first_identity:
-        raise CapabilityLiveEvidenceError("restart identity changed after resume")
+    if first_reservation is None:
+        raise CapabilityLiveEvidenceError("restart reservation is unavailable")
+    if (
+        evidence.restart.run_id != evidence.run_id
+        or evidence.restart.job_id != first.job_id
+        or evidence.restart.reservation_id != first_reservation.reservation_id
+        or evidence.restart.correlation_id != first.correlation_id
+        or evidence.restart.capability_id != first.capability_id
+        or evidence.restart.capability_version != first.capability_version
+        or evidence.restart.original_execution_command_id != first.execution_command_id
+        or evidence.restart.original_execution_result_id != first.execution_result_id
+        or evidence.restart.projection_event_id != first.projection_event_id
+        or evidence.restart.projection_readback_id != first.projection_readback_id
+    ):
+        raise CapabilityLiveEvidenceError("restart evidence changed stable authority binding")
+    if (
+        evidence.restart.resumed_execution_command_id
+        == evidence.restart.original_execution_command_id
+    ):
+        raise CapabilityLiveEvidenceError("reused restart execution command")
+    if (
+        evidence.restart.resumed_execution_result_id
+        == evidence.restart.original_execution_result_id
+    ):
+        raise CapabilityLiveEvidenceError("reused restart execution result")
 
     reservation_total = sum(
         (item.maximum_cost_usd for item in evidence.reservations), Decimal("0")

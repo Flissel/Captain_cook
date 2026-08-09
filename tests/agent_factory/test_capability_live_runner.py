@@ -71,6 +71,7 @@ def _capability_evidence(module: Any, request: Any) -> Any:
     return module.CapabilityLiveCapabilityEvidence(
         input_id=request.input.input_id,
         conversation_pattern=request.input.conversation_pattern,
+        job_id=uuid5(NAMESPACE_URL, f"{seed}:job"),
         correlation_id=request.correlation_id,
         capability_id=f"capability-{request.input.input_id}",
         capability_version=1,
@@ -182,11 +183,23 @@ class _Pipeline:
         self.restart_calls.append(request)
         first = request.capability
         return self.module.CapabilityLiveRestartEvidence(
+            run_id=request.run_id,
+            job_id=first.job_id,
+            reservation_id=request.reservation.reservation_id,
             correlation_id=first.correlation_id,
             capability_id=first.capability_id,
             capability_version=first.capability_version,
-            execution_command_id=first.execution_command_id,
-            execution_result_id=first.execution_result_id,
+            original_execution_command_id=first.execution_command_id,
+            original_execution_result_id=first.execution_result_id,
+            resumed_execution_authority_id=uuid5(
+                NAMESPACE_URL, f"{first.input_id}:resume-authority"
+            ),
+            resumed_execution_command_id=uuid5(
+                NAMESPACE_URL, f"{first.input_id}:resume-command"
+            ),
+            resumed_execution_result_id=uuid5(
+                NAMESPACE_URL, f"{first.input_id}:resume-result"
+            ),
             projection_event_id=first.projection_event_id,
             projection_readback_id=first.projection_readback_id,
         )
@@ -338,11 +351,17 @@ def _complete_demo_evidence(module: Any) -> Any:
         reservations=tuple(reservations),
         capabilities=tuple(capabilities),
         restart=module.CapabilityLiveRestartEvidence(
+            run_id=RUN_ID,
+            job_id=first.job_id,
+            reservation_id=reservations[0].reservation_id,
             correlation_id=first.correlation_id,
             capability_id=first.capability_id,
             capability_version=first.capability_version,
-            execution_command_id=first.execution_command_id,
-            execution_result_id=first.execution_result_id,
+            original_execution_command_id=first.execution_command_id,
+            original_execution_result_id=first.execution_result_id,
+            resumed_execution_authority_id=uuid5(RUN_ID, "restart-authority"),
+            resumed_execution_command_id=uuid5(RUN_ID, "restart-command"),
+            resumed_execution_result_id=uuid5(RUN_ID, "restart-result"),
             projection_event_id=first.projection_event_id,
             projection_readback_id=first.projection_readback_id,
         ),
@@ -446,14 +465,24 @@ def _complete_demo_evidence(module: Any) -> Any:
                 update={
                     "restart": value.restart.model_copy(
                         update={
-                            "execution_command_id": uuid5(
-                                NAMESPACE_URL, "changed-command"
-                            )
+                            "resumed_execution_command_id": value.restart.original_execution_command_id
                         }
                     )
                 }
             ),
-            "restart identity",
+            "reused restart execution command",
+        ),
+        (
+            lambda module, value: value.model_copy(
+                update={
+                    "restart": value.restart.model_copy(
+                        update={
+                            "resumed_execution_result_id": value.restart.original_execution_result_id
+                        }
+                    )
+                }
+            ),
+            "reused restart execution result",
         ),
         (
             lambda module, value: value.model_copy(
@@ -472,6 +501,34 @@ def test_final_gate_rejects_incomplete_or_unbound_evidence(
 
     with pytest.raises(module.CapabilityLiveEvidenceError, match=message):
         module.validate_live_demo_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("run_id", uuid5(NAMESPACE_URL, "foreign-run")),
+        ("job_id", uuid5(NAMESPACE_URL, "foreign-job")),
+        ("reservation_id", uuid5(NAMESPACE_URL, "foreign-reservation")),
+        ("correlation_id", uuid5(NAMESPACE_URL, "foreign-correlation")),
+        ("capability_id", "foreign-capability"),
+        ("capability_version", 2),
+    ],
+)
+def test_final_gate_rejects_changed_restart_authority_binding(
+    field: str,
+    value: object,
+) -> None:
+    module = _module()
+    evidence = _complete_demo_evidence(module)
+    changed = evidence.model_copy(
+        update={"restart": evidence.restart.model_copy(update={field: value})}
+    )
+
+    with pytest.raises(
+        module.CapabilityLiveEvidenceError,
+        match="stable authority binding",
+    ):
+        module.validate_live_demo_evidence(changed)
 
 
 def test_input_contract_requires_the_three_exact_demo_semantics() -> None:

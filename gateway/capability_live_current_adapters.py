@@ -8,6 +8,7 @@ from uuid import UUID
 
 from agenten.agent_factory.capability_live_runner import (
     CapabilityLiveCapabilityEvidence,
+    CapabilityLiveRestartRequest,
     CapabilityLiveStage,
     CapabilityLiveStageRequest,
 )
@@ -27,6 +28,8 @@ from gateway.capability_live_pipeline import (
     CapabilityFactoryAuthority,
     CapabilityLiveAuthorityUnavailable,
     CapabilityProjectionAuthority,
+    CapabilityResumeAuthorization,
+    CapabilityResumeExecutionRequest,
 )
 from gateway.registry_feed import factory_promotion_projection
 
@@ -64,6 +67,25 @@ class CapabilityProjectionEffectsPort(Protocol):
     ) -> CapabilityProjectionReadback: ...
 
     async def readback(self, event_id: UUID) -> CapabilityProjectionReadback | None: ...
+
+
+class CapabilityResumeExecutionPort(Protocol):
+    """Current Gateway authority plus effectful runtime resume boundary."""
+
+    async def authorize_resume(
+        self,
+        request: CapabilityResumeExecutionRequest,
+    ) -> CapabilityResumeAuthorization | None: ...
+
+    async def dispatch_resume(
+        self,
+        authorization: CapabilityResumeAuthorization,
+    ) -> CapabilityExecutionAuthority | None: ...
+
+    async def readback_resume(
+        self,
+        authorization: CapabilityResumeAuthorization,
+    ) -> CapabilityExecutionAuthority | None: ...
 
 
 class GatewayCapabilityBusinessBenchmarkAdapter:
@@ -124,10 +146,16 @@ class GatewayCapabilityBusinessBenchmarkAdapter:
 
 
 class RecordedFactoryCapabilityExecutionAdapter:
-    """Use an existing accepted release run; never send a new runtime command."""
+    """Read release evidence and require a fresh Gateway-authorized resume."""
 
-    def __init__(self, *, composition: CapabilityWorkflowCompositionPort) -> None:
+    def __init__(
+        self,
+        *,
+        composition: CapabilityWorkflowCompositionPort,
+        resume_execution: CapabilityResumeExecutionPort | None = None,
+    ) -> None:
         self._composition = composition
+        self._resume_execution = resume_execution
 
     async def execute(
         self,
@@ -145,14 +173,127 @@ class RecordedFactoryCapabilityExecutionAdapter:
 
     async def restart_and_resume(
         self,
-        capability: CapabilityLiveCapabilityEvidence,
+        request: CapabilityLiveRestartRequest,
         release: CapabilityFactoryAuthority,
     ) -> CapabilityExecutionAuthority | None:
-        if capability.correlation_id != release.correlation_id:
+        capability = request.capability
+        if (
+            capability.job_id != release.job_id
+            or capability.correlation_id != release.correlation_id
+            or capability.capability_id != release.capability_id
+            or capability.capability_version != release.capability_version
+            or request.reservation.run_id != request.run_id
+            or request.reservation.input_id != capability.input_id
+        ):
             raise CapabilityLiveAuthorityUnavailable(
-                "restart capability does not match released correlation"
+                "restart capability changed the stable release binding"
             )
-        return self._authority_for_release(release)
+        if self._resume_execution is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart authorization receipt is unavailable"
+            )
+        if capability.execution_command_id is None or capability.execution_result_id is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart original execution evidence is incomplete"
+            )
+        authorization_request = CapabilityResumeExecutionRequest(
+            job_id=release.job_id,
+            reservation_id=request.reservation.reservation_id,
+            correlation_id=release.correlation_id,
+            capability_id=release.capability_id,
+            capability_version=release.capability_version,
+            original_execution_command_id=capability.execution_command_id,
+            original_execution_result_id=capability.execution_result_id,
+        )
+        authorization = await self._resume_execution.authorize_resume(
+            authorization_request
+        )
+        if authorization is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart authorization receipt is unavailable"
+            )
+        expected_authorization = (
+            release.job_id,
+            request.reservation.reservation_id,
+            release.correlation_id,
+            release.capability_id,
+            release.capability_version,
+        )
+        observed_authorization = (
+            authorization.job_id,
+            authorization.reservation_id,
+            authorization.correlation_id,
+            authorization.capability_id,
+            authorization.capability_version,
+        )
+        if observed_authorization != expected_authorization:
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart authorization changed the stable release binding"
+            )
+        dispatched = await self._resume_execution.dispatch_resume(authorization)
+        if dispatched is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart dispatch result is unavailable"
+            )
+        self._require_fresh_resume(
+            dispatched,
+            authorization=authorization,
+            capability=capability,
+            release=release,
+        )
+        readback = await self._resume_execution.readback_resume(authorization)
+        if readback is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart read-back result is unavailable"
+            )
+        self._require_fresh_resume(
+            readback,
+            authorization=authorization,
+            capability=capability,
+            release=release,
+        )
+        if readback != dispatched:
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart read-back does not match dispatched result"
+            )
+        return readback
+
+    @staticmethod
+    def _require_fresh_resume(
+        execution: CapabilityExecutionAuthority,
+        *,
+        authorization: CapabilityResumeAuthorization,
+        capability: CapabilityLiveCapabilityEvidence,
+        release: CapabilityFactoryAuthority,
+    ) -> None:
+        if (
+            execution.job_id != release.job_id
+            or execution.correlation_id != release.correlation_id
+            or execution.capability_id != release.capability_id
+            or execution.capability_version != release.capability_version
+            or execution.execution_authority_id
+            != authorization.authorization_receipt_id
+            or execution.booked_cost_usd != release.booked_cost_usd
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart execution changed the stable release binding"
+            )
+        if execution.execution_command_id == capability.execution_command_id:
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart execution reused original command"
+            )
+        if execution.execution_result_id == capability.execution_result_id:
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart execution reused original result"
+            )
+        if execution.replayed:
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart execution cannot count an evidence replay"
+            )
+        if execution.terminal_status != "succeeded":
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart requires a successful terminal result"
+            )
 
     def _authority(
         self,
@@ -193,6 +334,8 @@ class RecordedFactoryCapabilityExecutionAdapter:
             execution_result_id=outcome.result_id,
             evidence_refs=_refs((selected,)),
             booked_cost_usd=_consumed_cost(self._composition, release.job_id),
+            terminal_status="succeeded",
+            replayed=True,
         )
 
 
@@ -330,6 +473,7 @@ def _consumed_cost(composition: CapabilityWorkflowCompositionPort, job_id: UUID)
 
 __all__ = [
     "CapabilityProjectionReadback",
+    "CapabilityResumeExecutionPort",
     "GatewayCapabilityBusinessBenchmarkAdapter",
     "GatewayMinibookCapabilityProjectionAdapter",
     "RecordedFactoryCapabilityExecutionAdapter",

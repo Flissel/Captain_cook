@@ -7,13 +7,17 @@ from decimal import Decimal
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+import pytest
+
 from agenten.agent_factory.business_benchmark_contracts import (
     BenchmarkDisposition,
     BusinessBenchmarkSummaryV1,
 )
 from agenten.agent_factory.capability_live_runner import (
+    CapabilityLiveCapabilityEvidence,
     CapabilityLiveInput,
     CapabilityLiveReservation,
+    CapabilityLiveRestartRequest,
     CapabilityLiveStage,
     CapabilityLiveStageRequest,
 )
@@ -52,6 +56,11 @@ from gateway.capability_live_current_adapters import (
     RecordedFactoryCapabilityExecutionAdapter,
 )
 from gateway.capability_live_pipeline import CapabilityFactoryAuthority
+from gateway.capability_live_pipeline import (
+    CapabilityExecutionAuthority,
+    CapabilityLiveAuthorityUnavailable,
+    CapabilityResumeAuthorization,
+)
 from gateway.contracts import FactoryJobProjection
 from gateway.registry_feed import factory_promotion_projection
 
@@ -323,6 +332,31 @@ def _release() -> CapabilityFactoryAuthority:
     )
 
 
+def _capability() -> CapabilityLiveCapabilityEvidence:
+    request = _request(CapabilityLiveStage.PROJECT)
+    outcome = _runs()[2].execution_outcome
+    return CapabilityLiveCapabilityEvidence(
+        input_id=request.input.input_id,
+        conversation_pattern=request.input.conversation_pattern,
+        job_id=JOB_ID,
+        correlation_id=CORRELATION_ID,
+        capability_id="capability-sequential-n8n",
+        capability_version=1,
+        controlled_recovery_id=_uuid("recovery"),
+        normal_trace_ids=tuple(run.execution_outcome.result_id for run in _runs()),
+        release_authority_id=_promotion_block().event_id,
+        execution_authority_id=_runs()[2].invocation_id,
+        execution_command_id=outcome.command_id,
+        execution_result_id=outcome.result_id,
+        projection_event_id=_uuid("projection"),
+        projection_readback_id=_uuid("projection-readback"),
+        suite_ref=request.suite_ref,
+        hermes_result_ref=request.hermes_result_ref,
+        booked_cost_usd=Decimal("1.00"),
+        checkpoint_refs=(),
+    )
+
+
 def test_benchmark_adapter_advances_current_composition_and_reads_authority() -> None:
     composition = _Composition()
     adapter = GatewayCapabilityBusinessBenchmarkAdapter(
@@ -354,6 +388,178 @@ def test_recorded_execution_adapter_uses_existing_third_release_gate_run() -> No
     assert authority.execution_authority_id == _runs()[2].invocation_id
     assert authority.execution_command_id == _runs()[2].execution_outcome.command_id
     assert authority.execution_result_id == _runs()[2].execution_outcome.result_id
+
+
+def _resume_authorization(
+    capability: CapabilityLiveCapabilityEvidence,
+) -> CapabilityResumeAuthorization:
+    return CapabilityResumeAuthorization(
+        job_id=JOB_ID,
+        reservation_id=_request(CapabilityLiveStage.PROJECT).reservation.reservation_id,
+        correlation_id=CORRELATION_ID,
+        capability_id=capability.capability_id,
+        capability_version=capability.capability_version,
+        authorization_receipt_id=_uuid("resumed-authority"),
+        evidence_refs=(_ref("resume-authority", "accepted"),),
+    )
+
+
+def _resumed_execution(
+    capability: CapabilityLiveCapabilityEvidence,
+    authorization: CapabilityResumeAuthorization,
+) -> CapabilityExecutionAuthority:
+    return CapabilityExecutionAuthority(
+        job_id=JOB_ID,
+        correlation_id=CORRELATION_ID,
+        capability_id=capability.capability_id,
+        capability_version=capability.capability_version,
+        execution_authority_id=authorization.authorization_receipt_id,
+        execution_command_id=_uuid("resumed-command"),
+        execution_result_id=_uuid("resumed-result"),
+        evidence_refs=(_ref("resumed-execution", "accepted"),),
+        booked_cost_usd=Decimal("1.00"),
+        terminal_status="succeeded",
+        replayed=False,
+    )
+
+
+class _ResumeGateway:
+    def __init__(
+        self,
+        *,
+        authorization: CapabilityResumeAuthorization | None,
+        dispatched: CapabilityExecutionAuthority | None,
+        readback: CapabilityExecutionAuthority | None,
+    ) -> None:
+        self.authorization = authorization
+        self.dispatched = dispatched
+        self.readback = readback
+        self.calls: list[str] = []
+
+    async def authorize_resume(self, request: object) -> CapabilityResumeAuthorization | None:
+        self.calls.append("authorize")
+        assert getattr(request, "job_id") == JOB_ID
+        assert getattr(request, "reservation_id") == _request(
+            CapabilityLiveStage.PROJECT
+        ).reservation.reservation_id
+        assert getattr(request, "original_execution_command_id") == _capability().execution_command_id
+        return self.authorization
+
+    async def dispatch_resume(
+        self,
+        authorization: CapabilityResumeAuthorization,
+    ) -> CapabilityExecutionAuthority | None:
+        self.calls.append("dispatch")
+        return self.dispatched
+
+    async def readback_resume(
+        self,
+        authorization: CapabilityResumeAuthorization,
+    ) -> CapabilityExecutionAuthority | None:
+        self.calls.append("readback")
+        return self.readback
+
+
+def _restart(
+    gateway: _ResumeGateway,
+) -> CapabilityExecutionAuthority | None:
+    capability = _capability()
+    adapter = RecordedFactoryCapabilityExecutionAdapter(
+        composition=_Composition(promoted=True),
+        resume_execution=gateway,
+    )
+    return asyncio.run(
+        adapter.restart_and_resume(
+            CapabilityLiveRestartRequest(
+                run_id=RUN_ID,
+                input=_request(CapabilityLiveStage.PROJECT).input,
+                reservation=_request(CapabilityLiveStage.PROJECT).reservation,
+                capability=capability,
+            ),
+            _release(),
+        )
+    )
+
+
+def test_restart_dispatches_a_new_gateway_authorized_execution_and_reads_it_back() -> None:
+    capability = _capability()
+    authorization = _resume_authorization(capability)
+    execution = _resumed_execution(capability, authorization)
+    gateway = _ResumeGateway(
+        authorization=authorization,
+        dispatched=execution,
+        readback=execution,
+    )
+
+    authority = _restart(gateway)
+
+    assert authority is not None
+    assert gateway.calls == ["authorize", "dispatch", "readback"]
+    assert authority.execution_command_id != capability.execution_command_id
+    assert authority.execution_result_id != capability.execution_result_id
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        ("missing_authority", "authorization receipt"),
+        ("wrong_correlation", "stable release binding"),
+        ("wrong_capability", "stable release binding"),
+        ("missing_dispatch_result", "dispatch result"),
+        ("reused_command", "reused original command"),
+        ("reused_result", "reused original result"),
+        ("replayed", "evidence replay"),
+        ("cancelled", "successful terminal result"),
+        ("timed_out", "successful terminal result"),
+        ("missing_readback", "read-back result"),
+        ("drifted_readback", "read-back does not match"),
+    ],
+)
+def test_restart_fails_closed_without_a_fresh_verified_gateway_execution(
+    fault: str,
+    message: str,
+) -> None:
+    capability = _capability()
+    authorization = _resume_authorization(capability)
+    execution = _resumed_execution(capability, authorization)
+    if fault == "missing_authority":
+        authorization = None
+    elif fault == "wrong_correlation":
+        authorization = authorization.model_copy(
+            update={"correlation_id": _uuid("foreign-correlation")}
+        )
+    elif fault == "wrong_capability":
+        authorization = authorization.model_copy(update={"capability_id": "foreign"})
+    elif fault == "missing_dispatch_result":
+        execution = None
+    elif fault == "reused_command":
+        execution = execution.model_copy(
+            update={"execution_command_id": capability.execution_command_id}
+        )
+    elif fault == "reused_result":
+        execution = execution.model_copy(
+            update={"execution_result_id": capability.execution_result_id}
+        )
+    elif fault == "replayed":
+        execution = execution.model_copy(update={"replayed": True})
+    elif fault in {"cancelled", "timed_out"}:
+        execution = execution.model_copy(update={"terminal_status": fault})
+
+    readback = execution
+    if fault == "missing_readback":
+        readback = None
+    elif fault == "drifted_readback":
+        readback = execution.model_copy(
+            update={"execution_result_id": _uuid("drifted-result")}
+        )
+    gateway = _ResumeGateway(
+        authorization=authorization,
+        dispatched=execution,
+        readback=readback,
+    )
+
+    with pytest.raises(CapabilityLiveAuthorityUnavailable, match=message):
+        _restart(gateway)
 
 
 class _ProjectionEffects:

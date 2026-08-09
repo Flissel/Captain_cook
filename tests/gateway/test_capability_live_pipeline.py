@@ -13,6 +13,7 @@ from agenten.agent_factory.capability_live_runner import (
     CapabilityLiveInput,
     CapabilityLiveReservation,
     CapabilityLiveReservationRequest,
+    CapabilityLiveRestartRequest,
     CapabilityLiveRunner,
     CapabilityLiveStage,
     CapabilityLiveStageRequest,
@@ -251,15 +252,18 @@ class _Execution:
 
     async def restart_and_resume(
         self,
-        capability: CapabilityLiveCapabilityEvidence,
+        request: CapabilityLiveRestartRequest,
         release: CapabilityFactoryAuthority,
     ) -> CapabilityExecutionAuthority | None:
+        capability = request.capability
         self.calls.append((capability.input_id, "restart_and_resume"))
-        return None if self.unavailable else self._authority(release)
+        return None if self.unavailable else self._authority(release, resumed=True)
 
     @staticmethod
     def _authority(
         release: CapabilityFactoryAuthority,
+        *,
+        resumed: bool = False,
     ) -> CapabilityExecutionAuthority:
         input_id = release.input_id
         return CapabilityExecutionAuthority(
@@ -267,11 +271,19 @@ class _Execution:
             correlation_id=release.correlation_id,
             capability_id=release.capability_id,
             capability_version=release.capability_version,
-            execution_authority_id=_uuid(f"execution-authority:{input_id}"),
-            execution_command_id=_uuid(f"command:{input_id}"),
-            execution_result_id=_uuid(f"result:{input_id}"),
+            execution_authority_id=_uuid(
+                f"{'resume-' if resumed else ''}execution-authority:{input_id}"
+            ),
+            execution_command_id=_uuid(
+                f"{'resume-' if resumed else ''}command:{input_id}"
+            ),
+            execution_result_id=_uuid(
+                f"{'resume-' if resumed else ''}result:{input_id}"
+            ),
             evidence_refs=(_ref("execution", input_id),),
             booked_cost_usd=release.booked_cost_usd,
+            terminal_status="succeeded",
+            replayed=False,
         )
 
 
@@ -465,12 +477,14 @@ def test_production_composition_builds_current_authority_adapters_as_one_binding
     composition = object()
     provisioning = object()
     effects = object()
+    resume_execution = object()
 
     runner = compose_gateway_capability_live_runner(
         repository_root=tmp_path,
         factory_composition=composition,
         factory_provisioning=provisioning,
         minibook_effects=effects,
+        resume_execution=resume_execution,
         clock=lambda: NOW,
     )
 
@@ -478,4 +492,21 @@ def test_production_composition_builds_current_authority_adapters_as_one_binding
     assert isinstance(pipeline._factory, CurrentCapabilityFactoryAdapter)
     assert isinstance(pipeline._benchmark, GatewayCapabilityBusinessBenchmarkAdapter)
     assert isinstance(pipeline._execution, RecordedFactoryCapabilityExecutionAdapter)
+    assert pipeline._execution._resume_execution is resume_execution
     assert isinstance(pipeline._projection, GatewayMinibookCapabilityProjectionAdapter)
+
+
+def test_current_composition_fails_closed_without_resume_execution_authority(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        GatewayCapabilityLiveCompositionError,
+        match="resume execution authority",
+    ):
+        compose_gateway_capability_live_runner(
+            repository_root=tmp_path,
+            factory_composition=object(),
+            factory_provisioning=object(),
+            minibook_effects=object(),
+            clock=lambda: NOW,
+        )
