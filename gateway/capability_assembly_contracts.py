@@ -497,6 +497,16 @@ class CapabilityAssemblyRepositoryPort(Protocol):
         expected_revision: int,
     ) -> CapabilityAssemblyRecordPort: ...
 
+    def consume_retry_authorization_and_append(
+        self,
+        checkpoint: CapabilityAssemblyCheckpoint,
+        authorization: CapabilityAssemblyNoEffectRetryAuthorization,
+        *,
+        expected_revision: int,
+    ) -> CapabilityAssemblyRecordPort:
+        """Atomically consume one globally unique receipt and append its checkpoint."""
+        ...
+
 
 def canonical_assembly_model_bytes(value: BaseModel) -> bytes:
     import json

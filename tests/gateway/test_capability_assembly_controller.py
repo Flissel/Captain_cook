@@ -66,6 +66,7 @@ def _input_request(
     *,
     pattern: str,
     path: str,
+    assembly_id: UUID = ASSEMBLY_ID,
 ) -> CapabilityAssemblyInputRequest:
     input_id = f"input-{index}"
     return CapabilityAssemblyInputRequest(
@@ -75,16 +76,20 @@ def _input_request(
         correlation_id=_id(f"correlation-{index}"),
         reservation=CapabilityLiveReservation(
             reservation_id=_id(f"reservation-{index}"),
-            run_id=ASSEMBLY_ID,
+            run_id=assembly_id,
             input_id=input_id,
             maximum_cost_usd=Decimal("2.00"),
         ),
     )
 
 
-def _submission(*, idempotency_key: str = "a" * 64) -> CapabilityAssemblySubmitRequest:
+def _submission(
+    *,
+    idempotency_key: str = "a" * 64,
+    assembly_id: UUID = ASSEMBLY_ID,
+) -> CapabilityAssemblySubmitRequest:
     return CapabilityAssemblySubmitRequest(
-        assembly_id=ASSEMBLY_ID,
+        assembly_id=assembly_id,
         idempotency_key=idempotency_key,
         maximum_cost_usd=Decimal("6.00"),
         inputs=(
@@ -92,16 +97,19 @@ def _submission(*, idempotency_key: str = "a" * 64) -> CapabilityAssemblySubmitR
                 1,
                 pattern="sequential",
                 path="examples/customer-a/TO_BE_BUILT.md",
+                assembly_id=assembly_id,
             ),
             _input_request(
                 2,
                 pattern="selector_group_chat",
                 path="examples/customer-b/TO_BE_BUILT.md",
+                assembly_id=assembly_id,
             ),
             _input_request(
                 3,
                 pattern="swarm",
                 path="products/customer-c/TO_BE_BUILT.md",
+                assembly_id=assembly_id,
             ),
         ),
     )
@@ -128,6 +136,7 @@ def _record_for_checkpoint(checkpoint: CapabilityAssemblyCheckpoint) -> _Record:
 class _Repository:
     def __init__(self) -> None:
         self._records: dict[UUID, list[_Record]] = {}
+        self._consumed_retry_authorizations: dict[UUID, bytes] = {}
 
     def history(self, assembly_id: UUID) -> tuple[_Record, ...]:
         return tuple(self._records.get(assembly_id, ()))
@@ -152,6 +161,21 @@ class _Repository:
             raise AssertionError("controller attempted a non-monotone append")
         record = _record_for_checkpoint(checkpoint)
         records.append(record)
+        return record
+
+    def consume_retry_authorization_and_append(
+        self,
+        checkpoint: CapabilityAssemblyCheckpoint,
+        authorization: CapabilityAssemblyNoEffectRetryAuthorization,
+        *,
+        expected_revision: int,
+    ) -> _Record:
+        receipt_id = authorization.authorization_receipt_id
+        binding = canonical_assembly_model_bytes(authorization)
+        if receipt_id in self._consumed_retry_authorizations:
+            raise CapabilityAssemblyWriteConflict("retry authorization was already consumed")
+        record = self.append(checkpoint, expected_revision=expected_revision)
+        self._consumed_retry_authorizations[receipt_id] = binding
         return record
 
 
@@ -376,6 +400,34 @@ class _Reconciliation:
         return self.outcome
 
 
+class _SharedReceiptReconciliation(_Reconciliation):
+    def __init__(self, receipt_id: UUID) -> None:
+        super().__init__()
+        self.receipt_id = receipt_id
+
+    async def reconcile(self, request: CapabilityAssemblyReconciliationRequest):
+        self.calls.append(request)
+        authorization = CapabilityAssemblyNoEffectRetryAuthorization(
+            assembly_id=request.assembly_id,
+            operation_id=request.operation_id,
+            request_sha256=request.request_sha256,
+            started_slice=request.started_slice,
+            started_checkpoint_ref=request.started_checkpoint_ref,
+            authorization_receipt_id=self.receipt_id,
+            evidence_refs=(_ref("shared-no-effect-evidence"),),
+            no_effect_observed=True,
+        )
+        return CapabilityAssemblyReconciliationOutcome(
+            assembly_id=request.assembly_id,
+            operation_id=request.operation_id,
+            request_sha256=request.request_sha256,
+            started_slice=request.started_slice,
+            started_checkpoint_ref=request.started_checkpoint_ref,
+            disposition="retry_authorized_no_effect",
+            retry_authorization=authorization,
+        )
+
+
 def _controller(
     repository: _Repository | None = None,
     *,
@@ -525,6 +577,11 @@ def test_persisted_projection_recomputes_the_immutable_submit_digest() -> None:
         ("repository", "history", "not_callable"),
         ("repository", "find_by_idempotency_key", "wrong_signature"),
         ("repository", "append", "wrong_signature"),
+        (
+            "repository",
+            "consume_retry_authorization_and_append",
+            "wrong_signature",
+        ),
         ("admission", "admit", "async_for_sync"),
         ("factory", "scaffold", "sync_for_async"),
         ("factory", "implement", "wrong_async_signature"),
@@ -1040,6 +1097,85 @@ def test_no_effect_retry_receipt_cannot_authorize_a_second_crashed_slice() -> No
 
     assert len(repo.history(ASSEMBLY_ID)) == before
     assert second_restart_factory.calls == []
+
+
+def test_retry_authorization_is_atomically_single_use_across_two_assemblies() -> None:
+    repository = _Repository()
+    first_assembly_id = ASSEMBLY_ID
+    second_assembly_id = _id("second-assembly")
+    receipt_id = _id("cross-assembly-single-use-authorization")
+    reconciliation = _SharedReceiptReconciliation(receipt_id)
+    first, _, _, first_factory, *_ = _controller(
+        repository,
+        reconciliation=reconciliation,
+    )
+    second, _, _, second_factory, *_ = _controller(
+        repository,
+        reconciliation=reconciliation,
+    )
+    first.submit(_submission(assembly_id=first_assembly_id))
+    second.submit(
+        _submission(
+            assembly_id=second_assembly_id,
+            idempotency_key="b" * 64,
+        )
+    )
+    first_request = CapabilityAssemblyAdvanceRequest(
+        assembly_id=first_assembly_id,
+        operation_id=_id("first-cross-assembly-operation"),
+        request_sha256=first.projection(first_assembly_id).request_sha256,
+        maximum_slices=1,
+    )
+    second_request = CapabilityAssemblyAdvanceRequest(
+        assembly_id=second_assembly_id,
+        operation_id=_id("second-cross-assembly-operation"),
+        request_sha256=second.projection(second_assembly_id).request_sha256,
+        maximum_slices=1,
+    )
+    _crash_first_slice(first, first_factory, first_request)
+    _crash_first_slice(second, second_factory, second_request)
+    first_restart, _, _, first_restart_factory, *_ = _controller(
+        repository,
+        reconciliation=reconciliation,
+    )
+    second_restart, _, _, second_restart_factory, *_ = _controller(
+        repository,
+        reconciliation=reconciliation,
+    )
+    before_first = len(repository.history(first_assembly_id))
+    before_second = len(repository.history(second_assembly_id))
+
+    async def race_reconciliation():
+        return await asyncio.gather(
+            first_restart.advance(first_request),
+            second_restart.advance(second_request),
+            return_exceptions=True,
+        )
+
+    results = asyncio.run(race_reconciliation())
+
+    conflicts = [result for result in results if isinstance(result, CapabilityAssemblyConflict)]
+    assert len(conflicts) == 1
+    assert "sole-writer fencing" in str(conflicts[0])
+    history_growth = (
+        len(repository.history(first_assembly_id)) - before_first,
+        len(repository.history(second_assembly_id)) - before_second,
+    )
+    effect_counts = (
+        len(first_restart_factory.calls),
+        len(second_restart_factory.calls),
+    )
+    assert sorted(zip(history_growth, effect_counts, strict=True)) == [(0, 0), (4, 1)]
+    assert repository._consumed_retry_authorizations == {
+        receipt_id: next(
+            canonical_assembly_model_bytes(outcome.retry_authorization)
+            for outcome in (
+                first_restart.projection(first_assembly_id).reconciliation_outcomes
+                + second_restart.projection(second_assembly_id).reconciliation_outcomes
+            )
+            if outcome.retry_authorization is not None
+        )
+    }
 
 
 def test_mismatched_reconciliation_is_rejected_without_reexecuting_started_effect() -> None:

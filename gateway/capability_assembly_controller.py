@@ -34,6 +34,7 @@ from gateway.capability_assembly_contracts import (
     CapabilityAssemblyCheckpoint,
     CapabilityAssemblyInputAdmissionPort,
     CapabilityAssemblyItemState,
+    CapabilityAssemblyNoEffectRetryAuthorization,
     CapabilityAssemblyReconciliationOutcome,
     CapabilityAssemblyReconciliationPort,
     CapabilityAssemblyReconciliationRequest,
@@ -405,7 +406,16 @@ class CapabilityAssemblyController:
                     outcome,
                 ),
             )
-            self._append(cleared, expected_revision=current.revision)
+            authorization = outcome.retry_authorization
+            if authorization is None:
+                raise CapabilityAssemblyConflict(
+                    "no-effect retry lacks an authorization receipt"
+                )
+            self._consume_retry_authorization_and_append(
+                cleared,
+                authorization,
+                expected_revision=current.revision,
+            )
             return cleared
         return self._complete_from_reconciliation(current, outcome)
 
@@ -840,6 +850,27 @@ class CapabilityAssemblyController:
             raise CapabilityAssemblyConflict("assembly repository changed checkpoint bytes")
         self._require_record_digest(record)
 
+    def _consume_retry_authorization_and_append(
+        self,
+        checkpoint: CapabilityAssemblyCheckpoint,
+        authorization: CapabilityAssemblyNoEffectRetryAuthorization,
+        *,
+        expected_revision: int,
+    ) -> None:
+        try:
+            record = self._repository.consume_retry_authorization_and_append(
+                checkpoint,
+                authorization,
+                expected_revision=expected_revision,
+            )
+        except CapabilityAssemblyWriteConflict as exc:
+            raise CapabilityAssemblyConflict(
+                "assembly append lost sole-writer fencing"
+            ) from exc
+        if record.checkpoint != checkpoint:
+            raise CapabilityAssemblyConflict("assembly repository changed checkpoint bytes")
+        self._require_record_digest(record)
+
     def _validate_ports(self) -> None:
         positional = object()
         method_specs = (
@@ -850,6 +881,13 @@ class CapabilityAssemblyController:
                 "append",
                 False,
                 (positional,),
+                {"expected_revision": 0},
+            ),
+            (
+                self._repository,
+                "consume_retry_authorization_and_append",
+                False,
+                (positional, positional),
                 {"expected_revision": 0},
             ),
             (self._admission, "admit", False, (positional,), {}),
