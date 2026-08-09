@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -19,6 +17,19 @@ RATIONALE_BENCHMARK_PREDICATE_KINDS = frozenset({"rationale_contains"})
 SAFETY_BENCHMARK_PREDICATE_KINDS = frozenset({"forbidden_tool_absent"})
 TOOL_BENCHMARK_PREDICATE_KINDS = frozenset({"tool_receipt"})
 HANDOFF_BENCHMARK_PREDICATE_KINDS = frozenset({"handoff_event"})
+BENCHMARK_CATEGORIES = (
+    "normal", "boundary", "missing", "conflicting", "mandatory_escalation",
+)
+BENCHMARK_DIMENSIONS = (
+    "business_outcome", "rationale", "safety", "required_tool",
+)
+BENCHMARK_RULESET_REFS = (
+    "captain.business-outcome.v1",
+    "captain.rationale.v1",
+    "captain.safety.v1",
+    "captain.tool-decision.v1",
+    "captain.handoff.v1",
+)
 
 
 class _FrozenContract(BaseModel):
@@ -102,6 +113,29 @@ class PrivateBenchmarkCaseRequirement(_FrozenContract):
         return self
 
 
+class BenchmarkPolicyRequirement(_FrozenContract):
+    """Public benchmark shape; it never carries cases or expected answers."""
+
+    categories: tuple[str, ...] = BENCHMARK_CATEGORIES
+    cases_per_category: int = Field(default=3, strict=True)
+    required_dimensions: tuple[str, ...] = BENCHMARK_DIMENSIONS
+    ruleset_refs: tuple[str, ...] = BENCHMARK_RULESET_REFS
+    source_case_keys: tuple[str, ...] = Field(min_length=1)
+    public_policy_statement: str | None = None
+
+    @model_validator(mode="after")
+    def require_canonical_public_shape(self) -> "BenchmarkPolicyRequirement":
+        if self.categories != BENCHMARK_CATEGORIES or self.cases_per_category != 3:
+            raise ValueError("benchmark policy requires exactly three cases per category")
+        if self.required_dimensions != BENCHMARK_DIMENSIONS:
+            raise ValueError("benchmark policy dimensions are not canonical")
+        if self.ruleset_refs != BENCHMARK_RULESET_REFS:
+            raise ValueError("benchmark policy rulesets are not canonical")
+        if len(self.source_case_keys) != len(set(self.source_case_keys)):
+            raise ValueError("benchmark policy source keys must be unique")
+        return self
+
+
 class RequestedIntegration(_FrozenContract):
     integration_key: str = Field(pattern=IDENTIFIER_PATTERN)
     purpose: str = Field(min_length=1)
@@ -151,7 +185,7 @@ class FactoryInputDocumentV2(_FrozenContract):
     real_cases: tuple[RealCaseRequirement, ...] = Field(min_length=1)
     helpful_resources: tuple[str, ...] = Field(min_length=1)
     stop_conditions: tuple[str, ...] = Field(min_length=1)
-    private_benchmark_cases: tuple[PrivateBenchmarkCaseRequirement, ...] = ()
+    benchmark_policy: BenchmarkPolicyRequirement
     sections: tuple[InputSection, ...] = Field(min_length=10)
     extra_sections: tuple[InputSection, ...] = ()
 
@@ -165,46 +199,22 @@ class FactoryInputDocumentV2(_FrozenContract):
             raise ValueError("duplicate integration stable name")
         known_agents = set(agent_keys)
         known_integrations = set(integration_keys)
-        benchmark_keys = tuple(item.case_key for item in self.private_benchmark_cases)
-        if len(benchmark_keys) != len(set(benchmark_keys)):
-            raise ValueError("duplicate private benchmark case stable name")
-        if self.private_benchmark_cases:
-            categories = (
-                "normal", "boundary", "missing", "conflicting", "mandatory_escalation"
-            )
-            if (len(self.private_benchmark_cases) != 15
-                    or any(sum(item.category == category for item in self.private_benchmark_cases) != 3
-                           for category in categories)):
-                raise ValueError(
-                    "private benchmark cases require exactly three cases per category"
-                )
-            semantic_digests = tuple(
-                hashlib.sha256(json.dumps({
-                    "category": item.category,
-                    "setup": item.observable_setup,
-                    "action": item.observable_action,
-                    "source_case_keys": item.source_case_keys,
-                    "expected_predicates": sorted(
-                        (
-                            predicate.kind,
-                            predicate.observed_key,
-                            predicate.expected_value,
-                        )
-                        for predicate in item.expected_predicates
-                    ),
-                }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-                for item in self.private_benchmark_cases
-            )
-            if len(semantic_digests) != len(set(semantic_digests)):
-                raise ValueError("private benchmark semantic definitions must be unique")
-        source_case_keys = {
+        public_source_keys = (
             *(item.case_key for item in self.real_cases),
             *(item.case_key for item in self.acceptance_outcomes),
-            *(item.integration_key for item in self.integrations),
-        }
-        for item in self.private_benchmark_cases:
-            if set(item.source_case_keys) - source_case_keys:
-                raise ValueError("private benchmark case references an unknown source case")
+            *(case.case_key for agent in self.agents for case in agent.real_cases),
+            *(f"{item.integration_key}_integration" for item in self.integrations),
+            *(f"{item.integration_key}_failure" for item in self.integrations),
+            *(f"{item.integration_key}_tool" for item in self.integrations),
+            *(f"authority_{index}" for index, _ in enumerate(self.authority_boundaries, 1)),
+            *(f"security_{index}" for index, _ in enumerate(self.security_requirements, 1)),
+            *(f"stop_{index}" for index, _ in enumerate(self.stop_conditions, 1)),
+        )
+        if len(public_source_keys) != len(set(public_source_keys)):
+            raise ValueError("benchmark public source keys must be unique")
+        source_case_keys = set(public_source_keys)
+        if set(self.benchmark_policy.source_case_keys) - source_case_keys:
+            raise ValueError("benchmark policy references an unknown public source")
         for agent in self.agents:
             unknown_handoffs = set(agent.handoffs) - known_agents
             if unknown_handoffs:

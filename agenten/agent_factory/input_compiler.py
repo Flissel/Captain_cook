@@ -13,6 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validat
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.holdout_store import PrivateHoldoutStore
 from agenten.agent_factory.input_contracts import FactoryInputDocumentV2, RealCaseRequirement
+from agenten.agent_factory.private_benchmark_catalog import (
+    PrivateBenchmarkCatalogError,
+    PrivateBenchmarkCatalogPort,
+)
 from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN
 
 
@@ -70,8 +74,10 @@ class CompiledFactorySpecification(_FrozenContract):
 
 
 class FactoryInputCompiler:
-    def __init__(self, *, holdout_store: PrivateHoldoutStore) -> None:
+    def __init__(self, *, holdout_store: PrivateHoldoutStore,
+                 private_benchmark_catalog: PrivateBenchmarkCatalogPort | None = None) -> None:
         self._holdout_store = holdout_store
+        self._private_benchmark_catalog = private_benchmark_catalog
 
     def compile(self, document: FactoryInputDocumentV2, subject_version: int) -> CompiledFactorySpecification:
         if isinstance(subject_version, bool) or subject_version < 1:
@@ -100,12 +106,26 @@ class FactoryInputCompiler:
         sources: list[tuple[tuple[str, ...], RealCaseRequirement, str]] = []
         sources.extend((("Acceptance outcomes", case.case_key), case, "business") for case in document.acceptance_outcomes)
         sources.extend((("Real cases", case.case_key), case, "business") for case in document.real_cases)
+        sources.extend(
+            (("Agents", agent.agent_key, "Real cases", case.case_key), case, "business")
+            for agent in document.agents for case in agent.real_cases
+        )
         for integration in document.integrations:
             case = RealCaseRequirement(case_key=f"{integration.integration_key}_integration", observable_setup=integration.trigger, observable_action=integration.operation, observable_expected=integration.success_behavior)
-            sources.append((("Integrations", integration.integration_key), case, "integration"))
+            sources.append((("Integrations", case.case_key), case, "integration"))
+            failure = RealCaseRequirement(case_key=f"{integration.integration_key}_failure", observable_setup=integration.trigger, observable_action=integration.operation, observable_expected=integration.failure_behavior)
+            sources.append((("Integrations", failure.case_key), failure, "recovery"))
+            tool = RealCaseRequirement(case_key=f"{integration.integration_key}_tool", observable_setup=integration.trigger, observable_action=integration.operation, observable_expected=integration.success_behavior)
+            sources.append((("Integrations", tool.case_key), tool, "integration"))
+        for index, rule in enumerate(document.authority_boundaries, 1):
+            case = RealCaseRequirement(case_key=f"authority_{index}", observable_setup="Given a bounded Captain authority", observable_action="Exercise the authority boundary", observable_expected=rule)
+            sources.append((("Authority boundaries", case.case_key), case, "security"))
         for index, rule in enumerate(document.security_requirements, 1):
             case = RealCaseRequirement(case_key=f"security_{index}", observable_setup="Given the compiled capability", observable_action="Exercise the security boundary", observable_expected=rule)
-            sources.append((("Security requirements", _semantic(rule)), case, "security"))
+            sources.append((("Security requirements", case.case_key), case, "security"))
+        for index, rule in enumerate(document.stop_conditions, 1):
+            case = RealCaseRequirement(case_key=f"stop_{index}", observable_setup="Given a controlled failure", observable_action="Exercise the stop condition", observable_expected=rule)
+            sources.append((("Stop conditions", case.case_key), case, "recovery"))
         for path, case, kind in sources:
             assertion_id = "assert-" + _short_id(document.input_ref.sha256, path, case.observable_expected)
             result.append(AcceptanceAssertion(assertion_id=assertion_id, source_path=path, observable_setup=case.observable_setup, observable_action=case.observable_action, observable_expected=case.observable_expected, kind=kind))
@@ -117,14 +137,28 @@ class FactoryInputCompiler:
         assertions: tuple[AcceptanceAssertion, ...],
     ) -> tuple[PrivateHoldoutRef, ...]:
         refs = []
-        if document.private_benchmark_cases:
+        if self._private_benchmark_catalog is not None:
+            suite = self._private_benchmark_catalog.resolve(document.input_ref.sha256)
+            expected_policy_digest = hashlib.sha256(
+                _canonical_json(document.benchmark_policy.model_dump(mode="json")).encode()
+            ).hexdigest()
+            if (suite.input_sha256 != document.input_ref.sha256
+                    or suite.policy_sha256 != expected_policy_digest):
+                raise PrivateBenchmarkCatalogError(
+                    "private benchmark suite changed admitted input or policy authority"
+                )
             assertions_by_source = {
                 item.source_path[-1]: item.assertion_id for item in assertions
             }
-            for case in document.private_benchmark_cases:
-                assertion_ids = tuple(
-                    assertions_by_source[key] for key in case.source_case_keys
-                )
+            for case in suite.cases:
+                try:
+                    assertion_ids = tuple(
+                        assertions_by_source[key] for key in case.source_case_keys
+                    )
+                except KeyError:
+                    raise PrivateBenchmarkCatalogError(
+                        "private benchmark case references an unknown admitted source"
+                    ) from None
                 body = _canonical_json({
                     "case_key": case.case_key,
                     "category": case.category,
