@@ -1,9 +1,9 @@
-"""Atomic local initialization and fail-closed D12 bundle loading."""
+"""Local secret initialization and adapters for real D10/D11 exports."""
 
 from __future__ import annotations
 
 import hashlib
-import json
+import importlib
 import os
 import secrets
 import subprocess
@@ -11,14 +11,24 @@ import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Protocol
 
-from pydantic import ValidationError
-
-from .contracts import CANONICAL_INPUT_PATHS, DemoBundleV1
+from .contracts import CANONICAL_INPUT_PATHS
 
 
 class DemoConfigurationError(RuntimeError):
-    """The live demo is not safe to initialize or start."""
+    """The live demo is not safe to initialize or operate."""
+
+
+class ProductionManifestLoader(Protocol):
+    def __call__(self, *, environment: Mapping[str, str]) -> object: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorityHealthBinding:
+    service: str
+    health_url: str
+    token_name: str
 
 
 PRIVATE_ENV_RELATIVE = Path(".captain-cook/live-demo/private/demo.env")
@@ -26,10 +36,11 @@ STATE_ROOT_RELATIVE = Path(".captain-cook/live-demo")
 GENERATED_SECRET_NAMES = (
     "CAPTAIN_GATEWAY_TOKEN",
     "WORKER_GATEWAY_TOKEN",
-    "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
     "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN",
+    "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+    "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
     "CAPTAIN_RUNTIME_TOKEN",
-    "CAPTAIN_BENCHMARK_TOKEN",
+    "MINIBOOK_API_KEY",
     "MINIBOOK_PROJECTION_API_KEY",
 )
 
@@ -38,24 +49,106 @@ GENERATED_SECRET_NAMES = (
 class DemoConfiguration:
     repository_root: Path
     state_root: Path
-    bundle: DemoBundleV1
-    bundle_path: Path
-    bundle_sha256: str
+    production_manifest: object
+    repository_revision: str
+    canonical_input_digests: Mapping[str, str]
     environment: Mapping[str, str]
 
-    def environment_for(self, service_name: str) -> dict[str, str]:
-        service = next(
-            (item for item in self.bundle.services if item.name == service_name),
-            None,
+    @property
+    def bundle_sha256(self) -> str:
+        return str(getattr(self.production_manifest, "manifest_sha256"))
+
+    @property
+    def gateway_base_url(self) -> str:
+        return str(getattr(getattr(self.production_manifest, "gateway"), "base_url"))
+
+    @property
+    def provider_context_reference_header(self) -> str:
+        return str(
+            getattr(self.production_manifest, "provider_context_reference_header")
         )
-        if service is None:
-            raise DemoConfigurationError(f"unknown demo service: {service_name}")
-        missing = [name for name in service.environment if not self.environment.get(name)]
-        if missing:
-            raise DemoConfigurationError(
-                f"{service_name} environment is missing {', '.join(sorted(missing))}"
+
+    def health_bindings(self) -> tuple[AuthorityHealthBinding, ...]:
+        names = (
+            ("gateway", "CAPTAIN_GATEWAY_TOKEN"),
+            ("provider_proxy", "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"),
+            ("runtime", "CAPTAIN_RUNTIME_TOKEN"),
+            ("benchmark", "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN"),
+            ("minibook", "MINIBOOK_API_KEY"),
+        )
+        return tuple(
+            AuthorityHealthBinding(
+                service=service,
+                health_url=str(
+                    getattr(getattr(self.production_manifest, service), "health_url")
+                ),
+                token_name=token,
             )
-        return {name: self.environment[name] for name in service.environment}
+            for service, token in names
+        )
+
+    def authority_token(self, name: str) -> str:
+        value = self.environment.get(name, "").strip()
+        if not value:
+            raise DemoConfigurationError(f"required authority is unavailable: {name}")
+        return value
+
+    def require_private_benchmark_catalog(self) -> object:
+        try:
+            module = importlib.import_module(
+                "agenten.agent_factory.private_benchmark_catalog"
+            )
+            catalog_type = getattr(module, "VerifiedFilePrivateBenchmarkCatalog")
+        except (ImportError, AttributeError):
+            raise DemoConfigurationError(
+                "D10 private benchmark catalog capability is unavailable"
+            ) from None
+        names = (
+            "CAPTAIN_PRIVATE_BENCHMARK_ROOT",
+            "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_PATH",
+            "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256",
+        )
+        if any(not self.environment.get(name, "").strip() for name in names):
+            raise DemoConfigurationError(
+                "D10 private benchmark catalog configuration is incomplete"
+            )
+        try:
+            catalog = catalog_type.open(
+                private_root=Path(self.environment[names[0]]),
+                manifest_path=Path(self.environment[names[1]]),
+                expected_sha256=self.environment[names[2]],
+                expected_input_sha256s=tuple(
+                    self.canonical_input_digests[path]
+                    for path in CANONICAL_INPUT_PATHS
+                ),
+                forbidden_roots=(self.repository_root / ".git",),
+            )
+            catalog.revalidate()
+        except Exception:
+            raise DemoConfigurationError(
+                "D10 private benchmark catalog validation failed"
+            ) from None
+        return catalog
+
+    def require_minibook_evidence_readback(self) -> str:
+        value = getattr(
+            self.production_manifest, "minibook_evidence_url_template", None
+        )
+        if not isinstance(value, str) or value.count("{assembly_id}") != 1:
+            raise DemoConfigurationError(
+                "D11 Minibook assembly evidence readback capability is unavailable"
+            )
+        return value
+
+    def require_operator_process_bootstrap(self) -> object:
+        raise DemoConfigurationError(
+            "D11 operator process bootstrap is unavailable"
+        )
+
+    def require_runtime_restart_control(self) -> object:
+        raise DemoConfigurationError(
+            "D11 operator process bootstrap is unavailable"
+        )
 
 
 def initialize_private_environment(
@@ -83,10 +176,10 @@ def load_demo_configuration(
     repository_root: Path,
     *,
     revision_reader: Callable[[Path], str] | None = None,
+    production_manifest_loader: ProductionManifestLoader | None = None,
 ) -> DemoConfiguration:
     repository = repository_root.resolve(strict=True)
-    private_env_path = repository / PRIVATE_ENV_RELATIVE
-    private = _read_env(private_env_path)
+    private = _read_env(repository / PRIVATE_ENV_RELATIVE)
     root = _read_env(repository / ".env")
     overlap = set(private) & set(root)
     if overlap:
@@ -94,94 +187,86 @@ def load_demo_configuration(
             "root and private demo environments contain overlapping authority names"
         )
     environment = {**root, **private}
-    raw_manifest = environment.get("CAPTAIN_DEMO_BUNDLE_MANIFEST", "").strip()
-    raw_digest = environment.get("CAPTAIN_DEMO_BUNDLE_MANIFEST_SHA256", "").strip()
-    if not raw_manifest or not raw_digest:
-        raise DemoConfigurationError("D11 sealed capability demo bundle is unavailable")
-    manifest_path = Path(raw_manifest)
-    if not manifest_path.is_absolute():
-        manifest_path = repository / manifest_path
-    manifest_path = _resolve_repository_or_private_path(
-        repository, manifest_path, "bundle manifest"
-    )
-    actual_digest = _sha256(manifest_path)
-    if actual_digest != raw_digest:
-        raise DemoConfigurationError("capability demo bundle digest mismatch")
+    loader = production_manifest_loader or _resolve_d11_loader()
     try:
-        raw_text = manifest_path.read_text(encoding="utf-8")
-        json.loads(raw_text)
-        bundle = DemoBundleV1.model_validate_json(raw_text)
-    except (OSError, json.JSONDecodeError, ValidationError) as exc:
-        raise DemoConfigurationError("capability demo bundle is invalid") from exc
+        manifest = loader(environment=environment)
+    except DemoConfigurationError:
+        raise
+    except Exception:
+        raise DemoConfigurationError(
+            "D11 production bundle configuration is incomplete"
+        ) from None
+    _validate_d11_manifest(manifest)
     reader = revision_reader or _git_revision
-    if reader(repository) != bundle.repository_revision:
-        raise DemoConfigurationError("capability demo bundle repository revision mismatch")
-    _verify_bundle_files(repository, bundle)
+    revision = reader(repository)
+    digests = {
+        relative: _sha256(_resolve_relative_file(repository, relative))
+        for relative in CANONICAL_INPUT_PATHS
+    }
+    if len(set(digests.values())) != 3:
+        raise DemoConfigurationError("canonical demo inputs must have distinct bytes")
     values = [environment.get(name, "") for name in GENERATED_SECRET_NAMES]
     if any(not value.strip() for value in values):
         raise DemoConfigurationError("private demo authorities are incomplete")
     if len(values) != len(set(values)):
         raise DemoConfigurationError("private demo authorities must be distinct")
-    if not environment.get("OPENAI_API_KEY", "").strip():
-        raise DemoConfigurationError("operator-supplied OPENAI_API_KEY is unavailable")
-    for service in bundle.services:
-        configuration = DemoConfiguration(
-            repository_root=repository,
-            state_root=repository / STATE_ROOT_RELATIVE,
-            bundle=bundle,
-            bundle_path=manifest_path,
-            bundle_sha256=actual_digest,
-            environment=environment,
-        )
-        configuration.environment_for(service.name)
-    return configuration
+    return DemoConfiguration(
+        repository_root=repository,
+        state_root=repository / STATE_ROOT_RELATIVE,
+        production_manifest=manifest,
+        repository_revision=revision,
+        canonical_input_digests=digests,
+        environment=environment,
+    )
 
 
-def _verify_bundle_files(repository: Path, bundle: DemoBundleV1) -> None:
-    catalog = repository.joinpath(*PurePosixPath(bundle.benchmark_catalog_path).parts)
-    if not catalog.is_file():
-        raise DemoConfigurationError("D10 private benchmark catalog is unavailable")
-    for relative, expected in {
-        **bundle.canonical_inputs,
-        **bundle.artifact_digests,
-        **bundle.compose_files,
-        bundle.benchmark_catalog_path: bundle.benchmark_catalog_sha256,
-    }.items():
-        path = _resolve_relative_file(repository, relative)
-        if _sha256(path) != expected:
-            raise DemoConfigurationError(f"sealed file digest mismatch: {relative}")
-    referenced = {
-        relative for service in bundle.services for relative in service.artifact_paths
-    }
-    if not referenced.issubset(bundle.artifact_digests):
-        raise DemoConfigurationError("service artifact is not digest-bound")
-    if set(bundle.canonical_inputs) != set(CANONICAL_INPUT_PATHS):
-        raise DemoConfigurationError("canonical input set changed")
+def _resolve_d11_loader() -> ProductionManifestLoader:
+    try:
+        module = importlib.import_module("gateway.capability_assembly_bootstrap")
+        loader = getattr(module, "load_capability_production_bundle_manifest")
+    except (ImportError, AttributeError):
+        raise DemoConfigurationError(
+            "D11 operator process bootstrap is unavailable"
+        ) from None
+    if not callable(loader):
+        raise DemoConfigurationError("D11 operator process bootstrap is unavailable")
+    return loader
+
+
+def _validate_d11_manifest(manifest: object) -> None:
+    if (
+        getattr(manifest, "schema_name", None)
+        != "captain.capability-production-bundle-manifest.v1"
+        or getattr(manifest, "provider_supervisor_mode", None)
+        != "dynamic_gateway_context_v1"
+        or getattr(manifest, "provider_context_reference_header", None)
+        != "X-Captain-Provider-Context-Ref"
+    ):
+        raise DemoConfigurationError("D11 production bundle manifest is invalid")
+    digest = getattr(manifest, "manifest_sha256", None)
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise DemoConfigurationError("D11 production bundle manifest is invalid")
+    for name in ("gateway", "benchmark", "runtime", "provider_proxy", "minibook"):
+        binding = getattr(manifest, name, None)
+        if (
+            getattr(binding, "service", None) != name
+            or getattr(binding, "authentication", None) != "bearer"
+            or not isinstance(getattr(binding, "base_url", None), str)
+            or not isinstance(getattr(binding, "health_url", None), str)
+        ):
+            raise DemoConfigurationError("D11 production bundle manifest is invalid")
 
 
 def _resolve_relative_file(repository: Path, relative: str) -> Path:
-    if "\\" in relative:
-        raise DemoConfigurationError("bundle path must be repository-relative POSIX")
     pure = PurePosixPath(relative)
-    if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
-        raise DemoConfigurationError("bundle path must be repository-relative POSIX")
-    return _resolve_repository_or_private_path(repository, repository.joinpath(*pure.parts), relative)
-
-
-def _resolve_repository_or_private_path(
-    repository: Path, path: Path, label: str
-) -> Path:
+    path = repository.joinpath(*pure.parts).resolve(strict=True)
     try:
-        resolved = path.resolve(strict=True)
-    except OSError:
-        raise DemoConfigurationError(f"sealed file is unavailable: {label}") from None
-    try:
-        resolved.relative_to(repository)
+        path.relative_to(repository)
     except ValueError:
-        raise DemoConfigurationError(f"sealed file escaped repository: {label}") from None
-    if not resolved.is_file():
-        raise DemoConfigurationError(f"sealed file is unavailable: {label}")
-    return resolved
+        raise DemoConfigurationError("canonical input escaped repository") from None
+    if not path.is_file():
+        raise DemoConfigurationError(f"canonical input is unavailable: {relative}")
+    return path
 
 
 def _read_env(path: Path) -> dict[str, str]:
@@ -243,6 +328,7 @@ def _git_revision(repository: Path) -> str:
 
 
 __all__ = [
+    "AuthorityHealthBinding",
     "DemoConfiguration",
     "DemoConfigurationError",
     "initialize_private_environment",
