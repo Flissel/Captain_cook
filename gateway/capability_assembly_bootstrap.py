@@ -496,13 +496,14 @@ class CaptainBenchmarkToolEvidenceAuthority:
         except Exception:
             return False
         common = {
+            "case_digest": request.case_ref.case_digest,
             "tool_key": request.tool_key,
             "trace_id": str(request.trace_id),
             "run_id": str(request.run_id),
+            "model_policy_digest": request.model_policy_digest,
         }
         expected_registry = {
             **common,
-            "model_policy_digest": request.model_policy_digest,
             "call_ref": request.call_ref.model_dump(mode="json"),
             "lease_ref": request.lease_ref.model_dump(mode="json"),
             "receipt_ref": request.receipt_ref.model_dump(mode="json"),
@@ -512,26 +513,38 @@ class CaptainBenchmarkToolEvidenceAuthority:
             and all(registry.get(key) == value for key, value in expected_registry.items())
             and isinstance(registry.get("batch_id"), str)
             and isinstance(registry.get("execution_result_id"), str)
-            and call
-            == {
-                "schema": "captain.capability-tool-call.v1",
-                **common,
-                "model_policy_digest": request.model_policy_digest,
+            and set(call) == {
+                "schema", *common, "operation", "call_id"
             }
-            and lease
-            == {
-                "schema": "captain.capability-tool-lease.v1",
-                **common,
-                "call_sha256": request.call_ref.sha256,
+            and call.get("schema") == "captain.capability-benchmark-tool-call.v1"
+            and all(call.get(key) == value for key, value in common.items())
+            and isinstance(call.get("operation"), str)
+            and bool(call["operation"])
+            and isinstance(call.get("call_id"), str)
+            and bool(call["call_id"])
+            and set(lease) == {
+                "schema", *common, "call_id", "call_sha256", "lease_id", "scope"
             }
-            and receipt
-            == {
-                "schema": "captain.capability-tool-receipt.v1",
-                **common,
-                "call_sha256": request.call_ref.sha256,
-                "lease_sha256": request.lease_ref.sha256,
-                "status": "succeeded",
+            and lease.get("schema") == "captain.capability-benchmark-tool-lease.v1"
+            and all(lease.get(key) == value for key, value in common.items())
+            and lease.get("call_id") == call.get("call_id")
+            and lease.get("call_sha256") == request.call_ref.sha256
+            and isinstance(lease.get("lease_id"), str)
+            and bool(lease["lease_id"])
+            and lease.get("scope") == [call.get("operation")]
+            and set(receipt) == {
+                "schema", *common, "call_id", "call_sha256", "lease_sha256",
+                "status", "result_ref_sha256",
             }
+            and receipt.get("schema")
+            == "captain.capability-benchmark-tool-receipt.v1"
+            and all(receipt.get(key) == value for key, value in common.items())
+            and receipt.get("call_id") == call.get("call_id")
+            and receipt.get("call_sha256") == request.call_ref.sha256
+            and receipt.get("lease_sha256") == request.lease_ref.sha256
+            and receipt.get("status") == "succeeded"
+            and isinstance(receipt.get("result_ref_sha256"), str)
+            and _SHA256.fullmatch(receipt["result_ref_sha256"]) is not None
         )
 
     def _read(self, reference: ArtifactRef) -> dict[str, object]:

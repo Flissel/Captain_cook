@@ -75,6 +75,7 @@ from gateway.capability_generic_benchmark import (
     build_generic_benchmark_suite,
 )
 from gateway.capability_assembly_repository import GatewayCapabilityAssemblyRepository
+from gateway.capability_assembly_bootstrap import CaptainBenchmarkToolEvidenceAuthority
 from gateway.capability_benchmark_process_executor import (
     GatewayHttpBenchmarkProcessTransport,
     GatewayIsolatedBenchmarkExecutorClient,
@@ -1639,7 +1640,13 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             return SimpleNamespace(job=job)
 
     class Evidence:
-        gateway_store = object()
+        class ToolRegistry:
+            issued: dict[str, dict[str, object]] = {}
+
+            def capability_tool_evidence(self, receipt_sha256: str):
+                return self.issued.get(receipt_sha256)
+
+        gateway_store = ToolRegistry()
         bodies: dict[ArtifactRef, bytes] = {}
 
         def put(self, value: dict[str, object]) -> ArtifactRef:
@@ -1653,6 +1660,9 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             return ref
 
         def resolve(self, reference: ArtifactRef) -> bytes:
+            return self.bodies[reference]
+
+        def read_bytes(self, reference: ArtifactRef) -> bytes:
             return self.bodies[reference]
 
         def record_evaluation(self, payload: bytes) -> ArtifactRef:
@@ -1745,6 +1755,8 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                 "schema": "captain.capability-benchmark-tool-lease.v1",
                 **common,
                 "tool_key": "captain_tool",
+                "call_id": f"call-{execution_request.case_ref.case_id}-{kind}",
+                "call_sha256": call_ref.sha256,
                 "lease_id": f"lease-{execution_request.case_ref.case_id}-{kind}",
                 "scope": ["read"],
             })
@@ -1753,10 +1765,20 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                 **common,
                 "tool_key": "captain_tool",
                 "call_id": f"call-{execution_request.case_ref.case_id}-{kind}",
+                "call_sha256": call_ref.sha256,
+                "lease_sha256": lease_ref.sha256,
                 "status": "succeeded",
                 "result_ref_sha256": outcome_ref.sha256,
             })
-            tool_authority.issue(call_ref, lease_ref, receipt_ref)
+            evidence.gateway_store.issued[receipt_ref.sha256] = {
+                **common,
+                "tool_key": "captain_tool",
+                "call_ref": call_ref.model_dump(mode="json"),
+                "lease_ref": lease_ref.model_dump(mode="json"),
+                "receipt_ref": receipt_ref.model_dump(mode="json"),
+                "batch_id": "n8n-benchmark-batch",
+                "execution_result_id": str(_id(f"{kind}-execution-result")),
+            }
             return GenericBenchmarkExecutionEvidence(
                 case_ref=execution_request.case_ref,
                 team_kind=kind,
@@ -1793,7 +1815,10 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             )
 
     evidence, executor, recorder = Evidence(), Executor(), Recorder()
-    tool_authority = _ToolEvidenceAuthority(evidence.gateway_store)
+    tool_authority = CaptainBenchmarkToolEvidenceAuthority(
+        gateway_store=evidence.gateway_store,
+        artifacts=evidence,
+    )
     private_cases = _private_case_repository(
         holdouts, executor_authority_id=executor.authority_id,
     )

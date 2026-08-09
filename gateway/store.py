@@ -6557,6 +6557,7 @@ class GatewayStore:
     def record_capability_tool_evidence(
         self,
         *,
+        case_digest: str,
         tool_key: str,
         trace_id: UUID,
         run_id: UUID,
@@ -6571,7 +6572,9 @@ class GatewayStore:
 
         refs = (call_ref, lease_ref, receipt_ref)
         if (
-            not tool_key
+            len(case_digest) != 64
+            or any(character not in "0123456789abcdef" for character in case_digest)
+            or not tool_key
             or len(model_policy_digest) != 64
             or any(character not in "0123456789abcdef" for character in model_policy_digest)
             or len({item.sha256 for item in refs}) != 3
@@ -6583,6 +6586,7 @@ class GatewayStore:
         ):
             raise HTTPException(status_code=409, detail="capability tool evidence is invalid")
         payload = {
+            "case_digest": case_digest,
             "tool_key": tool_key,
             "trace_id": str(trace_id),
             "run_id": str(run_id),

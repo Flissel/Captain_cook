@@ -114,37 +114,51 @@ def test_tool_evidence_authority_requires_three_gateway_bound_cas_documents() ->
     run_id = uuid4()
     policy = "a" * 64
     tool_key = "crm.lookup"
+    case_digest = "b" * 64
+    call_id = "call-crm-lookup"
     call_payload = json.dumps(
         {
-            "schema": "captain.capability-tool-call.v1",
+            "schema": "captain.capability-benchmark-tool-call.v1",
+            "case_digest": case_digest,
             "tool_key": tool_key,
             "trace_id": str(trace_id),
             "run_id": str(run_id),
             "model_policy_digest": policy,
+            "operation": "read",
+            "call_id": call_id,
         },
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
     lease_payload = json.dumps(
         {
-            "schema": "captain.capability-tool-lease.v1",
+            "schema": "captain.capability-benchmark-tool-lease.v1",
+            "case_digest": case_digest,
             "tool_key": tool_key,
             "trace_id": str(trace_id),
             "run_id": str(run_id),
+            "model_policy_digest": policy,
+            "call_id": call_id,
             "call_sha256": hashlib.sha256(call_payload).hexdigest(),
+            "lease_id": "lease-crm-lookup",
+            "scope": ["read"],
         },
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
     receipt_payload = json.dumps(
         {
-            "schema": "captain.capability-tool-receipt.v1",
+            "schema": "captain.capability-benchmark-tool-receipt.v1",
+            "case_digest": case_digest,
             "tool_key": tool_key,
             "trace_id": str(trace_id),
             "run_id": str(run_id),
+            "model_policy_digest": policy,
+            "call_id": call_id,
             "call_sha256": hashlib.sha256(call_payload).hexdigest(),
             "lease_sha256": hashlib.sha256(lease_payload).hexdigest(),
             "status": "succeeded",
+            "result_ref_sha256": "c" * 64,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -155,6 +169,7 @@ def test_tool_evidence_authority_requires_three_gateway_bound_cas_documents() ->
         "trace_id": str(trace_id),
         "run_id": str(run_id),
         "model_policy_digest": policy,
+        "case_digest": case_digest,
         "call_ref": refs[0].model_dump(mode="json"),
         "lease_ref": refs[1].model_dump(mode="json"),
         "receipt_ref": refs[2].model_dump(mode="json"),
@@ -178,7 +193,7 @@ def test_tool_evidence_authority_requires_three_gateway_bound_cas_documents() ->
             case_id="case-a",
             category=GenericBenchmarkCategory.NORMAL,
             assertion_ids=("a",),
-            case_digest="b" * 64,
+            case_digest=case_digest,
         ),
         tool_key=tool_key,
         call_ref=refs[0],
@@ -195,6 +210,76 @@ def test_tool_evidence_authority_requires_three_gateway_bound_cas_documents() ->
         **{**request.__dict__, "tool_key": "crm.delete"}
     )
     assert authority.verify(changed) is False
+
+
+def test_gateway_tool_registry_persists_case_bound_entry() -> None:
+    rows: dict[str, str] = {}
+
+    class Cursor:
+        result: dict[str, str] | None = None
+        rowcount = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def execute(self, statement: str, parameters: object = None) -> None:
+            normalized = " ".join(statement.split())
+            values = tuple(parameters or ())
+            if normalized.startswith("SELECT payload FROM capability_tool_evidence_registry"):
+                payload = rows.get(str(values[0]))
+                self.result = None if payload is None else {"payload": payload}
+            elif normalized.startswith("INSERT INTO capability_tool_evidence_registry"):
+                rows[str(values[0])] = str(values[1])
+                self.result = None
+
+        def fetchone(self):
+            return self.result
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def cursor(self):
+            return Cursor()
+
+    class Storage:
+        def transaction(self):
+            return Connection()
+
+    class Store(GatewayStore):
+        def __init__(self) -> None:
+            self.storage = Storage()
+
+        def _batch_row(self, cursor, batch_id, **kwargs):
+            del cursor, kwargs
+            return {"data": {"batch_id": batch_id}}
+
+        def _runtime_block_by_json_value(self, cursor, **kwargs):
+            del cursor, kwargs
+            return {"data": {"status": "succeeded"}}
+
+    refs = tuple(_ref(label.encode()) for label in ("call", "lease", "receipt"))
+    store = Store()
+    store.record_capability_tool_evidence(
+        case_digest="d" * 64,
+        tool_key="crm.lookup",
+        trace_id=uuid4(),
+        run_id=uuid4(),
+        model_policy_digest="e" * 64,
+        call_ref=refs[0],
+        lease_ref=refs[1],
+        receipt_ref=refs[2],
+        batch_id="n8n-benchmark-batch",
+        execution_result_id=uuid4(),
+    )
+
+    assert store.capability_tool_evidence(refs[2].sha256)["case_digest"] == "d" * 64
 
 
 class _Store:
