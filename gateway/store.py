@@ -5358,8 +5358,18 @@ class GatewayStore:
     ) -> AppendResult:
         """Persist one exact Factory-to-Minibook acknowledgement as delivery evidence."""
 
-        generic_payload = self.generic_capability_promotion(
+        source = self.factory_promotion_source(
             acknowledgement.projection_event_id
+        )
+        integration_source = (
+            self.integration_setup_source(acknowledgement.projection_event_id)
+            if source is None
+            else None
+        )
+        generic_payload = (
+            self.generic_capability_promotion(acknowledgement.projection_event_id)
+            if source is None and integration_source is None
+            else None
         )
         if generic_payload is not None:
             from agenten.delivery.minibook_events import MinibookProjectionEvent
@@ -5410,13 +5420,7 @@ class GatewayStore:
             })
             return self.append_delivery_event(mirror)
 
-        source = self.factory_promotion_source(
-            acknowledgement.projection_event_id
-        )
         if source is None:
-            integration_source = self.integration_setup_source(
-                acknowledgement.projection_event_id
-            )
             if integration_source is None:
                 raise HTTPException(
                     status_code=409,
