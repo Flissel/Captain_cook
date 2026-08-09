@@ -23,6 +23,110 @@ WORKER_TOKEN = "worker-assembly-test-token"
 PROVIDER_TOKEN = "provider-assembly-test-token"
 
 
+class _PortProbe:
+    def __init__(self, calls: dict[str, int], mutate) -> None:
+        self.calls = calls
+        self.mutate = mutate
+
+    def _touch(self, method: str) -> None:
+        self.calls[method] += 1
+        self.mutate()
+        raise AssertionError(f"malformed controller method ran: {method}")
+
+    def submit(self, request):
+        self._touch("submit")
+
+    def projection(self, assembly_id):
+        self._touch("projection")
+
+    async def advance(self, request):
+        self._touch("advance")
+
+    def final_evidence(self, assembly_id):
+        self._touch("final_evidence")
+
+
+class _NonCallableSubmit(_PortProbe):
+    submit = None
+
+
+class _TwoArgumentSubmit(_PortProbe):
+    def submit(self, request, extra):
+        self._touch("submit")
+
+
+class _AsyncSubmit(_PortProbe):
+    async def submit(self, request):
+        self._touch("submit")
+
+
+class _OptionalSubmit(_PortProbe):
+    def submit(self, request=None):
+        self._touch("submit")
+
+
+class _NoArgumentProjection(_PortProbe):
+    def projection(self):
+        self._touch("projection")
+
+
+class _AsyncProjection(_PortProbe):
+    async def projection(self, assembly_id):
+        self._touch("projection")
+
+
+class _VariadicProjection(_PortProbe):
+    def projection(self, *assembly_ids):
+        self._touch("projection")
+
+
+class _TwoArgumentFinalEvidence(_PortProbe):
+    def final_evidence(self, assembly_id, extra):
+        self._touch("final_evidence")
+
+
+class _KeywordOnlyFinalEvidence(_PortProbe):
+    def final_evidence(self, *, assembly_id):
+        self._touch("final_evidence")
+
+
+class _AsyncFinalEvidence(_PortProbe):
+    async def final_evidence(self, assembly_id):
+        self._touch("final_evidence")
+
+
+class _SyncAdvance(_PortProbe):
+    def advance(self, request):
+        self._touch("advance")
+
+
+class _TwoArgumentAdvance(_PortProbe):
+    async def advance(self, request, extra):
+        self._touch("advance")
+
+
+class _RecordingController:
+    def __init__(self, controller, calls: dict[str, int]) -> None:
+        self.controller = controller
+        self.calls = calls
+
+    def submit(self, request):
+        self.calls["submit"] += 1
+        return self.controller.submit(request)
+
+    def projection(self, assembly_id):
+        self.calls["projection"] += 1
+        return self.controller.projection(assembly_id)
+
+    async def advance(self, request):
+        self.calls["advance"] += 1
+        return await self.controller.advance(request)
+
+    def final_evidence(self, assembly_id):
+        self.calls["final_evidence"] += 1
+        return self.controller.final_evidence(assembly_id)
+
+
 def _settings() -> GatewaySettings:
     return GatewaySettings(
         ledger_dsn="mysql://ignored:ignored@127.0.0.1:3306/ignored",
@@ -56,6 +160,125 @@ def _advance_payload(controller, operation: str, *, maximum_slices: int = 1):
         request_sha256=controller.projection(ASSEMBLY_ID).request_sha256,
         maximum_slices=maximum_slices,
     ).model_dump(mode="json", by_alias=True)
+
+
+@pytest.mark.parametrize(
+    "controller_type",
+    [
+        _NonCallableSubmit,
+        _TwoArgumentSubmit,
+        _AsyncSubmit,
+        _OptionalSubmit,
+        _NoArgumentProjection,
+        _AsyncProjection,
+        _VariadicProjection,
+        _TwoArgumentFinalEvidence,
+        _KeywordOnlyFinalEvidence,
+        _AsyncFinalEvidence,
+        _SyncAdvance,
+        _TwoArgumentAdvance,
+    ],
+)
+def test_malformed_controller_binding_fails_before_any_method_or_state_effect(
+    controller_type,
+) -> None:
+    valid_controller, repository, *_ = _controller()
+    calls = {
+        "factory": 0,
+        "submit": 0,
+        "projection": 0,
+        "advance": 0,
+        "final_evidence": 0,
+    }
+
+    def factory():
+        calls["factory"] += 1
+        return controller_type(
+            calls,
+            lambda: valid_controller.submit(_submission()),
+        )
+
+    client = _client(factory)
+    health = client.get("/v1/capability-assemblies/health", headers=_headers())
+    submit = client.post(
+        "/v1/capability-assemblies",
+        json=_submit_payload(),
+        headers=_headers(),
+    )
+
+    assert health.status_code == 503
+    assert submit.status_code == 503
+    assert health.json() == submit.json() == {
+        "detail": "capability assembly service unavailable"
+    }
+    assert calls == {
+        "factory": 1,
+        "submit": 0,
+        "projection": 0,
+        "advance": 0,
+        "final_evidence": 0,
+    }
+    assert repository.history(ASSEMBLY_ID) == ()
+
+
+def test_factory_is_resolved_once_and_health_never_touches_controller() -> None:
+    controller, *_ = _controller()
+    calls = {
+        "factory": 0,
+        "submit": 0,
+        "projection": 0,
+        "advance": 0,
+        "final_evidence": 0,
+    }
+    recording = _RecordingController(controller, calls)
+
+    def factory():
+        calls["factory"] += 1
+        return recording
+
+    client = _client(factory)
+    assert calls == {
+        "factory": 1,
+        "submit": 0,
+        "projection": 0,
+        "advance": 0,
+        "final_evidence": 0,
+    }
+
+    for _ in range(3):
+        response = client.get(
+            "/v1/capability-assemblies/health",
+            headers=_headers(),
+        )
+        assert response.status_code == 200
+
+    assert calls == {
+        "factory": 1,
+        "submit": 0,
+        "projection": 0,
+        "advance": 0,
+        "final_evidence": 0,
+    }
+
+    submitted = client.post(
+        "/v1/capability-assemblies",
+        json=_submit_payload(),
+        headers=_headers(),
+    )
+    projected = client.get(
+        f"/v1/capability-assemblies/{ASSEMBLY_ID}",
+        headers=_headers(),
+    )
+
+    assert submitted.status_code == 200
+    assert projected.status_code == 200
+    assert calls == {
+        "factory": 1,
+        "submit": 1,
+        "projection": 1,
+        "advance": 0,
+        "final_evidence": 0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -109,22 +332,36 @@ def test_missing_or_failed_controller_binding_is_fixed_redacted_503() -> None:
         headers=_headers(),
     )
 
+    factory_calls = 0
+
     def unavailable():
+        nonlocal factory_calls
+        factory_calls += 1
         raise RuntimeError(
             "C:\\private\\environment.env provider-body=private"
         )
 
-    failed = _client(unavailable).get(
+    failed_client = _client(unavailable)
+    failed = failed_client.get(
         "/v1/capability-assemblies/health",
+        headers=_headers(),
+    )
+    failed_again = failed_client.post(
+        "/v1/capability-assemblies",
+        json=_submit_payload(),
         headers=_headers(),
     )
 
     assert missing.status_code == 503
     assert incomplete.status_code == 503
     assert failed.status_code == 503
-    assert missing.json() == incomplete.json() == failed.json() == {
-        "detail": "capability assembly service unavailable"
-    }
+    assert failed_again.status_code == 503
+    expected = {"detail": "capability assembly service unavailable"}
+    assert missing.json() == expected
+    assert incomplete.json() == expected
+    assert failed.json() == expected
+    assert failed_again.json() == expected
+    assert factory_calls == 1
     assert "private" not in failed.text
     assert "environment" not in failed.text
 
