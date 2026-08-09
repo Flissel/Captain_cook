@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path as FileSystemPath
 from threading import Lock
+from collections.abc import Mapping
 from typing import Any, Callable, Literal, Protocol
 from uuid import UUID, uuid4
 
@@ -148,6 +149,12 @@ from gateway.capability_assembly_api import (
     CapabilityAssemblyCompositionFactory,
     create_production_capability_assembly_router,
     unavailable_capability_assembly_composition,
+)
+from agenten.agent_factory.holdout_store import PrivateHoldoutStore
+from gateway.capability_assembly_bootstrap import (
+    CapabilityAssemblyFactoryRuntime,
+    build_production_capability_assembly_from_environment,
+    close_production_capability_assembly,
 )
 from gateway.portal_live_contracts import (
     PortalLiveEvidenceQueryV1,
@@ -317,6 +324,10 @@ def create_app(
     capability_assembly_composition_factory: (
         CapabilityAssemblyCompositionFactory | None
     ) = None,
+    capability_assembly_environment: Mapping[str, str] | None = None,
+    capability_assembly_factory_runtime: CapabilityAssemblyFactoryRuntime | None = None,
+    capability_assembly_private_catalog: PrivateHoldoutStore | None = None,
+    capability_assembly_repository_root: FileSystemPath | None = None,
     runtime_usage_artifacts: ContentAddressedArtifactAdapter | None = None,
     runtime_usage_pricing_snapshots: tuple[
         RuntimeUsagePricingSnapshotV1, ...
@@ -373,10 +384,38 @@ def create_app(
     store: GatewayStore | None = gateway_store or (
         configured_store(storage, settings) if storage else None
     )
+    portal_clock = portal_clock or (lambda: datetime.now(timezone.utc))
+    selected_capability_assembly_factory = capability_assembly_composition_factory
+    production_composition = None
+    if selected_capability_assembly_factory is None and all(
+        value is not None
+        for value in (
+            store,
+            capability_assembly_environment,
+            capability_assembly_factory_runtime,
+            capability_assembly_private_catalog,
+            capability_assembly_repository_root,
+        )
+    ):
+        # Compose once for this app instance.  Importing ``gateway.app`` and
+        # hitting health on an unconfigured deployment remain side-effect free.
+        assert store is not None
+        assert capability_assembly_environment is not None
+        assert capability_assembly_factory_runtime is not None
+        assert capability_assembly_private_catalog is not None
+        assert capability_assembly_repository_root is not None
+        production_composition = build_production_capability_assembly_from_environment(
+            repository_root=capability_assembly_repository_root,
+            environment=capability_assembly_environment,
+            store=store,
+            runtime=capability_assembly_factory_runtime,
+            private_benchmark_catalog=capability_assembly_private_catalog,
+            clock=portal_clock,
+        )
+        selected_capability_assembly_factory = lambda: production_composition
     resume_service = capability_resume_service
     runtime_http_client: httpx.AsyncClient | None = None
     resume_service_lock = Lock()
-    portal_clock = portal_clock or (lambda: datetime.now(timezone.utc))
     portal_control_boot_id = str(uuid4())
     sink_calls: list[dict[str, Any]] = []
 
@@ -391,6 +430,8 @@ def create_app(
         finally:
             if runtime_http_client is not None:
                 await runtime_http_client.aclose()
+            if production_composition is not None:
+                await close_production_capability_assembly(production_composition)
             stop = getattr(mirror, "stop", None)
             if stop:
                 await stop()
@@ -408,7 +449,7 @@ def create_app(
     initialize_portal_auth(app)
     app.include_router(
         create_production_capability_assembly_router(
-            capability_assembly_composition_factory
+            selected_capability_assembly_factory
             or unavailable_capability_assembly_composition
         )
     )
