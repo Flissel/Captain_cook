@@ -1297,6 +1297,16 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             raise FactoryDispatchError("Captain V3 candidate binding is invalid") from exc
         try:
             candidate_source_path = self._artifacts.local_path(candidate_source_ref)
+            local_source_bytes = self._read_bound_v3_source_path(
+                candidate_source_path,
+                maximum_bytes=len(candidate_source_bytes),
+            )
+            if (
+                local_source_bytes != candidate_source_bytes
+                or hashlib.sha256(local_source_bytes).hexdigest()
+                != candidate_source_ref.sha256
+            ):
+                raise ValueError
         except (OSError, ValueError) as exc:
             raise FactoryDispatchError(
                 "Captain V3 candidate source archive binding is invalid"
@@ -1350,6 +1360,75 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
         if hashlib.sha256(content).hexdigest() != reference.sha256:
             raise FactoryDispatchError("Captain CAS readback digest mismatch")
         return content
+
+    @staticmethod
+    def _read_bound_v3_source_path(path: Path, *, maximum_bytes: int) -> bytes:
+        descriptor: int | None = None
+        try:
+            before = os.stat(path, follow_symlinks=False)
+            reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or path.is_symlink()
+                or (
+                    reparse_flag
+                    and getattr(before, "st_file_attributes", 0) & reparse_flag
+                )
+            ):
+                raise OSError
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            opened = os.fstat(descriptor)
+            if (
+                (opened.st_dev, opened.st_ino, stat.S_IFMT(opened.st_mode))
+                != (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode))
+                or opened.st_size != before.st_size
+            ):
+                raise OSError
+            content = bytearray()
+            while len(content) <= maximum_bytes:
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, maximum_bytes + 1 - len(content)),
+                )
+                if not chunk:
+                    break
+                content.extend(chunk)
+            after_open = os.fstat(descriptor)
+            after_path = os.stat(path, follow_symlinks=False)
+            if (
+                len(content) != maximum_bytes
+                or (
+                    after_open.st_dev,
+                    after_open.st_ino,
+                    after_open.st_size,
+                    after_open.st_mtime_ns,
+                )
+                != (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_size,
+                    opened.st_mtime_ns,
+                )
+                or (
+                    after_path.st_dev,
+                    after_path.st_ino,
+                    after_path.st_size,
+                    after_path.st_mtime_ns,
+                )
+                != (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_size,
+                    opened.st_mtime_ns,
+                )
+            ):
+                raise OSError
+            return bytes(content)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     @staticmethod
     def _safe_v3_zip_files(content: bytes) -> dict[PurePosixPath, bytes]:

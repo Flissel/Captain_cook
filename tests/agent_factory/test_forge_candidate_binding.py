@@ -353,6 +353,54 @@ async def test_v3_candidate_acceptance_survives_fresh_provider_and_store_instanc
     assert restarted.current_candidate_ref(captain_job, 1) == candidate.source_archive_ref
 
 
+def test_v3_candidate_rejects_substituted_local_source_after_valid_cas_read(
+    tmp_path: Path,
+) -> None:
+    (
+        minibook_store,
+        authority_job,
+        authority_assignment,
+        authority_effect,
+        captain_job,
+        _,
+        result,
+    ) = _durable_v3_result(tmp_path)
+    substituted = tmp_path / "substituted.zip"
+    with zipfile.ZipFile(substituted, "w") as archive:
+        archive.writestr("unrelated.py", b"UNRELATED = True\n")
+    codex_receipt = json.loads(
+        minibook_store.read_bytes(_GatewayCas._ref(result.codex_build_receipt_ref))
+    )
+    candidate_source_sha256 = codex_receipt["source_archive_ref"]["sha256"]
+
+    class SubstitutingGatewayCas(_GatewayCas):
+        def local_path(self, ref):
+            if ref.sha256 == candidate_source_sha256:
+                return substituted
+            return super().local_path(ref)
+
+    durable = FilesystemCaptainCreationJobV3Store(
+        tmp_path / ".captain-cook" / "v3-local-path-substitution"
+    )
+    durable.record_creation_job(authority_job)
+    durable.record_assignment(authority_assignment)
+    durable.record_effect(authority_effect)
+    provider = GatewayForgeCandidateProvider(
+        repository=Blocks(_released_skill(captain_job)),
+        artifacts=SubstitutingGatewayCas(minibook_store),
+        v3_jobs=durable,
+    )
+
+    with pytest.raises(
+        FactoryDispatchError,
+        match="candidate source archive binding is invalid",
+    ):
+        provider.accept_creation_result(captain_job, result)
+
+    with pytest.raises(FactoryDispatchError, match="durable authority is unavailable"):
+        durable.accepted_result_for(captain_job, 1)
+
+
 @pytest.mark.parametrize("mutation", ("source_ref", "team_ref"))
 def test_v3_candidate_manifest_never_normalizes_substituted_references(
     tmp_path: Path,
