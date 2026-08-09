@@ -643,16 +643,27 @@ class WindowsProcessBackend:
     def _start_identity(pid: int) -> str | None:
         script = (
             f"$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue;"
-            "if($null -ne $p){$p.StartTime.ToUniversalTime().Ticks}"
+            "if($null -eq $p){'__CAPTAIN_PROCESS_ABSENT__';exit 0};"
+            "$p.StartTime.ToUniversalTime().Ticks"
         )
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        value = result.stdout.strip()
-        return value if result.returncode == 0 and value else None
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            raise DemoProcessError("could not inspect process identity") from None
+        values = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if result.returncode != 0 or len(values) != 1:
+            raise DemoProcessError("could not inspect process identity")
+        value = values[0]
+        if value == "__CAPTAIN_PROCESS_ABSENT__":
+            return None
+        if not value.isdecimal() or int(value) <= 0:
+            raise DemoProcessError("could not inspect process identity")
+        return value
 
 
 def _canonical_sha256(value: object) -> str:
