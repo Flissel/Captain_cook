@@ -28,7 +28,6 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from agenten.agent_factory.capability_live_runner import CapabilityLiveStage
 from agenten.agent_factory.contracts import AgentFactoryJobV3
-from agenten.agent_factory.holdout_store import PrivateHoldoutStore
 from agenten.agent_runtime.captain_production_adapters import (
     ContentAddressedArtifactAdapter,
 )
@@ -579,6 +578,22 @@ class GatewayCapabilityN8nWorkBatchAuthority:
         return f"n8n-{job_id.hex[:24]}"
 
 
+class GatewayPrivateHoldoutStore:
+    """Gateway-backed, atomic durable storage for private benchmark bodies."""
+
+    def __init__(self, *, gateway_store: GatewayStore) -> None:
+        self.gateway_store = gateway_store
+
+    def put(self, uri: str, body: str) -> None:
+        self.put_many(((uri, body),))
+
+    def put_many(self, entries: tuple[tuple[str, str], ...]) -> None:
+        self.gateway_store.put_capability_private_holdouts(entries)
+
+    def get(self, uri: str) -> str:
+        return self.gateway_store.capability_private_holdout(uri)
+
+
 class GatewayGenericBenchmarkRecorder:
     """Append one canonical aggregate per job/suite and return its CAS receipt."""
 
@@ -1044,7 +1059,7 @@ def build_production_capability_assembly_from_environment(
     environment: Mapping[str, str],
     store: GatewayStore,
     runtime: CapabilityAssemblyFactoryRuntime,
-    private_benchmark_catalog: PrivateHoldoutStore,
+    private_benchmark_catalog: GatewayPrivateHoldoutStore,
     clock: Callable[[], datetime] | None = None,
 ) -> ProductionCapabilityAssemblyComposition:
     """Compose one sealed D6 graph from one store and native authorities."""
@@ -1161,7 +1176,7 @@ def _native_runtime_is_bound(
     *,
     runtime: CapabilityAssemblyFactoryRuntime,
     store: GatewayStore,
-    private_benchmark_catalog: PrivateHoldoutStore,
+    private_benchmark_catalog: GatewayPrivateHoldoutStore,
 ) -> bool:
     factory = getattr(runtime, "factory", None)
     provisioning = getattr(runtime, "provisioning", None)
@@ -1170,6 +1185,8 @@ def _native_runtime_is_bound(
         type(factory) is not AgentFactoryLiveComposition
         or type(provisioning) is not CurrentAuthorityCapabilityFactoryProvisioner
         or type(n8n) is not GatewayCapabilityN8nWorkBatchAuthority
+        or type(private_benchmark_catalog) is not GatewayPrivateHoldoutStore
+        or private_benchmark_catalog.gateway_store is not store
         or n8n.gateway_store is not store
         or type(factory.repository) is not GatewayFactoryRepository
         or getattr(factory.repository, "_store", None) is not store
@@ -1227,6 +1244,7 @@ __all__ = [
     "GatewayCapabilityReconciliation",
     "GatewayGenericBenchmarkRecorder",
     "GatewayGenericCapabilityPromotion",
+    "GatewayPrivateHoldoutStore",
     "StoreBoundGatewayCapabilityResumeClient",
     "build_production_capability_assembly_from_environment",
     "close_production_capability_assembly",

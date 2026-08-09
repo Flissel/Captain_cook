@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import time
 from contextlib import contextmanager
@@ -6228,6 +6229,69 @@ class GatewayStore:
                     ),
                 )
         return batch.batch_id
+
+    def put_capability_private_holdouts(
+        self, entries: tuple[tuple[str, str], ...]
+    ) -> None:
+        """Atomically bind each opaque holdout URI to exact private body bytes."""
+
+        if (
+            not entries
+            or len({uri for uri, _ in entries}) != len(entries)
+            or any(
+                re.fullmatch(r"holdout://holdout-[0-9a-f]{12}", uri) is None
+                or not isinstance(body, str)
+                or not body
+                for uri, body in entries
+            )
+        ):
+            raise HTTPException(status_code=409, detail="private holdout binding is invalid")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_private_holdouts (
+                        uri VARCHAR(128) NOT NULL PRIMARY KEY,
+                        body_sha256 CHAR(64) NOT NULL,
+                        body LONGTEXT NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                for uri, body in entries:
+                    digest = hashlib.sha256(body.encode()).hexdigest()
+                    cursor.execute(
+                        "SELECT body_sha256, body FROM capability_private_holdouts "
+                        "WHERE uri = %s FOR UPDATE",
+                        (uri,),
+                    )
+                    existing = cursor.fetchone()
+                    if existing is not None:
+                        if existing["body_sha256"] == digest and existing["body"] == body:
+                            continue
+                        raise HTTPException(status_code=409, detail="private holdout binding conflicts")
+                    cursor.execute(
+                        "INSERT INTO capability_private_holdouts (uri, body_sha256, body) "
+                        "VALUES (%s, %s, %s)",
+                        (uri, digest, body),
+                    )
+
+    def capability_private_holdout(self, uri: str) -> str:
+        if re.fullmatch(r"holdout://holdout-[0-9a-f]{12}", uri) is None:
+            raise HTTPException(status_code=404, detail="private holdout not found")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT body_sha256, body FROM capability_private_holdouts WHERE uri = %s",
+                    (uri,),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="private holdout not found")
+        body = str(row["body"])
+        if hashlib.sha256(body.encode()).hexdigest() != row["body_sha256"]:
+            raise HTTPException(status_code=409, detail="private holdout readback mismatch")
+        return body
 
     def capability_n8n_work_batch(self, job_id: UUID) -> str | None:
         with self.storage.transaction() as connection:

@@ -16,6 +16,7 @@ from gateway.capability_assembly_bootstrap import (
     CapabilityAssemblyBootstrapConfigurationError,
     CaptainBenchmarkToolEvidenceAuthority,
     GatewayCapabilityN8nWorkBatchAuthority,
+    GatewayPrivateHoldoutStore,
     build_production_capability_assembly_from_environment,
     load_capability_assembly_bootstrap_settings,
 )
@@ -297,6 +298,21 @@ def test_n8n_authority_persists_and_reads_only_deterministic_job_batch() -> None
     assert authority.active_n8n_work_batch_id(job_id) == batch.batch_id
     restarted = GatewayCapabilityN8nWorkBatchAuthority(gateway_store=store)  # type: ignore[arg-type]
     assert restarted.active_n8n_work_batch_id(job_id) == batch.batch_id
+
+
+def test_private_holdout_store_uses_gateway_durable_exact_readback() -> None:
+    bodies: dict[str, str] = {}
+    gateway = SimpleNamespace(
+        put_capability_private_holdouts=lambda entries: bodies.update(dict(entries)),
+        capability_private_holdout=lambda uri: bodies[uri],
+    )
+    catalog = GatewayPrivateHoldoutStore(gateway_store=gateway)
+
+    catalog.put_many((("holdout://holdout-aaaaaaaaaaaa", "one"), ("holdout://holdout-bbbbbbbbbbbb", "two")))
+
+    restarted = GatewayPrivateHoldoutStore(gateway_store=gateway)
+    assert restarted.get("holdout://holdout-aaaaaaaaaaaa") == "one"
+    assert restarted.get("holdout://holdout-bbbbbbbbbbbb") == "two"
 
 
 def test_bootstrap_rejects_raw_factory_runtime_before_schema_or_network() -> None:
