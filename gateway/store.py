@@ -26,6 +26,8 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     CapabilityGrantRevocation,
     RuntimeCostEvidenceV1,
+    RuntimeProviderUsageReceiptV1,
+    RuntimeUsagePricingSnapshotV1,
     RuntimeOperation,
     RuntimeResumeCostAuthorityV1,
     RuntimeResumeCostSettlementRequestV1,
@@ -266,6 +268,10 @@ def _after(candidate: datetime, previous: datetime) -> datetime:
     return max(candidate_utc, previous_utc + timedelta(microseconds=1))
 
 
+class RuntimeUsageArtifactReader(Protocol):
+    def read_bytes(self, reference: ArtifactRef) -> bytes: ...
+
+
 class GatewayStore:
     """Own all gateway queries and append-only ledger writes."""
 
@@ -276,6 +282,10 @@ class GatewayStore:
         claim_ttl: timedelta = timedelta(minutes=90),
         portal_credential_source: PortalCredentialMetadataSource | None = None,
         portal_verification_source: PortalCredentialVerificationSource | None = None,
+        runtime_usage_artifacts: RuntimeUsageArtifactReader | None = None,
+        runtime_usage_pricing_snapshots: tuple[
+            RuntimeUsagePricingSnapshotV1, ...
+        ] = (),
     ):
         if claim_ttl <= timedelta(0):
             raise ValueError("claim_ttl must be positive")
@@ -283,6 +293,8 @@ class GatewayStore:
         self._claim_ttl = claim_ttl
         self._portal_credential_source = portal_credential_source
         self._portal_verification_source = portal_verification_source
+        self._runtime_usage_artifacts = runtime_usage_artifacts
+        self._runtime_usage_pricing_snapshots = runtime_usage_pricing_snapshots
         self._ensure_schema()
         self._portal_tickets = PortalTicketStore(storage)
 
@@ -2536,7 +2548,7 @@ class GatewayStore:
             command_id=command.event_id,
             ceiling_usd=reservation.requested_usd,
             expires_at=reservation.expires_at,
-            hard_ceiling_enforced=True,
+            hard_ceiling_enforced=False,
             metering_mode="provider_usage_receipt",
         )
 
@@ -2546,6 +2558,7 @@ class GatewayStore:
         *,
         now: datetime,
     ) -> RuntimeResumeCostSettlementV1:
+        request = self._verified_capability_resume_cost_request(request)
         settlement = self._derive_capability_resume_cost_settlement(request)
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
@@ -2591,6 +2604,40 @@ class GatewayStore:
                     schema_name=settlement.schema_name,
                 )
         return settlement
+
+    def _verified_capability_resume_cost_request(
+        self,
+        request: RuntimeResumeCostSettlementRequestV1,
+    ) -> RuntimeResumeCostSettlementRequestV1:
+        evidence = request.result.cost_evidence
+        if evidence is None:
+            return request
+        artifacts = getattr(self, "_runtime_usage_artifacts", None)
+        snapshots = getattr(self, "_runtime_usage_pricing_snapshots", ())
+        if artifacts is None or not snapshots:
+            raise HTTPException(
+                status_code=409,
+                detail="runtime provider usage verification is unavailable",
+            )
+        try:
+            content = artifacts.read_bytes(evidence.evidence_ref)
+        except Exception:
+            raise HTTPException(
+                status_code=409,
+                detail="runtime provider usage evidence is unavailable",
+            ) from None
+        actual = self._verify_runtime_provider_usage(
+            command=request.command,
+            result_id=request.result.event_id,
+            evidence=evidence,
+            receipt_bytes=content,
+            pricing_snapshots=snapshots,
+        )
+        if actual != evidence.actual_cost_usd:
+            raise HTTPException(
+                status_code=409, detail="runtime provider usage cost mismatch"
+            )
+        return request
 
     @staticmethod
     def _derive_capability_resume_cost_settlement(
@@ -2653,7 +2700,7 @@ class GatewayStore:
             disposition = (
                 "accounted" if actual <= authority.ceiling_usd else "overrun"
             )
-            accounted = min(actual, authority.ceiling_usd)
+            accounted = actual
         return RuntimeResumeCostSettlementV1(
             schema_name="captain.runtime-resume-cost-settlement.v1",
             settlement_id=uuid5(command.event_id, "resume-cost-settlement"),
@@ -2664,6 +2711,104 @@ class GatewayStore:
             accounted_cost_usd=accounted,
             evidence_refs=references,
         )
+
+    @staticmethod
+    def _verify_runtime_provider_usage(
+        *,
+        command: AgentRuntimeCommand,
+        result_id: UUID,
+        evidence: RuntimeCostEvidenceV1,
+        receipt_bytes: bytes,
+        pricing_snapshots: tuple[RuntimeUsagePricingSnapshotV1, ...],
+    ) -> Decimal:
+        digest = hashlib.sha256(receipt_bytes).hexdigest()
+        if (
+            evidence.evidence_ref.sha256 != digest
+            or evidence.evidence_ref.uri != f"artifact://sha256/{digest}"
+            or evidence.evidence_ref.media_type != "application/json"
+        ):
+            raise HTTPException(
+                status_code=409, detail="runtime provider usage digest mismatch"
+            )
+        try:
+            receipt = RuntimeProviderUsageReceiptV1.model_validate_json(
+                receipt_bytes, strict=True
+            )
+        except (ValidationError, ValueError):
+            raise HTTPException(
+                status_code=409, detail="runtime provider usage receipt is invalid"
+            ) from None
+        snapshot = next(
+            (
+                item
+                for item in pricing_snapshots
+                if item.snapshot_id == receipt.pricing_snapshot_id
+                and item.snapshot_sha256 == receipt.pricing_snapshot_sha256
+                and item.model == receipt.model
+                and item.provider == receipt.provider
+            ),
+            None,
+        )
+        original_command_id = command.causation_id or command.event_id
+        payload = command.payload
+        if (
+            snapshot is None
+            or receipt.request_id != command.event_id
+            or receipt.command_id != original_command_id
+            or receipt.result_id != result_id
+            or receipt.receipt_id != evidence.receipt_id
+            or receipt.reservation_id != payload.budget_reservation_id
+            or receipt.job_id != payload.cost_job_id
+            or receipt.run_id != payload.cost_run_id
+            or receipt.input_id != payload.cost_input_id
+            or receipt.correlation_id != command.correlation_id
+            or receipt.capability_id != payload.cost_capability_id
+            or receipt.capability_version != payload.cost_capability_version
+            or not (
+                snapshot.effective_at
+                <= receipt.started_at
+                <= receipt.ended_at
+                < snapshot.expires_at
+            )
+        ):
+            raise HTTPException(
+                status_code=409, detail="runtime provider usage binding mismatch"
+            )
+        mirrored = (
+            evidence.command_id == command.event_id
+            and evidence.result_id == result_id
+            and evidence.original_command_id == receipt.command_id
+            and evidence.reservation_id == receipt.reservation_id
+            and evidence.job_id == receipt.job_id
+            and evidence.run_id == receipt.run_id
+            and evidence.input_id == receipt.input_id
+            and evidence.correlation_id == receipt.correlation_id
+            and evidence.capability_id == receipt.capability_id
+            and evidence.capability_version == receipt.capability_version
+            and evidence.provider == receipt.provider
+            and evidence.model == receipt.model
+            and evidence.input_units == receipt.input_units
+            and evidence.cached_input_units == receipt.cached_input_units
+            and evidence.output_units == receipt.output_units
+            and evidence.pricing_snapshot_id == receipt.pricing_snapshot_id
+            and evidence.pricing_snapshot_sha256 == receipt.pricing_snapshot_sha256
+            and evidence.started_at == receipt.started_at
+            and evidence.ended_at == receipt.ended_at
+        )
+        actual = snapshot.cost(
+            input_units=receipt.input_units,
+            cached_input_units=receipt.cached_input_units,
+            output_units=receipt.output_units,
+        )
+        if (
+            not mirrored
+            or receipt.actual_cost_usd != actual
+            or evidence.actual_cost_usd != actual
+        ):
+            raise HTTPException(
+                status_code=409, detail="runtime provider usage cost mismatch"
+            )
+        return actual
 
     def record_factory_job(self, job: FactoryJob) -> FactoryWriteReceipt:
         canonical = job.model_dump(mode="json", by_alias=True)

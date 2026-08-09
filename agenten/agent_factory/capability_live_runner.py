@@ -161,6 +161,14 @@ class CapabilityLiveRestartEvidence(_FrozenModel):
     resumed_execution_result_id: UUID
     projection_event_id: UUID | None
     projection_readback_id: UUID | None
+    resume_actual_spend_usd: Decimal
+    total_booked_cost_usd: Decimal
+    resume_budget_violation: bool
+
+    @field_validator("resume_actual_spend_usd", "total_booked_cost_usd", mode="before")
+    @classmethod
+    def require_known_resume_cost(cls, value: object) -> Decimal:
+        return _nonnegative_decimal(value, "restart resume cost")
 
 
 class CapabilityLiveStageRequest(_FrozenModel):
@@ -830,6 +838,15 @@ def validate_live_demo_evidence(
         == evidence.restart.original_execution_result_id
     ):
         raise CapabilityLiveEvidenceError("reused restart execution result")
+    if (
+        evidence.restart.resume_budget_violation
+        or evidence.restart.total_booked_cost_usd
+        != first.booked_cost_usd + evidence.restart.resume_actual_spend_usd
+        or evidence.restart.total_booked_cost_usd > first_reservation.maximum_cost_usd
+    ):
+        raise CapabilityLiveEvidenceError(
+            "restart cost evidence violates the reservation ceiling"
+        )
 
     reservation_total = sum(
         (item.maximum_cost_usd for item in evidence.reservations), Decimal("0")

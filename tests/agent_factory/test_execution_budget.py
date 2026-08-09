@@ -36,6 +36,19 @@ def test_budget_projection_preserves_micro_usd_provider_usage() -> None:
     assert projection.remaining_usd == Decimal("0.269867")
 
 
+def test_budget_projection_preserves_visible_overspend() -> None:
+    projection = FactoryBudgetProjection(
+        job_id=UUID("10000000-0000-0000-0000-000000000003"),
+        limit_usd="2.00",
+        consumed_usd="2.05",
+        reserved_usd="0.00",
+        remaining_usd="-0.05",
+    )
+
+    assert projection.consumed_usd == Decimal("2.05")
+    assert projection.remaining_usd == Decimal("-0.05")
+
+
 def artifact(kind: str, digest: str) -> dict[str, str]:
     return {
         "uri": f"artifact://{kind}/{digest}",

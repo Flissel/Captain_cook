@@ -103,6 +103,9 @@ def _write_valid_real_entrypoint_evidence(path: Path) -> None:
             resumed_execution_result_id=uuid5(run_id, "restart-result"),
             projection_event_id=first.projection_event_id,
             projection_readback_id=first.projection_readback_id,
+            resume_actual_spend_usd=Decimal("0"),
+            total_booked_cost_usd=first.booked_cost_usd,
+            resume_budget_violation=False,
         ),
     )
     path.parent.mkdir(parents=True, exist_ok=True)

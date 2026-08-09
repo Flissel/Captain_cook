@@ -27,6 +27,9 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     HermesPlanResult,
     RuntimeStatus,
+    RuntimeCostEvidenceV1,
+    RuntimeProviderUsageReceiptV1,
+    RuntimeUsagePricingSnapshotV1,
 )
 from agenten.agent_runtime.confined_files import ConfinedFileError, ConfinedFileStore
 from agenten.agent_runtime.production_bootstrap import (
@@ -220,12 +223,16 @@ class CaptainCodexExecutionAdapter:
         repository_root: Path,
         observer: RuntimeEventObserver | None = None,
         environ: Mapping[str, str],
+        pricing_snapshots: tuple[RuntimeUsagePricingSnapshotV1, ...] = (),
     ) -> None:
         self._execution = execution
         self._artifacts = artifacts
         self._repository_root = repository_root.resolve()
         self._observer = observer
         self._environ = dict(environ)
+        self._pricing = {snapshot.model: snapshot for snapshot in pricing_snapshots}
+        if len(self._pricing) != len(pricing_snapshots):
+            raise ValueError("runtime usage pricing models must be unique")
 
     @classmethod
     def from_context(
@@ -280,6 +287,7 @@ class CaptainCodexExecutionAdapter:
             prompt=prompt,
             timeout_seconds=command.payload.limits.wall_seconds,
             observer=self._observe,
+            **self._usage_invocation(command),
         )
         return self._result(command, grant, evidence)
 
@@ -301,6 +309,15 @@ class CaptainCodexExecutionAdapter:
             prompt=prompt,
             timeout_seconds=command.payload.limits.wall_seconds,
             observer=self._observe,
+            request_id=command.event_id,
+            maximum_cost_usd=(
+                str(command.payload.maximum_cost_usd)
+                if command.payload.maximum_cost_usd is not None
+                else None
+            ),
+            cost_authority_ref=command.payload.cost_authority_ref,
+            hard_ceiling_enforced=False,
+            **self._usage_invocation(command),
         )
         return self._result(command, grant, evidence)
 
@@ -394,9 +411,12 @@ class CaptainCodexExecutionAdapter:
         )
         evidence_bytes = canonical_factory_codex_model(evidence)
         evidence_ref = self._artifacts.put(evidence_bytes, "application/json")
+        result_id = uuid5(command.event_id, "captain.runtime-result")
+        cost_evidence = self._cost_evidence(command, evidence, result_id=result_id)
         evidence_refs = _unique_references(
             (
                 evidence_ref,
+                *((cost_evidence.evidence_ref,) if cost_evidence is not None else ()),
                 *(
                     (evidence.resumable_checkpoint,)
                     if evidence.resumable_checkpoint is not None
@@ -417,9 +437,20 @@ class CaptainCodexExecutionAdapter:
             if evidence.status == "failed"
             else None
         )
+        if (
+            command.payload.operation.value == "codex.resume"
+            and command.payload.cost_authority_ref is not None
+            and evidence.status == "succeeded"
+        ):
+            status = RuntimeStatus.POLICY_FAILED
+            error = (
+                "codex.resume provider usage is unavailable"
+                if cost_evidence is None
+                else "codex.resume provider hard ceiling is unavailable"
+            )
         return AgentRuntimeResult(
             schema_name="captain.agent-runtime-result.v1",
-            event_id=uuid5(command.event_id, "captain.runtime-result"),
+            event_id=result_id,
             command_id=command.event_id,
             correlation_id=command.correlation_id,
             occurred_at=command.occurred_at,
@@ -432,7 +463,116 @@ class CaptainCodexExecutionAdapter:
             session_id=evidence.session_id,
             artifact_refs=(),
             evidence_refs=evidence_refs,
+            cost_evidence=cost_evidence,
             error=error,
+        )
+
+    def _usage_invocation(self, command: AgentRuntimeCommand) -> dict[str, object]:
+        model = self._environ.get("CAPTAIN_CODEX_MODEL", "").strip()
+        if not model and len(self._pricing) == 1:
+            model = next(iter(self._pricing))
+        snapshot = self._pricing.get(model)
+        return {
+            "model": model or None,
+            "pricing_snapshot_id": (
+                snapshot.snapshot_id if snapshot is not None else None
+            ),
+            "pricing_snapshot_sha256": (
+                snapshot.snapshot_sha256 if snapshot is not None else None
+            ),
+        }
+
+    def _cost_evidence(
+        self,
+        command: AgentRuntimeCommand,
+        evidence: RuntimeCodexTerminalEvidenceV1,
+        *,
+        result_id,
+    ) -> RuntimeCostEvidenceV1 | None:
+        usage = evidence.usage
+        payload = command.payload
+        if (
+            usage is None
+            or command.payload.operation.value != "codex.resume"
+            or payload.cost_authority_ref is None
+        ):
+            return None
+        snapshot = self._pricing.get(usage.model)
+        original_command_id = command.causation_id or command.event_id
+        if (
+            snapshot is None
+            or usage.request_id != command.event_id
+            or usage.command_id != original_command_id
+            or usage.session_id != evidence.session_id
+            or usage.pricing_snapshot_id != snapshot.snapshot_id
+            or usage.pricing_snapshot_sha256 != snapshot.snapshot_sha256
+            or not (snapshot.effective_at <= usage.started_at <= usage.ended_at < snapshot.expires_at)
+            or payload.budget_reservation_id is None
+            or payload.cost_job_id is None
+            or payload.cost_run_id is None
+            or payload.cost_input_id is None
+            or payload.cost_capability_id is None
+            or payload.cost_capability_version is None
+        ):
+            raise FactoryDispatchError("Codex runtime usage binding is invalid")
+        actual = snapshot.cost(
+            input_units=usage.input_units,
+            cached_input_units=usage.cached_input_units,
+            output_units=usage.output_units,
+        )
+        receipt_id = uuid5(command.event_id, "runtime-provider-usage")
+        receipt = RuntimeProviderUsageReceiptV1(
+            schema_name="captain.runtime-provider-usage-receipt.v1",
+            receipt_id=receipt_id,
+            request_id=command.event_id,
+            command_id=original_command_id,
+            result_id=result_id,
+            reservation_id=payload.budget_reservation_id,
+            job_id=payload.cost_job_id,
+            run_id=payload.cost_run_id,
+            input_id=payload.cost_input_id,
+            correlation_id=command.correlation_id,
+            capability_id=payload.cost_capability_id,
+            capability_version=payload.cost_capability_version,
+            session_id=usage.session_id,
+            provider=snapshot.provider,
+            model=usage.model,
+            input_units=usage.input_units,
+            cached_input_units=usage.cached_input_units,
+            output_units=usage.output_units,
+            actual_cost_usd=actual,
+            pricing_snapshot_id=snapshot.snapshot_id,
+            pricing_snapshot_sha256=snapshot.snapshot_sha256,
+            started_at=usage.started_at,
+            ended_at=usage.ended_at,
+        )
+        receipt_ref = self._artifacts.put(
+            canonical_factory_codex_model(receipt), "application/json"
+        )
+        return RuntimeCostEvidenceV1(
+            schema_name="captain.runtime-cost-evidence.v1",
+            receipt_id=receipt_id,
+            command_id=command.event_id,
+            result_id=result_id,
+            original_command_id=original_command_id,
+            reservation_id=payload.budget_reservation_id,
+            job_id=payload.cost_job_id,
+            run_id=payload.cost_run_id,
+            input_id=payload.cost_input_id,
+            correlation_id=command.correlation_id,
+            capability_id=payload.cost_capability_id,
+            capability_version=payload.cost_capability_version,
+            provider=snapshot.provider,
+            model=usage.model,
+            input_units=usage.input_units,
+            cached_input_units=usage.cached_input_units,
+            output_units=usage.output_units,
+            actual_cost_usd=actual,
+            pricing_snapshot_id=snapshot.snapshot_id,
+            pricing_snapshot_sha256=snapshot.snapshot_sha256,
+            started_at=usage.started_at,
+            ended_at=usage.ended_at,
+            evidence_ref=receipt_ref,
         )
 
     @staticmethod

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Protocol
 from uuid import UUID
 
@@ -326,7 +327,10 @@ class RecordedFactoryCapabilityExecutionAdapter:
             or execution.capability_version != release.capability_version
             or execution.execution_authority_id
             != authorization.authorization_receipt_id
-            or execution.booked_cost_usd != release.booked_cost_usd
+            or execution.booked_cost_usd
+            != release.booked_cost_usd
+            + (execution.resume_actual_spend_usd or Decimal("0"))
+            or execution.resume_budget_violation
         ):
             raise CapabilityLiveAuthorityUnavailable(
                 "restart execution changed the stable release binding"

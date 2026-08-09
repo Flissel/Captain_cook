@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 from uuid import NAMESPACE_URL, uuid5
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from gateway.capability_live_pipeline import CapabilityResumeExecutionRequest
@@ -20,12 +23,16 @@ from gateway.capability_resume_service import CapabilityResumeDispatchFailed
 from gateway.settings import GatewaySettings
 from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
+    ArtifactRef,
     RuntimeCostEvidenceV1,
     RuntimeOperation,
     RuntimeResumeCostAuthorityV1,
     RuntimeResumeCostSettlementV1,
     RuntimeResumeCostSettlementRequestV1,
     RuntimeStatus,
+    RuntimeUsagePricingSnapshotV1,
+    RuntimeProviderUsageReceiptV1,
+    canonical_json_bytes,
 )
 from tests.agent_runtime.test_service import (
     FakeCapabilityPolicy,
@@ -40,6 +47,17 @@ from gateway.store import GatewayStore
 
 CAPTAIN_TOKEN = "captain-resume-test-token"
 WORKER_TOKEN = "worker-resume-test-token"
+PRICING = RuntimeUsagePricingSnapshotV1(
+    schema_name="captain.runtime-usage-pricing-snapshot.v1",
+    snapshot_id="openai-test-2026-08-09",
+    provider="openai",
+    model="gpt-5.6-terra",
+    input_cost_per_million_usd=Decimal("1.25"),
+    cached_input_cost_per_million_usd=Decimal("0.125"),
+    output_cost_per_million_usd=Decimal("10.00"),
+    effective_at=datetime(2026, 8, 9, tzinfo=timezone.utc),
+    expires_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+)
 
 
 class RecordingResumeService:
@@ -402,6 +420,8 @@ def test_runtime_cost_settlement_route_books_typed_actual_usage() -> None:
         schema_name="captain.runtime-cost-evidence.v1",
         receipt_id=uuid5(command.event_id, "provider-usage"),
         command_id=command.event_id,
+        result_id=uuid5(command.event_id, "runtime-result"),
+        original_command_id=command.causation_id or command.event_id,
         reservation_id=authority.reservation_id,
         job_id=authority.job_id,
         run_id=authority.run_id,
@@ -411,9 +431,12 @@ def test_runtime_cost_settlement_route_books_typed_actual_usage() -> None:
         capability_version=authority.capability_version,
         provider="openai",
         model="gpt-5.6-terra",
-        input_units=100,
-        output_units=50,
+        input_units=100_000,
+        cached_input_units=0,
+        output_units=12_500,
         actual_cost_usd=Decimal("0.25"),
+        pricing_snapshot_id=PRICING.snapshot_id,
+        pricing_snapshot_sha256=PRICING.snapshot_sha256,
         started_at=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
         ended_at=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
         evidence_ref=artifact("provider-usage", "f"),
@@ -524,7 +547,7 @@ async def test_gateway_derives_actual_overrun_and_unmetered_resume_accounting() 
     )
     assert (overrun.disposition, overrun.accounted_cost_usd) == (
         "overrun",
-        Decimal("0.75"),
+        Decimal("0.80"),
     )
     assert (unmetered.disposition, unmetered.accounted_cost_usd) == (
         "unmetered",
@@ -553,6 +576,51 @@ def test_gateway_cost_settlement_replay_survives_closed_reservation() -> None:
     )
     grant = FakeCapabilityPolicy().derive(command, batch_for(command), command.occurred_at)
     result = FakeCodex(["command_accepted", "grant_recorded"])._result(command, grant)
+    receipt = RuntimeProviderUsageReceiptV1(
+        schema_name="captain.runtime-provider-usage-receipt.v1",
+        receipt_id=result.cost_evidence.receipt_id,
+        request_id=command.event_id,
+        command_id=command.causation_id or command.event_id,
+        result_id=result.event_id,
+        reservation_id=authority.reservation_id,
+        job_id=authority.job_id,
+        run_id=authority.run_id,
+        input_id=authority.input_id,
+        correlation_id=authority.correlation_id,
+        capability_id=authority.capability_id,
+        capability_version=authority.capability_version,
+        session_id=result.session_id,
+        provider="openai",
+        model=PRICING.model,
+        input_units=100_000,
+        cached_input_units=0,
+        output_units=12_500,
+        actual_cost_usd=Decimal("0.25"),
+        pricing_snapshot_id=PRICING.snapshot_id,
+        pricing_snapshot_sha256=PRICING.snapshot_sha256,
+        started_at=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
+    )
+    receipt_bytes = canonical_json_bytes(receipt)
+    receipt_digest = hashlib.sha256(receipt_bytes).hexdigest()
+    receipt_ref = ArtifactRef(
+        uri=f"artifact://sha256/{receipt_digest}",
+        sha256=receipt_digest,
+        media_type="application/json",
+    )
+    result = result.model_copy(
+        update={
+            "cost_evidence": result.cost_evidence.model_copy(
+                update={
+                    "pricing_snapshot_id": PRICING.snapshot_id,
+                    "pricing_snapshot_sha256": PRICING.snapshot_sha256,
+                    "started_at": receipt.started_at,
+                    "ended_at": receipt.ended_at,
+                    "evidence_ref": receipt_ref,
+                }
+            )
+        }
+    )
     request = RuntimeResumeCostSettlementRequestV1(
         command=command, result=result, authority=authority
     )
@@ -576,6 +644,10 @@ def test_gateway_cost_settlement_replay_survives_closed_reservation() -> None:
 
     store = GatewayStore.__new__(GatewayStore)
     store.storage = Storage()
+    store._runtime_usage_artifacts = SimpleNamespace(
+        read_bytes=lambda ref: receipt_bytes
+    )
+    store._runtime_usage_pricing_snapshots = (PRICING,)
     store._factory_budget_event = lambda *_args, **_kwargs: {
         "payload": settlement.model_dump(mode="json", by_alias=True)
     }
@@ -588,3 +660,145 @@ def test_gateway_cost_settlement_replay_survives_closed_reservation() -> None:
     assert store.settle_capability_resume_cost(
         request, now=datetime(2026, 8, 10, tzinfo=timezone.utc)
     ) == settlement
+
+
+def test_production_runtime_cost_authority_does_not_claim_an_absent_cli_hard_ceiling() -> None:
+    command = resume_command_with_cost()
+    command = command.model_copy(
+        update={
+            "payload": command.payload.model_copy(
+                update={
+                    "cost_authority_ref": (
+                        "gateway://capability-resume-authorizations/"
+                        f"{uuid5(NAMESPACE_URL, 'production-authority')}"
+                    )
+                }
+            )
+        }
+    )
+    request = {
+        "reservation_id": str(command.payload.budget_reservation_id),
+        "job_id": str(command.payload.cost_job_id),
+        "run_id": str(command.payload.cost_run_id),
+        "input_id": command.payload.cost_input_id,
+        "correlation_id": str(command.correlation_id),
+        "capability_id": command.payload.cost_capability_id,
+        "capability_version": command.payload.cost_capability_version,
+    }
+
+    class Cursor:
+        def execute(self, *_args):
+            return None
+
+        def fetchone(self):
+            return {
+                "payload": {
+                    "resume_command": command.model_dump(mode="json", by_alias=True),
+                    "request": request,
+                }
+            }
+
+    store = GatewayStore.__new__(GatewayStore)
+    store._runtime_block_by_json_value = lambda *_args, **_kwargs: {
+        "data": command.model_dump(mode="json", by_alias=True)
+    }
+    store._factory_reservation = lambda *_args, **_kwargs: SimpleNamespace(
+        reservation_id=command.payload.budget_reservation_id,
+        job_id=command.payload.cost_job_id,
+        correlation_id=command.correlation_id,
+        requested_usd=command.payload.maximum_cost_usd,
+        expires_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+    )
+    store._reservation_is_closed = lambda *_args, **_kwargs: False
+
+    authority = store._validate_capability_resume_cost_authority_with_cursor(
+        Cursor(), command, now=datetime(2026, 8, 9, tzinfo=timezone.utc)
+    )
+
+    assert authority.hard_ceiling_enforced is False
+
+
+@pytest.mark.parametrize("mutation", ["valid", "forged_zero", "unknown_model", "digest"])
+def test_gateway_reprices_cas_usage_and_rejects_forgery(
+    mutation: str,
+) -> None:
+    verify = getattr(GatewayStore, "_verify_runtime_provider_usage", None)
+    assert verify is not None, "Gateway provider usage verifier is missing"
+    command = resume_command_with_cost()
+    result_id = uuid5(command.event_id, "runtime-result")
+    receipt = RuntimeProviderUsageReceiptV1(
+        schema_name="captain.runtime-provider-usage-receipt.v1",
+        receipt_id=uuid5(command.event_id, "provider-usage"),
+        request_id=command.event_id,
+        command_id=command.causation_id or command.event_id,
+        result_id=result_id,
+        reservation_id=command.payload.budget_reservation_id,
+        job_id=command.payload.cost_job_id,
+        run_id=command.payload.cost_run_id,
+        input_id=command.payload.cost_input_id,
+        correlation_id=command.correlation_id,
+        capability_id=command.payload.cost_capability_id,
+        capability_version=command.payload.cost_capability_version,
+        session_id="runtime-session",
+        provider="openai",
+        model=("unknown-model" if mutation == "unknown_model" else PRICING.model),
+        input_units=100_000,
+        cached_input_units=0,
+        output_units=12_500,
+        actual_cost_usd=(Decimal("0") if mutation == "forged_zero" else Decimal("0.25")),
+        pricing_snapshot_id=PRICING.snapshot_id,
+        pricing_snapshot_sha256=PRICING.snapshot_sha256,
+        started_at=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 8, 9, 12, 0, 1, tzinfo=timezone.utc),
+    )
+    content = canonical_json_bytes(receipt)
+    digest = hashlib.sha256(content).hexdigest()
+    evidence = RuntimeCostEvidenceV1(
+        schema_name="captain.runtime-cost-evidence.v1",
+        receipt_id=receipt.receipt_id,
+        command_id=command.event_id,
+        result_id=result_id,
+        original_command_id=receipt.command_id,
+        reservation_id=receipt.reservation_id,
+        job_id=receipt.job_id,
+        run_id=receipt.run_id,
+        input_id=receipt.input_id,
+        correlation_id=receipt.correlation_id,
+        capability_id=receipt.capability_id,
+        capability_version=receipt.capability_version,
+        provider=receipt.provider,
+        model=receipt.model,
+        input_units=receipt.input_units,
+        cached_input_units=receipt.cached_input_units,
+        output_units=receipt.output_units,
+        actual_cost_usd=receipt.actual_cost_usd,
+        pricing_snapshot_id=receipt.pricing_snapshot_id,
+        pricing_snapshot_sha256=receipt.pricing_snapshot_sha256,
+        started_at=receipt.started_at,
+        ended_at=receipt.ended_at,
+        evidence_ref=artifact(
+            "usage-receipt",
+            "0" if mutation == "digest" else digest[0],
+        ).model_copy(
+            update={
+                "uri": f"artifact://sha256/{'0' * 64 if mutation == 'digest' else digest}",
+                "sha256": "0" * 64 if mutation == "digest" else digest,
+                "media_type": "application/json",
+            }
+        ),
+    )
+
+    arguments = {
+        "command": command,
+        "result_id": result_id,
+        "evidence": evidence,
+        "receipt_bytes": content,
+        "pricing_snapshots": (PRICING,),
+    }
+    if mutation == "valid":
+        assert verify(**arguments) == Decimal("0.250000")
+    else:
+        with pytest.raises(HTTPException, match="usage"):
+            verify(
+                **arguments
+            )

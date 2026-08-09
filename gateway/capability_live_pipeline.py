@@ -105,6 +105,7 @@ class CapabilityExecutionAuthority(_FrozenAuthority):
     evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
     booked_cost_usd: Decimal
     resume_actual_spend_usd: Decimal | None = None
+    resume_budget_violation: bool = False
     terminal_status: Literal["succeeded", "cancelled", "timed_out", "failed"]
     replayed: bool
 
@@ -450,6 +451,9 @@ class GatewayCapabilityLivePipeline(CapabilityLivePipelinePort):
             resumed_execution_result_id=execution.execution_result_id,
             projection_event_id=projection.projection_event_id,
             projection_readback_id=projection.projection_readback_id,
+            resume_actual_spend_usd=execution.resume_actual_spend_usd or Decimal("0"),
+            total_booked_cost_usd=execution.booked_cost_usd,
+            resume_budget_violation=execution.resume_budget_violation,
         )
 
     async def _released(
@@ -522,13 +526,15 @@ class GatewayCapabilityLivePipeline(CapabilityLivePipelinePort):
         release: CapabilityFactoryAuthority,
         execution: CapabilityExecutionAuthority,
     ) -> None:
+        resume_actual = execution.resume_actual_spend_usd or Decimal("0")
         if (
             execution.job_id != release.job_id
             or execution.correlation_id != release.correlation_id
             or execution.capability_id != release.capability_id
             or execution.capability_version != release.capability_version
-            or execution.booked_cost_usd != release.booked_cost_usd
+            or execution.booked_cost_usd != release.booked_cost_usd + resume_actual
             or execution.booked_cost_usd > request.reservation.maximum_cost_usd
+            or execution.resume_budget_violation
             or execution.terminal_status != "succeeded"
         ):
             raise CapabilityLiveAuthorityUnavailable(

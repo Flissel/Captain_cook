@@ -174,7 +174,9 @@ class _Factory:
             hermes_result_ref=hermes_ref,
             evidence_refs=(_ref("factory-stage", f"{input_id}:{stage.value}"),),
             booked_cost_usd=(
-                request.reservation.maximum_cost_usd if promoted else Decimal("0")
+                request.reservation.maximum_cost_usd - Decimal("0.01")
+                if promoted
+                else Decimal("0")
             ),
             controlled_recovery_id=(
                 _uuid(f"recovery:{input_id}")
@@ -281,7 +283,13 @@ class _Execution:
                 f"{'resume-' if resumed else ''}result:{input_id}"
             ),
             evidence_refs=(_ref("execution", input_id),),
-            booked_cost_usd=release.booked_cost_usd,
+            booked_cost_usd=(
+                release.booked_cost_usd + Decimal("0.01")
+                if resumed
+                else release.booked_cost_usd
+            ),
+            resume_actual_spend_usd=Decimal("0.01") if resumed else None,
+            resume_budget_violation=False,
             terminal_status="succeeded",
             replayed=False,
         )
@@ -398,6 +406,12 @@ def test_real_gateway_pipeline_composition_runs_all_seven_authority_stages(
     assert [action for _, action in projection.calls].count("project_and_readback") == 3
     assert execution.calls[-1] == ("sequential-n8n", "restart_and_resume")
     assert projection.calls[-1] == ("sequential-n8n", "readback")
+    assert evidence.restart.resume_actual_spend_usd == Decimal("0.01")
+    assert (
+        evidence.restart.total_booked_cost_usd
+        == evidence.capabilities[0].booked_cost_usd + Decimal("0.01")
+    )
+    assert evidence.restart.resume_budget_violation is False
 
 
 @pytest.mark.parametrize(

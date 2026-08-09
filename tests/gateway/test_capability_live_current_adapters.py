@@ -503,7 +503,9 @@ def _resumed_execution(
         execution_command_id=_uuid("resumed-command"),
         execution_result_id=_uuid("resumed-result"),
         evidence_refs=(_ref("resumed-execution", "accepted"),),
-        booked_cost_usd=Decimal("1.00"),
+        booked_cost_usd=Decimal("1.25"),
+        resume_actual_spend_usd=Decimal("0.25"),
+        resume_budget_violation=False,
         terminal_status="succeeded",
         replayed=False,
     )
@@ -633,6 +635,7 @@ def test_restart_rejects_pre_promotion_execution_before_resume_effects() -> None
         ("replayed", "evidence replay"),
         ("cancelled", "successful terminal result"),
         ("timed_out", "successful terminal result"),
+        ("budget_violation", "stable release binding"),
         ("missing_readback", "read-back result"),
         ("drifted_readback", "read-back does not match"),
     ],
@@ -666,6 +669,8 @@ def test_restart_fails_closed_without_a_fresh_verified_gateway_execution(
         execution = execution.model_copy(update={"replayed": True})
     elif fault in {"cancelled", "timed_out"}:
         execution = execution.model_copy(update={"terminal_status": fault})
+    elif fault == "budget_violation":
+        execution = execution.model_copy(update={"resume_budget_violation": True})
 
     readback = execution
     if fault == "missing_readback":

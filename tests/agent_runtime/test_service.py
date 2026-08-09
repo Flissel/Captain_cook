@@ -24,12 +24,24 @@ from agenten.agent_runtime.contracts import (
     RuntimeResumeCostAuthorityV1,
     RuntimeResumeCostSettlementV1,
     RuntimeStatus,
+    RuntimeUsagePricingSnapshotV1,
 )
 from agenten.agent_runtime.service import AgentRuntimeService, RuntimeContractViolation
 from agenten.validation.contracts import AcceptanceAssertion, AssertionKind, WorkBatch
 
 
 NOW = datetime(2026, 7, 17, 12, tzinfo=timezone.utc)
+PRICING = RuntimeUsagePricingSnapshotV1(
+    schema_name="captain.runtime-usage-pricing-snapshot.v1",
+    snapshot_id="openai-test-2026-08-09",
+    provider="openai",
+    model="gpt-5.6-terra",
+    input_cost_per_million_usd=Decimal("1.25"),
+    cached_input_cost_per_million_usd=Decimal("0.125"),
+    output_cost_per_million_usd=Decimal("10.00"),
+    effective_at=NOW,
+    expires_at=NOW + timedelta(days=1),
+)
 FIXTURE = (
     Path(__file__).parents[1]
     / "fixtures"
@@ -193,6 +205,7 @@ class FakeCodex:
         self.calls: list[RuntimeOperation] = []
         self.fail = False
         self.mismatch = False
+        self.actual_cost_usd = Decimal("0.25")
 
     async def start(
         self, command: AgentRuntimeCommand, grant: CapabilityGrant
@@ -251,6 +264,8 @@ class FakeCodex:
                         schema_name="captain.runtime-cost-evidence.v1",
                         receipt_id=uuid5(command.event_id, "provider-usage"),
                         command_id=command.event_id,
+                        result_id=result.event_id,
+                        original_command_id=command.causation_id or command.event_id,
                         reservation_id=command.payload.budget_reservation_id,
                         job_id=command.payload.cost_job_id,
                         run_id=command.payload.cost_run_id,
@@ -260,9 +275,12 @@ class FakeCodex:
                         capability_version=command.payload.cost_capability_version,
                         provider="openai",
                         model="gpt-5.6-terra",
-                        input_units=100,
-                        output_units=50,
-                        actual_cost_usd=Decimal("0.25"),
+                        input_units=100_000,
+                        cached_input_units=0,
+                        output_units=12_500,
+                        actual_cost_usd=self.actual_cost_usd,
+                        pricing_snapshot_id=PRICING.snapshot_id,
+                        pricing_snapshot_sha256=PRICING.snapshot_sha256,
                         started_at=NOW,
                         ended_at=NOW,
                         evidence_ref=artifact("provider-usage", "f"),
@@ -321,7 +339,11 @@ class FakeCostAuthority:
             disposition=self.disposition,
             actual_cost_usd=actual,
             accounted_cost_usd=(
-                authority.ceiling_usd if self.disposition != "accounted" else actual
+                actual
+                if self.disposition == "overrun"
+                else authority.ceiling_usd
+                if self.disposition == "unmetered"
+                else actual
             ),
             evidence_refs=(artifact("cost-settlement", "e"),),
         )
@@ -559,6 +581,7 @@ async def test_resume_cost_overrun_never_persists_success() -> None:
     command = resume_command_with_cost()
     state = FakeState(events, batch_for(command))
     codex = FakeCodex(events)
+    codex.actual_cost_usd = Decimal("0.80")
     costs = FakeCostAuthority(disposition="overrun")
 
     result = await service_with(

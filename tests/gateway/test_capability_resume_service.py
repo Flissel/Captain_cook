@@ -24,6 +24,7 @@ from agenten.agent_runtime.contracts import (
     RuntimeCostEvidenceV1,
     RuntimeOperation,
     RuntimeStatus,
+    RuntimeUsagePricingSnapshotV1,
 )
 from agenten.agent_runtime.http_executor import AgentRuntimeHttpExecutor
 from gateway.capability_live_pipeline import (
@@ -48,6 +49,17 @@ from gateway.contracts import RuntimeOperationProjection
 
 
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+PRICING = RuntimeUsagePricingSnapshotV1(
+    schema_name="captain.runtime-usage-pricing-snapshot.v1",
+    snapshot_id="openai-test-2026-08-09",
+    provider="openai",
+    model="gpt-5.6-terra",
+    input_cost_per_million_usd=Decimal("1.25"),
+    cached_input_cost_per_million_usd=Decimal("0.125"),
+    output_cost_per_million_usd=Decimal("10.00"),
+    effective_at=NOW,
+    expires_at=datetime(2026, 8, 10, 12, tzinfo=timezone.utc),
+)
 
 
 def _uuid(label: str) -> UUID:
@@ -98,6 +110,8 @@ def _result(
             schema_name="captain.runtime-cost-evidence.v1",
             receipt_id=_uuid(f"cost:{label}"),
             command_id=command.event_id,
+            result_id=_uuid(label),
+            original_command_id=command.causation_id or command.event_id,
             reservation_id=command.payload.budget_reservation_id,
             job_id=command.payload.cost_job_id,
             run_id=command.payload.cost_run_id,
@@ -107,9 +121,12 @@ def _result(
             capability_version=command.payload.cost_capability_version,
             provider="openai",
             model="gpt-5.6-terra",
-            input_units=100,
-            output_units=50,
+            input_units=100_000,
+            cached_input_units=0,
+            output_units=12_500,
             actual_cost_usd=Decimal("0.25"),
+            pricing_snapshot_id=PRICING.snapshot_id,
+            pricing_snapshot_sha256=PRICING.snapshot_sha256,
             started_at=NOW,
             ended_at=NOW,
             evidence_ref=_ref(f"cost-evidence-{label}"),
@@ -402,7 +419,43 @@ async def test_dispatch_calls_effect_once_and_replays_immutable_terminal_readbac
     assert first.execution_authority_id == authorization.authorization_receipt_id
     assert first.terminal_status == "succeeded"
     assert first.resume_actual_spend_usd == Decimal("0.25")
+    assert first.booked_cost_usd == Decimal("1.50")
+    assert first.resume_budget_violation is False
     assert first.replayed is False
+
+
+def test_restart_readback_exposes_full_overrun_total_and_violation() -> None:
+    repository = PersistentRepository()
+    truth = RuntimeTruth()
+    service = _service(repository, truth, None)
+    authorization = service.authorize(_request())
+    record = repository.authorization(authorization.authorization_receipt_id)
+    assert record is not None
+    overrun = _result(
+        record.resume_command,
+        status=RuntimeStatus.POLICY_FAILED,
+        error="codex.resume cost accounting failed",
+        label="overrun-result",
+    )
+    overrun = overrun.model_copy(
+        update={
+            "cost_evidence": overrun.cost_evidence.model_copy(
+                update={"actual_cost_usd": Decimal("0.80")}
+            )
+        }
+    )
+    repository.record_dispatch_started(authorization.authorization_receipt_id)
+    truth.operations[record.resume_command.event_id] = _operation(
+        record.resume_command, overrun
+    )
+
+    with pytest.raises(CapabilityResumeDispatchFailed) as failure:
+        _service(repository, truth, None).readback(authorization)
+
+    execution = failure.value.failure.execution
+    assert execution.resume_actual_spend_usd == Decimal("0.80")
+    assert execution.booked_cost_usd == Decimal("2.05")
+    assert execution.resume_budget_violation is True
 
 
 @pytest.mark.asyncio

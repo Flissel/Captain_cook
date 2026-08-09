@@ -154,7 +154,6 @@ class AgentRuntimeService:
         if (
             settlement.command_id != command.event_id
             or settlement.reservation_id != authority.reservation_id
-            or settlement.accounted_cost_usd > authority.ceiling_usd
         ):
             raise RuntimeContractViolation(
                 "codex.resume cost settlement binding is invalid"
@@ -163,6 +162,9 @@ class AgentRuntimeService:
             if (
                 evidence is None
                 or evidence.command_id != command.event_id
+                or evidence.result_id != result.event_id
+                or evidence.original_command_id
+                != (command.causation_id or command.event_id)
                 or evidence.reservation_id != authority.reservation_id
                 or evidence.job_id != authority.job_id
                 or evidence.run_id != authority.run_id
@@ -176,6 +178,27 @@ class AgentRuntimeService:
             ):
                 raise RuntimeContractViolation(
                     "codex.resume actual usage binding is invalid"
+                )
+        elif settlement.disposition == "overrun":
+            if (
+                evidence is None
+                or evidence.command_id != command.event_id
+                or evidence.result_id != result.event_id
+                or evidence.original_command_id
+                != (command.causation_id or command.event_id)
+                or evidence.reservation_id != authority.reservation_id
+                or evidence.job_id != authority.job_id
+                or evidence.run_id != authority.run_id
+                or evidence.input_id != authority.input_id
+                or evidence.correlation_id != authority.correlation_id
+                or evidence.capability_id != authority.capability_id
+                or evidence.capability_version != authority.capability_version
+                or settlement.actual_cost_usd != evidence.actual_cost_usd
+                or settlement.actual_cost_usd <= authority.ceiling_usd
+                or settlement.accounted_cost_usd != settlement.actual_cost_usd
+            ):
+                raise RuntimeContractViolation(
+                    "codex.resume overrun accounting is invalid"
                 )
         elif settlement.accounted_cost_usd != authority.ceiling_usd:
             raise RuntimeContractViolation(

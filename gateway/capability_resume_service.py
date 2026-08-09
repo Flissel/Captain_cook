@@ -280,6 +280,11 @@ class CapabilityResumeService:
             raise CapabilityResumeUnavailable(
                 "successful resume runtime result has no actual cost evidence"
             )
+        actual_spend = (
+            result.cost_evidence.actual_cost_usd
+            if result.cost_evidence is not None
+            else None
+        )
         execution = CapabilityExecutionAuthority(
             job_id=authorization.job_id,
             correlation_id=authorization.correlation_id,
@@ -289,11 +294,14 @@ class CapabilityResumeService:
             execution_command_id=record.resume_command.event_id,
             execution_result_id=result.event_id,
             evidence_refs=evidence_refs,
-            booked_cost_usd=record.booked_cost_usd,
-            resume_actual_spend_usd=(
-                result.cost_evidence.actual_cost_usd
-                if result.cost_evidence is not None
-                else None
+            booked_cost_usd=(
+                record.booked_cost_usd + actual_spend
+                if actual_spend is not None
+                else record.booked_cost_usd
+            ),
+            resume_actual_spend_usd=actual_spend,
+            resume_budget_violation=(
+                actual_spend is not None and actual_spend > record.resume_budget_usd
             ),
             terminal_status=_terminal_status(result),
             replayed=False,

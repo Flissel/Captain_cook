@@ -202,6 +202,9 @@ class _Pipeline:
             ),
             projection_event_id=first.projection_event_id,
             projection_readback_id=first.projection_readback_id,
+            resume_actual_spend_usd=Decimal("0"),
+            total_booked_cost_usd=first.booked_cost_usd,
+            resume_budget_violation=False,
         )
 
 
@@ -364,6 +367,9 @@ def _complete_demo_evidence(module: Any) -> Any:
             resumed_execution_result_id=uuid5(RUN_ID, "restart-result"),
             projection_event_id=first.projection_event_id,
             projection_readback_id=first.projection_readback_id,
+            resume_actual_spend_usd=Decimal("0"),
+            total_booked_cost_usd=first.booked_cost_usd,
+            resume_budget_violation=False,
         ),
     )
 
@@ -483,6 +489,26 @@ def _complete_demo_evidence(module: Any) -> Any:
                 }
             ),
             "reused restart execution result",
+        ),
+        (
+            lambda module, value: value.model_copy(
+                update={
+                    "restart": value.restart.model_copy(
+                        update={"resume_budget_violation": True}
+                    )
+                }
+            ),
+            "restart cost evidence",
+        ),
+        (
+            lambda module, value: value.model_copy(
+                update={
+                    "restart": value.restart.model_copy(
+                        update={"total_booked_cost_usd": Decimal("0.01")}
+                    )
+                }
+            ),
+            "restart cost evidence",
         ),
         (
             lambda module, value: value.model_copy(

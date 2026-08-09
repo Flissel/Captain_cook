@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -298,6 +299,120 @@ class RuntimeResumeCostAuthorityV1(_FrozenContract):
         return _require_utc(value)
 
 
+class RuntimeUsagePricingSnapshotV1(_FrozenContract):
+    """Immutable model allowlist and token pricing used for independent verification."""
+
+    schema_name: Literal["captain.runtime-usage-pricing-snapshot.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    snapshot_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    provider: Literal["openai"]
+    model: str = Field(pattern=IDENTIFIER_PATTERN)
+    input_cost_per_million_usd: Decimal
+    cached_input_cost_per_million_usd: Decimal
+    output_cost_per_million_usd: Decimal
+    effective_at: datetime
+    expires_at: datetime
+
+    @field_validator(
+        "input_cost_per_million_usd",
+        "cached_input_cost_per_million_usd",
+        "output_cost_per_million_usd",
+        mode="before",
+    )
+    @classmethod
+    def require_nonnegative_price(cls, value: object) -> Decimal:
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("runtime usage price must be finite and non-negative")
+        return amount
+
+    @field_validator("effective_at", "expires_at")
+    @classmethod
+    def require_utc_price_time(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+    @model_validator(mode="after")
+    def require_active_price_window(self) -> "RuntimeUsagePricingSnapshotV1":
+        if self.expires_at <= self.effective_at:
+            raise ValueError("runtime usage pricing window is invalid")
+        return self
+
+    @property
+    def snapshot_sha256(self) -> str:
+        return hashlib.sha256(canonical_json_bytes(self)).hexdigest()
+
+    def cost(
+        self,
+        *,
+        input_units: int,
+        cached_input_units: int,
+        output_units: int,
+    ) -> Decimal:
+        if (
+            min(input_units, cached_input_units, output_units) < 0
+            or cached_input_units > input_units
+        ):
+            raise ValueError("runtime usage token counts are invalid")
+        cost = (
+            Decimal(input_units - cached_input_units)
+            * self.input_cost_per_million_usd
+            + Decimal(cached_input_units)
+            * self.cached_input_cost_per_million_usd
+            + Decimal(output_units) * self.output_cost_per_million_usd
+        ) / Decimal(1_000_000)
+        return cost.quantize(Decimal("0.000001"))
+
+
+class RuntimeProviderUsageReceiptV1(_FrozenContract):
+    """Raw-free provider usage persisted in CAS and independently repriced."""
+
+    schema_name: Literal["captain.runtime-provider-usage-receipt.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    receipt_id: UUID
+    request_id: UUID
+    command_id: UUID
+    result_id: UUID
+    reservation_id: UUID
+    job_id: UUID
+    run_id: UUID
+    input_id: str = Field(min_length=1)
+    correlation_id: UUID
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    session_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    provider: Literal["openai"]
+    model: str = Field(min_length=1)
+    input_units: int = Field(ge=0, strict=True)
+    cached_input_units: int = Field(ge=0, strict=True)
+    output_units: int = Field(ge=0, strict=True)
+    actual_cost_usd: Decimal
+    pricing_snapshot_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    pricing_snapshot_sha256: str = Field(pattern=SHA256_PATTERN)
+    started_at: datetime
+    ended_at: datetime
+
+    @field_validator("actual_cost_usd", mode="before")
+    @classmethod
+    def require_known_receipt_cost(cls, value: object) -> Decimal:
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("runtime provider cost must be finite and non-negative")
+        return amount
+
+    @field_validator("started_at", "ended_at")
+    @classmethod
+    def require_utc_receipt_time(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+    @model_validator(mode="after")
+    def require_valid_receipt(self) -> "RuntimeProviderUsageReceiptV1":
+        if self.cached_input_units > self.input_units or self.ended_at < self.started_at:
+            raise ValueError("runtime provider usage receipt is invalid")
+        return self
+
+
 class RuntimeCostEvidenceV1(_FrozenContract):
     """Provider-originated actual usage for one runtime resume command."""
 
@@ -306,6 +421,8 @@ class RuntimeCostEvidenceV1(_FrozenContract):
     )
     receipt_id: UUID
     command_id: UUID
+    result_id: UUID
+    original_command_id: UUID
     reservation_id: UUID
     job_id: UUID
     run_id: UUID
@@ -316,8 +433,11 @@ class RuntimeCostEvidenceV1(_FrozenContract):
     provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
     input_units: int = Field(ge=0, strict=True)
+    cached_input_units: int = Field(ge=0, strict=True)
     output_units: int = Field(ge=0, strict=True)
     actual_cost_usd: Decimal
+    pricing_snapshot_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    pricing_snapshot_sha256: str = Field(pattern=SHA256_PATTERN)
     started_at: datetime
     ended_at: datetime
     evidence_ref: ArtifactRef
@@ -337,8 +457,11 @@ class RuntimeCostEvidenceV1(_FrozenContract):
 
     @model_validator(mode="after")
     def require_ordered_usage_time(self) -> "RuntimeCostEvidenceV1":
-        if self.ended_at < self.started_at:
-            raise ValueError("runtime cost evidence times are out of order")
+        if (
+            self.ended_at < self.started_at
+            or self.cached_input_units > self.input_units
+        ):
+            raise ValueError("runtime cost evidence usage is invalid")
         return self
 
 

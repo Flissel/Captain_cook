@@ -62,8 +62,46 @@ class RuntimeCodexInvocation:
     workspace: Path
     prompt: str
     timeout_seconds: int
+    request_id: UUID | None = None
+    model: str | None = None
+    pricing_snapshot_id: str | None = None
+    pricing_snapshot_sha256: str | None = None
+    maximum_cost_usd: str | None = None
+    cost_authority_ref: str | None = None
+    hard_ceiling_enforced: bool = False
     resume: bool = False
     prior_checkpoint_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeCodexUsageV1(BaseModel):
+    """Raw-free token usage derived only from recognized Codex JSONL events."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, populate_by_name=True)
+
+    schema_name: Literal["captain.runtime-codex-usage.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    request_id: UUID
+    command_id: UUID
+    command_identity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    session_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    model: str = Field(min_length=1)
+    input_units: int = Field(ge=0, strict=True)
+    cached_input_units: int = Field(ge=0, strict=True)
+    output_units: int = Field(ge=0, strict=True)
+    pricing_snapshot_id: str = Field(min_length=1)
+    pricing_snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    started_at: datetime
+    ended_at: datetime
+
+    @model_validator(mode="after")
+    def require_valid_usage(self) -> "RuntimeCodexUsageV1":
+        if self.cached_input_units > self.input_units:
+            raise ValueError("cached input usage exceeds input usage")
+        if self.ended_at < self.started_at:
+            raise ValueError("runtime Codex usage time is invalid")
+        return self
 
 
 @dataclass(frozen=True)
@@ -77,6 +115,7 @@ class RuntimeCodexProcessResult:
     event_types: tuple[str, ...]
     last_event_sha256: str | None
     failure_kind: RuntimeCodexFailureKind | None = None
+    usage: RuntimeCodexUsageV1 | None = None
 
     def __post_init__(self) -> None:
         expected = (
@@ -119,6 +158,7 @@ class RuntimeCodexTerminalEvidenceV1(BaseModel):
     process_cleanup_status: RuntimeCodexProcessCleanupStatus
     failure_kind: RuntimeCodexFailureKind | None = None
     resumable_checkpoint: ArtifactRef | None = None
+    usage: RuntimeCodexUsageV1 | None = None
 
     @field_validator("event_types")
     @classmethod
@@ -158,6 +198,10 @@ class _EventSummary:
     types: set[str] = field(default_factory=set)
     last_sha256: str | None = None
     session_id: str | None = None
+    input_units: int = 0
+    cached_input_units: int = 0
+    output_units: int = 0
+    usage_events: int = 0
 
     def observe(self, event: Mapping[str, object]) -> dict[str, object]:
         canonical = _runtime_codex_event(event)
@@ -170,6 +214,26 @@ class _EventSummary:
                 r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", candidate
             ):
                 self.session_id = candidate
+        elif canonical.get("type") == "turn.completed":
+            usage = canonical.get("usage")
+            if usage is None:
+                return canonical
+            if not isinstance(usage, dict):
+                raise FactoryDispatchError("Codex JSONL usage is invalid")
+            values = (
+                usage.get("input_tokens"),
+                usage.get("cached_input_tokens"),
+                usage.get("output_tokens"),
+            )
+            if any(type(value) is not int or value < 0 for value in values):
+                raise FactoryDispatchError("Codex JSONL usage is invalid")
+            input_units, cached_input_units, output_units = values
+            if cached_input_units > input_units:
+                raise FactoryDispatchError("Codex JSONL usage is invalid")
+            self.input_units += input_units
+            self.cached_input_units += cached_input_units
+            self.output_units += output_units
+            self.usage_events += 1
         return canonical
 
 
@@ -211,6 +275,10 @@ class RuntimeCodexExecution:
         prompt: str,
         timeout_seconds: int,
         observer: RuntimeCodexObserver,
+        request_id: UUID | None = None,
+        model: str | None = None,
+        pricing_snapshot_id: str | None = None,
+        pricing_snapshot_sha256: str | None = None,
     ) -> RuntimeCodexTerminalEvidenceV1:
         workspace_binding = _workspace_binding(workspace)
         identity = _runtime_codex_command_identity(
@@ -236,6 +304,10 @@ class RuntimeCodexExecution:
             workspace=workspace,
             prompt=prompt,
             timeout_seconds=timeout_seconds,
+            request_id=request_id or command_id,
+            model=model,
+            pricing_snapshot_id=pricing_snapshot_id,
+            pricing_snapshot_sha256=pricing_snapshot_sha256,
         )
         return await self._single_flight(invocation, observer)
 
@@ -251,6 +323,13 @@ class RuntimeCodexExecution:
         prompt: str,
         timeout_seconds: int,
         observer: RuntimeCodexObserver,
+        request_id: UUID | None = None,
+        model: str | None = None,
+        pricing_snapshot_id: str | None = None,
+        pricing_snapshot_sha256: str | None = None,
+        maximum_cost_usd: str | None = None,
+        cost_authority_ref: str | None = None,
+        hard_ceiling_enforced: bool = False,
     ) -> RuntimeCodexTerminalEvidenceV1:
         workspace_binding = _workspace_binding(workspace)
         key = (correlation_id, subject_id, prompt_sha256, workspace_ref, workspace_binding)
@@ -288,6 +367,13 @@ class RuntimeCodexExecution:
             workspace=workspace,
             prompt=prompt,
             timeout_seconds=timeout_seconds,
+            request_id=request_id,
+            model=model,
+            pricing_snapshot_id=pricing_snapshot_id,
+            pricing_snapshot_sha256=pricing_snapshot_sha256,
+            maximum_cost_usd=maximum_cost_usd,
+            cost_authority_ref=cost_authority_ref,
+            hard_ceiling_enforced=hard_ceiling_enforced,
             resume=True,
             prior_checkpoint_sha256=(
                 prior.resumable_checkpoint.sha256
@@ -643,6 +729,11 @@ class RuntimeCodexExecution:
             "event_types": list(result.event_types),
             "process_cleanup_status": result.process_cleanup_status,
             "failure_kind": result.failure_kind,
+            "usage": (
+                result.usage.model_dump(mode="json", by_alias=True)
+                if result.usage is not None
+                else None
+            ),
         }
         record = self._persist_checkpoint(payload)
         checkpoint = record if result.terminal_status in {"timed_out", "cancelled", "failed"} else None
@@ -663,6 +754,7 @@ class RuntimeCodexExecution:
             process_cleanup_status=result.process_cleanup_status,
             failure_kind=result.failure_kind,
             resumable_checkpoint=checkpoint,
+            usage=result.usage,
         )
         self._write_checkpoint_index(invocation.command_id, record, replace=replace_checkpoint)
         return evidence
@@ -775,6 +867,11 @@ class RuntimeCodexExecution:
                 resumable_checkpoint=(
                     reference if status in {"timed_out", "cancelled", "failed"} else None
                 ),
+                usage=(
+                    RuntimeCodexUsageV1.model_validate(payload["usage"])
+                    if payload.get("usage") is not None
+                    else None
+                ),
             )
         except FactoryDispatchError:
             raise
@@ -830,14 +927,20 @@ class PowerShellRuntimeCodexRunner:
             self._active[invocation.session_id] = runner
             self._cancelled.discard(invocation.session_id)
         started = self._monotonic()
+        started_at = datetime.now(timezone.utc)
         try:
+            command_parts = ["codex", "exec"]
+            if invocation.resume:
+                command_parts.append("resume")
+            command_parts.append("--json")
+            if invocation.model is not None:
+                command_parts.extend(("--model", invocation.model))
+            if invocation.resume:
+                command_parts.append(invocation.session_id)
+            command_parts.append(invocation.prompt)
             authorized = AuthorizedCodexRun(
                 workspace=invocation.workspace,
-                command=(
-                    ("codex", "exec", "resume", "--json", invocation.session_id, invocation.prompt)
-                    if invocation.resume
-                    else ("codex", "exec", "--json", invocation.prompt)
-                ),
+                command=tuple(command_parts),
                 environment=FrozenEnvironment(
                     {name: value for name, value in self._environ.items() if name in self._ALLOWED_ENV}
                 ),
@@ -851,6 +954,7 @@ class PowerShellRuntimeCodexRunner:
         finally:
             async with self._lock:
                 self._active.pop(invocation.session_id, None)
+        ended_at = datetime.now(timezone.utc)
         elapsed_ms = max(0, int((self._monotonic() - started) * 1000))
         session_id = summary.session_id or invocation.session_id
         if result is None:
@@ -865,6 +969,29 @@ class PowerShellRuntimeCodexRunner:
                 last_event_sha256=summary.last_sha256,
                 failure_kind=failure_kind,
             )
+        usage = None
+        if (
+            summary.usage_events > 0
+            and invocation.request_id is not None
+            and invocation.model is not None
+            and invocation.pricing_snapshot_id is not None
+            and invocation.pricing_snapshot_sha256 is not None
+        ):
+            usage = RuntimeCodexUsageV1(
+                schema_name="captain.runtime-codex-usage.v1",
+                request_id=invocation.request_id,
+                command_id=invocation.command_id,
+                command_identity_sha256=invocation.command_identity_sha256,
+                session_id=session_id,
+                model=invocation.model,
+                input_units=summary.input_units,
+                cached_input_units=summary.cached_input_units,
+                output_units=summary.output_units,
+                pricing_snapshot_id=invocation.pricing_snapshot_id,
+                pricing_snapshot_sha256=invocation.pricing_snapshot_sha256,
+                started_at=started_at,
+                ended_at=ended_at,
+            )
         return RuntimeCodexProcessResult(
             exit_code=result.exit_code,
             terminal_status=result.terminal_status,
@@ -874,6 +1001,7 @@ class PowerShellRuntimeCodexRunner:
             event_count=summary.count,
             event_types=tuple(sorted(summary.types)),
             last_event_sha256=summary.last_sha256,
+            usage=usage,
         )
 
     async def cancel(self, session_id: str) -> RuntimeCodexCancelOutcome:
@@ -1001,4 +1129,5 @@ __all__ = [
     "RuntimeCodexInvocation",
     "RuntimeCodexProcessResult",
     "RuntimeCodexTerminalEvidenceV1",
+    "RuntimeCodexUsageV1",
 ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path as FileSystemPath
 from threading import Lock
 from typing import Any, Callable, Literal, Protocol
 from uuid import UUID, uuid4
@@ -28,6 +29,10 @@ from agenten.agent_runtime.contracts import (
     RuntimeResumeCostAuthorityV1,
     RuntimeResumeCostSettlementRequestV1,
     RuntimeResumeCostSettlementV1,
+    RuntimeUsagePricingSnapshotV1,
+)
+from agenten.agent_runtime.captain_production_adapters import (
+    ContentAddressedArtifactAdapter,
 )
 from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob, FactoryLease, FactoryPhase
 from agenten.agent_factory.execution_budget import (
@@ -298,6 +303,10 @@ def create_app(
     portal_clock: Callable[[], datetime] | None = None,
     capability_resume_service: CapabilityResumeService | None = None,
     capability_resume_executor: CapabilityResumeExecutor | None = None,
+    runtime_usage_artifacts: ContentAddressedArtifactAdapter | None = None,
+    runtime_usage_pricing_snapshots: tuple[
+        RuntimeUsagePricingSnapshotV1, ...
+    ] = (),
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
@@ -314,6 +323,13 @@ def create_app(
             ),
             portal_credential_source=portal_credential_source,
             portal_verification_source=portal_verification_source,
+            runtime_usage_artifacts=(
+                runtime_usage_artifacts
+                or ContentAddressedArtifactAdapter(
+                    FileSystemPath.cwd() / ".captain-cook" / "artifacts" / "sha256"
+                )
+            ),
+            runtime_usage_pricing_snapshots=runtime_usage_pricing_snapshots,
         )
         if (
             configured is not None

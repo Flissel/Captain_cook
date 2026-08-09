@@ -7,16 +7,21 @@ import os
 import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+
+import agenten.agent_runtime.runtime_codex as runtime_codex
 
 from agenten.agent_runtime.runtime_codex import (
     PowerShellRuntimeCodexRunner,
     RuntimeCodexExecution,
     RuntimeCodexInvocation,
     RuntimeCodexProcessResult,
+    RuntimeCodexUsageV1,
 )
 from agenten.agent_factory.hermes_cli import HermesCliFactory, HermesCliSettings
 from agenten.agent_runtime.captain_production_adapters import (
@@ -32,6 +37,8 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     HermesPlanResult,
     RuntimeStatus,
+    RuntimeProviderUsageReceiptV1,
+    RuntimeUsagePricingSnapshotV1,
 )
 from agenten.agent_runtime.production_bootstrap import (
     RuntimeAdapterBinding,
@@ -46,6 +53,17 @@ from agenten.execution.codex_supervisor import (
 
 
 NOW = datetime(2026, 8, 8, 8, 0, tzinfo=timezone.utc)
+PRICING = RuntimeUsagePricingSnapshotV1(
+    schema_name="captain.runtime-usage-pricing-snapshot.v1",
+    snapshot_id="openai-test-2026-08-09",
+    provider="openai",
+    model="gpt-5.6-terra",
+    input_cost_per_million_usd=Decimal("1.25"),
+    cached_input_cost_per_million_usd=Decimal("0.125"),
+    output_cost_per_million_usd=Decimal("10.00"),
+    effective_at=NOW,
+    expires_at=NOW + timedelta(days=2),
+)
 
 
 def _reference(content: bytes, *, media_type: str = "text/markdown") -> ArtifactRef:
@@ -109,6 +127,27 @@ def _grant(command: AgentRuntimeCommand) -> CapabilityGrant:
             "mcp_servers": [],
             "issued_at": NOW,
             "expires_at": NOW + timedelta(minutes=5),
+        }
+    )
+
+
+def _cost_bound(command: AgentRuntimeCommand) -> AgentRuntimeCommand:
+    return command.model_copy(
+        update={
+            "payload": command.payload.model_copy(
+                update={
+                    "maximum_cost_usd": Decimal("0.75"),
+                    "budget_reservation_id": uuid4(),
+                    "cost_authority_ref": (
+                        "gateway://capability-resume-authorizations/" f"{uuid4()}"
+                    ),
+                    "cost_job_id": uuid4(),
+                    "cost_run_id": uuid4(),
+                    "cost_input_id": "input-one",
+                    "cost_capability_id": "claims-capability",
+                    "cost_capability_version": 1,
+                }
+            )
         }
     )
 
@@ -235,11 +274,23 @@ class StreamingRunner:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.block = False
+        self.include_usage = False
 
     async def run(self, invocation, observer):
         self.invocations.append(invocation)
         first = {"type": "thread.started", "thread_id": "runtime-thread"}
-        second = self.private_event or {"type": "turn.completed"}
+        second = self.private_event or (
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 100_000,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 12_500,
+                },
+            }
+            if self.include_usage
+            else {"type": "turn.completed"}
+        )
         await observer(first)
         await observer(second)
         self.started.set()
@@ -254,6 +305,25 @@ class StreamingRunner:
             if self.exit_code == 0
             else "failed"
         )
+        usage = (
+            RuntimeCodexUsageV1(
+                schema_name="captain.runtime-codex-usage.v1",
+                request_id=invocation.request_id,
+                command_id=invocation.command_id,
+                command_identity_sha256=invocation.command_identity_sha256,
+                session_id="runtime-thread",
+                model=invocation.model,
+                input_units=100_000,
+                cached_input_units=0,
+                output_units=12_500,
+                pricing_snapshot_id=invocation.pricing_snapshot_id,
+                pricing_snapshot_sha256=invocation.pricing_snapshot_sha256,
+                started_at=NOW,
+                ended_at=NOW + timedelta(seconds=1),
+            )
+            if self.include_usage
+            else None
+        )
         return RuntimeCodexProcessResult(
             exit_code=self.exit_code,
             terminal_status=status,
@@ -265,6 +335,7 @@ class StreamingRunner:
             last_event_sha256=hashlib.sha256(
                 json.dumps(second, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest(),
+            usage=usage,
         )
 
     async def cancel(self, session_id: str) -> str:
@@ -282,6 +353,7 @@ def _codex_adapter(
     *,
     observer=None,
     environ: dict[str, str] | None = None,
+    pricing_snapshots: tuple[RuntimeUsagePricingSnapshotV1, ...] = (),
 ) -> tuple[CaptainCodexExecutionAdapter, RuntimeCodexExecution, ContentAddressedArtifactAdapter]:
     (tmp_path / ".captain-cook" / "workspaces" / "runtime" / "task").mkdir(
         parents=True,
@@ -299,6 +371,7 @@ def _codex_adapter(
             repository_root=tmp_path,
             observer=observer,
             environ=environ or {},
+            pricing_snapshots=pricing_snapshots,
         ),
         execution,
         artifacts,
@@ -549,6 +622,48 @@ async def test_resume_reuses_original_correlation_session_and_command_identity(
     assert second.command_identity_sha256 == first.command_identity_sha256
     assert first.session_id.startswith("runtime-")
     assert second.session_id == "runtime-thread"
+
+
+@pytest.mark.asyncio
+async def test_resume_carries_cost_authority_and_persists_digest_bound_usage_receipt(
+    tmp_path: Path,
+) -> None:
+    runner = StreamingRunner(exit_code=124)
+    adapter, _, artifacts = _codex_adapter(
+        tmp_path, runner, pricing_snapshots=(PRICING,)
+    )
+    prompt_ref = artifacts.put(b"cost-bound resume", "text/markdown")
+    original = _command(prompt_ref)
+    await adapter.start(original, _grant(original))
+    runner.exit_code = 0
+    runner.include_usage = True
+    resumed = _cost_bound(
+        _command(
+            prompt_ref,
+            operation="codex.resume",
+            correlation_id=original.correlation_id,
+            causation_id=original.event_id,
+        )
+    )
+
+    result = await adapter.resume(resumed, _grant(resumed))
+
+    invocation = runner.invocations[-1]
+    assert invocation.request_id == resumed.event_id
+    assert invocation.maximum_cost_usd == "0.75"
+    assert invocation.cost_authority_ref == resumed.payload.cost_authority_ref
+    assert invocation.hard_ceiling_enforced is False
+    assert result.status is RuntimeStatus.POLICY_FAILED
+    assert result.error == "codex.resume provider hard ceiling is unavailable"
+    assert result.cost_evidence is not None
+    receipt = RuntimeProviderUsageReceiptV1.model_validate_json(
+        artifacts.read_bytes(result.cost_evidence.evidence_ref)
+    )
+    assert receipt.request_id == resumed.event_id
+    assert receipt.command_id == original.event_id
+    assert receipt.result_id == result.event_id
+    assert receipt.actual_cost_usd == Decimal("0.250000")
+    assert receipt.pricing_snapshot_sha256 == PRICING.snapshot_sha256
 
 
 @pytest.mark.asyncio
@@ -1210,6 +1325,96 @@ async def test_parser_failure_from_current_runner_becomes_typed_terminal_evidenc
     assert evidence.failure_kind == "invalid_json_object"
     assert evidence.process_cleanup_status == "verified_cancelled"
     assert evidence.resumable_checkpoint is not None
+
+
+@pytest.mark.asyncio
+async def test_current_runner_accepts_real_shaped_jsonl_usage_without_retaining_raw_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    usage_type = getattr(runtime_codex, "RuntimeCodexUsageV1", None)
+    assert usage_type is not None, "typed runtime Codex usage is missing"
+    process_runner = PowerShellRuntimeCodexRunner(
+        repository_root=tmp_path,
+        executable="codex",
+        environ={},
+        evidence_root=tmp_path / "runtime-codex",
+    )
+    authorized_commands: list[tuple[str, ...]] = []
+
+    class JsonlRunner:
+        async def run(self, authorized):
+            authorized_commands.append(authorized.command)
+            await observer(
+                {"type": "thread.started", "thread_id": "usage-session"}
+            )
+            await observer(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 100_000,
+                        "cached_input_tokens": 20_000,
+                        "output_tokens": 12_500,
+                    },
+                }
+            )
+            return SimpleNamespace(
+                exit_code=0,
+                terminal_status="succeeded",
+                process_cleanup_status="not_required",
+            )
+
+    observer = None
+
+    def make_runner(_invocation, observed):
+        nonlocal observer
+        observer = observed
+        return JsonlRunner()
+
+    monkeypatch.setattr(process_runner, "_make_runner", make_runner)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    invocation = RuntimeCodexInvocation(
+        command_id=uuid4(),
+        request_id=uuid4(),
+        correlation_id=uuid4(),
+        subject_id="runtime-task",
+        prompt_sha256="1" * 64,
+        command_identity_sha256="2" * 64,
+        session_id="usage-session",
+        workspace_ref="workspace://runtime/task",
+        workspace_binding_sha256="3" * 64,
+        workspace=workspace,
+        prompt="not persisted",
+        timeout_seconds=30,
+        model="gpt-5.6-terra",
+        pricing_snapshot_id="openai-test-2026-08-09",
+        pricing_snapshot_sha256="4" * 64,
+    )
+
+    async def ignore(_event: dict[str, object]) -> None:
+        return None
+
+    result = await process_runner.run(invocation, ignore)
+
+    assert authorized_commands == [
+        ("codex", "exec", "--json", "--model", "gpt-5.6-terra", "not persisted")
+    ]
+    assert result.usage == usage_type(
+        schema_name="captain.runtime-codex-usage.v1",
+        request_id=invocation.request_id,
+        command_id=invocation.command_id,
+        command_identity_sha256=invocation.command_identity_sha256,
+        session_id="usage-session",
+        model="gpt-5.6-terra",
+        input_units=100_000,
+        cached_input_units=20_000,
+        output_units=12_500,
+        pricing_snapshot_id="openai-test-2026-08-09",
+        pricing_snapshot_sha256="4" * 64,
+        started_at=result.usage.started_at,
+        ended_at=result.usage.ended_at,
+    )
 
 
 @pytest.mark.asyncio
