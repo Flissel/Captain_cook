@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -19,6 +20,33 @@ def creation_job(**updates: object) -> CreationJobV1:
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     payload.update(updates)
     return CreationJobV1.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "foreign"),
+    [
+        ("creation_job_id", uuid4()),
+        ("correlation_id", uuid4()),
+        ("subject_version", 2),
+        ("attempt", 2),
+    ],
+)
+def test_v1_finish_rejects_foreign_terminal_result_identity(
+    tmp_path: Path, field: str, foreign: object
+) -> None:
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    job = creation_job()
+    store.submit(job)
+    result = CreationResultV1(
+        creation_job_id=job.creation_job_id,
+        correlation_id=job.correlation_id,
+        subject_version=job.subject_version,
+        attempt=job.attempt,
+        status="failed",
+        failure=CreationFailure(code="internal_error", summary="creation failed"),
+    ).model_copy(update={field: foreign})
+    with pytest.raises(CreationConflictError, match="result.*job"):
+        store.finish(result, expected_version=1)
 
 
 class ScriptedPipeline:
@@ -42,7 +70,12 @@ class ScriptedPipeline:
         if effect is None:
             self.calls[step] += 1
             effect = {"receipt_id": f"receipt-{step}"}
-            self.store.record_external_effect(job.creation_job_id, effect_key, effect)
+            self.store.record_external_effect(
+                job.creation_job_id,
+                effect_key,
+                effect,
+                expected_version=self.store.progress(job.creation_job_id).version,
+            )
             if self.crash_after_effect == step:
                 raise RuntimeError("simulated crash")
         snapshot = prior_snapshot | {step: effect["receipt_id"]}

@@ -7,7 +7,7 @@ from collections.abc import Callable
 from uuid import UUID
 
 from .contracts import CreationFailure, CreationJobV3, CreationResultV1, CreationResultV2
-from .job_store import CreationJobStore
+from .job_store import CreationConflictError, CreationJobStore
 from .runner import CreationRunner
 
 
@@ -99,6 +99,9 @@ class CreationScheduler:
         if self._store.result(job_id) is not None:
             return
         job = self._store.job(job_id)
+        progress = self._store.progress(job_id)
+        if progress.status in {"succeeded", "failed", "blocked", "cancelled"}:
+            return
         failure = CreationFailure(
             code="internal_error",
             summary="creation step failed",
@@ -124,10 +127,16 @@ class CreationScheduler:
                 failure=failure,
             )
         )
-        self._store.finish(
-            result,
-            expected_version=self._store.progress(job_id).version,
-        )
+        try:
+            self._store.finish(result, expected_version=progress.version)
+        except CreationConflictError:
+            latest_result = self._store.result(job_id)
+            latest_progress = self._store.progress(job_id)
+            if latest_result is not None or latest_progress.status in {
+                "succeeded", "failed", "blocked", "cancelled"
+            }:
+                return
+            raise
 
 
 __all__ = ["CreationRunnerFactory", "CreationScheduler"]

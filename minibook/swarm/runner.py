@@ -95,6 +95,7 @@ class CreationRunner:
         for step in self.pipeline.steps:
             if step in completed:
                 continue
+            step_expected_version = self.store.progress(job_id).version
             effect_key = self._effect_key(job, step)
             accepted = (
                 self.store.external_effect(job_id, effect_key)
@@ -107,13 +108,16 @@ class CreationRunner:
             if outcome.yield_status is not None:
                 if outcome.yield_status not in {"awaiting_build", "awaiting_user_input"}:
                     raise ValueError("unsupported creation yield status")
-                self.store.transition(job_id, outcome.yield_status, expected_version=self.store.progress(job_id).version, checkpoint=step, snapshot=outcome.snapshot)
+                self.store.transition(job_id, outcome.yield_status, expected_version=step_expected_version, checkpoint=step, snapshot=outcome.snapshot)
                 return None
             if step in self.pipeline.effectful_steps and outcome.effect_receipt is not None:
-                self.store.record_external_effect(job_id, effect_key, outcome.effect_receipt)
+                self.store.record_external_effect(
+                    job_id, effect_key, outcome.effect_receipt,
+                    expected_version=step_expected_version,
+                )
             self.store.complete_step(
                 job_id, step, effect_key, outcome.snapshot,
-                expected_version=self.store.progress(job_id).version,
+                expected_version=step_expected_version,
             )
             snapshot = outcome.snapshot
         return self.store.finish(

@@ -280,7 +280,8 @@ class CreationJobStore:
         return None if row is None else json.loads(row["receipt"])
 
     def record_external_effect(
-        self, job_id: UUID, effect_key: str, receipt: dict[str, Any]
+        self, job_id: UUID, effect_key: str, receipt: dict[str, Any],
+        *, expected_version: int,
     ) -> dict[str, Any]:
         encoded = _json(receipt)
         with self._immediate_transaction() as db:
@@ -292,6 +293,10 @@ class CreationJobStore:
                 if row["receipt"] != encoded:
                     raise CreationConflictError("effect key already has different receipt")
                 return json.loads(row["receipt"])
+            head = self._head(job_id, db)
+            self._require_version(head, expected_version)
+            if head["status"] in self._TERMINAL:
+                raise CreationConflictError("creation job is already terminal")
             db.execute(
                 "INSERT INTO creation_effect_receipts VALUES (?, ?, ?)",
                 (str(job_id), effect_key, encoded),
@@ -578,6 +583,25 @@ class CreationJobStore:
         encoded = _json(result)
         job_id = str(result.creation_job_id)
         with self._immediate_transaction() as db:
+            try:
+                job = self._job(result.creation_job_id, db)
+                head = self._head(result.creation_job_id, db)
+            except CreationNotFoundError as error:
+                raise CreationConflictError("creation result does not match a stored job") from error
+            if isinstance(job, CreationJobV3) != isinstance(result, CreationResultV2):
+                raise CreationConflictError("creation result schema does not match job schema")
+            common_bindings = (
+                result.creation_job_id == job.creation_job_id,
+                result.correlation_id == job.correlation_id,
+                result.subject_version == job.subject_version,
+                result.attempt == job.attempt,
+            )
+            v2_binding = not isinstance(result, CreationResultV2) or (
+                isinstance(job, CreationJobV3)
+                and result.factory_job_id == job.factory_job_id
+            )
+            if not all(common_bindings) or not v2_binding:
+                raise CreationConflictError("creation result bindings do not match stored job")
             existing = db.execute(
                 "SELECT payload FROM creation_results WHERE job_id = ?", (job_id,)
             ).fetchone()
@@ -585,11 +609,7 @@ class CreationJobStore:
                 if existing["payload"] != encoded:
                     raise CreationConflictError("creation result already differs")
                 return self._parse_result(existing["payload"])
-            head = self._head(result.creation_job_id, db)
             self._require_version(head, expected_version)
-            job = self._job(result.creation_job_id, db)
-            if isinstance(job, CreationJobV3) != isinstance(result, CreationResultV2):
-                raise CreationConflictError("creation result schema does not match job schema")
             already_terminal = head["status"] in self._TERMINAL
             if already_terminal and head["status"] != result.status:
                 raise CreationConflictError("creation result conflicts with terminal job state")

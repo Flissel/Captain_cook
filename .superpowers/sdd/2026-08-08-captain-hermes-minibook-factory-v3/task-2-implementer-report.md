@@ -39,7 +39,7 @@ Warnings were dependency/environment warnings only: a Starlette `httpx` deprecat
 
 - Exact assignment replay remains immutable; foreign canonical content conflicts.
 - Claim replay is limited to the same worker; another worker conflicts.
-- Effect replay remains immutable but still rejects terminal or expired authority.
+- An exact already-persisted effect remains immutable and may replay after terminal lifecycle advancement; a first acceptance still rejects terminal or expired authority.
 - Action requests and responses are stored separately so the request projection is never mutated; restart reads both typed records.
 - Every head-writing operation in this scope uses one `BEGIN IMMEDIATE` transaction and an expected-version/legal-state fence where it can create a new lifecycle version.
 
@@ -54,3 +54,16 @@ The re-review identified that an exact accepted effect replay was limited to the
 - `python -m compileall -q minibook/swarm` and `git diff --check`: exit 0.
 
 The narrow correction checks the claim and exact assignment/effect binding first, then returns an already persisted byte-identical canonical effect regardless of later legal lifecycle advancement. A changed canonical body still conflicts. Only a first acceptance reaches the deadline, terminal-state, building-state, and checkpoint-version gates, so unclaimed, expired, terminal, or otherwise invalid new effects remain rejected.
+
+## Quality-review terminal binding and cancellation race correction
+
+The quality review found two independent authority gaps. `finish()` did not compare all result identity fields with the stored job, and the runner read the job version again after an awaited step, allowing a concurrent cancellation version to be adopted before scheduler failure persistence tried to overwrite the cancelled head.
+
+- RED: `10 failed`. Nine parameterized cases showed foreign V1/V2 result identity was either accepted or raised untyped not-found; the cancel-during-step case timed out because the sole worker died and never processed the next queued job.
+- GREEN focused: `10 passed in 1.33s`.
+- Fresh required four-file command: `60 passed in 5.23s`.
+- Fresh entire `minibook/tests`: `190 passed, 1 deselected, 1 warning in 6.93s`.
+- Contract compatibility: `73 passed in 0.88s`.
+- `python -m compileall -q minibook/swarm` and `git diff --check`: exit 0.
+
+`finish()` now validates schema and every compatible result identity inside its existing `BEGIN IMMEDIATE` transaction: creation job, correlation, subject version, and attempt for V1; those fields plus factory job for V2. The runner captures the version before awaiting a step and uses only that version for yielded transitions, effect-receipt insertion, and step completion. Scheduler failure persistence returns only when a fresh read proves another actor already made the job terminal or persisted a result; unrelated conflicts still propagate.

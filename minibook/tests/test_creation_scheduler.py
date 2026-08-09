@@ -299,6 +299,40 @@ async def test_scheduler_shutdown_cancels_the_worker_without_terminalizing_the_j
     assert store.resumable_job_ids() == (job.creation_job_id,)
 
 
+@pytest.mark.asyncio
+async def test_cancel_during_step_does_not_kill_worker_or_skip_next_job(
+    tmp_path: Path,
+) -> None:
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    cancelled = creation_job(creation_job_id=uuid4())
+    following = creation_job(creation_job_id=uuid4())
+    store.submit(cancelled)
+    store.submit(following)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    first_pipeline = ControlledPipeline(entered=entered, release=release)
+    second_pipeline = ControlledPipeline()
+
+    def runner_for(job_id: UUID) -> CreationRunner:
+        pipeline = first_pipeline if job_id == cancelled.creation_job_id else second_pipeline
+        return CreationRunner(store, pipeline)
+
+    scheduler = CreationScheduler(store=store, runner_for=runner_for)
+    await scheduler.start()
+    try:
+        await entered.wait()
+        store.cancel(cancelled.creation_job_id, expected_version=1)
+        release.set()
+        await asyncio.wait_for(scheduler.join(), timeout=2)
+    finally:
+        await scheduler.stop()
+
+    assert store.progress(cancelled.creation_job_id).status == "cancelled"
+    assert store.result(cancelled.creation_job_id) is None
+    assert store.result(following.creation_job_id).status == "succeeded"
+    assert first_pipeline.calls == second_pipeline.calls == 1
+
+
 def _reload_minibook_main() -> object:
     sys.modules.pop("minibook.src.main", None)
     return importlib.import_module("minibook.src.main")

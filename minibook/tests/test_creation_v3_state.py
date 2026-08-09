@@ -92,6 +92,35 @@ def successful_result(creation_job: CreationJobV3) -> CreationResultV2:
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "foreign"),
+    [
+        ("creation_job_id", uuid4()),
+        ("factory_job_id", uuid4()),
+        ("correlation_id", uuid4()),
+        ("subject_version", 2),
+        ("attempt", 2),
+    ],
+)
+def test_v2_finish_rejects_foreign_terminal_result_identity(
+    tmp_path: Path, field: str, foreign: object
+) -> None:
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    creation_job = job()
+    store.submit(creation_job)
+    result = CreationResultV2(
+        creation_job_id=creation_job.creation_job_id,
+        factory_job_id=creation_job.factory_job_id,
+        correlation_id=creation_job.correlation_id,
+        subject_version=creation_job.subject_version,
+        attempt=creation_job.attempt,
+        status="failed",
+        failure=CreationFailure(code="internal_error", summary="creation failed"),
+    ).model_copy(update={field: foreign})
+    with pytest.raises(CreationConflictError, match="result.*job"):
+        store.finish(result, expected_version=1)
+
+
 def test_assignment_claim_is_exactly_once_across_restart(tmp_path: Path) -> None:
     path = tmp_path / "creation.sqlite3"
     creation_job = job()
