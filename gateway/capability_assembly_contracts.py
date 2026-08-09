@@ -420,6 +420,21 @@ class CapabilityAssemblyCheckpoint(_FrozenContract):
         )
         if len(set(outcome_keys)) != len(outcome_keys):
             raise ValueError("checkpoint contains duplicate reconciliation outcomes")
+        retry_authorizations: dict[UUID, CapabilityAssemblyNoEffectRetryAuthorization] = {}
+        for outcome in self.reconciliation_outcomes:
+            authorization = outcome.retry_authorization
+            if authorization is None:
+                continue
+            prior = retry_authorizations.get(authorization.authorization_receipt_id)
+            if prior is not None:
+                if canonical_assembly_model_bytes(prior) != canonical_assembly_model_bytes(
+                    authorization
+                ):
+                    raise ValueError(
+                        "authorization receipt changed its binding or evidence"
+                    )
+                raise ValueError("authorization receipt was consumed more than once")
+            retry_authorizations[authorization.authorization_receipt_id] = authorization
         if self.status is CapabilityAssemblyStatus.READY_TO_USE:
             if self.completed_slices != ASSEMBLY_TOTAL_SLICES:
                 raise ValueError("ready assembly has incomplete slices")

@@ -392,6 +392,10 @@ class CapabilityAssemblyController:
                 "reconciliation changed the started slice authority"
             )
         if outcome.disposition == "retry_authorized_no_effect":
+            self._require_fresh_retry_authorization(
+                current.reconciliation_outcomes,
+                outcome,
+            )
             cleared = _validated_copy(
                 current,
                 revision=current.revision + 1,
@@ -404,6 +408,34 @@ class CapabilityAssemblyController:
             self._append(cleared, expected_revision=current.revision)
             return cleared
         return self._complete_from_reconciliation(current, outcome)
+
+    @staticmethod
+    def _require_fresh_retry_authorization(
+        persisted_outcomes: tuple[CapabilityAssemblyReconciliationOutcome, ...],
+        proposed_outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> None:
+        proposed = proposed_outcome.retry_authorization
+        if proposed is None:
+            raise CapabilityAssemblyConflict(
+                "no-effect retry lacks an authorization receipt"
+            )
+        for persisted_outcome in persisted_outcomes:
+            persisted = persisted_outcome.retry_authorization
+            if (
+                persisted is None
+                or persisted.authorization_receipt_id
+                != proposed.authorization_receipt_id
+            ):
+                continue
+            if canonical_assembly_model_bytes(persisted) != canonical_assembly_model_bytes(
+                proposed
+            ):
+                raise CapabilityAssemblyConflict(
+                    "authorization receipt changed its binding or evidence"
+                )
+            raise CapabilityAssemblyConflict(
+                "authorization receipt was already consumed"
+            )
 
     def _complete_from_reconciliation(
         self,
@@ -878,6 +910,8 @@ class CapabilityAssemblyController:
             or first.status is not CapabilityAssemblyStatus.ADMITTED
         ):
             raise CapabilityAssemblyConflict("assembly history is not monotone")
+        consumed_authorizations: dict[UUID, bytes] = {}
+        prior_outcome_count = 0
         for expected_revision, record in enumerate(history, start=1):
             CapabilityAssemblyController._require_record_digest(record)
             checkpoint = record.checkpoint
@@ -889,6 +923,25 @@ class CapabilityAssemblyController:
                 or checkpoint.request_sha256 != first.request_sha256
             ):
                 raise CapabilityAssemblyConflict("assembly history is not monotone")
+            if len(checkpoint.reconciliation_outcomes) < prior_outcome_count:
+                raise CapabilityAssemblyConflict("assembly history is not monotone")
+            for outcome in checkpoint.reconciliation_outcomes[prior_outcome_count:]:
+                authorization = outcome.retry_authorization
+                if authorization is None:
+                    continue
+                receipt_id = authorization.authorization_receipt_id
+                binding = canonical_assembly_model_bytes(authorization)
+                prior_binding = consumed_authorizations.get(receipt_id)
+                if prior_binding is not None:
+                    if prior_binding != binding:
+                        raise CapabilityAssemblyConflict(
+                            "authorization receipt changed its binding or evidence"
+                        )
+                    raise CapabilityAssemblyConflict(
+                        "authorization receipt was consumed more than once"
+                    )
+                consumed_authorizations[receipt_id] = binding
+            prior_outcome_count = len(checkpoint.reconciliation_outcomes)
             if expected_revision == 1:
                 continue
             prior = history[expected_revision - 2].checkpoint

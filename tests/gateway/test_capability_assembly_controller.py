@@ -959,6 +959,89 @@ def test_no_effect_retry_requires_explicit_captain_authorization_before_reexecut
     assert len(reconciliation.calls) == 1
 
 
+def test_no_effect_retry_receipt_cannot_authorize_a_second_crashed_slice() -> None:
+    reconciliation = _Reconciliation()
+    controller, repo, _, factory, *_ = _controller(reconciliation=reconciliation)
+    controller.submit(_submission())
+    request = CapabilityAssemblyAdvanceRequest(
+        assembly_id=ASSEMBLY_ID,
+        operation_id=_id("two-crash-retry"),
+        request_sha256=controller.projection(ASSEMBLY_ID).request_sha256,
+        maximum_slices=1,
+    )
+    _crash_first_slice(controller, factory, request)
+    first_started = controller.projection(ASSEMBLY_ID)
+    first_started_record = repo.history(ASSEMBLY_ID)[-1]
+    assert first_started.started_slice is not None
+    receipt_id = _id("single-use-no-effect-authorization")
+    first_authorization = CapabilityAssemblyNoEffectRetryAuthorization(
+        assembly_id=ASSEMBLY_ID,
+        operation_id=request.operation_id,
+        request_sha256=request.request_sha256,
+        started_slice=first_started.started_slice,
+        started_checkpoint_ref=first_started_record.artifact_ref,
+        authorization_receipt_id=receipt_id,
+        evidence_refs=(_ref("first-no-effect-evidence"),),
+        no_effect_observed=True,
+    )
+    reconciliation.outcome = CapabilityAssemblyReconciliationOutcome(
+        assembly_id=ASSEMBLY_ID,
+        operation_id=request.operation_id,
+        request_sha256=request.request_sha256,
+        started_slice=first_started.started_slice,
+        started_checkpoint_ref=first_started_record.artifact_ref,
+        disposition="retry_authorized_no_effect",
+        retry_authorization=first_authorization,
+    )
+
+    restarted, _, _, restarted_factory, *_ = _controller(
+        repo,
+        reconciliation=reconciliation,
+    )
+
+    async def interrupted_again(stage_request):
+        restarted_factory.calls.append(("interrupted-again", stage_request.input.input_id))
+        raise RuntimeError("simulated second process interruption")
+
+    restarted_factory.scaffold = interrupted_again
+    with pytest.raises(RuntimeError, match="second process interruption"):
+        asyncio.run(restarted.advance(request))
+
+    second_started = restarted.projection(ASSEMBLY_ID)
+    second_started_record = repo.history(ASSEMBLY_ID)[-1]
+    assert second_started.started_slice is not None
+    reused_authorization = CapabilityAssemblyNoEffectRetryAuthorization(
+        assembly_id=ASSEMBLY_ID,
+        operation_id=request.operation_id,
+        request_sha256=request.request_sha256,
+        started_slice=second_started.started_slice,
+        started_checkpoint_ref=second_started_record.artifact_ref,
+        authorization_receipt_id=receipt_id,
+        evidence_refs=(_ref("second-no-effect-evidence"),),
+        no_effect_observed=True,
+    )
+    reconciliation.outcome = CapabilityAssemblyReconciliationOutcome(
+        assembly_id=ASSEMBLY_ID,
+        operation_id=request.operation_id,
+        request_sha256=request.request_sha256,
+        started_slice=second_started.started_slice,
+        started_checkpoint_ref=second_started_record.artifact_ref,
+        disposition="retry_authorized_no_effect",
+        retry_authorization=reused_authorization,
+    )
+
+    second_restart, _, _, second_restart_factory, *_ = _controller(
+        repo,
+        reconciliation=reconciliation,
+    )
+    before = len(repo.history(ASSEMBLY_ID))
+    with pytest.raises(CapabilityAssemblyConflict, match="authorization receipt"):
+        asyncio.run(second_restart.advance(request))
+
+    assert len(repo.history(ASSEMBLY_ID)) == before
+    assert second_restart_factory.calls == []
+
+
 def test_mismatched_reconciliation_is_rejected_without_reexecuting_started_effect() -> None:
     reconciliation = _Reconciliation()
     controller, repo, _, factory, *_ = _controller(reconciliation=reconciliation)
