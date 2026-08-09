@@ -46,3 +46,31 @@ The pytest warning is the existing Starlette `httpx` deprecation. The environmen
 - Artifact metadata validates the requested digest against current bytes and never serializes the CAS root or local object path.
 - V3 configuration is opt-in. Partial configuration raises before the service starts, and the validator must expose both validation and result-assembly callables.
 - `V3CreationPipeline` is intentionally a Task 3 composition seam. Strict team/package validation and deterministic packaging remain Task 4 work and are not claimed here.
+
+## Spec-review durable handoff and assignment-query correction
+
+The spec review found that the first implementation composed a V3 validator but did not publish the durable build assignment before validation, and the assignment polling route queried raw assignment rows without proving current lifecycle/version/deadline claimability.
+
+Behavioral RED command:
+
+```powershell
+$env:PYTHONPATH=(Resolve-Path minibook).Path
+python -m pytest minibook/tests/test_creation_api.py::test_next_assignment_exposes_only_current_claimable_or_same_worker_replay minibook/tests/test_creation_cli.py::test_production_v3_pipeline_yields_assignment_then_consumes_exact_durable_effect -q --no-cov
+```
+
+RED result: `2 failed`. The store lacked `next_claimable_build_assignment`, and the production V3 runner returned a terminal validation result on its first slice rather than persisting an assignment and yielding `awaiting_build`.
+
+The correction adds a typed store query that joins each assignment to its typed V3 job, current head, claim, and accepted effect. It returns only a non-expired current `awaiting_build` assignment or the same worker's current `building` replay; cancelled, blocked, failed, succeeded, stale-version, awaiting-user-input, expired, other-worker, and effect-accepted records are not exposed. The claim transaction remains final authority.
+
+The production V3 pipeline now completes deterministic planning, builds and publishes one typed assignment through the store, and returns only after the store has durably entered `awaiting_build`. It does not call either build-effect validation or package validation on that initial slice. After claim/effect acceptance and rescheduling, it loads the exact typed durable `FactoryBuildEffectV2`, rejects a missing or differing runner receipt, passes that exact effect to the injected validator, and records its canonical body as the external effect receipt. A crash between external-receipt recording and step completion replays only after comparing the runner receipt with the same durable effect.
+
+Fresh correction verification:
+
+- Behavioral correction tests: `2 passed, 1 warning in 1.28s`.
+- Focused Task 3 suite: `32 passed, 1 warning in 2.73s`.
+- Task 2 state/runner regression: `60 passed in 5.23s`.
+- Entire `minibook/tests`: `201 passed, 1 deselected, 1 warning in 8.47s`.
+- `python -m compileall -q minibook/swarm minibook/src`: exit 0.
+- `git diff --check`: exit 0; Git emitted only CRLF normalization notices.
+
+The warning/non-claims remain unchanged: the Starlette `httpx` warning and environment Requests dependency warning are pre-existing; no live provider, Docker, external service, Task 4 packaging, promotion, deployment, or OpenFang behavior was exercised or claimed.

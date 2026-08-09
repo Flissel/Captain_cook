@@ -210,8 +210,15 @@ if _creation_db:
         _creation_v3_validator = _load_configured_object(
             required_v3_settings["MINIBOOK_CREATION_V3_VALIDATOR"]
         )
-        if not callable(getattr(_creation_v3_validator, "validate", None)) or not callable(
-            getattr(_creation_v3_validator, "assemble_result", None)
+        required_validator_methods = (
+            "build_assignment",
+            "validate_build_effect",
+            "validate",
+            "assemble_result",
+        )
+        if any(
+            not callable(getattr(_creation_v3_validator, name, None))
+            for name in required_validator_methods
         ):
             raise RuntimeError("configured V3 creation validator is invalid")
         _creation_worker_token = required_v3_settings["MINIBOOK_CREATION_WORKER_TOKEN"]

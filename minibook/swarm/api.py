@@ -159,28 +159,10 @@ def create_creation_router(
     def next_assignment(authorization: str | None = Header(default=None)):
         bound_worker = require_worker(authorization)
         current_store = require_store()
-        with current_store._connect() as db:
-            row = db.execute(
-                """
-                SELECT assignments.payload
-                FROM creation_build_assignments AS assignments
-                LEFT JOIN creation_assignment_claims AS claims
-                  ON claims.assignment_id = assignments.assignment_id
-                LEFT JOIN creation_build_effects AS effects
-                  ON effects.assignment_id = assignments.assignment_id
-                WHERE effects.assignment_id IS NULL
-                  AND (claims.worker_id IS NULL OR claims.worker_id = ?)
-                ORDER BY assignments.rowid
-                LIMIT 1
-                """,
-                (bound_worker,),
-            ).fetchone()
-        if row is None:
+        assignment = current_store.next_claimable_build_assignment(bound_worker)
+        if assignment is None:
             return Response(status_code=204)
-        from .contracts import FactoryBuildAssignmentV2
-        return FactoryBuildAssignmentV2.model_validate_json(row["payload"]).model_dump(
-            mode="json", by_alias=True
-        )
+        return assignment.model_dump(mode="json", by_alias=True)
 
     @router.post("/v3/creation/assignments/{assignment_id}/claim")
     def claim_assignment(

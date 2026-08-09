@@ -443,6 +443,90 @@ class CreationJobStore:
             row = db.execute("SELECT payload FROM creation_build_effects WHERE assignment_id=?", (str(assignment_id),)).fetchone()
         return None if row is None else FactoryBuildEffectV2.model_validate_json(row["payload"])
 
+    def build_assignment_for_job(
+        self, job_id: UUID
+    ) -> FactoryBuildAssignmentV2 | None:
+        """Return the immutable assignment published for a V3 creation job."""
+
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT payload FROM creation_build_assignments WHERE job_id=? ORDER BY rowid",
+                (str(job_id),),
+            ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise CreationConflictError("creation job has multiple build assignments")
+        return FactoryBuildAssignmentV2.model_validate_json(rows[0]["payload"])
+
+    def next_claimable_build_assignment(
+        self,
+        worker_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> FactoryBuildAssignmentV2 | None:
+        """Return only a currently claimable assignment or this worker's live replay.
+
+        The subsequent claim transaction remains the final race authority.
+        """
+
+        if not worker_id:
+            raise ValueError("worker id is required")
+        current_time = now or datetime.now(timezone.utc)
+        if current_time.tzinfo is None:
+            raise ValueError("assignment query time must be timezone aware")
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT assignments.payload AS assignment_payload,
+                       jobs.payload AS job_payload,
+                       claims.worker_id AS claimed_worker_id,
+                       heads.status AS head_status,
+                       heads.version AS head_version
+                FROM creation_build_assignments AS assignments
+                JOIN creation_jobs AS jobs ON jobs.job_id = assignments.job_id
+                JOIN creation_heads AS heads
+                  ON heads.job_id = assignments.job_id
+                 AND heads.version = (
+                    SELECT MAX(current.version)
+                    FROM creation_heads AS current
+                    WHERE current.job_id = assignments.job_id
+                 )
+                LEFT JOIN creation_assignment_claims AS claims
+                  ON claims.assignment_id = assignments.assignment_id
+                LEFT JOIN creation_build_effects AS effects
+                  ON effects.assignment_id = assignments.assignment_id
+                WHERE effects.assignment_id IS NULL
+                  AND (claims.worker_id IS NULL OR claims.worker_id = ?)
+                ORDER BY assignments.rowid
+                """,
+                (worker_id,),
+            ).fetchall()
+        for row in rows:
+            job = self._parse_job(row["job_payload"])
+            if not isinstance(job, CreationJobV3):
+                continue
+            assignment = FactoryBuildAssignmentV2.model_validate_json(
+                row["assignment_payload"]
+            )
+            if current_time >= assignment.deadline_at:
+                continue
+            claimed_worker = row["claimed_worker_id"]
+            if claimed_worker is None:
+                is_current = (
+                    row["head_status"] == "awaiting_build"
+                    and row["head_version"] == assignment.checkpoint_version + 1
+                )
+            else:
+                is_current = (
+                    claimed_worker == worker_id
+                    and row["head_status"] == "building"
+                    and row["head_version"] == assignment.checkpoint_version + 2
+                )
+            if is_current:
+                return assignment
+        return None
+
     def action_request(self, request_id: UUID) -> FactoryActionRequestV1:
         with self._connect() as db:
             row = db.execute(

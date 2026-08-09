@@ -16,6 +16,7 @@ class StepOutcome:
     snapshot: dict[str, Any]
     effect_receipt: dict[str, Any] | None = None
     yield_status: str | None = None
+    yield_transition_persisted: bool = False
 
 
 class PipelineStepPort(Protocol):
@@ -108,7 +109,15 @@ class CreationRunner:
             if outcome.yield_status is not None:
                 if outcome.yield_status not in {"awaiting_build", "awaiting_user_input"}:
                     raise ValueError("unsupported creation yield status")
-                self.store.transition(job_id, outcome.yield_status, expected_version=step_expected_version, checkpoint=step, snapshot=outcome.snapshot)
+                if outcome.yield_transition_persisted:
+                    persisted = self.store.progress(job_id)
+                    if (
+                        persisted.status != outcome.yield_status
+                        or persisted.version != step_expected_version + 1
+                    ):
+                        raise ValueError("pipeline persisted an invalid creation yield")
+                else:
+                    self.store.transition(job_id, outcome.yield_status, expected_version=step_expected_version, checkpoint=step, snapshot=outcome.snapshot)
                 return None
             if step in self.pipeline.effectful_steps and outcome.effect_receipt is not None:
                 self.store.record_external_effect(

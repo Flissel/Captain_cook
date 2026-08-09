@@ -34,9 +34,9 @@ def client(tmp_path: Path) -> tuple[TestClient, list[str]]:
     return TestClient(app), scheduled
 
 
-def v3_job() -> CreationJobV3:
+def v3_job(**updates: object) -> CreationJobV3:
     value = json.loads((FIXTURE_ROOT / "minibook_creation_job.v3.json").read_text(encoding="utf-8"))
-    value["deadline_at"] = "2099-08-09T12:00:00Z"
+    value.update({"deadline_at": "2099-08-09T12:00:00Z"} | updates)
     return CreationJobV3.model_validate(value)
 
 
@@ -217,3 +217,48 @@ def test_artifact_metadata_never_returns_local_path(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert response.json() == {"sha256": reference.sha256, "size_bytes": 4}
     assert str(tmp_path) not in response.text
+
+
+def test_next_assignment_exposes_only_current_claimable_or_same_worker_replay(
+    tmp_path: Path,
+) -> None:
+    api, store, _, _ = v3_client(tmp_path)
+    headers = {"Authorization": "Bearer worker-secret"}
+
+    cancelled_job = v3_job(creation_job_id=str(uuid4()))
+    store.submit(cancelled_job)
+    store.transition(cancelled_job.creation_job_id, "planning", expected_version=1)
+    store.publish_build_assignment(build_assignment(cancelled_job))
+    store.cancel(cancelled_job.creation_job_id, expected_version=3)
+
+    expired_job = v3_job(
+        creation_job_id=str(uuid4()), deadline_at="2020-08-09T12:00:00Z"
+    )
+    store.submit(expired_job)
+    store.transition(expired_job.creation_job_id, "planning", expected_version=1)
+    store.publish_build_assignment(build_assignment(expired_job))
+
+    stale_job = v3_job(creation_job_id=str(uuid4()))
+    store.submit(stale_job)
+    store.transition(stale_job.creation_job_id, "planning", expected_version=1)
+    store.publish_build_assignment(build_assignment(stale_job))
+    store.transition(stale_job.creation_job_id, "awaiting_user_input", expected_version=3)
+
+    assert store.next_claimable_build_assignment("hermes-factory") is None
+    assert api.get("/v3/creation/assignments/next", headers=headers).status_code == 204
+
+    live_job = v3_job(creation_job_id=str(uuid4()))
+    store.submit(live_job)
+    store.transition(live_job.creation_job_id, "planning", expected_version=1)
+    live = store.publish_build_assignment(build_assignment(live_job))
+    assert store.next_claimable_build_assignment("hermes-factory") == live
+    assert api.get("/v3/creation/assignments/next", headers=headers).json()[
+        "assignment_id"
+    ] == str(live.assignment_id)
+
+    store.claim_build_assignment(live.assignment_id, "hermes-factory")
+    assert store.next_claimable_build_assignment("hermes-factory") == live
+    assert store.next_claimable_build_assignment("other-worker") is None
+    assert api.get("/v3/creation/assignments/next", headers=headers).json()[
+        "assignment_id"
+    ] == str(live.assignment_id)
