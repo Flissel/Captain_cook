@@ -6083,6 +6083,221 @@ class GatewayStore:
                             return dict(case)
         raise HTTPException(status_code=404, detail="holdout not found")
 
+    def record_capability_n8n_work_batch(
+        self,
+        *,
+        job: AgentFactoryJobV3,
+        batch: WorkBatch,
+    ) -> str:
+        """Atomically persist the exact Factory n8n root and its job binding."""
+
+        expected = f"n8n-{job.job_id.hex[:24]}"
+        canonical = batch.model_dump(mode="json")
+        if (
+            batch.batch_id != expected
+            or batch.target != "n8n"
+            or batch.runtime != "n8n"
+            or "n8n-builder" not in batch.capability_tags
+            or f"factory-job-id:{job.job_id}" not in batch.constraints
+            or not batch.acceptance_criteria
+            or {item.assertion_id for item in batch.acceptance_criteria}
+            != set(job.acceptance_assertion_ids)
+        ):
+            raise HTTPException(status_code=409, detail="Factory n8n WorkBatch binding mismatch")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_n8n_work_batches (
+                        job_id CHAR(36) NOT NULL PRIMARY KEY,
+                        batch_id VARCHAR(128) NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        block_index BIGINT NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT batch_id, payload, block_index FROM capability_n8n_work_batches "
+                    "WHERE job_id = %s FOR UPDATE",
+                    (str(job.job_id),),
+                )
+                registered = cursor.fetchone()
+                existing_batch = self._batch_row(cursor, batch.batch_id, for_update=True)
+                if registered is not None or existing_batch is not None:
+                    stored_payload = (
+                        None if registered is None else self._decode_json(registered["payload"])
+                    )
+                    if (
+                        registered is not None
+                        and existing_batch is not None
+                        and registered["batch_id"] == batch.batch_id
+                        and int(registered["block_index"]) == int(existing_batch["index"])
+                        and stored_payload == canonical
+                        and existing_batch["data"] == canonical
+                    ):
+                        return batch.batch_id
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Factory n8n WorkBatch persistence is partial or conflicting",
+                    )
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type="work_batch",
+                    data=canonical,
+                    status="pending",
+                    parent_index=None,
+                    metadata={
+                        "factory_job_id": str(job.job_id),
+                        "purpose": "capability_assembly_n8n",
+                    },
+                )
+                try:
+                    project_batch([block], batch.batch_id, now=_utcnow())
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                self._insert(cursor, block)
+                cursor.execute(
+                    "INSERT INTO capability_n8n_work_batches "
+                    "(job_id, batch_id, payload, block_index) VALUES (%s, %s, %s, %s)",
+                    (
+                        str(job.job_id),
+                        batch.batch_id,
+                        json.dumps(canonical, sort_keys=True),
+                        block["index"],
+                    ),
+                )
+        return batch.batch_id
+
+    def capability_n8n_work_batch(self, job_id: UUID) -> str | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_n8n_work_batches (
+                        job_id CHAR(36) NOT NULL PRIMARY KEY,
+                        batch_id VARCHAR(128) NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        block_index BIGINT NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT batch_id, payload, block_index FROM capability_n8n_work_batches "
+                    "WHERE job_id = %s",
+                    (str(job_id),),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                batch = self._batch_row(cursor, str(row["batch_id"]))
+        if (
+            batch is None
+            or int(batch["index"]) != int(row["block_index"])
+            or batch["data"] != self._decode_json(row["payload"])
+        ):
+            raise HTTPException(status_code=409, detail="Factory n8n WorkBatch readback mismatch")
+        return str(row["batch_id"])
+
+    def record_capability_tool_evidence(
+        self,
+        *,
+        tool_key: str,
+        trace_id: UUID,
+        run_id: UUID,
+        model_policy_digest: str,
+        call_ref: ArtifactRef,
+        lease_ref: ArtifactRef,
+        receipt_ref: ArtifactRef,
+        batch_id: str,
+        execution_result_id: UUID,
+    ) -> None:
+        """Admit only a WorkBatch- and Runtime-result-bound tool receipt chain."""
+
+        refs = (call_ref, lease_ref, receipt_ref)
+        if (
+            not tool_key
+            or len(model_policy_digest) != 64
+            or any(character not in "0123456789abcdef" for character in model_policy_digest)
+            or len({item.sha256 for item in refs}) != 3
+            or any(
+                item.media_type != "application/json"
+                or item.uri != f"artifact://sha256/{item.sha256}"
+                for item in refs
+            )
+        ):
+            raise HTTPException(status_code=409, detail="capability tool evidence is invalid")
+        payload = {
+            "tool_key": tool_key,
+            "trace_id": str(trace_id),
+            "run_id": str(run_id),
+            "model_policy_digest": model_policy_digest,
+            "call_ref": call_ref.model_dump(mode="json"),
+            "lease_ref": lease_ref.model_dump(mode="json"),
+            "receipt_ref": receipt_ref.model_dump(mode="json"),
+            "batch_id": batch_id,
+            "execution_result_id": str(execution_result_id),
+        }
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_evidence_registry (
+                        receipt_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                if self._batch_row(cursor, batch_id, for_update=True) is None:
+                    raise HTTPException(status_code=409, detail="tool WorkBatch is unavailable")
+                result = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_result",
+                    field="event_id",
+                    value=str(execution_result_id),
+                    for_update=True,
+                )
+                if result is None or result["data"].get("status") != "succeeded":
+                    raise HTTPException(status_code=409, detail="tool execution result is unavailable")
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_evidence_registry "
+                    "WHERE receipt_sha256 = %s FOR UPDATE",
+                    (receipt_ref.sha256,),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) == payload:
+                        return
+                    raise HTTPException(status_code=409, detail="tool evidence conflicts")
+                cursor.execute(
+                    "INSERT INTO capability_tool_evidence_registry "
+                    "(receipt_sha256, payload) VALUES (%s, %s)",
+                    (receipt_ref.sha256, json.dumps(payload, sort_keys=True)),
+                )
+
+    def capability_tool_evidence(self, receipt_sha256: str) -> dict[str, Any] | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_evidence_registry (
+                        receipt_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_evidence_registry "
+                    "WHERE receipt_sha256 = %s",
+                    (receipt_sha256,),
+                )
+                row = cursor.fetchone()
+        return None if row is None else dict(self._decode_json(row["payload"]))
+
     def _batch_row(
         self,
         cursor: Any,

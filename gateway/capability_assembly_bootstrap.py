@@ -13,7 +13,7 @@ import json
 import re
 import secrets
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -323,6 +323,9 @@ class CaptainBenchmarkToolEvidenceAuthority:
             call = self._read(request.call_ref)
             lease = self._read(request.lease_ref)
             receipt = self._read(request.receipt_ref)
+            registry = self.gateway_store.capability_tool_evidence(
+                request.receipt_ref.sha256
+            )
         except Exception:
             return False
         common = {
@@ -330,8 +333,19 @@ class CaptainBenchmarkToolEvidenceAuthority:
             "trace_id": str(request.trace_id),
             "run_id": str(request.run_id),
         }
+        expected_registry = {
+            **common,
+            "model_policy_digest": request.model_policy_digest,
+            "call_ref": request.call_ref.model_dump(mode="json"),
+            "lease_ref": request.lease_ref.model_dump(mode="json"),
+            "receipt_ref": request.receipt_ref.model_dump(mode="json"),
+        }
         return (
-            call
+            isinstance(registry, dict)
+            and all(registry.get(key) == value for key, value in expected_registry.items())
+            and isinstance(registry.get("batch_id"), str)
+            and isinstance(registry.get("execution_result_id"), str)
+            and call
             == {
                 "schema": "captain.capability-tool-call.v1",
                 **common,
@@ -368,44 +382,14 @@ class CaptainBenchmarkToolEvidenceAuthority:
         return value
 
 
-@dataclass(frozen=True)
-class _RootWorkBatchWrite:
-    block_type: str
-    data: dict[str, Any]
-    status: str = "pending"
-    parent_index: int | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
 class GatewayCapabilityN8nWorkBatchAuthority:
     """Persist and resolve only the deterministic Factory-owned n8n root batch."""
 
     def __init__(self, *, gateway_store: GatewayStore) -> None:
         self.gateway_store = gateway_store
-        self._schema_ready = False
-        self._schema_lock = Lock()
-
-    def _ensure_schema(self) -> None:
-        if self._schema_ready:
-            return
-        with self._schema_lock:
-            if self._schema_ready:
-                return
-            with self.gateway_store.storage.transaction() as connection:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS capability_n8n_work_batches (
-                            job_id CHAR(36) NOT NULL PRIMARY KEY,
-                            batch_id VARCHAR(128) NOT NULL UNIQUE,
-                            created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-                        ) ENGINE=InnoDB
-                        """
-                    )
-            self._schema_ready = True
+        self._pending: dict[UUID, WorkBatch] = {}
 
     def persist_work_batch(self, job: AgentFactoryJobV3, batch: WorkBatch) -> None:
-        self._ensure_schema()
         expected = self._expected(job.job_id)
         if (
             batch.batch_id != expected
@@ -417,61 +401,33 @@ class GatewayCapabilityN8nWorkBatchAuthority:
             raise CapabilityLiveAuthorityUnavailable(
                 "n8n WorkBatch is not bound to the Factory job"
             )
-        self.gateway_store.append(
-            _RootWorkBatchWrite(
-                block_type="work_batch",
-                data=batch.model_dump(mode="json"),
-                metadata={
-                    "factory_job_id": str(job.job_id),
-                    "purpose": "capability_assembly_n8n",
-                },
-            ),
-            None,
-        )
+        prior = self._pending.get(job.job_id)
+        if prior is not None and prior != batch:
+            raise CapabilityLiveAuthorityUnavailable("n8n WorkBatch staging conflicts")
+        self._pending[job.job_id] = batch
 
     def register_n8n_work_batch(self, job: AgentFactoryJobV3, batch_id: str) -> None:
-        self._ensure_schema()
         if batch_id != self._expected(job.job_id):
             raise CapabilityLiveAuthorityUnavailable("n8n WorkBatch identity changed")
-        projection = self.gateway_store.batch_projection(batch_id)
-        if getattr(projection, "batch_id", None) != batch_id:
-            raise CapabilityLiveAuthorityUnavailable("n8n WorkBatch readback is unavailable")
-        with self.gateway_store.storage.transaction() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT batch_id FROM capability_n8n_work_batches "
-                    "WHERE job_id = %s FOR UPDATE",
-                    (str(job.job_id),),
-                )
-                prior = cursor.fetchone()
-                if prior is not None and prior["batch_id"] != batch_id:
-                    raise CapabilityLiveAuthorityUnavailable(
-                        "n8n WorkBatch registration conflicts"
-                    )
-                if prior is None:
-                    cursor.execute(
-                        "INSERT INTO capability_n8n_work_batches (job_id, batch_id) "
-                        "VALUES (%s, %s)",
-                        (str(job.job_id), batch_id),
-                    )
+        batch = self._pending.get(job.job_id)
+        if batch is None or batch.batch_id != batch_id:
+            existing = self.gateway_store.capability_n8n_work_batch(job.job_id)
+            if existing == batch_id:
+                return
+            raise CapabilityLiveAuthorityUnavailable("n8n WorkBatch staging is unavailable")
+        recorded = self.gateway_store.record_capability_n8n_work_batch(job=job, batch=batch)
+        if recorded != batch_id:
+            raise CapabilityLiveAuthorityUnavailable("n8n WorkBatch readback changed identity")
+        self._pending.pop(job.job_id, None)
 
     def active_n8n_work_batch_id(self, job_id: UUID) -> str | None:
-        self._ensure_schema()
-        with self.gateway_store.storage.transaction() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT batch_id FROM capability_n8n_work_batches WHERE job_id = %s",
-                    (str(job_id),),
-                )
-                row = cursor.fetchone()
-        batch_id = None if row is None else str(row["batch_id"])
-        if batch_id is None or batch_id != self._expected(job_id):
-            return None
         try:
-            projection = self.gateway_store.batch_projection(batch_id)
+            batch_id = self.gateway_store.capability_n8n_work_batch(job_id)
         except Exception:
             return None
-        return batch_id if getattr(projection, "batch_id", None) == batch_id else None
+        if batch_id is None or batch_id != self._expected(job_id):
+            return None
+        return batch_id
 
     @staticmethod
     def _expected(job_id: UUID) -> str:

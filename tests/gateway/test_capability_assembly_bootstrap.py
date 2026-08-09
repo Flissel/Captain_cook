@@ -141,7 +141,20 @@ def test_tool_evidence_authority_requires_three_gateway_bound_cas_documents() ->
         separators=(",", ":"),
     ).encode()
     refs = tuple(_ref(item) for item in (call_payload, lease_payload, receipt_payload))
-    store = object()
+    registry = {
+        "tool_key": tool_key,
+        "trace_id": str(trace_id),
+        "run_id": str(run_id),
+        "model_policy_digest": policy,
+        "call_ref": refs[0].model_dump(mode="json"),
+        "lease_ref": refs[1].model_dump(mode="json"),
+        "receipt_ref": refs[2].model_dump(mode="json"),
+        "batch_id": "n8n-batch",
+        "execution_result_id": str(uuid4()),
+    }
+    store = SimpleNamespace(
+        capability_tool_evidence=lambda _digest: registry
+    )
     authority = CaptainBenchmarkToolEvidenceAuthority(
         gateway_store=store,
         artifacts=_Artifacts(
@@ -194,6 +207,15 @@ class _Store:
         if batch_id not in self.projections:
             raise LookupError(batch_id)
         return self.projections[batch_id]
+
+    def record_capability_n8n_work_batch(self, *, job: object, batch: object) -> str:
+        batch_id = str(getattr(batch, "batch_id"))
+        self.storage.rows[str(getattr(job, "job_id"))] = batch_id
+        self.projections[batch_id] = SimpleNamespace(batch_id=batch_id, status="pending")
+        return batch_id
+
+    def capability_n8n_work_batch(self, job_id: UUID) -> str | None:
+        return self.storage.rows.get(str(job_id))
 
 
 class _SqlCursor:
