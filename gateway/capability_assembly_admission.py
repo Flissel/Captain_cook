@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
+from typing import Protocol
 
 from agenten.agent_factory.holdout_store import PrivateHoldoutStore
 from agenten.agent_factory.input_compiler import FactoryInputCompiler
@@ -13,6 +14,7 @@ from agenten.agent_factory.input_document import (
     parse_factory_input_bytes,
 )
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
+from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_runtime.production_bootstrap import (
     RuntimeAdapterManifestError,
     read_verified_repository_bytes,
@@ -41,6 +43,12 @@ class CapabilityAssemblyAdmissionError(ValueError):
     """A repository input cannot be admitted without changing its authority."""
 
 
+class FactoryInputArtifactAdmissionPort(Protocol):
+    """Persist exact verified bytes under their canonical Factory input ref."""
+
+    def put_factory_input(self, source: bytes) -> ArtifactRef: ...
+
+
 class RepositoryCapabilityAssemblyInputAdmission:
     """Single-open, Git-attested implementation of the assembly admission port."""
 
@@ -55,6 +63,7 @@ class RepositoryCapabilityAssemblyInputAdmission:
         ],
         holdout_store: PrivateHoldoutStore,
         subject_version: int,
+        source_artifacts: FactoryInputArtifactAdmissionPort | None = None,
     ) -> None:
         if _REVISION.fullmatch(expected_repository_revision) is None:
             raise ValueError("expected repository revision is invalid")
@@ -89,6 +98,7 @@ class RepositoryCapabilityAssemblyInputAdmission:
         self._compiled_tool_gaps_by_source_sha256 = compiled_tool_gaps
         self._compiler = FactoryInputCompiler(holdout_store=holdout_store)
         self._subject_version = subject_version
+        self._source_artifacts = source_artifacts
 
     def admit(
         self,
@@ -123,6 +133,12 @@ class RepositoryCapabilityAssemblyInputAdmission:
                 compiled_specification=compiled,
                 tool_gaps=self._compiled_tool_gaps_by_source_sha256[expected_digest],
             )
+            if self._source_artifacts is not None:
+                stored = self._source_artifacts.put_factory_input(source)
+                if stored != canonical.source_ref:
+                    raise ValueError(
+                        "Factory input artifact store changed canonical source authority"
+                    )
         except (FactoryInputError, RuntimeAdapterManifestError, ValueError) as exc:
             raise CapabilityAssemblyAdmissionError(str(exc)) from None
         return CapabilityAssemblyAdmittedInput(
@@ -156,5 +172,6 @@ def _conversation_pattern(source: bytes) -> str:
 
 __all__ = [
     "CapabilityAssemblyAdmissionError",
+    "FactoryInputArtifactAdmissionPort",
     "RepositoryCapabilityAssemblyInputAdmission",
 ]
