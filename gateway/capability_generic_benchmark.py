@@ -5,8 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import secrets
-import threading
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
@@ -247,23 +245,52 @@ class GenericPrivateHoldoutReader(Protocol):
     def get(self, uri: str) -> str: ...
 
 
-class ScopedPrivateCaseAccess:
-    __slots__ = ("case_ref", "__token", "_resolved")
+@dataclass(slots=True)
+class _PrivateCaseAccessState:
+    active: bool = True
 
-    def __init__(self, *, case_ref: GenericPrivateCaseRef, token: str) -> None:
-        self.case_ref = case_ref
-        self.__token = token
+
+class ScopedPrivateCaseAccess:
+    """Executor capability containing only its pre-materialized execution view."""
+
+    __slots__ = ("case_ref", "__view", "__state", "_resolved")
+
+    def __init__(self, *, view: GenericExecutionCaseView,
+                 state: _PrivateCaseAccessState) -> None:
+        self.case_ref = view.case_ref
+        self.__view = view
+        self.__state = state
         self._resolved = False
 
-    def resolve(self) -> GenericExecutionCaseView | GenericEvaluationCaseView:
+    def resolve(self) -> GenericExecutionCaseView:
         if self._resolved:
             raise CapabilityLiveAuthorityUnavailable("private case access is single use")
         self._resolved = True
-        return _redeem_private_case_capability(self.__token)
+        if not self.__state.active:
+            raise CapabilityLiveAuthorityUnavailable("private case capability is stale")
+        return self.__view
 
     @property
     def resolved(self) -> bool:
         return self._resolved
+
+
+class _ScopedPrivateEvaluationAccess:
+    __slots__ = ("__view", "__state", "_resolved")
+
+    def __init__(self, *, view: GenericEvaluationCaseView,
+                 state: _PrivateCaseAccessState) -> None:
+        self.__view = view
+        self.__state = state
+        self._resolved = False
+
+    def resolve(self) -> GenericEvaluationCaseView:
+        if self._resolved:
+            raise CapabilityLiveAuthorityUnavailable("private case access is single use")
+        self._resolved = True
+        if not self.__state.active:
+            raise CapabilityLiveAuthorityUnavailable("private case capability is stale")
+        return self.__view
 
 
 class GenericPrivateBenchmarkRepository:
@@ -282,7 +309,7 @@ class GenericPrivateBenchmarkRepository:
         self._executor_authority_id = executor_authority_id
         self._evaluator_authority_id = evaluator_authority_id
         self._definitions: dict[str, GenericPrivateCaseDefinition] = {}
-        self._issued_tokens: dict[str, str] = {}
+        self._access_states: dict[str, list[_PrivateCaseAccessState]] = {}
 
     def binds_authorities(
         self, *, executor_authority_id: UUID, evaluator_authority_id: UUID,
@@ -346,15 +373,16 @@ class GenericPrivateBenchmarkRepository:
     def scoped_access(
         self, case_ref: GenericPrivateCaseRef, *,
         purpose: Literal["execution", "evaluation"], authority_id: UUID,
-    ) -> ScopedPrivateCaseAccess:
+    ) -> ScopedPrivateCaseAccess | _ScopedPrivateEvaluationAccess:
         self._require_purpose_authority(purpose, authority_id)
-        token = secrets.token_urlsafe(32)
-        with _PRIVATE_CAPABILITY_LOCK:
-            _PRIVATE_CAPABILITIES[token] = (self, case_ref, purpose, authority_id)
-            self._issued_tokens[token] = case_ref.case_id
-        return ScopedPrivateCaseAccess(
-            case_ref=case_ref, token=token,
+        view = self.resolve(
+            case_ref, purpose=purpose, authority_id=authority_id,
         )
+        state = _PrivateCaseAccessState()
+        self._access_states.setdefault(case_ref.case_id, []).append(state)
+        if isinstance(view, GenericExecutionCaseView):
+            return ScopedPrivateCaseAccess(view=view, state=state)
+        return _ScopedPrivateEvaluationAccess(view=view, state=state)
 
     def resolve(
         self, case_ref: GenericPrivateCaseRef, *,
@@ -381,14 +409,9 @@ class GenericPrivateBenchmarkRepository:
 
     def retire(self, suite: GenericBenchmarkSuite) -> None:
         retired_ids = {case_ref.case_id for case_ref in suite.cases}
-        tokens = tuple(
-            token for token, case_id in self._issued_tokens.items()
-            if case_id in retired_ids
-        )
-        with _PRIVATE_CAPABILITY_LOCK:
-            for token in tokens:
-                _PRIVATE_CAPABILITIES.pop(token, None)
-                self._issued_tokens.pop(token, None)
+        for case_id in retired_ids:
+            for state in self._access_states.pop(case_id, ()):
+                state.active = False
         for case_ref in suite.cases:
             self._definitions.pop(case_ref.case_id, None)
 
@@ -403,33 +426,6 @@ class GenericPrivateBenchmarkRepository:
             raise CapabilityLiveAuthorityUnavailable(
                 "private case purpose authority is invalid"
             )
-
-
-_PRIVATE_CAPABILITY_LOCK = threading.Lock()
-_PRIVATE_CAPABILITIES: dict[
-    str, tuple[
-        GenericPrivateBenchmarkRepository,
-        GenericPrivateCaseRef,
-        Literal["execution", "evaluation"],
-        UUID,
-    ]
-] = {}
-
-
-def _redeem_private_case_capability(
-    token: str,
-) -> GenericExecutionCaseView | GenericEvaluationCaseView:
-    with _PRIVATE_CAPABILITY_LOCK:
-        issued = _PRIVATE_CAPABILITIES.pop(token, None)
-        if issued is not None:
-            issued[0]._issued_tokens.pop(token, None)
-    if issued is None:
-        raise CapabilityLiveAuthorityUnavailable("private case capability is stale")
-    repository, case_ref, purpose, authority_id = issued
-    return repository.resolve(
-        case_ref, purpose=purpose, authority_id=authority_id,
-    )
-
 
 class ContentAddressedBenchmarkEvidenceResolver:
     """Resolve exact JSON evidence bytes from Captain CAS and recheck the ref."""

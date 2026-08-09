@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import json
 import subprocess
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid5
 
 import pytest
+import gateway.capability_generic_benchmark as generic_benchmark_module
 
 from agenten.agent_factory.capability_live_runner import (
     CapabilityLiveReservation,
@@ -56,6 +58,7 @@ from gateway.capability_generic_benchmark import (
     BenchmarkToolEvidenceVerificationRequest,
     GenericBenchmarkCategory,
     GenericBenchmarkExecutionEvidence,
+    GenericEvaluationCaseView,
     GenericPrivateCaseDefinition,
     GenericBenchmarkReceipt,
     GenericCapabilityBenchmarkAdapter,
@@ -1200,6 +1203,25 @@ def test_generic_suite_uses_compiled_private_authority_and_all_five_categories()
         )
 
 
+def test_materialized_execution_capability_is_revoked_by_suite_retirement() -> None:
+    holdouts = InMemoryPrivateHoldoutStore()
+    admitted, _ = _admitted_demo(
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
+    )
+    canonical = _with_grounded_benchmark_sources(admitted.input, holdouts)
+    repository = _private_case_repository(holdouts)
+    suite = build_generic_benchmark_suite(canonical, repository)
+    access = repository.scoped_access(
+        suite.cases[0], purpose="execution",
+        authority_id=_id("test-private-case-executor"),
+    )
+
+    repository.retire(suite)
+
+    with pytest.raises(CapabilityLiveAuthorityUnavailable, match="stale"):
+        access.resolve()
+
+
 def test_raw_execution_contract_contains_no_executor_authored_verdicts() -> None:
     fields = set(GenericBenchmarkExecutionEvidence.__dataclass_fields__)
     assert fields.isdisjoint({
@@ -1512,6 +1534,27 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             access = execution_request.private_case_access
             assert not hasattr(access, "_repository")
             assert not hasattr(access, "__dict__")
+            escaped_token = getattr(
+                access, "_ScopedPrivateCaseAccess__token", None
+            )
+            escaped_registry = getattr(
+                generic_benchmark_module, "_PRIVATE_CAPABILITIES", None
+            )
+            assert escaped_token is None
+            assert escaped_registry is None
+            frontier = list(gc.get_referents(access))
+            seen: set[int] = set()
+            while frontier:
+                referent = frontier.pop()
+                if id(referent) in seen or isinstance(referent, type):
+                    continue
+                seen.add(id(referent))
+                assert not isinstance(referent, (
+                    GenericPrivateBenchmarkRepository,
+                    GenericEvaluationCaseView,
+                    BenchmarkExpectedPredicate,
+                ))
+                frontier.extend(gc.get_referents(referent))
             assert not any(
                 isinstance(getattr(access, name), GenericPrivateBenchmarkRepository)
                 for name in dir(access)
