@@ -32,6 +32,7 @@ def write_isolated_codex_config(*, root: Path, proxy_base_url: str) -> Path:
                 'name = "Captain localhost budget proxy"',
                 f'base_url = "{proxy_base_url.rstrip("/")}"',
                 'env_key = "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"',
+                'env_http_headers = { "X-Captain-Provider-Context-Ref" = "CAPTAIN_PROVIDER_CONTEXT_REF" }',
                 'wire_api = "responses"',
                 "request_max_retries = 0",
                 "stream_max_retries = 0",

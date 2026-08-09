@@ -1224,6 +1224,17 @@ def create_app(
             now=datetime.now(timezone.utc),
         )
 
+    @app.get("/v1/capability-resumes/provider-authorities/by-context/{context_sha256}")
+    async def resolve_runtime_provider_authority(
+        context_sha256: str,
+        _: GatewayRole = Depends(require_provider_receipt_authority),
+    ) -> ProviderBudgetContextV1:
+        return await run_in_threadpool(
+            get_store().resolve_provider_proxy_authority,
+            f"gateway://provider-budget-contexts/{context_sha256}",
+            now=datetime.now(timezone.utc),
+        )
+
     @app.post("/v1/capability-resumes/cost-authorities/settle")
     async def settle_capability_resume_cost(
         request: RuntimeResumeCostSettlementRequestV1,

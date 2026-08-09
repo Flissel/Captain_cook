@@ -56,6 +56,13 @@ def test_runner_script_can_load_package_from_scripts_directory() -> None:
 @pytest.mark.asyncio
 async def test_runtime_finalizes_provider_before_gateway_cost_settlement() -> None:
     command = resume_command_with_cost()
+    command = command.model_copy(
+        update={
+            "payload": command.payload.model_copy(
+                update={"provider_context_sha256": "c" * 64}
+            )
+        }
+    )
     authority = await FakeCostAuthority().authorize(command)
     grant = FakeCapabilityPolicy().derive(command, batch_for(command), command.occurred_at)
     result = FakeCodex(["command_accepted", "grant_recorded"])._result(command, grant)
@@ -65,6 +72,10 @@ async def test_runtime_finalizes_provider_before_gateway_cost_settlement() -> No
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.port == 18091:
             order.append("provider-finalized")
+            assert request.headers["X-Captain-Provider-Context-Ref"] == (
+                "gateway://provider-budget-contexts/"
+                + str(command.payload.provider_context_sha256)
+            )
             return httpx.Response(200, json={"schema": "settlement"})
         order.append("runtime-cost-settled")
         return httpx.Response(200, json=expected.model_dump(mode="json", by_alias=True))

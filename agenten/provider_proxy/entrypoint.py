@@ -11,11 +11,12 @@ from pathlib import Path
 import httpx
 import uvicorn
 
-from .app import create_provider_proxy_app
+from .app import create_dynamic_provider_proxy_app
 from .codex_config import write_isolated_codex_config
 from .contracts import OpenAIPriceCardV1, ProviderBudgetContextV1, RuntimeProviderPolicyV1
 from .repository import SQLiteProviderBudgetRepository
 from .service import ProviderBudgetProxy
+from .supervisor import DynamicProviderBudgetProxySupervisor
 from .transports import GatewayProviderSettlementHTTPClient, OpenAIResponsesHTTPClient
 
 
@@ -50,7 +51,6 @@ def _load_contract(path: Path, contract_type):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Captain's bounded Responses proxy")
-    parser.add_argument("--context", type=Path, required=True)
     parser.add_argument("--price-card", type=Path, required=True)
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--state-root", type=Path, required=True)
@@ -63,7 +63,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     require_distinct_authority_secrets(os.environ)
-    context = _load_contract(args.context, ProviderBudgetContextV1)
     card = _load_contract(args.price_card, OpenAIPriceCardV1)
     policy = _load_contract(args.policy, RuntimeProviderPolicyV1)
     state_root = args.state_root.resolve()
@@ -81,23 +80,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     from datetime import datetime, timezone
 
-    proxy = ProviderBudgetProxy(
-        context=context,
-        policy=policy,
-        price_card=card,
-        repository=SQLiteProviderBudgetRepository(state_root / "budget.sqlite3"),
-        cas_root=state_root / "cas",
-        provider=provider,
-        gateway=gateway,
-        clock=lambda: datetime.now(timezone.utc),
+    def proxy_for(context: ProviderBudgetContextV1) -> ProviderBudgetProxy:
+        context_root = state_root / "contexts" / context.sha256
+        return ProviderBudgetProxy(
+            context=context,
+            policy=policy,
+            price_card=card,
+            repository=SQLiteProviderBudgetRepository(context_root / "budget.sqlite3"),
+            cas_root=context_root / "cas",
+            provider=provider,
+            gateway=gateway,
+            clock=lambda: datetime.now(timezone.utc),
+        )
+
+    supervisor = DynamicProviderBudgetProxySupervisor(
+        resolver=gateway,
+        proxy_factory=proxy_for,
     )
     if args.codex_home is not None:
         write_isolated_codex_config(
             root=args.codex_home,
             proxy_base_url=f"http://127.0.0.1:{args.port}/v1",
         )
-    app = create_provider_proxy_app(
-        proxy=proxy,
+    app = create_dynamic_provider_proxy_app(
+        supervisor=supervisor,
         client_token=os.environ["CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"],
         runtime_finalize_token=os.environ["CAPTAIN_RUNTIME_TOKEN"],
     )

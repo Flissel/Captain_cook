@@ -2715,6 +2715,65 @@ class GatewayStore:
                     raise HTTPException(status_code=409, detail="provider authority is unavailable")
                 return context
 
+    def resolve_provider_proxy_authority(
+        self,
+        reference: str,
+        *,
+        now: datetime,
+    ) -> ProviderBudgetContextV1:
+        """Resolve one opaque context reference from authoritative command state."""
+
+        prefix = "gateway://provider-budget-contexts/"
+        digest = reference.removeprefix(prefix) if reference.startswith(prefix) else ""
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise HTTPException(status_code=409, detail="provider authority is unavailable")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="payload.provider_context_sha256",
+                    value=digest,
+                    for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=409, detail="provider authority is unavailable")
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                authority = self._validate_capability_resume_cost_authority_with_cursor(
+                    cursor, command, now=now
+                )
+                if (
+                    not authority.hard_ceiling_enforced
+                    or authority.provider_context_sha256 != digest
+                    or authority.provider_session_id is None
+                    or authority.provider_result_id is None
+                    or authority.provider_policy_sha256 is None
+                    or authority.provider_price_card_sha256 is None
+                ):
+                    raise HTTPException(status_code=409, detail="provider authority is unavailable")
+                context = ProviderBudgetContextV1(
+                    schema="captain.provider-budget-context.v1",
+                    command_id=authority.command_id,
+                    original_command_id=command.causation_id or command.event_id,
+                    result_id=authority.provider_result_id,
+                    reservation_id=authority.reservation_id,
+                    job_id=authority.job_id,
+                    run_id=authority.run_id,
+                    input_id=authority.input_id,
+                    correlation_id=authority.correlation_id,
+                    capability_id=authority.capability_id,
+                    capability_version=authority.capability_version,
+                    session_id=authority.provider_session_id,
+                    cost_authority_ref=authority.cost_authority_ref,
+                    ceiling_usd=authority.ceiling_usd,
+                    expires_at=authority.expires_at,
+                    policy_sha256=authority.provider_policy_sha256,
+                    price_card_sha256=authority.provider_price_card_sha256,
+                )
+                if context.sha256 != digest:
+                    raise HTTPException(status_code=409, detail="provider authority is unavailable")
+                return context
+
     def _validate_capability_resume_cost_authority_with_cursor(
         self,
         cursor: Any,

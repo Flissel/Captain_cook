@@ -162,6 +162,27 @@ class GatewayProviderSettlementHTTPClient:
             raise RuntimeError("Gateway provider authority is unavailable")
         return returned
 
+    async def resolve_provider_authority(
+        self, reference: str
+    ) -> ProviderBudgetContextV1:
+        prefix = "gateway://provider-budget-contexts/"
+        digest = reference.removeprefix(prefix) if reference.startswith(prefix) else ""
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise RuntimeError("Gateway provider authority is unavailable")
+        response = await self._client.get(
+            f"{self._base_url}/v1/capability-resumes/provider-authorities/by-context/{digest}",
+            headers={"Authorization": f"Bearer {self._provider_token}"},
+        )
+        if response.status_code != 200:
+            raise RuntimeError("Gateway provider authority is unavailable")
+        try:
+            returned = ProviderBudgetContextV1.model_validate(response.json())
+        except (ValueError, TypeError):
+            raise RuntimeError("Gateway provider authority is unavailable") from None
+        if returned.sha256 != digest:
+            raise RuntimeError("Gateway provider authority is unavailable")
+        return returned
+
     async def record_provider_settlement(self, payload: dict[str, object]) -> None:
         response = await self._client.post(
             f"{self._base_url}/v1/capability-resumes/provider-settlements",

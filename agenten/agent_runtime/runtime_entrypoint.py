@@ -247,10 +247,18 @@ class ProviderProxyRuntimeFinalizer:
     async def finalize(
         self, command: AgentRuntimeCommand, result: AgentRuntimeResult
     ) -> None:
+        context_sha256 = command.payload.provider_context_sha256
+        if context_sha256 is None:
+            raise GatewayRuntimeError("provider finalization context is unavailable")
         try:
             response = await self._client.post(
                 f"{self._base_url}/v1/captain/provider-settlements/finalize",
-                headers={"Authorization": f"Bearer {self._token}"},
+                headers={
+                    "Authorization": f"Bearer {self._token}",
+                    "X-Captain-Provider-Context-Ref": (
+                        "gateway://provider-budget-contexts/" + context_sha256
+                    ),
+                },
                 json={
                     "command_id": str(command.event_id),
                     "result_id": str(result.event_id),

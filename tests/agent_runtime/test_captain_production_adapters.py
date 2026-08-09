@@ -1503,6 +1503,9 @@ async def test_proxy_bound_runtime_child_has_only_proxy_credential_and_immutable
     assert captured is not None
     child = captured.child_environment()
     assert child["CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"] == "proxy-only"
+    assert child["CAPTAIN_PROVIDER_CONTEXT_REF"] == (
+        "gateway://provider-budget-contexts/" + "6" * 64
+    )
     assert "OPENAI_API_KEY" not in child
     assert not any(name in child for name in (
         "CAPTAIN_GATEWAY_TOKEN", "CAPTAIN_RUNTIME_TOKEN",

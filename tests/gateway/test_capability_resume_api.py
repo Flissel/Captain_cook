@@ -943,6 +943,10 @@ def test_gateway_claims_hard_ceiling_only_for_exact_active_proxy_binding() -> No
     assert store.validate_provider_proxy_authority(
         context, now=datetime(2026, 8, 9, tzinfo=timezone.utc)
     ) == context
+    assert store.resolve_provider_proxy_authority(
+        f"gateway://provider-budget-contexts/{context.sha256}",
+        now=datetime(2026, 8, 9, tzinfo=timezone.utc),
+    ) == context
 
     with pytest.raises(HTTPException, match="provider authority is unavailable"):
         store.validate_provider_proxy_authority(
