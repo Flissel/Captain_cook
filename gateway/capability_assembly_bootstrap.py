@@ -17,14 +17,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 from weakref import WeakKeyDictionary
 
 import httpx
 from fastapi import HTTPException
-from pydantic import SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from agenten.agent_factory.capability_live_runner import CapabilityLiveStage
 from agenten.agent_factory.contracts import AgentFactoryJobV3
@@ -115,6 +115,7 @@ class CapabilityAssemblyBootstrapSettings:
     minibook_url: str
     minibook_api_key: SecretStr
     minibook_projection_api_key: SecretStr
+    runtime_url: str
     runtime_token: SecretStr
     provider_token: SecretStr
     provider_url: str
@@ -134,6 +135,7 @@ _REQUIRED_BOOTSTRAP_NAMES = (
     "MINIBOOK_BACKEND_URL",
     "MINIBOOK_API_KEY",
     "MINIBOOK_PROJECTION_API_KEY",
+    "CAPTAIN_RUNTIME_URL",
     "CAPTAIN_RUNTIME_TOKEN",
     "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
     "CAPTAIN_PROVIDER_PROXY_URL",
@@ -239,6 +241,11 @@ def load_capability_assembly_bootstrap_settings(
             raw["MINIBOOK_PROJECTION_API_KEY"]
         ),
         runtime_token=SecretStr(raw["CAPTAIN_RUNTIME_TOKEN"]),
+        runtime_url=_allowed_service_url(
+            raw["CAPTAIN_RUNTIME_URL"],
+            allowed_hosts=allowed_hosts,
+            label="Runtime",
+        ),
         provider_token=SecretStr(raw["CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"]),
         provider_url=provider_url,
         provider_policy_sha256=raw["CAPTAIN_PROVIDER_POLICY_SHA256"],
@@ -291,6 +298,142 @@ def _allowed_endpoint(
 
 def _is_loopback(host: str) -> bool:
     return host in {"localhost", "127.0.0.1", "::1"}
+
+
+class CapabilityProductionProcessBindingV1(BaseModel):
+    """Secret-free operator binding for one concrete production process."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    service: Literal["gateway", "benchmark", "runtime", "provider_proxy", "minibook"]
+    base_url: str
+    health_url: str
+    execute_url: str | None = None
+    authentication: Literal["bearer"] = "bearer"
+
+
+class CapabilityProductionBundleManifestV1(BaseModel):
+    """Digest-bound, secret-free contract consumed by the demo orchestrator."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+    schema_name: Literal["captain.capability-production-bundle-manifest.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    provider_supervisor_mode: Literal["dynamic_gateway_context_v1"]
+    provider_context_reference_header: Literal["X-Captain-Provider-Context-Ref"]
+    provider_policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_price_card_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    gateway: CapabilityProductionProcessBindingV1
+    benchmark: CapabilityProductionProcessBindingV1
+    runtime: CapabilityProductionProcessBindingV1
+    provider_proxy: CapabilityProductionProcessBindingV1
+    minibook: CapabilityProductionProcessBindingV1
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CapabilityProductionBundleHealthV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+    schema_name: Literal["captain.capability-production-bundle-health.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: Literal["ready", "incomplete"]
+    ready_services: tuple[str, ...]
+
+
+_OPERATOR_REQUIRED_NAMES = (
+    "CAPTAIN_GATEWAY_URL",
+    "CAPTAIN_GATEWAY_TOKEN",
+    "CAPTAIN_CAPABILITY_BENCHMARK_URL",
+    "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+    "CAPTAIN_RUNTIME_URL",
+    "CAPTAIN_RUNTIME_TOKEN",
+    "CAPTAIN_PROVIDER_PROXY_URL",
+    "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
+    "CAPTAIN_PROVIDER_POLICY_SHA256",
+    "CAPTAIN_PROVIDER_PRICE_CARD_SHA256",
+    "MINIBOOK_BACKEND_URL",
+    "MINIBOOK_API_KEY",
+    "MINIBOOK_PROJECTION_API_KEY",
+)
+
+
+def load_capability_production_bundle_manifest(
+    *, environment: Mapping[str, str]
+) -> CapabilityProductionBundleManifestV1:
+    """Validate and export operator topology without filesystem or network I/O."""
+
+    raw = {name: environment.get(name, "").strip() for name in _OPERATOR_REQUIRED_NAMES}
+    if any(not value for value in raw.values()):
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "capability assembly bootstrap configuration is incomplete"
+        )
+    credentials = tuple(
+        raw[name]
+        for name in _OPERATOR_REQUIRED_NAMES
+        if name.endswith("_TOKEN") or name.endswith("_KEY")
+    )
+    if any(
+        secrets.compare_digest(left, right)
+        for index, left in enumerate(credentials)
+        for right in credentials[index + 1 :]
+    ):
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "capability assembly credentials must be distinct"
+        )
+    for name in ("CAPTAIN_PROVIDER_POLICY_SHA256", "CAPTAIN_PROVIDER_PRICE_CARD_SHA256"):
+        if _SHA256.fullmatch(raw[name]) is None:
+            raise CapabilityAssemblyBootstrapConfigurationError(
+                "capability assembly provider authority is invalid"
+            )
+    allowed_hosts = tuple(
+        sorted(
+            value.strip().casefold()
+            for value in environment.get("CAPTAIN_CAPABILITY_ALLOWED_HOSTS", "").split(",")
+            if value.strip()
+        )
+    )
+    gateway = _allowed_service_url(raw["CAPTAIN_GATEWAY_URL"], allowed_hosts=allowed_hosts, label="Gateway")
+    runtime = _allowed_service_url(raw["CAPTAIN_RUNTIME_URL"], allowed_hosts=allowed_hosts, label="Runtime")
+    minibook = _allowed_service_url(raw["MINIBOOK_BACKEND_URL"], allowed_hosts=allowed_hosts, label="Minibook")
+    provider = _allowed_service_url(raw["CAPTAIN_PROVIDER_PROXY_URL"], allowed_hosts=allowed_hosts, label="provider proxy")
+    benchmark = _allowed_endpoint(raw["CAPTAIN_CAPABILITY_BENCHMARK_URL"], allowed_hosts=allowed_hosts, label="benchmark")
+    if not benchmark.endswith("/v1/execute") or not provider.endswith("/v1"):
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "capability assembly operator endpoint contract is invalid"
+        )
+    material: dict[str, object] = {
+        "schema": "captain.capability-production-bundle-manifest.v1",
+        "provider_supervisor_mode": "dynamic_gateway_context_v1",
+        "provider_context_reference_header": "X-Captain-Provider-Context-Ref",
+        "provider_policy_sha256": raw["CAPTAIN_PROVIDER_POLICY_SHA256"],
+        "provider_price_card_sha256": raw["CAPTAIN_PROVIDER_PRICE_CARD_SHA256"],
+        "gateway": _process_binding("gateway", gateway, f"{gateway}/healthz"),
+        "benchmark": _process_binding(
+            "benchmark", benchmark.removesuffix("/v1/execute"),
+            benchmark.removesuffix("/v1/execute") + "/healthz", benchmark,
+        ),
+        "runtime": _process_binding("runtime", runtime, f"{runtime}/healthz"),
+        "provider_proxy": _process_binding("provider_proxy", provider, f"{provider}/healthz"),
+        "minibook": _process_binding("minibook", minibook, f"{minibook}/healthz"),
+    }
+    digest = hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return CapabilityProductionBundleManifestV1.model_validate(
+        {**material, "manifest_sha256": digest}
+    )
+
+
+def _process_binding(
+    service: str, base_url: str, health_url: str, execute_url: str | None = None
+) -> dict[str, object]:
+    return {
+        "service": service,
+        "base_url": base_url,
+        "health_url": health_url,
+        "execute_url": execute_url,
+        "authentication": "bearer",
+    }
 
 
 def _confined_path(root: Path, raw: str) -> Path:
@@ -1010,6 +1153,9 @@ __all__ = [
     "CapabilityAssemblyBootstrapConfigurationError",
     "CapabilityAssemblyBootstrapSettings",
     "CapabilityAssemblyFactoryRuntime",
+    "CapabilityProductionBundleHealthV1",
+    "CapabilityProductionBundleManifestV1",
+    "CapabilityProductionProcessBindingV1",
     "CaptainBenchmarkToolEvidenceAuthority",
     "GatewayCapabilityN8nWorkBatchAuthority",
     "GatewayCapabilityProjectionAuthority",
@@ -1020,4 +1166,5 @@ __all__ = [
     "build_production_capability_assembly_from_environment",
     "close_production_capability_assembly",
     "load_capability_assembly_bootstrap_settings",
+    "load_capability_production_bundle_manifest",
 ]
