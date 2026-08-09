@@ -10,6 +10,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Literal, Protocol
 from uuid import UUID
+from uuid import uuid4
 
 from agenten.agent_factory.capability_live_runner import CapabilityLiveStage
 from agenten.agent_factory.input_contracts import (
@@ -115,6 +116,8 @@ class GenericBenchmarkExecutionEvidence:
     latency_ms: int
     trace_id: UUID
     run_id: UUID
+    request_nonce: UUID
+    request_digest: str
 
 
 @dataclass(frozen=True)
@@ -126,7 +129,9 @@ class GenericBenchmarkExecutionRequest:
     team_kind: Literal["team", "single_agent"]
     model_id: str
     model_policy_digest: str
-    private_case_access: "ScopedPrivateCaseAccess"
+    execution_case: GenericExecutionCaseView
+    request_nonce: UUID
+    request_digest: str
 
 
 @dataclass(frozen=True)
@@ -245,54 +250,6 @@ class GenericPrivateHoldoutReader(Protocol):
     def get(self, uri: str) -> str: ...
 
 
-@dataclass(slots=True)
-class _PrivateCaseAccessState:
-    active: bool = True
-
-
-class ScopedPrivateCaseAccess:
-    """Executor capability containing only its pre-materialized execution view."""
-
-    __slots__ = ("case_ref", "__view", "__state", "_resolved")
-
-    def __init__(self, *, view: GenericExecutionCaseView,
-                 state: _PrivateCaseAccessState) -> None:
-        self.case_ref = view.case_ref
-        self.__view = view
-        self.__state = state
-        self._resolved = False
-
-    def resolve(self) -> GenericExecutionCaseView:
-        if self._resolved:
-            raise CapabilityLiveAuthorityUnavailable("private case access is single use")
-        self._resolved = True
-        if not self.__state.active:
-            raise CapabilityLiveAuthorityUnavailable("private case capability is stale")
-        return self.__view
-
-    @property
-    def resolved(self) -> bool:
-        return self._resolved
-
-
-class _ScopedPrivateEvaluationAccess:
-    __slots__ = ("__view", "__state", "_resolved")
-
-    def __init__(self, *, view: GenericEvaluationCaseView,
-                 state: _PrivateCaseAccessState) -> None:
-        self.__view = view
-        self.__state = state
-        self._resolved = False
-
-    def resolve(self) -> GenericEvaluationCaseView:
-        if self._resolved:
-            raise CapabilityLiveAuthorityUnavailable("private case access is single use")
-        self._resolved = True
-        if not self.__state.active:
-            raise CapabilityLiveAuthorityUnavailable("private case capability is stale")
-        return self.__view
-
-
 class GenericPrivateBenchmarkRepository:
     """Keep semantic case bodies private and expose content-addressed refs only."""
 
@@ -309,7 +266,9 @@ class GenericPrivateBenchmarkRepository:
         self._executor_authority_id = executor_authority_id
         self._evaluator_authority_id = evaluator_authority_id
         self._definitions: dict[str, GenericPrivateCaseDefinition] = {}
-        self._access_states: dict[str, list[_PrivateCaseAccessState]] = {}
+        self._execution_issuances: dict[
+            tuple[str, UUID], tuple[str, bool]
+        ] = {}
 
     def binds_authorities(
         self, *, executor_authority_id: UUID, evaluator_authority_id: UUID,
@@ -370,19 +329,33 @@ class GenericPrivateBenchmarkRepository:
         })
         return references
 
-    def scoped_access(
-        self, case_ref: GenericPrivateCaseRef, *,
-        purpose: Literal["execution", "evaluation"], authority_id: UUID,
-    ) -> ScopedPrivateCaseAccess | _ScopedPrivateEvaluationAccess:
-        self._require_purpose_authority(purpose, authority_id)
+    def issue_execution(
+        self, case_ref: GenericPrivateCaseRef, *, authority_id: UUID,
+        request_nonce: UUID, request_digest: str,
+    ) -> GenericExecutionCaseView:
         view = self.resolve(
-            case_ref, purpose=purpose, authority_id=authority_id,
+            case_ref, purpose="execution", authority_id=authority_id,
         )
-        state = _PrivateCaseAccessState()
-        self._access_states.setdefault(case_ref.case_id, []).append(state)
-        if isinstance(view, GenericExecutionCaseView):
-            return ScopedPrivateCaseAccess(view=view, state=state)
-        return _ScopedPrivateEvaluationAccess(view=view, state=state)
+        assert isinstance(view, GenericExecutionCaseView)
+        key = (case_ref.case_id, request_nonce)
+        if key in self._execution_issuances:
+            raise CapabilityLiveAuthorityUnavailable(
+                "private execution request nonce was replayed"
+            )
+        self._execution_issuances[key] = (request_digest, False)
+        return view
+
+    def consume_execution(
+        self, case_ref: GenericPrivateCaseRef, *, request_nonce: UUID,
+        request_digest: str,
+    ) -> None:
+        key = (case_ref.case_id, request_nonce)
+        issued = self._execution_issuances.get(key)
+        if issued is None or issued[0] != request_digest or issued[1]:
+            raise CapabilityLiveAuthorityUnavailable(
+                "private execution request binding is stale"
+            )
+        self._execution_issuances[key] = (issued[0], True)
 
     def resolve(
         self, case_ref: GenericPrivateCaseRef, *,
@@ -409,9 +382,10 @@ class GenericPrivateBenchmarkRepository:
 
     def retire(self, suite: GenericBenchmarkSuite) -> None:
         retired_ids = {case_ref.case_id for case_ref in suite.cases}
-        for case_id in retired_ids:
-            for state in self._access_states.pop(case_id, ()):
-                state.active = False
+        self._execution_issuances = {
+            key: value for key, value in self._execution_issuances.items()
+            if key[0] not in retired_ids
+        }
         for case_ref in suite.cases:
             self._definitions.pop(case_ref.case_id, None)
 
@@ -474,9 +448,10 @@ class RuleBasedCapabilityBenchmarkEvaluator:
         self._tool_authority = tool_authority
 
     def evaluate(self, request: IndependentBenchmarkEvaluationRequest) -> IndependentBenchmarkOutcome:
-        case = self._private_cases.scoped_access(
+        case = self._private_cases.resolve(
             request.case_ref, purpose="evaluation", authority_id=self.authority_id
-        ).resolve()
+        )
+        assert isinstance(case, GenericEvaluationCaseView)
         outcome = self._json_evidence(request.execution.outcome_ref, "captain.capability-benchmark-outcome.v1")
         rationale = self._json_evidence(request.execution.rationale_ref, "captain.capability-benchmark-rationale.v1")
         execution = request.execution
@@ -743,20 +718,19 @@ class GenericCapabilityBenchmarkAdapter:
                                     policy_digest: str) -> GenericBenchmarkPair:
         common = dict(job_id=job.job_id, capability_id=job.required_capability,
                       input_ref=request.input.source_ref, case_ref=case,
-                      model_id=model_id,
-                      model_policy_digest=policy_digest)
-        team_access = self._private_cases.scoped_access(
-            case, purpose="execution", authority_id=self._executor.authority_id)
-        team = await self._executor.execute(GenericBenchmarkExecutionRequest(
-            team_kind="team", private_case_access=team_access, **common))
-        if not team_access.resolved:
-            raise ValueError("executor did not resolve the private case")
-        baseline_access = self._private_cases.scoped_access(
-            case, purpose="execution", authority_id=self._executor.authority_id)
-        baseline = await self._executor.execute(GenericBenchmarkExecutionRequest(
-            team_kind="single_agent", private_case_access=baseline_access, **common))
-        if not baseline_access.resolved:
-            raise ValueError("baseline did not resolve the private case")
+                      model_id=model_id, model_policy_digest=policy_digest)
+        team_request = self._execution_request(
+            authority_id=self._executor.authority_id,
+            team_kind="team", **common,
+        )
+        team = await self._executor.execute(team_request)
+        self._consume_execution(team_request, team)
+        baseline_request = self._execution_request(
+            authority_id=self._executor.authority_id,
+            team_kind="single_agent", **common,
+        )
+        baseline = await self._executor.execute(baseline_request)
+        self._consume_execution(baseline_request, baseline)
         _require_execution(team, request.input.source_ref, job.required_capability,
                            case, "team", model_id, policy_digest)
         _require_execution(baseline, request.input.source_ref, job.required_capability,
@@ -770,6 +744,48 @@ class GenericCapabilityBenchmarkAdapter:
         _require_evaluation(team_eval, team)
         _require_evaluation(baseline_eval, baseline)
         return GenericBenchmarkPair(case, team, baseline, team_eval, baseline_eval)
+
+    def _execution_request(
+        self, *, authority_id: UUID, team_kind: Literal["team", "single_agent"],
+        **common: object,
+    ) -> GenericBenchmarkExecutionRequest:
+        case_ref = common["case_ref"]
+        assert isinstance(case_ref, GenericPrivateCaseRef)
+        execution_case = self._private_cases.resolve(
+            case_ref, purpose="execution", authority_id=authority_id,
+        )
+        assert isinstance(execution_case, GenericExecutionCaseView)
+        nonce = uuid4()
+        request_digest = generic_execution_request_digest(
+            job_id=common["job_id"], capability_id=common["capability_id"],
+            input_ref=common["input_ref"], case_ref=case_ref,
+            team_kind=team_kind, model_id=common["model_id"],
+            model_policy_digest=common["model_policy_digest"],
+            execution_case=execution_case, request_nonce=nonce,
+        )
+        execution_case = self._private_cases.issue_execution(
+            case_ref, authority_id=authority_id,
+            request_nonce=nonce, request_digest=request_digest,
+        )
+        return GenericBenchmarkExecutionRequest(
+            team_kind=team_kind, execution_case=execution_case,
+            request_nonce=nonce, request_digest=request_digest,
+            **common,
+        )
+
+    def _consume_execution(
+        self, request: GenericBenchmarkExecutionRequest,
+        evidence: GenericBenchmarkExecutionEvidence,
+    ) -> None:
+        if (evidence.request_nonce != request.request_nonce
+                or evidence.request_digest != request.request_digest):
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark execution response changed request binding"
+            )
+        self._private_cases.consume_execution(
+            request.case_ref, request_nonce=request.request_nonce,
+            request_digest=request.request_digest,
+        )
 
 
 def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
@@ -928,12 +944,46 @@ def _require_execution(value: GenericBenchmarkExecutionEvidence,
             or value.cost_usd < 0 or not isinstance(value.latency_ms, int)
             or isinstance(value.latency_ms, bool) or value.latency_ms < 0
             or not isinstance(value.trace_id, UUID) or not isinstance(value.run_id, UUID)
+            or not isinstance(value.request_nonce, UUID)
+            or re.fullmatch(r"[0-9a-f]{64}", value.request_digest) is None
             or not isinstance(value.outcome_ref, ArtifactRef)
             or not isinstance(value.rationale_ref, ArtifactRef)
             or any(not isinstance(item, ArtifactRef)
                    for item in (*value.message_event_refs, *value.handoff_event_refs))
             or not valid_tool_calls):
         raise ValueError("benchmark executor returned invalid raw evidence")
+
+
+def generic_execution_request_digest(
+    *, job_id: object, capability_id: object, input_ref: object,
+    case_ref: GenericPrivateCaseRef, team_kind: object, model_id: object,
+    model_policy_digest: object, execution_case: GenericExecutionCaseView,
+    request_nonce: UUID,
+) -> str:
+    payload = {
+        "schema": "captain.capability-benchmark-execution-request.v1",
+        "job_id": str(job_id),
+        "capability_id": capability_id,
+        "input_ref": (
+            input_ref.model_dump(mode="json")
+            if isinstance(input_ref, ArtifactRef) else input_ref
+        ),
+        "case": {
+            "case_id": case_ref.case_id,
+            "category": case_ref.category.value,
+            "case_digest": case_ref.case_digest,
+        },
+        "team_kind": team_kind,
+        "model_id": model_id,
+        "model_policy_digest": model_policy_digest,
+        "execution_case": {
+            "setup": execution_case.setup,
+            "action": execution_case.action,
+            "opaque_source_refs": execution_case.opaque_source_refs,
+        },
+        "request_nonce": str(request_nonce),
+    }
+    return hashlib.sha256(_canonical(payload).encode()).hexdigest()
 
 
 def _require_evaluation(value: IndependentBenchmarkOutcome,

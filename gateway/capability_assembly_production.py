@@ -50,6 +50,9 @@ from gateway.capability_assembly_contracts import (
 )
 from gateway.capability_assembly_controller import CapabilityAssemblyController
 from gateway.capability_assembly_repository import GatewayCapabilityAssemblyRepository
+from gateway.capability_benchmark_process_executor import (
+    GatewayIsolatedBenchmarkExecutorClient,
+)
 from gateway.capability_generic_benchmark import (
     GenericBenchmarkExecutorPort,
     GenericBenchmarkRecorderPort,
@@ -817,6 +820,7 @@ def compose_capability_assembly_controller(
         n8n_work_batches=n8n_work_batches,
         holdout_store=holdout_store,
         clock=clock,
+        require_isolated_executor=False,
     )
     private_cases = GenericPrivateBenchmarkRepository(
         holdouts=holdout_store,
@@ -919,6 +923,7 @@ def build_capability_assembly_controller(
         holdout_store=holdout_store,
         source_artifacts=authorities.source_artifacts,
         clock=selected_clock,
+        require_isolated_executor=True,
     )
     repository = GatewayCapabilityAssemblyRepository(authorities.store)
     return compose_capability_assembly_controller(
@@ -1015,6 +1020,7 @@ def _preflight_composition(
     holdout_store: object,
     source_artifacts: object | None = None,
     clock: object,
+    require_isolated_executor: bool,
 ) -> None:
     if not isinstance(factory_composition, AgentFactoryLiveComposition):
         raise CapabilityAssemblyProductionConfigurationError(
@@ -1032,6 +1038,12 @@ def _preflight_composition(
             or benchmark_executor.authority_id == RuleBasedCapabilityBenchmarkEvaluator.AUTHORITY_ID):
         raise CapabilityAssemblyProductionConfigurationError(
             "benchmark executor and evaluator authorities are not independent"
+        )
+    if (require_isolated_executor
+            and (type(benchmark_executor) is not GatewayIsolatedBenchmarkExecutorClient
+                 or not benchmark_executor.uses_production_transport())):
+        raise CapabilityAssemblyProductionConfigurationError(
+            "production benchmark executor must use the immutable Gateway HTTP process client"
         )
     tool_authority_id = getattr(benchmark_tool_authority, "authority_id", None)
     if (not isinstance(tool_authority_id, UUID)

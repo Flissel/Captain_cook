@@ -5,6 +5,7 @@ import gc
 import hashlib
 import json
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -12,7 +13,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid5
 
 import pytest
-import gateway.capability_generic_benchmark as generic_benchmark_module
+from pydantic import SecretStr
 
 from agenten.agent_factory.capability_live_runner import (
     CapabilityLiveReservation,
@@ -70,6 +71,10 @@ from gateway.capability_generic_benchmark import (
     build_generic_benchmark_suite,
 )
 from gateway.capability_assembly_repository import GatewayCapabilityAssemblyRepository
+from gateway.capability_benchmark_process_executor import (
+    GatewayHttpBenchmarkProcessTransport,
+    GatewayIsolatedBenchmarkExecutorClient,
+)
 from gateway.capability_live_current_adapters import CapabilityProjectionReadback
 from gateway.capability_live_factory_adapter import CurrentCapabilityFactoryAdapter
 from gateway.capability_live_pipeline import (
@@ -630,11 +635,6 @@ def _authorities(
         artifacts=_Sha256Artifacts()
     )
     projection_gateway.gateway_store = store
-    class BenchmarkExecutor:
-        gateway_store = store
-        authority_id = _id("builder-benchmark-executor")
-        async def execute(self, request: object) -> object:
-            raise AssertionError("not called by builder")
     class BenchmarkRecorder:
         gateway_store = store
         def record_generic_benchmark(self, request: object) -> object:
@@ -657,7 +657,14 @@ def _authorities(
         reconciliation=_Reconciliation(store),
         minibook_effects=projection,
         source_artifacts=source_artifacts,
-        benchmark_executor=BenchmarkExecutor(),  # type: ignore[arg-type]
+        benchmark_executor=GatewayIsolatedBenchmarkExecutorClient(
+            gateway_store=store,
+            authority_id=_id("builder-benchmark-executor"),
+            endpoint="http://127.0.0.1:8765/v1/execute",
+            transport=GatewayHttpBenchmarkProcessTransport(
+                bearer_token=SecretStr("unit-test-runtime-token")
+            ),
+        ),
         benchmark_evidence=ContentAddressedBenchmarkEvidenceResolver(
             gateway_store=store, artifacts=_BenchmarkArtifacts()
         ),
@@ -690,6 +697,67 @@ def test_production_builder_preflights_all_ports_before_repository_schema_effect
             holdout_store=InMemoryPrivateHoldoutStore(),
         )
 
+    assert store.storage.statements == []
+
+
+def test_production_builder_rejects_in_process_benchmark_executor_before_schema(
+    tmp_path: Path,
+) -> None:
+    store = _GatewayStore()
+    class InProcessExecutor:
+        gateway_store = store
+        authority_id = _id("unsafe-in-process-executor")
+        async def execute(self, request: object) -> object:
+            return request
+    authorities = replace(
+        _authorities(store=store),
+        benchmark_executor=InProcessExecutor(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(
+        CapabilityAssemblyProductionConfigurationError,
+        match="immutable Gateway HTTP process client",
+    ):
+        build_capability_assembly_controller(
+            repository_root=tmp_path,
+            settings=CapabilityAssemblyProductionSettings.from_environment(
+                _settings_environment(tmp_path)
+            ),
+            authorities=authorities,
+            holdout_store=InMemoryPrivateHoldoutStore(),
+        )
+    assert store.storage.statements == []
+
+
+def test_production_builder_rejects_fake_transport_hidden_in_exact_client(
+    tmp_path: Path,
+) -> None:
+    store = _GatewayStore()
+    class FakeTransport:
+        async def post(self, endpoint: str, body: bytes) -> bytes:
+            raise AssertionError((endpoint, body))
+    wrapped_fake = GatewayIsolatedBenchmarkExecutorClient(
+        gateway_store=store, authority_id=_id("wrapped-fake-executor"),
+        endpoint="https://benchmark-runtime.invalid/v1/execute",
+        transport=FakeTransport(),
+        allowed_hosts=("benchmark-runtime.invalid",),
+    )
+    authorities = replace(
+        _authorities(store=store), benchmark_executor=wrapped_fake,
+    )
+
+    with pytest.raises(
+        CapabilityAssemblyProductionConfigurationError,
+        match="immutable Gateway HTTP process client",
+    ):
+        build_capability_assembly_controller(
+            repository_root=tmp_path,
+            settings=CapabilityAssemblyProductionSettings.from_environment(
+                _settings_environment(tmp_path)
+            ),
+            authorities=authorities,
+            holdout_store=InMemoryPrivateHoldoutStore(),
+        )
     assert store.storage.statements == []
 
 
@@ -836,11 +904,12 @@ def test_production_builder_uses_gateway_repository_and_current_authority_adapte
     settings = CapabilityAssemblyProductionSettings.from_environment(
         _settings_environment(tmp_path)
     )
+    authorities = _authorities(store=store)
 
     controller = build_capability_assembly_controller(
         repository_root=tmp_path,
         settings=settings,
-        authorities=_authorities(store=store),
+        authorities=authorities,
         holdout_store=InMemoryPrivateHoldoutStore(),
     )
 
@@ -849,6 +918,8 @@ def test_production_builder_uses_gateway_repository_and_current_authority_adapte
     assert isinstance(controller._factory, CurrentCapabilityFactoryAdapter)
     assert isinstance(controller._resume, GatewayCapabilityResumeExecutionAdapter)
     assert len(store.storage.statements) == 3
+    with pytest.raises(AttributeError, match="immutable"):
+        authorities.benchmark_executor._transport = object()  # type: ignore[attr-defined]
 
 
 def test_low_level_composition_rejects_missing_authority_before_using_repository() -> None:
@@ -1203,7 +1274,7 @@ def test_generic_suite_uses_compiled_private_authority_and_all_five_categories()
         )
 
 
-def test_materialized_execution_capability_is_revoked_by_suite_retirement() -> None:
+def test_internal_execution_issuance_is_revoked_by_suite_retirement() -> None:
     holdouts = InMemoryPrivateHoldoutStore()
     admitted, _ = _admitted_demo(
         "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
@@ -1211,15 +1282,41 @@ def test_materialized_execution_capability_is_revoked_by_suite_retirement() -> N
     canonical = _with_grounded_benchmark_sources(admitted.input, holdouts)
     repository = _private_case_repository(holdouts)
     suite = build_generic_benchmark_suite(canonical, repository)
-    access = repository.scoped_access(
-        suite.cases[0], purpose="execution",
-        authority_id=_id("test-private-case-executor"),
+    nonce = _id("retired-execution-request")
+    repository.issue_execution(
+        suite.cases[0], authority_id=_id("test-private-case-executor"),
+        request_nonce=nonce, request_digest="a" * 64,
     )
 
     repository.retire(suite)
 
     with pytest.raises(CapabilityLiveAuthorityUnavailable, match="stale"):
-        access.resolve()
+        repository.consume_execution(
+            suite.cases[0], request_nonce=nonce, request_digest="a" * 64,
+        )
+
+
+def test_internal_execution_issuance_is_single_use() -> None:
+    holdouts = InMemoryPrivateHoldoutStore()
+    admitted, _ = _admitted_demo(
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
+    )
+    canonical = _with_grounded_benchmark_sources(admitted.input, holdouts)
+    repository = _private_case_repository(holdouts)
+    suite = build_generic_benchmark_suite(canonical, repository)
+    nonce = _id("single-use-execution-request")
+    repository.issue_execution(
+        suite.cases[0], authority_id=_id("test-private-case-executor"),
+        request_nonce=nonce, request_digest="e" * 64,
+    )
+    repository.consume_execution(
+        suite.cases[0], request_nonce=nonce, request_digest="e" * 64,
+    )
+
+    with pytest.raises(CapabilityLiveAuthorityUnavailable, match="stale"):
+        repository.consume_execution(
+            suite.cases[0], request_nonce=nonce, request_digest="e" * 64,
+        )
 
 
 def test_raw_execution_contract_contains_no_executor_authored_verdicts() -> None:
@@ -1531,18 +1628,8 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
         async def execute(self, execution_request):
             self.requests.append(execution_request)
             assert not hasattr(execution_request.case_ref, "setup")
-            access = execution_request.private_case_access
-            assert not hasattr(access, "_repository")
-            assert not hasattr(access, "__dict__")
-            escaped_token = getattr(
-                access, "_ScopedPrivateCaseAccess__token", None
-            )
-            escaped_registry = getattr(
-                generic_benchmark_module, "_PRIVATE_CAPABILITIES", None
-            )
-            assert escaped_token is None
-            assert escaped_registry is None
-            frontier = list(gc.get_referents(access))
+            private_case = execution_request.execution_case
+            frontier = list(gc.get_referents(execution_request))
             seen: set[int] = set()
             while frontier:
                 referent = frontier.pop()
@@ -1555,11 +1642,6 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                     BenchmarkExpectedPredicate,
                 ))
                 frontier.extend(gc.get_referents(referent))
-            assert not any(
-                isinstance(getattr(access, name), GenericPrivateBenchmarkRepository)
-                for name in dir(access)
-                if not name.startswith("__")
-            )
             with pytest.raises(
                 CapabilityLiveAuthorityUnavailable, match="purpose authority"
             ):
@@ -1574,7 +1656,6 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                     execution_request.case_ref, purpose="execution",
                     authority_id=RuleBasedCapabilityBenchmarkEvaluator.AUTHORITY_ID,
                 )
-            private_case = access.resolve()
             assert private_case.setup and private_case.action
             assert not hasattr(private_case, "expected_predicates")
             kind = execution_request.team_kind
@@ -1656,6 +1737,8 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                 latency_ms=10 if kind == "team" else 20,
                 trace_id=trace_id,
                 run_id=run_id,
+                request_nonce=execution_request.request_nonce,
+                request_digest=execution_request.request_digest,
             )
 
     class Recorder:
@@ -1803,6 +1886,8 @@ def test_rule_evaluator_rejects_stale_or_malicious_observable_evidence(
             receipt_ref=receipt),),
         rationale_ref=rationale, cost_usd=Decimal("0.10"), latency_ms=10,
         trace_id=trace_id, run_id=run_id,
+        request_nonce=_id("direct-evaluator-request"),
+        request_digest="b" * 64,
     )
 
     tool_authority = _ToolEvidenceAuthority(resolver.gateway_store)
