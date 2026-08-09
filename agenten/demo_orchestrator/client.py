@@ -416,15 +416,6 @@ class CapabilityDemoClient:
                 raise DemoClientError(
                     f"authenticated {binding.service} health is not ready"
                 )
-        assembly_health = self._request(
-            "GET",
-            f"{self._configuration.gateway_base_url}/v1/capability-assemblies/health",
-            token=self._gateway_token(),
-            payload=None,
-            deadline=deadline,
-        )
-        if assembly_health.get("status") not in {"ok", "ready"}:
-            raise DemoClientError("Captain assembly authority is not ready")
         return template
 
     def _deadline(self, timeout_seconds: float) -> float:

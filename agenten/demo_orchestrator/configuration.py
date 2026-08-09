@@ -69,22 +69,20 @@ class DemoConfiguration:
         )
 
     def health_bindings(self) -> tuple[AuthorityHealthBinding, ...]:
-        names = (
-            ("gateway", "CAPTAIN_GATEWAY_TOKEN"),
-            ("provider_proxy", "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"),
-            ("runtime", "CAPTAIN_RUNTIME_TOKEN"),
-            ("benchmark", "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN"),
-            ("minibook", "MINIBOOK_API_KEY"),
-        )
+        names = ("gateway", "provider_proxy", "runtime", "benchmark", "minibook")
         return tuple(
             AuthorityHealthBinding(
                 service=service,
                 health_url=str(
                     getattr(getattr(self.production_manifest, service), "health_url")
                 ),
-                token_name=token,
+                token_name=str(
+                    getattr(
+                        getattr(self.production_manifest, service), "credential_env"
+                    )
+                ),
             )
-            for service, token in names
+            for service in names
         )
 
     def authority_token(self, name: str) -> str:
@@ -247,13 +245,40 @@ def _validate_d11_manifest(manifest: object) -> None:
     digest = getattr(manifest, "manifest_sha256", None)
     if not isinstance(digest, str) or len(digest) != 64:
         raise DemoConfigurationError("D11 production bundle manifest is invalid")
-    for name in ("gateway", "benchmark", "runtime", "provider_proxy", "minibook"):
+    expected = {
+        "gateway": ("CAPTAIN_GATEWAY_TOKEN", "/v1/capability-assemblies/health", None),
+        "benchmark": (
+            "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+            "/healthz",
+            "/v1/execute",
+        ),
+        "runtime": ("CAPTAIN_RUNTIME_TOKEN", "/health", None),
+        "provider_proxy": (
+            "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
+            "/healthz",
+            None,
+        ),
+        "minibook": ("MINIBOOK_API_KEY", "/health", None),
+    }
+    for name, (credential_env, health_suffix, execute_suffix) in expected.items():
         binding = getattr(manifest, name, None)
+        base_url = getattr(binding, "base_url", None)
+        health_url = getattr(binding, "health_url", None)
+        execute_url = getattr(binding, "execute_url", None)
         if (
             getattr(binding, "service", None) != name
             or getattr(binding, "authentication", None) != "bearer"
-            or not isinstance(getattr(binding, "base_url", None), str)
-            or not isinstance(getattr(binding, "health_url", None), str)
+            or getattr(binding, "credential_env", None) != credential_env
+            or not isinstance(base_url, str)
+            or health_url != base_url.rstrip("/") + health_suffix
+            or (
+                execute_url
+                != (
+                    None
+                    if execute_suffix is None
+                    else base_url.rstrip("/") + execute_suffix
+                )
+            )
         ):
             raise DemoConfigurationError("D11 production bundle manifest is invalid")
 
