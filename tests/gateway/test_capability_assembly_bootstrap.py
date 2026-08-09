@@ -79,6 +79,11 @@ def test_bootstrap_settings_reject_non_loopback_http_and_redact_secrets(
         "MINIBOOK_API_KEY": "minibook-secret-value",
         "MINIBOOK_PROJECTION_API_KEY": "projection-secret-value",
         "CAPTAIN_CAPABILITY_ALLOWED_HOSTS": "",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-secret-value",
+        "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "provider-secret-value",
+        "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
+        "CAPTAIN_PROVIDER_POLICY_SHA256": "c" * 64,
+        "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "d" * 64,
     }
 
     with pytest.raises(
@@ -305,6 +310,11 @@ def test_bootstrap_rejects_raw_factory_runtime_before_schema_or_network() -> Non
         "MINIBOOK_BACKEND_URL": "http://127.0.0.1:8080",
         "MINIBOOK_API_KEY": "minibook-secret-value",
         "MINIBOOK_PROJECTION_API_KEY": "projection-secret-value",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-secret-value",
+        "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "provider-secret-value",
+        "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
+        "CAPTAIN_PROVIDER_POLICY_SHA256": "c" * 64,
+        "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "d" * 64,
     }
     touched_store = SimpleNamespace(storage=SimpleNamespace(transaction=lambda: (_ for _ in ()).throw(AssertionError("schema touched"))))
 
@@ -418,3 +428,50 @@ def test_generic_benchmark_recorder_is_append_only_and_replay_stable(
     )
     with pytest.raises(CapabilityLiveAuthorityUnavailable, match="conflicts"):
         recorder.record_generic_benchmark(changed)
+
+
+def test_recorder_constructor_has_no_schema_effect(tmp_path: Path) -> None:
+    calls: list[str] = []
+    store = SimpleNamespace(
+        storage=SimpleNamespace(
+            transaction=lambda: calls.append("schema")
+        )
+    )
+
+    GatewayGenericBenchmarkRecorder(
+        gateway_store=store,  # type: ignore[arg-type]
+        artifacts=ContentAddressedArtifactAdapter(tmp_path / "cas"),
+    )
+
+    assert calls == []
+
+
+def test_bootstrap_rejects_reused_credentials_before_runtime_or_schema(
+    tmp_path: Path,
+) -> None:
+    environment = {
+        "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
+        "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "same-secret-value",
+        "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
+        "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": ".captain-cook/artifacts/sha256",
+        "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": ".captain-cook/capability-authority",
+        "CAPTAIN_GATEWAY_URL": "http://127.0.0.1:8088",
+        "CAPTAIN_GATEWAY_TOKEN": "same-secret-value",
+        "MINIBOOK_BACKEND_URL": "http://127.0.0.1:8080",
+        "MINIBOOK_API_KEY": "minibook-secret-value",
+        "MINIBOOK_PROJECTION_API_KEY": "projection-secret-value",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-secret-value",
+        "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "provider-secret-value",
+        "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
+        "CAPTAIN_PROVIDER_POLICY_SHA256": "c" * 64,
+        "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "d" * 64,
+    }
+
+    with pytest.raises(
+        CapabilityAssemblyBootstrapConfigurationError,
+        match="credentials must be distinct",
+    ):
+        load_capability_assembly_bootstrap_settings(
+            environment=environment,
+            repository_root=tmp_path,
+        )

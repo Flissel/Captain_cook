@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -42,6 +43,15 @@ from agenten.delivery.projection_cursor import ProjectionCursorStore
 from agenten.delivery.projector import MinibookProjector
 from agenten.validation.contracts import WorkBatch
 from gateway.agent_factory_live_composition import AgentFactoryLiveComposition
+from gateway.agent_factory_live_composition import ProductionFactoryTeamExecutionPort
+from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
+from gateway.factory_repository import GatewayFactoryRepository
+from agenten.agent_factory.business_benchmark_dispatch import BusinessBenchmarkDispatchService
+from agenten.agent_factory.candidate_evaluation import CandidateEvaluationFactory
+from agenten.agent_factory.hermes_cli import HermesCliFactory
+from agenten.agent_factory.orchestration import FactoryDispatcher
+from agenten.agent_factory.production_dispatch_runner import ProductionFactoryDispatchRunner
+from agenten.agent_factory.service import FactoryCoordinator
 from agenten.agent_factory.state_machine import FactoryActionKind
 from gateway.capability_assembly_contracts import (
     CapabilityAssemblyReconciliationOutcome,
@@ -105,6 +115,11 @@ class CapabilityAssemblyBootstrapSettings:
     minibook_url: str
     minibook_api_key: SecretStr
     minibook_projection_api_key: SecretStr
+    runtime_token: SecretStr
+    provider_token: SecretStr
+    provider_url: str
+    provider_policy_sha256: str
+    provider_price_card_sha256: str
     allowed_hosts: tuple[str, ...] = ()
 
 
@@ -119,6 +134,11 @@ _REQUIRED_BOOTSTRAP_NAMES = (
     "MINIBOOK_BACKEND_URL",
     "MINIBOOK_API_KEY",
     "MINIBOOK_PROJECTION_API_KEY",
+    "CAPTAIN_RUNTIME_TOKEN",
+    "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
+    "CAPTAIN_PROVIDER_PROXY_URL",
+    "CAPTAIN_PROVIDER_POLICY_SHA256",
+    "CAPTAIN_PROVIDER_PRICE_CARD_SHA256",
 )
 
 
@@ -135,6 +155,31 @@ def load_capability_assembly_bootstrap_settings(
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly bootstrap configuration is incomplete"
         )
+    credential_names = (
+        "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+        "CAPTAIN_GATEWAY_TOKEN",
+        "MINIBOOK_API_KEY",
+        "MINIBOOK_PROJECTION_API_KEY",
+        "CAPTAIN_RUNTIME_TOKEN",
+        "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
+    )
+    credentials = tuple(raw[name] for name in credential_names)
+    if any(
+        secrets.compare_digest(left, right)
+        for index, left in enumerate(credentials)
+        for right in credentials[index + 1 :]
+    ):
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "capability assembly credentials must be distinct"
+        )
+    for digest_name in (
+        "CAPTAIN_PROVIDER_POLICY_SHA256",
+        "CAPTAIN_PROVIDER_PRICE_CARD_SHA256",
+    ):
+        if _SHA256.fullmatch(raw[digest_name]) is None:
+            raise CapabilityAssemblyBootstrapConfigurationError(
+                "capability assembly provider authority is invalid"
+            )
     try:
         benchmark_authority_id = UUID(raw["CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID"])
     except ValueError:
@@ -163,6 +208,11 @@ def load_capability_assembly_bootstrap_settings(
     minibook_url = _allowed_service_url(
         raw["MINIBOOK_BACKEND_URL"], allowed_hosts=allowed_hosts, label="Minibook"
     )
+    provider_url = _allowed_service_url(
+        raw["CAPTAIN_PROVIDER_PROXY_URL"],
+        allowed_hosts=allowed_hosts,
+        label="provider proxy",
+    )
     try:
         assembly = CapabilityAssemblyProductionSettings.from_environment(environment)
     except CapabilityAssemblyProductionConfigurationError:
@@ -188,6 +238,11 @@ def load_capability_assembly_bootstrap_settings(
         minibook_projection_api_key=SecretStr(
             raw["MINIBOOK_PROJECTION_API_KEY"]
         ),
+        runtime_token=SecretStr(raw["CAPTAIN_RUNTIME_TOKEN"]),
+        provider_token=SecretStr(raw["CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"]),
+        provider_url=provider_url,
+        provider_policy_sha256=raw["CAPTAIN_PROVIDER_POLICY_SHA256"],
+        provider_price_card_sha256=raw["CAPTAIN_PROVIDER_PRICE_CARD_SHA256"],
         allowed_hosts=allowed_hosts,
     )
 
@@ -433,28 +488,36 @@ class GatewayGenericBenchmarkRecorder:
     ) -> None:
         self.gateway_store = gateway_store
         self._artifacts = artifacts
-        self._ensure_schema()
+        self._schema_ready = False
+        self._schema_lock = Lock()
 
     def _ensure_schema(self) -> None:
-        with self.gateway_store.storage.transaction() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS capability_generic_benchmarks (
-                        job_id CHAR(36) NOT NULL,
-                        suite_sha256 CHAR(64) NOT NULL,
-                        correlation_id CHAR(36) NOT NULL,
-                        summary_sha256 CHAR(64) NOT NULL,
-                        payload JSON NOT NULL,
-                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                        PRIMARY KEY (job_id, suite_sha256)
-                    ) ENGINE=InnoDB
-                    """
-                )
+        if self._schema_ready:
+            return
+        with self._schema_lock:
+            if self._schema_ready:
+                return
+            with self.gateway_store.storage.transaction() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS capability_generic_benchmarks (
+                            job_id CHAR(36) NOT NULL,
+                            suite_sha256 CHAR(64) NOT NULL,
+                            correlation_id CHAR(36) NOT NULL,
+                            summary_sha256 CHAR(64) NOT NULL,
+                            payload JSON NOT NULL,
+                            created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                            PRIMARY KEY (job_id, suite_sha256)
+                        ) ENGINE=InnoDB
+                        """
+                    )
+            self._schema_ready = True
 
     def record_generic_benchmark(
         self, request: GenericBenchmarkRecordingRequest
     ) -> GenericBenchmarkReceipt:
+        self._ensure_schema()
         payload = _benchmark_payload(request)
         body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         summary = self._artifacts.put(body, "application/json")
@@ -504,6 +567,7 @@ class GatewayGenericBenchmarkRecorder:
         )
 
     def receipt_for(self, *, job_id: UUID, suite_sha256: str) -> GenericBenchmarkReceipt:
+        self._ensure_schema()
         with self.gateway_store.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -541,6 +605,7 @@ class GatewayGenericBenchmarkRecorder:
         )
 
     def team_trace_ids(self, *, job_id: UUID, suite_sha256: str) -> tuple[UUID, ...]:
+        self._ensure_schema()
         with self.gateway_store.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -824,21 +889,24 @@ def build_production_capability_assembly_from_environment(
         environment=environment, repository_root=repository_root
     )
     selected_clock = clock or (lambda: datetime.now(timezone.utc))
-    if (
-        type(runtime.factory) is not AgentFactoryLiveComposition
-        or type(runtime.provisioning) is not CurrentAuthorityCapabilityFactoryProvisioner
-        or type(runtime.n8n) is not GatewayCapabilityN8nWorkBatchAuthority
-        or runtime.n8n.gateway_store is not store
-        or getattr(runtime.factory.repository, "_store", None) is not store
-        or getattr(getattr(runtime.provisioning, "_repository", None), "_store", None)
-        is not store
-        or getattr(runtime.provisioning, "_work_batches", None) is not runtime.n8n
-        or getattr(runtime.provisioning, "_n8n_registry", None) is not runtime.n8n
-        or getattr(getattr(runtime.provisioning, "_compiler", None), "_holdout_store", None)
-        is not private_benchmark_catalog
+    if not _native_runtime_is_bound(
+        runtime=runtime,
+        store=store,
+        private_benchmark_catalog=private_benchmark_catalog,
     ):
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly Factory runtime is not Gateway-native"
+        )
+    expected_provider_binding = (
+        settings.provider_url,
+        settings.provider_policy_sha256,
+        settings.provider_price_card_sha256,
+    )
+    if expected_provider_binding not in getattr(
+        store, "_runtime_provider_proxy_bindings", frozenset()
+    ):
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "capability assembly provider authority is not Gateway-bound"
         )
     artifacts = ContentAddressedArtifactAdapter(settings.artifact_root)
     provisioner_artifacts = getattr(runtime.provisioning, "_source_artifacts", None)
@@ -923,6 +991,50 @@ def build_production_capability_assembly_from_environment(
     )
     _BOOTSTRAP_RESOURCES[composition] = (resume_http, minibook_http)
     return composition
+
+
+def _native_runtime_is_bound(
+    *,
+    runtime: CapabilityAssemblyFactoryRuntime,
+    store: GatewayStore,
+    private_benchmark_catalog: PrivateHoldoutStore,
+) -> bool:
+    factory = getattr(runtime, "factory", None)
+    provisioning = getattr(runtime, "provisioning", None)
+    n8n = getattr(runtime, "n8n", None)
+    if (
+        type(factory) is not AgentFactoryLiveComposition
+        or type(provisioning) is not CurrentAuthorityCapabilityFactoryProvisioner
+        or type(n8n) is not GatewayCapabilityN8nWorkBatchAuthority
+        or n8n.gateway_store is not store
+        or type(factory.repository) is not GatewayFactoryRepository
+        or getattr(factory.repository, "_store", None) is not store
+        or type(factory.coordinator) is not FactoryCoordinator
+        or getattr(factory.coordinator, "_repository", None) is not factory.repository
+        or type(factory.lease_issuer) is not GatewayNextActionLeaseIssuer
+        or getattr(factory.lease_issuer, "_store", None) is not store
+        or type(factory.hermes) is not HermesCliFactory
+        or getattr(factory.hermes, "_workflow_artifacts", None) is not factory.repository
+        or type(factory.team_execution) is not ProductionFactoryTeamExecutionPort
+        or type(factory.candidate_validator) is not CandidateEvaluationFactory
+        or getattr(factory.candidate_validator, "_workflow_artifacts", None)
+        is not factory.repository
+        or type(factory.business_benchmark) is not BusinessBenchmarkDispatchService
+        or type(factory.dispatcher) is not FactoryDispatcher
+        or getattr(factory.dispatcher, "_coordinator", None) is not factory.coordinator
+        or getattr(factory.dispatcher, "_business_benchmark", None)
+        is not factory.business_benchmark
+        or type(factory.runner) is not ProductionFactoryDispatchRunner
+        or getattr(factory.runner, "_coordinator", None) is not factory.coordinator
+        or getattr(factory.runner, "_dispatcher", None) is not factory.dispatcher
+        or getattr(provisioning, "_repository", None) is not factory.repository
+        or getattr(provisioning, "_work_batches", None) is not n8n
+        or getattr(provisioning, "_n8n_registry", None) is not n8n
+        or getattr(getattr(provisioning, "_compiler", None), "_holdout_store", None)
+        is not private_benchmark_catalog
+    ):
+        return False
+    return True
 
 
 async def close_production_capability_assembly(
