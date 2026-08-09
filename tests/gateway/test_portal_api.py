@@ -232,6 +232,17 @@ class RecordingResumeDispatcher:
     def enqueue(self, *, request_id: UUID, tenant_id: str) -> None:
         self.enqueued.append((request_id, tenant_id))
 
+    def recover(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class EnqueueOnlyResumeDispatcher:
+    def enqueue(self, *, request_id: UUID, tenant_id: str) -> None:
+        del request_id, tenant_id
+
 
 class LifecycleResumeDispatcher(RecordingResumeDispatcher):
     def __init__(self) -> None:
@@ -244,6 +255,24 @@ class LifecycleResumeDispatcher(RecordingResumeDispatcher):
 
     def close(self) -> None:
         self.closed += 1
+
+
+class OrderedLifecycleResumeDispatcher(RecordingResumeDispatcher):
+    def __init__(self, *, fail_recover: bool = False, fail_close: bool = False) -> None:
+        super().__init__()
+        self.events: list[str] = []
+        self.fail_recover = fail_recover
+        self.fail_close = fail_close
+
+    def recover(self) -> None:
+        self.events.append("recover")
+        if self.fail_recover:
+            raise RuntimeError("recover failed")
+
+    def close(self) -> None:
+        self.events.append("close")
+        if self.fail_close:
+            raise RuntimeError("close failed")
 
 
 def settings() -> GatewaySettings:
@@ -361,6 +390,17 @@ def test_enabled_action_inbox_rejects_partial_default_composition() -> None:
         )
 
 
+def test_enabled_action_inbox_rejects_enqueue_only_dispatcher() -> None:
+    enabled = settings().model_copy(update={"factory_action_inbox_enabled": True})
+    with pytest.raises(ValueError, match="resume dispatcher.*lifecycle"):
+        create_app(
+            gateway_store=FakePortalGatewayStore(),
+            mirror=NullMirror(),
+            settings=enabled,
+            factory_action_resume_dispatcher=EnqueueOnlyResumeDispatcher(),
+        )
+
+
 def test_action_resume_recovery_starts_and_stops_with_app_lifecycle() -> None:
     dispatcher = LifecycleResumeDispatcher()
     application = create_app(
@@ -373,6 +413,38 @@ def test_action_resume_recovery_starts_and_stops_with_app_lifecycle() -> None:
         assert dispatcher.recovered == 1
         assert dispatcher.closed == 0
     assert dispatcher.closed == 1
+
+
+def test_action_resume_close_runs_after_recovery_failure_and_error_propagates() -> None:
+    dispatcher = OrderedLifecycleResumeDispatcher(fail_recover=True)
+    application = create_app(
+        gateway_store=FakePortalGatewayStore(),
+        mirror=NullMirror(),
+        settings=settings().model_copy(update={"factory_action_inbox_enabled": True}),
+        factory_action_resume_dispatcher=dispatcher,
+    )
+
+    with pytest.raises(RuntimeError, match="recover failed"):
+        with TestClient(application):
+            pass
+
+    assert dispatcher.events == ["recover", "close"]
+
+
+def test_action_resume_close_failure_propagates_after_recovery() -> None:
+    dispatcher = OrderedLifecycleResumeDispatcher(fail_close=True)
+    application = create_app(
+        gateway_store=FakePortalGatewayStore(),
+        mirror=NullMirror(),
+        settings=settings().model_copy(update={"factory_action_inbox_enabled": True}),
+        factory_action_resume_dispatcher=dispatcher,
+    )
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        with TestClient(application):
+            pass
+
+    assert dispatcher.events == ["recover", "close"]
 
 
 def test_org_b_cannot_read_org_a_setup_or_issue_org_a_ticket() -> None:

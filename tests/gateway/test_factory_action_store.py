@@ -131,8 +131,10 @@ def canonical_db_row() -> dict[str, object]:
         "response_sha256": hashlib.sha256(response_payload.encode()).hexdigest(),
         "resume_phase": "answered",
         "projection_idempotency_key": None,
+        "projection_intent_at": None,
         "projection_acknowledged_at": None,
         "continuation_idempotency_key": None,
+        "continuation_intent_at": None,
         "continuation_acknowledged_at": None,
         "consumed_at": None,
     }
@@ -148,6 +150,32 @@ def expected_effect_key(request: FactoryActionRequestV1, phase: str, response_sh
     return hashlib.sha256(
         json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def db_row_for_phase(phase: str) -> dict[str, object]:
+    row = canonical_db_row()
+    response_sha256 = str(row["response_sha256"])
+    projection_key = expected_effect_key(pending_request(), "projection", response_sha256)
+    continuation_key = expected_effect_key(pending_request(), "continuation", response_sha256)
+    row["resume_phase"] = phase
+    if phase != "answered":
+        row["projection_idempotency_key"] = projection_key
+        row["projection_intent_at"] = (NOW + timedelta(seconds=1)).replace(tzinfo=None)
+    if phase in {"projection_acknowledged", "continuation_intent", "continuation_acknowledged"}:
+        row["projection_acknowledged_at"] = (NOW + timedelta(seconds=2)).replace(tzinfo=None)
+    if phase in {"continuation_intent", "continuation_acknowledged"}:
+        row["continuation_idempotency_key"] = continuation_key
+        row["continuation_intent_at"] = (NOW + timedelta(seconds=3)).replace(tzinfo=None)
+    if phase == "continuation_acknowledged":
+        acknowledged_at = (NOW + timedelta(seconds=4)).replace(tzinfo=None)
+        row.update(
+            {
+                "status": "consumed",
+                "continuation_acknowledged_at": acknowledged_at,
+                "consumed_at": acknowledged_at,
+            }
+        )
+    return row
 
 
 @pytest.fixture
@@ -356,6 +384,47 @@ def test_schema_migration_backfills_legacy_row_under_one_locked_transaction() ->
     assert update_call[1][1] == hashlib.sha256(_canonical(request)).hexdigest()
 
 
+def test_schema_migration_backfills_missing_intent_timestamp_only_at_startup() -> None:
+    legacy = db_row_for_phase("projection_intent")
+    legacy["projection_intent_at"] = None
+
+    class Cursor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def execute(self, query, parameters=None):
+            self.calls.append((" ".join(str(query).split()), parameters))
+
+        def fetchall(self):
+            return [legacy]
+
+    cursor = Cursor()
+
+    class Connection:
+        def cursor(self):
+            return cursor
+
+    class Storage:
+        @contextmanager
+        def transaction(self):
+            yield Connection()
+
+    MariaDBFactoryActionRepository(Storage())  # type: ignore[arg-type]
+
+    update_parameters = next(
+        parameters
+        for query, parameters in cursor.calls
+        if query.startswith("UPDATE")
+    )
+    assert update_parameters[6] == NOW.replace(tzinfo=None)
+
+
 @pytest.mark.parametrize(
     ("phase", "status", "extra_column", "extra_value"),
     [
@@ -383,6 +452,66 @@ def test_db_row_rejects_every_incoherent_extra_phase_column(
         )
     row[extra_column] = extra_value
     with pytest.raises(ValueError, match="factory action durable row"):
+        _db_row(row)
+
+
+@pytest.mark.parametrize(
+    ("phase", "extra_column", "extra_value"),
+    [
+        ("answered", "projection_intent_at", NOW.replace(tzinfo=None)),
+        ("answered", "projection_idempotency_key", "a" * 64),
+        ("projection_intent", "projection_acknowledged_at", NOW.replace(tzinfo=None)),
+        ("projection_intent", "continuation_intent_at", NOW.replace(tzinfo=None)),
+        ("projection_acknowledged", "continuation_idempotency_key", "b" * 64),
+        ("projection_acknowledged", "continuation_intent_at", NOW.replace(tzinfo=None)),
+        ("continuation_intent", "continuation_acknowledged_at", NOW.replace(tzinfo=None)),
+        ("continuation_intent", "consumed_at", NOW.replace(tzinfo=None)),
+    ],
+)
+def test_db_row_rejects_keys_and_timestamps_outside_exact_phase_matrix(
+    phase: str, extra_column: str, extra_value: object
+) -> None:
+    row = db_row_for_phase(phase)
+    row[extra_column] = extra_value
+
+    with pytest.raises(ValueError, match="factory action durable row"):
+        _db_row(row)
+
+
+@pytest.mark.parametrize(
+    ("column", "invalid_value"),
+    [
+        ("projection_intent_at", NOW - timedelta(seconds=1)),
+        ("projection_acknowledged_at", NOW),
+        ("continuation_intent_at", NOW + timedelta(seconds=1)),
+        ("continuation_acknowledged_at", NOW + timedelta(seconds=2)),
+        ("consumed_at", NOW + timedelta(seconds=5)),
+    ],
+)
+def test_db_row_rejects_every_timestamp_ordering_drift(
+    column: str, invalid_value: datetime
+) -> None:
+    row = db_row_for_phase("continuation_acknowledged")
+    row[column] = invalid_value.replace(tzinfo=None)
+
+    with pytest.raises(ValueError, match="timestamp"):
+        _db_row(row)
+
+
+def test_db_row_rejects_phase_timestamp_after_action_deadline() -> None:
+    row = db_row_for_phase("continuation_acknowledged")
+    row["continuation_acknowledged_at"] = pending_request().deadline_at.replace(tzinfo=None) + timedelta(microseconds=1)
+    row["consumed_at"] = row["continuation_acknowledged_at"]
+
+    with pytest.raises(ValueError, match="timestamp"):
+        _db_row(row)
+
+
+def test_db_row_rejects_missing_intent_timestamp_after_migration() -> None:
+    row = db_row_for_phase("projection_intent")
+    row["projection_intent_at"] = None
+
+    with pytest.raises(ValueError, match="phase mismatch"):
         _db_row(row)
 
 

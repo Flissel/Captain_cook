@@ -44,8 +44,10 @@ class FactoryActionRow:
     response_sha256: str | None = None
     resume_phase: ResumePhase | None = None
     projection_idempotency_key: str | None = None
+    projection_intent_at: datetime | None = None
     projection_acknowledged_at: datetime | None = None
     continuation_idempotency_key: str | None = None
+    continuation_intent_at: datetime | None = None
     continuation_acknowledged_at: datetime | None = None
     consumed_at: datetime | None = None
 
@@ -214,6 +216,7 @@ class FactoryActionStore:
                 row.projection_idempotency_key = _effect_key(
                     row.request, "projection", row.response_sha256
                 )
+                row.projection_intent_at = _transition_time(row, now)
                 row.resume_phase = "projection_intent"
             return _resume_record(row)
 
@@ -231,7 +234,7 @@ class FactoryActionStore:
             if row.projection_idempotency_key != idempotency_key:
                 raise ValueError("factory action projection acknowledgement mismatch")
             if row.resume_phase == "projection_intent":
-                row.projection_acknowledged_at = _aware_utc(now)
+                row.projection_acknowledged_at = _transition_time(row, now)
                 row.resume_phase = "projection_acknowledged"
             elif row.resume_phase not in {
                 "projection_acknowledged",
@@ -251,6 +254,7 @@ class FactoryActionStore:
                 row.continuation_idempotency_key = _effect_key(
                     row.request, "continuation", row.response_sha256
                 )
+                row.continuation_intent_at = _transition_time(row, now)
                 row.resume_phase = "continuation_intent"
             if row.resume_phase not in {"continuation_intent", "continuation_acknowledged"}:
                 raise ValueError("factory action projection is not acknowledged")
@@ -270,7 +274,7 @@ class FactoryActionStore:
             if row.continuation_idempotency_key != idempotency_key:
                 raise ValueError("factory action continuation acknowledgement mismatch")
             if row.resume_phase == "continuation_intent":
-                acknowledged_at = _aware_utc(now)
+                acknowledged_at = _transition_time(row, now)
                 row.continuation_acknowledged_at = acknowledged_at
                 row.resume_phase = "continuation_acknowledged"
                 row.status = "consumed"
@@ -319,8 +323,10 @@ class MariaDBFactoryActionRepository:
                         response_sha256 CHAR(64) NULL,
                         resume_phase VARCHAR(32) NULL,
                         projection_idempotency_key CHAR(64) NULL,
+                        projection_intent_at DATETIME(6) NULL,
                         projection_acknowledged_at DATETIME(6) NULL,
                         continuation_idempotency_key CHAR(64) NULL,
+                        continuation_intent_at DATETIME(6) NULL,
                         continuation_acknowledged_at DATETIME(6) NULL,
                         consumed_at DATETIME(6) NULL,
                         created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -337,8 +343,10 @@ class MariaDBFactoryActionRepository:
                     "request_sha256 CHAR(64) NULL",
                     "resume_phase VARCHAR(32) NULL",
                     "projection_idempotency_key CHAR(64) NULL",
+                    "projection_intent_at DATETIME(6) NULL",
                     "projection_acknowledged_at DATETIME(6) NULL",
                     "continuation_idempotency_key CHAR(64) NULL",
+                    "continuation_intent_at DATETIME(6) NULL",
                     "continuation_acknowledged_at DATETIME(6) NULL",
                 ):
                     cursor.execute(
@@ -346,7 +354,9 @@ class MariaDBFactoryActionRepository:
                     )
                 cursor.execute("SELECT * FROM factory_action_inbox FOR UPDATE")
                 for persisted in cursor.fetchall():
-                    normalized = _normalize_legacy_db_row(persisted)
+                    normalized = _normalize_legacy_db_row(
+                        persisted, backfill_phase_timestamps=True
+                    )
                     if normalized == persisted:
                         continue
                     cursor.execute(
@@ -354,16 +364,18 @@ class MariaDBFactoryActionRepository:
                            request_sha256 = %s, response_payload = %s,
                            response_sha256 = %s, resume_phase = %s,
                            projection_idempotency_key = %s,
-                           projection_acknowledged_at = %s,
+                           projection_intent_at = %s, projection_acknowledged_at = %s,
                            continuation_idempotency_key = %s,
-                           continuation_acknowledged_at = %s
+                           continuation_intent_at = %s, continuation_acknowledged_at = %s
                            WHERE request_id = %s""",
                         (
                             normalized["request_payload"], normalized["request_sha256"],
                             normalized.get("response_payload"), normalized.get("response_sha256"),
                             normalized.get("resume_phase"), normalized.get("projection_idempotency_key"),
+                            normalized.get("projection_intent_at"),
                             normalized.get("projection_acknowledged_at"),
                             normalized.get("continuation_idempotency_key"),
+                            normalized.get("continuation_intent_at"),
                             normalized.get("continuation_acknowledged_at"),
                             normalized["request_id"],
                         ),
@@ -438,8 +450,9 @@ class MariaDBFactoryActionRepository:
                         """UPDATE factory_action_inbox SET status = %s,
                            response_payload = %s, response_sha256 = %s,
                            resume_phase = %s, projection_idempotency_key = %s,
-                           projection_acknowledged_at = %s,
+                           projection_intent_at = %s, projection_acknowledged_at = %s,
                            continuation_idempotency_key = %s,
+                           continuation_intent_at = %s,
                            continuation_acknowledged_at = %s, consumed_at = %s
                            WHERE request_id = %s AND tenant_id = %s""",
                         (
@@ -448,8 +461,10 @@ class MariaDBFactoryActionRepository:
                             row.response_sha256,
                             row.resume_phase,
                             row.projection_idempotency_key,
+                            None if row.projection_intent_at is None else _naive_utc(row.projection_intent_at),
                             None if row.projection_acknowledged_at is None else _naive_utc(row.projection_acknowledged_at),
                             row.continuation_idempotency_key,
+                            None if row.continuation_intent_at is None else _naive_utc(row.continuation_intent_at),
                             None if row.continuation_acknowledged_at is None else _naive_utc(row.continuation_acknowledged_at),
                             None if row.consumed_at is None else _naive_utc(row.consumed_at),
                             str(request_id), tenant_id,
@@ -484,7 +499,9 @@ def _canonical(model: FactoryActionRequestV1 | FactoryActionResponseV1) -> bytes
     ).encode("utf-8")
 
 
-def _normalize_legacy_db_row(row: dict[str, object]) -> dict[str, object]:
+def _normalize_legacy_db_row(
+    row: dict[str, object], *, backfill_phase_timestamps: bool = False
+) -> dict[str, object]:
     """Compatibility seam for pre-resume Action Inbox rows."""
     normalized = dict(row)
     request_bytes = _json_bytes(normalized["request_payload"])
@@ -495,7 +512,11 @@ def _normalize_legacy_db_row(row: dict[str, object]) -> dict[str, object]:
             "factory action durable row request invalid"
         ) from error
     if isinstance(decoded, dict) and set(decoded) == {"request", "tenant_id"}:
-        return normalized
+        return (
+            _backfill_phase_timestamps(normalized)
+            if backfill_phase_timestamps
+            else normalized
+        )
     try:
         request = FactoryActionRequestV1.model_validate(decoded)
     except (TypeError, ValueError) as error:
@@ -548,16 +569,56 @@ def _normalize_legacy_db_row(row: dict[str, object]) -> dict[str, object]:
                 "projection_idempotency_key": _effect_key(
                     request, "projection", response_digest
                 ),
+                "projection_intent_at": consumed_at,
                 "projection_acknowledged_at": consumed_at,
                 "continuation_idempotency_key": _effect_key(
                     request, "continuation", response_digest
                 ),
+                "continuation_intent_at": consumed_at,
                 "continuation_acknowledged_at": consumed_at,
             }
         )
     elif status not in {"pending", "expired"}:
         raise FactoryActionDurabilityError(
             "factory action durable legacy row state mismatch"
+        )
+    return (
+        _backfill_phase_timestamps(normalized)
+        if backfill_phase_timestamps
+        else normalized
+    )
+
+
+def _backfill_phase_timestamps(row: dict[str, object]) -> dict[str, object]:
+    """Backfill intent timestamps for rows created before the exact phase clock."""
+
+    normalized = dict(row)
+    phase = normalized.get("resume_phase")
+    response_payload = normalized.get("response_payload")
+    if phase in {None, "answered"} or response_payload is None:
+        return normalized
+    try:
+        response = FactoryActionResponseV1.model_validate_json(
+            _json_bytes(response_payload)
+        )
+    except ValueError as error:
+        raise FactoryActionDurabilityError(
+            "factory action durable row response invalid"
+        ) from error
+    answered_at = _naive_utc(response.answered_at)
+    projection_acknowledged_at = normalized.get("projection_acknowledged_at")
+    continuation_acknowledged_at = normalized.get("continuation_acknowledged_at")
+    if normalized.get("projection_intent_at") is None:
+        normalized["projection_intent_at"] = (
+            projection_acknowledged_at or answered_at
+        )
+    if phase in {"continuation_intent", "continuation_acknowledged"} and normalized.get(
+        "continuation_intent_at"
+    ) is None:
+        normalized["continuation_intent_at"] = (
+            continuation_acknowledged_at
+            or projection_acknowledged_at
+            or normalized["projection_intent_at"]
         )
     return normalized
 
@@ -646,8 +707,10 @@ def _db_row(row: dict[str, object]) -> FactoryActionRow:
         response_sha256=(None if row.get("response_sha256") is None else str(row["response_sha256"])),
         resume_phase=(None if phase is None else str(phase)),  # type: ignore[arg-type]
         projection_idempotency_key=(None if row.get("projection_idempotency_key") is None else str(row["projection_idempotency_key"])),
+        projection_intent_at=_optional_aware(row.get("projection_intent_at")),
         projection_acknowledged_at=_optional_aware(row.get("projection_acknowledged_at")),
         continuation_idempotency_key=(None if row.get("continuation_idempotency_key") is None else str(row["continuation_idempotency_key"])),
+        continuation_intent_at=_optional_aware(row.get("continuation_intent_at")),
         continuation_acknowledged_at=_optional_aware(row.get("continuation_acknowledged_at")),
         consumed_at=(None if consumed is None else _aware_utc(consumed)),  # type: ignore[arg-type]
     )
@@ -670,6 +733,8 @@ def _db_row(row: dict[str, object]) -> FactoryActionRow:
         )
     if result.tenant_id == "" or not _valid_phase_columns(result):
         raise FactoryActionDurabilityError("factory action durable row phase mismatch")
+    if not _valid_phase_timestamps(result):
+        raise FactoryActionDurabilityError("factory action durable row timestamp mismatch")
     return result
 
 
@@ -730,8 +795,10 @@ def _optional_aware(value: object) -> datetime | None:
 
 def _valid_phase_columns(row: FactoryActionRow) -> bool:
     projection_key = row.projection_idempotency_key
+    projection_intent_at = row.projection_intent_at
     projection_at = row.projection_acknowledged_at
     continuation_key = row.continuation_idempotency_key
+    continuation_intent_at = row.continuation_intent_at
     continuation_at = row.continuation_acknowledged_at
     consumed_at = row.consumed_at
     if row.resume_phase is None:
@@ -740,8 +807,10 @@ def _valid_phase_columns(row: FactoryActionRow) -> bool:
             and row.response is None
             and row.response_sha256 is None
             and projection_key is None
+            and projection_intent_at is None
             and projection_at is None
             and continuation_key is None
+            and continuation_intent_at is None
             and continuation_at is None
             and consumed_at is None
         )
@@ -750,36 +819,92 @@ def _valid_phase_columns(row: FactoryActionRow) -> bool:
             row.status == "answered"
             and row.response is not None
             and projection_key is None
+            and projection_intent_at is None
             and projection_at is None
             and continuation_key is None
+            and continuation_intent_at is None
             and continuation_at is None
             and consumed_at is None
         )
     if row.resume_phase == "projection_intent":
         return (
             row.status == "answered" and projection_key is not None
+            and projection_intent_at is not None
             and projection_at is None and continuation_key is None
+            and continuation_intent_at is None
             and continuation_at is None and consumed_at is None
         )
     if row.resume_phase == "projection_acknowledged":
         return (
             row.status == "answered" and projection_key is not None
+            and projection_intent_at is not None
             and projection_at is not None and continuation_key is None
+            and continuation_intent_at is None
             and continuation_at is None and consumed_at is None
         )
     if row.resume_phase == "continuation_intent":
         return (
             row.status == "answered" and projection_key is not None
             and projection_at is not None and continuation_key is not None
+            and projection_intent_at is not None and continuation_intent_at is not None
             and continuation_at is None and consumed_at is None
         )
     if row.resume_phase == "continuation_acknowledged":
         return (
             row.status == "consumed" and projection_key is not None
             and projection_at is not None and continuation_key is not None
+            and projection_intent_at is not None and continuation_intent_at is not None
             and continuation_at is not None and consumed_at is not None
         )
     return False
+
+
+def _valid_phase_timestamps(row: FactoryActionRow) -> bool:
+    if row.response is None:
+        return True
+    timestamps = tuple(
+        timestamp
+        for timestamp in (
+            row.response.answered_at,
+            row.projection_intent_at,
+            row.projection_acknowledged_at,
+            row.continuation_intent_at,
+            row.continuation_acknowledged_at,
+        )
+        if timestamp is not None
+    )
+    if any(left > right for left, right in zip(timestamps, timestamps[1:])):
+        return False
+    if timestamps and timestamps[-1] > row.request.deadline_at:
+        return False
+    if row.resume_phase == "continuation_acknowledged":
+        return row.consumed_at == row.continuation_acknowledged_at
+    return row.consumed_at is None
+
+
+def _transition_time(row: FactoryActionRow, now: datetime) -> datetime:
+    transition_at = _aware_utc(now)
+    if row.response is None:
+        raise FactoryActionDurabilityError("factory action durable row response missing")
+    prior = next(
+        (
+            timestamp
+            for timestamp in (
+                row.continuation_acknowledged_at,
+                row.continuation_intent_at,
+                row.projection_acknowledged_at,
+                row.projection_intent_at,
+                row.response.answered_at,
+            )
+            if timestamp is not None
+        ),
+        row.response.answered_at,
+    )
+    if transition_at < prior or transition_at > row.request.deadline_at:
+        raise FactoryActionDurabilityError(
+            "factory action durable row timestamp mismatch"
+        )
+    return transition_at
 
 
 def _json_bytes(value: object) -> bytes:

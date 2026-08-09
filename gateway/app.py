@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response, status
@@ -15,6 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
+from starlette.types import Receive, Scope, Send
 
 from blockchain.mariadb_storage import MariaDBStorage
 from agenten.agent_runtime.contracts import (
@@ -130,8 +132,13 @@ from gateway.portal_live_contracts import (
 )
 
 
+@runtime_checkable
 class FactoryActionResumeDispatcher(Protocol):
     def enqueue(self, *, request_id: UUID, tenant_id: str) -> None: ...
+
+    def recover(self) -> None: ...
+
+    def close(self) -> None: ...
 
 
 logger = logging.getLogger(__name__)
@@ -289,6 +296,10 @@ def create_app(
     factory_action_projection: FactoryActionProjection | None = None,
     factory_continuation_scheduler: FactoryContinuationScheduler | None = None,
 ) -> FastAPI:
+    if factory_action_resume_dispatcher is not None and not isinstance(
+        factory_action_resume_dispatcher, FactoryActionResumeDispatcher
+    ):
+        raise ValueError("factory action resume dispatcher lifecycle is incomplete")
     if (factory_action_projection is None) != (factory_continuation_scheduler is None):
         raise ValueError("factory action projection and continuation scheduler must be configured together")
     if (
@@ -348,15 +359,13 @@ def create_app(
         if start:
             await start()
         resume_dispatcher = get_factory_action_resume_dispatcher()
-        recover = getattr(resume_dispatcher, "recover", None)
-        if recover is not None:
-            recover()
         try:
+            if resume_dispatcher is not None:
+                resume_dispatcher.recover()
             yield
         finally:
-            close_resume = getattr(resume_dispatcher, "close", None)
-            if close_resume is not None:
-                close_resume()
+            if resume_dispatcher is not None:
+                resume_dispatcher.close()
             stop = getattr(mirror, "stop", None)
             if stop:
                 await stop()
@@ -1368,15 +1377,35 @@ def create_app(
     return app
 
 
-app = create_app()
+def create_production_app(
+    *, environ: Mapping[str, str] | None = None
+) -> FastAPI:
+    """Load and validate effective production settings before composition."""
+
+    return create_app(settings=GatewaySettings.from_env(environ))
+
+
+_production_app: FastAPI | None = None
+_production_app_lock = Lock()
+
+
+async def app(scope: Scope, receive: Receive, send: Send) -> None:
+    """Lazy ASGI entrypoint whose first composition uses validated settings."""
+
+    global _production_app
+    if _production_app is None:
+        with _production_app_lock:
+            if _production_app is None:
+                _production_app = create_production_app()
+    await _production_app(scope, receive, send)
 
 
 def main() -> None:
     import uvicorn
 
-    settings = GatewaySettings.from_env()
-    app.state.gateway_settings = settings
-    uvicorn.run(app, host=settings.host, port=settings.port, workers=1)
+    production_app = create_production_app()
+    settings = production_app.state.gateway_settings
+    uvicorn.run(production_app, host=settings.host, port=settings.port, workers=1)
 
 
 if __name__ == "__main__":
