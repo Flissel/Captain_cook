@@ -39,6 +39,7 @@ class GatewaySettings(BaseModel):
     ledger_dsn: SecretStr
     captain_gateway_token: SecretStr
     worker_gateway_token: SecretStr
+    provider_receipt_gateway_token: SecretStr | None = None
     approval_enabled: bool = False
     host: Literal["127.0.0.1"] = "127.0.0.1"
     port: int = Field(default=8090, ge=1, le=65535)
@@ -112,6 +113,15 @@ class GatewaySettings(BaseModel):
             raise ValueError("Captain Runtime token must not be blank")
         return value
 
+    @field_validator("provider_receipt_gateway_token")
+    @classmethod
+    def _provider_receipt_token_must_not_be_blank(
+        cls, value: SecretStr | None
+    ) -> SecretStr | None:
+        if value is not None and not value.get_secret_value().strip():
+            raise ValueError("provider receipt token must not be blank")
+        return value
+
     @field_validator(
         "portal_supabase_issuer",
         "portal_supabase_audience",
@@ -174,6 +184,29 @@ class GatewaySettings(BaseModel):
             self.worker_gateway_token.get_secret_value(),
         ):
             raise ValueError("gateway role tokens must be distinct")
+        if self.provider_receipt_gateway_token is not None:
+            provider_token = self.provider_receipt_gateway_token.get_secret_value()
+            isolated_tokens = [
+                self.captain_gateway_token.get_secret_value(),
+                self.worker_gateway_token.get_secret_value(),
+            ]
+            isolated_tokens.extend(
+                value.get_secret_value()
+                for value in (
+                    self.captain_runtime_token,
+                    self.portal_provider_control_token,
+                    self.portal_evidence_token,
+                    self.portal_restart_control_token,
+                    self.portal_n8n_api_key,
+                    self.portal_n8n_mcp_token,
+                )
+                if value is not None
+            )
+            if any(
+                secrets.compare_digest(provider_token, actor_token)
+                for actor_token in isolated_tokens
+            ):
+                raise ValueError("provider receipt token must be a distinct authority")
         if (self.captain_runtime_url is None) != (self.captain_runtime_token is None):
             raise ValueError("Captain Runtime settings must be configured together")
         portal_settings = (
@@ -340,6 +373,11 @@ class GatewaySettings(BaseModel):
                 ledger_dsn=SecretStr(source["LEDGER_DSN"]),
                 captain_gateway_token=SecretStr(captain_token),
                 worker_gateway_token=SecretStr(worker_token),
+                provider_receipt_gateway_token=(
+                    SecretStr(source["PROVIDER_RECEIPT_GATEWAY_TOKEN"])
+                    if source.get("PROVIDER_RECEIPT_GATEWAY_TOKEN") is not None
+                    else None
+                ),
                 approval_enabled=approval_enabled,
                 port=port,
                 claim_ttl_seconds=claim_ttl_seconds,

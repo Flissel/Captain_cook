@@ -413,6 +413,31 @@ class RuntimeProviderUsageReceiptV1(_FrozenContract):
         return self
 
 
+class RuntimeProviderCostSettlementV1(_FrozenContract):
+    """Provider-authoritative immutable usage settlement for one exact call."""
+
+    schema_name: Literal["captain.runtime-provider-cost-settlement.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    settlement_id: UUID
+    provider_call_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    receipt: RuntimeProviderUsageReceiptV1
+    receipt_sha256: str = Field(pattern=SHA256_PATTERN)
+    settled_at: datetime
+
+    @field_validator("settled_at")
+    @classmethod
+    def require_utc_settlement_time(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+    @model_validator(mode="after")
+    def require_digest_bound_settlement(self) -> "RuntimeProviderCostSettlementV1":
+        digest = hashlib.sha256(canonical_json_bytes(self.receipt)).hexdigest()
+        if self.receipt_sha256 != digest or self.settled_at < self.receipt.ended_at:
+            raise ValueError("runtime provider settlement is not digest bound")
+        return self
+
+
 class RuntimeCostEvidenceV1(_FrozenContract):
     """Provider-originated actual usage for one runtime resume command."""
 

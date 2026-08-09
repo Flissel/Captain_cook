@@ -25,6 +25,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     ArtifactRef,
     RuntimeCostEvidenceV1,
+    RuntimeProviderCostSettlementV1,
     RuntimeOperation,
     RuntimeResumeCostAuthorityV1,
     RuntimeResumeCostSettlementV1,
@@ -117,10 +118,69 @@ def _settings() -> GatewaySettings:
             "ledger_dsn": "mysql://ignored:ignored@127.0.0.1:3306/ignored",
             "captain_gateway_token": CAPTAIN_TOKEN,
             "worker_gateway_token": WORKER_TOKEN,
+            "provider_receipt_gateway_token": "provider-receipt-test-token",
             "captain_runtime_url": "https://runtime.test",
             "captain_runtime_token": "runtime-resume-test-token",
         }
     )
+
+
+def _provider_settlement(command, result) -> dict[str, object]:
+    evidence = result.cost_evidence
+    receipt = {
+        "schema": "captain.runtime-provider-usage-receipt.v1",
+        "receipt_id": str(evidence.receipt_id),
+        "request_id": str(command.event_id),
+        "command_id": str(command.causation_id or command.event_id),
+        "result_id": str(result.event_id),
+        "reservation_id": str(command.payload.budget_reservation_id),
+        "job_id": str(command.payload.cost_job_id),
+        "run_id": str(command.payload.cost_run_id),
+        "input_id": command.payload.cost_input_id,
+        "correlation_id": str(command.correlation_id),
+        "capability_id": command.payload.cost_capability_id,
+        "capability_version": command.payload.cost_capability_version,
+        "session_id": result.session_id,
+        "provider": "openai",
+        "model": PRICING.model,
+        "input_units": 100_000,
+        "cached_input_units": 0,
+        "output_units": 12_500,
+        "actual_cost_usd": "0.25",
+        "pricing_snapshot_id": PRICING.snapshot_id,
+        "pricing_snapshot_sha256": PRICING.snapshot_sha256,
+        "started_at": "2026-08-09T12:00:00Z",
+        "ended_at": "2026-08-09T12:00:01Z",
+    }
+    receipt_bytes = canonical_json_bytes(
+        RuntimeProviderUsageReceiptV1.model_validate(receipt)
+    )
+    return {
+        "schema": "captain.runtime-provider-cost-settlement.v1",
+        "settlement_id": str(uuid5(command.event_id, "provider-cost-settlement")),
+        "provider_call_id": "provider-call-one",
+        "receipt": receipt,
+        "receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+        "settled_at": "2026-08-09T12:00:02Z",
+    }
+
+
+def _provider_bound_runtime(command):
+    grant = FakeCapabilityPolicy().derive(command, batch_for(command), command.occurred_at)
+    result = FakeCodex(["command_accepted", "grant_recorded"])._result(command, grant)
+    result = result.model_copy(
+        update={
+            "cost_evidence": result.cost_evidence.model_copy(
+                update={
+                    "pricing_snapshot_id": PRICING.snapshot_id,
+                    "pricing_snapshot_sha256": PRICING.snapshot_sha256,
+                    "started_at": datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
+                    "ended_at": datetime(2026, 8, 9, 12, 0, 1, tzinfo=timezone.utc),
+                }
+            )
+        }
+    )
+    return grant, result
 
 
 def _authorization_request() -> dict[str, object]:
@@ -166,6 +226,88 @@ def test_resume_authorization_requires_the_captain_token() -> None:
         headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
     ).status_code == 403
     assert service.calls == []
+
+
+def test_only_provider_receipt_role_can_record_provider_settlement() -> None:
+    command = resume_command_with_cost()
+    _, result = _provider_bound_runtime(command)
+
+    class Store:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def record_runtime_provider_settlement(self, settlement):
+            self.calls += 1
+            return SimpleNamespace(
+                operation_id=settlement.receipt.request_id,
+                replayed=False,
+            )
+
+        def record_runtime_result(self, _result):
+            raise HTTPException(
+                status_code=409,
+                detail="runtime provider settlement is unavailable",
+            )
+
+    store = Store()
+    client = TestClient(
+        create_app(
+            settings=_settings(),
+            gateway_store=store,
+            capability_resume_service=RecordingResumeService(),
+        )
+    )
+    path = "/v1/capability-resumes/provider-settlements"
+    payload = _provider_settlement(command, result)
+
+    assert client.post(path, json=payload).status_code == 401
+    assert client.post(
+        path,
+        json=payload,
+        headers={"Authorization": f"Bearer {CAPTAIN_TOKEN}"},
+    ).status_code == 403
+    assert client.post(
+        path,
+        json=payload,
+        headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
+    ).status_code == 403
+    assert client.post(
+        path,
+        json=payload,
+        headers={"Authorization": "Bearer runtime-resume-test-token"},
+    ).status_code == 401
+    accepted = client.post(
+        path,
+        json=payload,
+        headers={"Authorization": "Bearer provider-receipt-test-token"},
+    )
+
+    assert accepted.status_code == 201
+    assert store.calls == 1
+    assert client.post(
+        "/v1/runtime/results",
+        json=result.model_dump(mode="json", by_alias=True),
+        headers={"Authorization": "Bearer provider-receipt-test-token"},
+    ).status_code == 401
+    assert client.post(
+        "/v1/runtime/results",
+        json=result.model_dump(mode="json", by_alias=True),
+        headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
+    ).status_code == 409
+
+
+def test_provider_receipt_credential_cannot_equal_runtime_credential() -> None:
+    with pytest.raises(ValueError, match="distinct authority"):
+        GatewaySettings.model_validate(
+            {
+                "ledger_dsn": "mysql://ignored:ignored@127.0.0.1:3306/ignored",
+                "captain_gateway_token": CAPTAIN_TOKEN,
+                "worker_gateway_token": WORKER_TOKEN,
+                "provider_receipt_gateway_token": "shared-runtime-token",
+                "captain_runtime_url": "https://runtime.test",
+                "captain_runtime_token": "shared-runtime-token",
+            }
+        )
 
 
 def test_resume_authorize_dispatch_and_readback_are_authenticated_typed_routes() -> None:
@@ -438,7 +580,7 @@ def test_runtime_cost_settlement_route_books_typed_actual_usage() -> None:
         pricing_snapshot_id=PRICING.snapshot_id,
         pricing_snapshot_sha256=PRICING.snapshot_sha256,
         started_at=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
-        ended_at=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 8, 9, 12, 0, 1, tzinfo=timezone.utc),
         evidence_ref=artifact("provider-usage", "f"),
     )
     result = AgentRuntimeResult(
@@ -599,7 +741,7 @@ def test_gateway_cost_settlement_replay_survives_closed_reservation() -> None:
         pricing_snapshot_id=PRICING.snapshot_id,
         pricing_snapshot_sha256=PRICING.snapshot_sha256,
         started_at=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
-        ended_at=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 8, 9, 12, 0, 1, tzinfo=timezone.utc),
     )
     receipt_bytes = canonical_json_bytes(receipt)
     receipt_digest = hashlib.sha256(receipt_bytes).hexdigest()
@@ -648,6 +790,9 @@ def test_gateway_cost_settlement_replay_survives_closed_reservation() -> None:
         read_bytes=lambda ref: receipt_bytes
     )
     store._runtime_usage_pricing_snapshots = (PRICING,)
+    store._runtime_block_by_json_value = lambda *_args, **_kwargs: {
+        "data": _provider_settlement(command, result)
+    }
     store._factory_budget_event = lambda *_args, **_kwargs: {
         "payload": settlement.model_dump(mode="json", by_alias=True)
     }
@@ -802,3 +947,224 @@ def test_gateway_reprices_cas_usage_and_rejects_forgery(
             verify(
                 **arguments
             )
+
+
+@pytest.mark.parametrize(
+    "settlement_state", ["missing", "wrong_result", "forged_zero"]
+)
+def test_cost_bound_runtime_result_requires_exact_preexisting_provider_settlement(
+    settlement_state: str,
+) -> None:
+    command = resume_command_with_cost()
+    grant, result = _provider_bound_runtime(command)
+    settlement = _provider_settlement(command, result)
+    if settlement_state == "wrong_result":
+        settlement["receipt"] = {
+            **settlement["receipt"],
+            "result_id": str(uuid5(NAMESPACE_URL, "wrong-provider-result")),
+        }
+    elif settlement_state == "forged_zero":
+        settlement["receipt"] = {
+            **settlement["receipt"],
+            "input_units": 0,
+            "output_units": 0,
+            "actual_cost_usd": "0",
+        }
+    inserted: list[dict[str, object]] = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    class Storage:
+        @contextmanager
+        def transaction(self):
+            yield Connection()
+
+    def block(_cursor, *, block_type, **_kwargs):
+        if block_type == "agent_runtime_command":
+            return {"index": 1, "data": command.model_dump(mode="json", by_alias=True)}
+        if block_type == "agent_runtime_grant":
+            return {"index": 2, "data": grant.model_dump(mode="json", by_alias=True)}
+        if block_type == "runtime_provider_cost_settlement":
+            return None if settlement_state == "missing" else {"data": settlement}
+        return None
+
+    store = GatewayStore.__new__(GatewayStore)
+    store.storage = Storage()
+    store._runtime_block_by_json_value = block
+    store._runtime_result_block = lambda *_args, **_kwargs: None
+    store._next_index = lambda _cursor: 3
+    store._new_block = lambda *_args, **kwargs: kwargs
+    store._insert = lambda _cursor, value: inserted.append(value)
+
+    with pytest.raises(HTTPException, match="provider settlement"):
+        store._record_runtime_result_once(result)
+
+    assert inserted == []
+
+
+def test_matching_preexisting_provider_settlement_allows_result_once() -> None:
+    command = resume_command_with_cost()
+    grant, result = _provider_bound_runtime(command)
+    settlement = _provider_settlement(command, result)
+    inserted: list[dict[str, object]] = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    class Storage:
+        @contextmanager
+        def transaction(self):
+            yield Connection()
+
+    def block(_cursor, *, block_type, **_kwargs):
+        values = {
+            "agent_runtime_command": {
+                "index": 1,
+                "data": command.model_dump(mode="json", by_alias=True),
+            },
+            "agent_runtime_grant": {
+                "index": 2,
+                "data": grant.model_dump(mode="json", by_alias=True),
+            },
+            "runtime_provider_cost_settlement": {"data": settlement},
+        }
+        return values.get(block_type)
+
+    store = GatewayStore.__new__(GatewayStore)
+    store.storage = Storage()
+    store._runtime_block_by_json_value = block
+    store._runtime_result_block = lambda *_args, **_kwargs: (
+        {
+            "data": result.model_dump(mode="json", by_alias=True),
+        }
+        if inserted
+        else None
+    )
+    store._next_index = lambda _cursor: 3
+    store._new_block = lambda *_args, **kwargs: kwargs
+    store._insert = lambda _cursor, value: inserted.append(value)
+    store._retry_write = lambda operation: operation()
+
+    first = store.record_runtime_result(result)
+    replay = store.record_runtime_result(result)
+
+    assert len(inserted) == 1
+    assert inserted[0]["block_type"] == "agent_runtime_result"
+    assert first.replayed is False
+    assert replay.replayed is True
+
+
+def test_runtime_cas_receipt_cannot_establish_budget_settlement_truth() -> None:
+    command = resume_command_with_cost()
+    _, result = _provider_bound_runtime(command)
+    provider = _provider_settlement(command, result)
+    receipt_bytes = canonical_json_bytes(
+        RuntimeProviderUsageReceiptV1.model_validate(provider["receipt"])
+    )
+    digest = hashlib.sha256(receipt_bytes).hexdigest()
+    result = result.model_copy(
+        update={
+            "cost_evidence": result.cost_evidence.model_copy(
+                update={
+                    "evidence_ref": ArtifactRef(
+                        uri=f"artifact://sha256/{digest}",
+                        sha256=digest,
+                        media_type="application/json",
+                    )
+                }
+            )
+        }
+    )
+    authority = RuntimeResumeCostAuthorityV1(
+        schema_name="captain.runtime-resume-cost-authority.v1",
+        authorization_receipt_id=uuid5(NAMESPACE_URL, "provider-authority"),
+        cost_authority_ref=command.payload.cost_authority_ref,
+        reservation_id=command.payload.budget_reservation_id,
+        job_id=command.payload.cost_job_id,
+        run_id=command.payload.cost_run_id,
+        input_id=command.payload.cost_input_id,
+        correlation_id=command.correlation_id,
+        capability_id=command.payload.cost_capability_id,
+        capability_version=command.payload.cost_capability_version,
+        command_id=command.event_id,
+        ceiling_usd=command.payload.maximum_cost_usd,
+        expires_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        hard_ceiling_enforced=True,
+        metering_mode="provider_usage_receipt",
+    )
+    request = RuntimeResumeCostSettlementRequestV1(
+        command=command,
+        result=result,
+        authority=authority,
+    )
+
+    class Artifacts:
+        def read_bytes(self, _reference):
+            return receipt_bytes
+
+    store = GatewayStore.__new__(GatewayStore)
+    store._runtime_usage_artifacts = Artifacts()
+    store._runtime_usage_pricing_snapshots = (PRICING,)
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    class Storage:
+        @contextmanager
+        def transaction(self):
+            yield Connection()
+
+    store.storage = Storage()
+    store._runtime_block_by_json_value = lambda *_args, **_kwargs: None
+
+    with pytest.raises(HTTPException, match="provider settlement"):
+        store._verified_capability_resume_cost_request(request)
+
+
+def test_provider_authority_settlement_is_independently_repriced() -> None:
+    command = resume_command_with_cost()
+    _, result = _provider_bound_runtime(command)
+    settlement = RuntimeProviderCostSettlementV1.model_validate(
+        _provider_settlement(command, result)
+    )
+    store = GatewayStore.__new__(GatewayStore)
+    store._runtime_usage_pricing_snapshots = (PRICING,)
+
+    store._validate_runtime_provider_settlement(settlement, command)
+
+    unknown_receipt = settlement.receipt.model_copy(update={"model": "unknown-model"})
+    unknown = settlement.model_copy(
+        update={
+            "receipt": unknown_receipt,
+            "receipt_sha256": hashlib.sha256(
+                canonical_json_bytes(unknown_receipt)
+            ).hexdigest(),
+        }
+    )
+    with pytest.raises(HTTPException, match="provider settlement binding"):
+        store._validate_runtime_provider_settlement(unknown, command)

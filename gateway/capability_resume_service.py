@@ -10,6 +10,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
+    RuntimeProviderCostSettlementV1,
     RuntimeOperation,
     RuntimeStatus,
 )
@@ -94,6 +95,10 @@ class CapabilityResumeRuntimeReader(Protocol):
     def runtime_operation(
         self, command_id: UUID
     ) -> RuntimeOperationProjection | None: ...
+
+    def runtime_provider_settlement(
+        self, command_id: UUID, result_id: UUID
+    ) -> RuntimeProviderCostSettlementV1 | None: ...
 
 
 class CapabilityResumeExecutor(Protocol):
@@ -201,7 +206,7 @@ class CapabilityResumeService:
             authorization.authorization_receipt_id
         )
         if terminal is not None:
-            return self._terminal_execution(terminal)
+            return self._validated_terminal_execution(record, terminal)
         if self._repository.dispatch_started(
             authorization.authorization_receipt_id
         ):
@@ -233,12 +238,52 @@ class CapabilityResumeService:
             authorization.authorization_receipt_id
         )
         if terminal is not None:
-            return self._terminal_execution(terminal)
+            return self._validated_terminal_execution(record, terminal)
         if not self._repository.dispatch_started(
             authorization.authorization_receipt_id
         ):
             raise CapabilityResumeUnavailable("capability resume was not dispatched")
         return self._recover(record)
+
+    def _validated_terminal_execution(
+        self,
+        record: CapabilityResumeAuthorizationRecordV1,
+        terminal: CapabilityResumeTerminalV1,
+    ) -> CapabilityExecutionAuthority:
+        operation = self._runtime_reader.runtime_operation(
+            record.resume_command.event_id
+        )
+        result = operation.result if operation is not None else None
+        if result is None or result.event_id != terminal.execution.execution_result_id:
+            raise CapabilityResumeUnavailable(
+                "persisted terminal runtime result is unavailable"
+            )
+        settlement = self._runtime_reader.runtime_provider_settlement(
+            record.resume_command.event_id,
+            result.event_id,
+        )
+        if settlement is None:
+            raise CapabilityResumeUnavailable(
+                "persisted runtime provider settlement is unavailable"
+            )
+        _require_result_binding(result, record.resume_command)
+        _require_provider_settlement_binding(
+            settlement,
+            record.resume_command,
+            result,
+        )
+        actual = settlement.receipt.actual_cost_usd
+        execution = terminal.execution
+        if (
+            execution.resume_actual_spend_usd != actual
+            or execution.booked_cost_usd != record.booked_cost_usd + actual
+            or execution.resume_budget_violation
+            != (actual > record.resume_budget_usd)
+        ):
+            raise CapabilityResumeConflict(
+                "persisted terminal provider settlement binding changed"
+            )
+        return self._terminal_execution(terminal)
 
     def _exact_record(
         self, authorization: CapabilityResumeAuthorization
@@ -270,6 +315,19 @@ class CapabilityResumeService:
             )
         result = operation.result
         _require_result_binding(result, record.resume_command)
+        provider_settlement = self._runtime_reader.runtime_provider_settlement(
+            record.resume_command.event_id,
+            result.event_id,
+        )
+        if provider_settlement is None:
+            raise CapabilityResumeUnavailable(
+                "persisted runtime provider settlement is unavailable"
+            )
+        _require_provider_settlement_binding(
+            provider_settlement,
+            record.resume_command,
+            result,
+        )
         evidence_refs = _result_evidence(result)
         if not evidence_refs:
             raise CapabilityResumeUnavailable(
@@ -280,11 +338,7 @@ class CapabilityResumeService:
             raise CapabilityResumeUnavailable(
                 "successful resume runtime result has no actual cost evidence"
             )
-        actual_spend = (
-            result.cost_evidence.actual_cost_usd
-            if result.cost_evidence is not None
-            else None
-        )
+        actual_spend = provider_settlement.receipt.actual_cost_usd
         execution = CapabilityExecutionAuthority(
             job_id=authorization.job_id,
             correlation_id=authorization.correlation_id,
@@ -397,6 +451,46 @@ def _require_result_binding(
     ):
         raise CapabilityResumeConflict(
             "persisted resume result binding does not match"
+        )
+
+
+def _require_provider_settlement_binding(
+    settlement: RuntimeProviderCostSettlementV1,
+    command: AgentRuntimeCommand,
+    result: AgentRuntimeResult,
+) -> None:
+    receipt = settlement.receipt
+    evidence = result.cost_evidence
+    if (
+        receipt.request_id != command.event_id
+        or receipt.command_id != (command.causation_id or command.event_id)
+        or receipt.result_id != result.event_id
+        or receipt.reservation_id != command.payload.budget_reservation_id
+        or evidence is None
+        or evidence.receipt_id != receipt.receipt_id
+        or evidence.command_id != command.event_id
+        or evidence.result_id != result.event_id
+        or evidence.original_command_id != receipt.command_id
+        or evidence.reservation_id != receipt.reservation_id
+        or evidence.job_id != receipt.job_id
+        or evidence.run_id != receipt.run_id
+        or evidence.input_id != receipt.input_id
+        or evidence.correlation_id != receipt.correlation_id
+        or evidence.capability_id != receipt.capability_id
+        or evidence.capability_version != receipt.capability_version
+        or evidence.provider != receipt.provider
+        or evidence.model != receipt.model
+        or evidence.input_units != receipt.input_units
+        or evidence.cached_input_units != receipt.cached_input_units
+        or evidence.output_units != receipt.output_units
+        or evidence.actual_cost_usd != receipt.actual_cost_usd
+        or evidence.pricing_snapshot_id != receipt.pricing_snapshot_id
+        or evidence.pricing_snapshot_sha256 != receipt.pricing_snapshot_sha256
+        or evidence.started_at != receipt.started_at
+        or evidence.ended_at != receipt.ended_at
+    ):
+        raise CapabilityResumeConflict(
+            "persisted provider settlement does not match resume result"
         )
 
 

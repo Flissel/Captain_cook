@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
@@ -23,8 +24,11 @@ from agenten.agent_runtime.contracts import (
     RuntimeLimits,
     RuntimeCostEvidenceV1,
     RuntimeOperation,
+    RuntimeProviderCostSettlementV1,
+    RuntimeProviderUsageReceiptV1,
     RuntimeStatus,
     RuntimeUsagePricingSnapshotV1,
+    canonical_json_bytes,
 )
 from agenten.agent_runtime.http_executor import AgentRuntimeHttpExecutor
 from gateway.capability_live_pipeline import (
@@ -150,6 +154,47 @@ def _result(
         evidence_refs=(_ref(f"evidence-{label}"),),
         cost_evidence=cost_evidence,
         error=error,
+    )
+
+
+def _provider_settlement(
+    command: AgentRuntimeCommand,
+    result: AgentRuntimeResult,
+) -> RuntimeProviderCostSettlementV1:
+    evidence = result.cost_evidence
+    assert evidence is not None
+    receipt = RuntimeProviderUsageReceiptV1(
+        schema_name="captain.runtime-provider-usage-receipt.v1",
+        receipt_id=evidence.receipt_id,
+        request_id=command.event_id,
+        command_id=command.causation_id or command.event_id,
+        result_id=result.event_id,
+        reservation_id=evidence.reservation_id,
+        job_id=evidence.job_id,
+        run_id=evidence.run_id,
+        input_id=evidence.input_id,
+        correlation_id=evidence.correlation_id,
+        capability_id=evidence.capability_id,
+        capability_version=evidence.capability_version,
+        session_id=result.session_id,
+        provider=evidence.provider,
+        model=evidence.model,
+        input_units=evidence.input_units,
+        cached_input_units=evidence.cached_input_units,
+        output_units=evidence.output_units,
+        actual_cost_usd=evidence.actual_cost_usd,
+        pricing_snapshot_id=evidence.pricing_snapshot_id,
+        pricing_snapshot_sha256=evidence.pricing_snapshot_sha256,
+        started_at=evidence.started_at,
+        ended_at=evidence.ended_at,
+    )
+    return RuntimeProviderCostSettlementV1(
+        schema_name="captain.runtime-provider-cost-settlement.v1",
+        settlement_id=uuid5(command.event_id, "provider-cost-settlement"),
+        provider_call_id=f"provider-{result.event_id}",
+        receipt=receipt,
+        receipt_sha256=hashlib.sha256(canonical_json_bytes(receipt)).hexdigest(),
+        settled_at=receipt.ended_at,
     )
 
 
@@ -280,6 +325,9 @@ class RuntimeTruth:
             original_operation=_operation(original, original_result),
         )
         self.operations = {original.event_id: self.snapshot.original_operation}
+        self.provider_settlements: dict[
+            tuple[UUID, UUID], RuntimeProviderCostSettlementV1
+        ] = {}
 
     def resolve(
         self, _request: CapabilityResumeExecutionRequest
@@ -288,6 +336,11 @@ class RuntimeTruth:
 
     def runtime_operation(self, command_id: UUID) -> RuntimeOperationProjection | None:
         return self.operations.get(command_id)
+
+    def runtime_provider_settlement(
+        self, command_id: UUID, result_id: UUID
+    ) -> RuntimeProviderCostSettlementV1 | None:
+        return self.provider_settlements.get((command_id, result_id))
 
 
 class PersistingExecutor:
@@ -315,6 +368,10 @@ class PersistingExecutor:
         )
         if self.persist:
             self.truth.operations[command.event_id] = _operation(command, result)
+            if result.cost_evidence is not None:
+                self.truth.provider_settlements[(command.event_id, result.event_id)] = (
+                    _provider_settlement(command, result)
+                )
         return result
 
 
@@ -448,6 +505,9 @@ def test_restart_readback_exposes_full_overrun_total_and_violation() -> None:
     truth.operations[record.resume_command.event_id] = _operation(
         record.resume_command, overrun
     )
+    truth.provider_settlements[(record.resume_command.event_id, overrun.event_id)] = (
+        _provider_settlement(record.resume_command, overrun)
+    )
 
     with pytest.raises(CapabilityResumeDispatchFailed) as failure:
         _service(repository, truth, None).readback(authorization)
@@ -456,6 +516,37 @@ def test_restart_readback_exposes_full_overrun_total_and_violation() -> None:
     assert execution.resume_actual_spend_usd == Decimal("0.80")
     assert execution.booked_cost_usd == Decimal("2.05")
     assert execution.resume_budget_violation is True
+
+
+def test_restart_readback_rejects_runtime_result_without_gateway_provider_settlement() -> None:
+    repository = PersistentRepository()
+    truth = RuntimeTruth()
+    service = _service(repository, truth, None)
+    authorization = service.authorize(_request())
+    record = repository.authorization(authorization.authorization_receipt_id)
+    assert record is not None
+    result = _result(record.resume_command, label="unsettled-result")
+    repository.record_dispatch_started(authorization.authorization_receipt_id)
+    truth.operations[record.resume_command.event_id] = _operation(
+        record.resume_command,
+        result,
+    )
+
+    with pytest.raises(CapabilityResumeUnavailable, match="provider settlement"):
+        service.readback(authorization)
+
+
+@pytest.mark.asyncio
+async def test_persisted_terminal_does_not_bypass_provider_settlement_readback() -> None:
+    repository = PersistentRepository()
+    truth = RuntimeTruth()
+    service = _service(repository, truth, PersistingExecutor(truth))
+    authorization = service.authorize(_request())
+    await service.dispatch(authorization)
+    truth.provider_settlements.clear()
+
+    with pytest.raises(CapabilityResumeUnavailable, match="provider settlement"):
+        _service(repository, truth, None).readback(authorization)
 
 
 @pytest.mark.asyncio
@@ -472,6 +563,9 @@ async def test_dispatch_uses_authenticated_runtime_http_boundary_then_gateway_re
         command = AgentRuntimeCommand.model_validate(json.loads(request.content))
         result = _result(command, label="http-runtime-result")
         truth.operations[command.event_id] = _operation(command, result)
+        truth.provider_settlements[(command.event_id, result.event_id)] = (
+            _provider_settlement(command, result)
+        )
         return httpx.Response(
             200,
             json=result.model_dump(mode="json", by_alias=True),
@@ -556,6 +650,9 @@ async def test_transport_failure_remains_ambiguous_until_late_runtime_truth() ->
         record.resume_command,
         late_result,
     )
+    truth.provider_settlements[(record.resume_command.event_id, late_result.event_id)] = (
+        _provider_settlement(record.resume_command, late_result)
+    )
     restarted = CapabilityResumeService(
         repository=repository,
         authority_source=truth,
@@ -581,6 +678,9 @@ def test_restart_recovers_terminal_runtime_truth_without_a_second_dispatch() -> 
     truth.operations[record.resume_command.event_id] = _operation(
         record.resume_command, persisted_result
     )
+    truth.provider_settlements[
+        (record.resume_command.event_id, persisted_result.event_id)
+    ] = _provider_settlement(record.resume_command, persisted_result)
 
     restarted = _service(repository, truth, None)
     recovered = restarted.readback(authorization)
@@ -590,7 +690,7 @@ def test_restart_recovers_terminal_runtime_truth_without_a_second_dispatch() -> 
 
 
 @pytest.mark.asyncio
-async def test_runtime_infrastructure_failure_evidence_recovers_as_restart_stable_dispatch_failure() -> None:
+async def test_runtime_infrastructure_failure_without_provider_settlement_stays_unavailable() -> None:
     from tests.agent_runtime.test_service import (
         FakeCodex,
         FakeCostAuthority,
@@ -633,11 +733,10 @@ async def test_runtime_infrastructure_failure_evidence_recovers_as_restart_stabl
     )
     restarted = _service(repository, truth, None)
 
-    with pytest.raises(CapabilityResumeDispatchFailed) as failure:
+    with pytest.raises(CapabilityResumeUnavailable, match="provider settlement"):
         restarted.readback(authorization)
 
-    assert failure.value.failure.execution.execution_result_id == runtime_result.event_id
-    assert repository.terminal(authorization.authorization_receipt_id) is not None
+    assert repository.terminal(authorization.authorization_receipt_id) is None
 
 
 @pytest.mark.parametrize(

@@ -29,6 +29,7 @@ from agenten.agent_runtime.contracts import (
     RuntimeResumeCostAuthorityV1,
     RuntimeResumeCostSettlementRequestV1,
     RuntimeResumeCostSettlementV1,
+    RuntimeProviderCostSettlementV1,
     RuntimeUsagePricingSnapshotV1,
 )
 from agenten.agent_runtime.captain_production_adapters import (
@@ -53,6 +54,7 @@ from gateway.auth import (
     require_actor,
     require_captain,
     require_reader,
+    require_provider_receipt_authority,
     require_worker,
 )
 from gateway.contracts import (
@@ -1110,6 +1112,23 @@ def create_app(
             command,
             now=datetime.now(timezone.utc),
         )
+
+    @app.post(
+        "/v1/capability-resumes/provider-settlements",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def record_runtime_provider_settlement(
+        settlement: RuntimeProviderCostSettlementV1,
+        response: Response,
+        _: GatewayRole = Depends(require_provider_receipt_authority),
+    ) -> RuntimeWriteReceipt:
+        receipt = await run_in_threadpool(
+            get_store().record_runtime_provider_settlement,
+            settlement,
+        )
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
 
     @app.post("/v1/capability-resumes/cost-authorities/settle")
     async def settle_capability_resume_cost(

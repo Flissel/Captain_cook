@@ -26,6 +26,7 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     CapabilityGrantRevocation,
     RuntimeCostEvidenceV1,
+    RuntimeProviderCostSettlementV1,
     RuntimeProviderUsageReceiptV1,
     RuntimeUsagePricingSnapshotV1,
     RuntimeOperation,
@@ -2246,6 +2247,124 @@ class GatewayStore:
             return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
         return RuntimeWriteReceipt(operation_id=result.command_id, replayed=False)
 
+    def record_runtime_provider_settlement(
+        self,
+        settlement: RuntimeProviderCostSettlementV1,
+    ) -> RuntimeWriteReceipt:
+        try:
+            self._retry_write(
+                lambda: self._record_runtime_provider_settlement_once(settlement)
+            )
+        except _RuntimeReplay as replay:
+            return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
+        return RuntimeWriteReceipt(
+            operation_id=settlement.receipt.request_id,
+            replayed=False,
+        )
+
+    def _record_runtime_provider_settlement_once(
+        self,
+        settlement: RuntimeProviderCostSettlementV1,
+    ) -> None:
+        canonical = settlement.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="event_id",
+                    value=str(settlement.receipt.request_id),
+                    for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime provider settlement command not found",
+                    )
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                self._validate_runtime_provider_settlement(settlement, command)
+                for field, value in (
+                    ("settlement_id", str(settlement.settlement_id)),
+                    ("provider_call_id", settlement.provider_call_id),
+                    ("receipt.request_id", str(settlement.receipt.request_id)),
+                ):
+                    existing = self._runtime_block_by_json_value(
+                        cursor,
+                        block_type="runtime_provider_cost_settlement",
+                        field=field,
+                        value=value,
+                        for_update=True,
+                    )
+                    if existing is not None:
+                        if existing["data"] == canonical:
+                            raise _RuntimeReplay(settlement.receipt.request_id)
+                        raise HTTPException(
+                            status_code=409,
+                            detail="runtime provider settlement already changed",
+                        )
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="runtime_provider_cost_settlement",
+                    data=canonical,
+                    status="settled",
+                    parent_index=command_block["index"],
+                    metadata={"schema": settlement.schema_name},
+                )
+                self._insert(cursor, block)
+
+    def _validate_runtime_provider_settlement(
+        self,
+        settlement: RuntimeProviderCostSettlementV1,
+        command: AgentRuntimeCommand,
+    ) -> None:
+        receipt = settlement.receipt
+        payload = command.payload
+        snapshot = next(
+            (
+                item
+                for item in self._runtime_usage_pricing_snapshots
+                if item.snapshot_id == receipt.pricing_snapshot_id
+                and item.snapshot_sha256 == receipt.pricing_snapshot_sha256
+                and item.provider == receipt.provider
+                and item.model == receipt.model
+            ),
+            None,
+        )
+        if (
+            command.payload.operation is not RuntimeOperation.CODEX_RESUME
+            or command.payload.cost_authority_ref is None
+            or settlement.settlement_id
+            != uuid5(command.event_id, "provider-cost-settlement")
+            or receipt.request_id != command.event_id
+            or receipt.command_id != (command.causation_id or command.event_id)
+            or receipt.reservation_id != payload.budget_reservation_id
+            or receipt.job_id != payload.cost_job_id
+            or receipt.run_id != payload.cost_run_id
+            or receipt.input_id != payload.cost_input_id
+            or receipt.correlation_id != command.correlation_id
+            or receipt.capability_id != payload.cost_capability_id
+            or receipt.capability_version != payload.cost_capability_version
+            or snapshot is None
+            or not (
+                snapshot.effective_at
+                <= receipt.started_at
+                <= receipt.ended_at
+                < snapshot.expires_at
+            )
+            or receipt.actual_cost_usd
+            != snapshot.cost(
+                input_units=receipt.input_units,
+                cached_input_units=receipt.cached_input_units,
+                output_units=receipt.output_units,
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="runtime provider settlement binding is invalid",
+            )
+
     def record_capability_grant_revocation(
         self,
         revocation: CapabilityGrantRevocation,
@@ -2346,6 +2465,11 @@ class GatewayStore:
                     raise HTTPException(status_code=409, detail="runtime command not found")
                 command = AgentRuntimeCommand.model_validate(command_block["data"])
                 self._assert_result_matches_command(result, command)
+                self._require_provider_settlement_for_result(
+                    cursor,
+                    command,
+                    result,
+                )
 
                 grant_block = self._runtime_block_by_json_value(
                     cursor,
@@ -2393,6 +2517,91 @@ class GatewayStore:
                     metadata={"schema": "captain.agent-runtime-result.v1"},
                 )
                 self._insert(cursor, block)
+
+    def _require_provider_settlement_for_result(
+        self,
+        cursor: Any,
+        command: AgentRuntimeCommand,
+        result: AgentRuntimeResult,
+    ) -> RuntimeProviderCostSettlementV1 | None:
+        if (
+            command.payload.operation is not RuntimeOperation.CODEX_RESUME
+            or command.payload.cost_authority_ref is None
+        ):
+            return None
+        block = self._runtime_block_by_json_value(
+            cursor,
+            block_type="runtime_provider_cost_settlement",
+            field="receipt.request_id",
+            value=str(command.event_id),
+            for_update=True,
+        )
+        if block is None:
+            raise HTTPException(
+                status_code=409,
+                detail="runtime provider settlement is unavailable",
+            )
+        try:
+            settlement = RuntimeProviderCostSettlementV1.model_validate(block["data"])
+        except (ValidationError, ValueError):
+            raise HTTPException(
+                status_code=409,
+                detail="runtime provider settlement is invalid",
+            ) from None
+        receipt = settlement.receipt
+        evidence = result.cost_evidence
+        if (
+            receipt.request_id != command.event_id
+            or receipt.command_id != (command.causation_id or command.event_id)
+            or receipt.result_id != result.event_id
+            or evidence is None
+            or evidence.receipt_id != receipt.receipt_id
+            or evidence.command_id != command.event_id
+            or evidence.result_id != result.event_id
+            or evidence.original_command_id != receipt.command_id
+            or evidence.reservation_id != receipt.reservation_id
+            or evidence.job_id != receipt.job_id
+            or evidence.run_id != receipt.run_id
+            or evidence.input_id != receipt.input_id
+            or evidence.correlation_id != receipt.correlation_id
+            or evidence.capability_id != receipt.capability_id
+            or evidence.capability_version != receipt.capability_version
+            or evidence.provider != receipt.provider
+            or evidence.model != receipt.model
+            or evidence.input_units != receipt.input_units
+            or evidence.cached_input_units != receipt.cached_input_units
+            or evidence.output_units != receipt.output_units
+            or evidence.actual_cost_usd != receipt.actual_cost_usd
+            or evidence.pricing_snapshot_id != receipt.pricing_snapshot_id
+            or evidence.pricing_snapshot_sha256 != receipt.pricing_snapshot_sha256
+            or evidence.started_at != receipt.started_at
+            or evidence.ended_at != receipt.ended_at
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="runtime provider settlement does not match result",
+            )
+        return settlement
+
+    def runtime_provider_settlement(
+        self,
+        command_id: UUID,
+        result_id: UUID,
+    ) -> RuntimeProviderCostSettlementV1 | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="runtime_provider_cost_settlement",
+                    field="receipt.request_id",
+                    value=str(command_id),
+                )
+        if block is None:
+            return None
+        settlement = RuntimeProviderCostSettlementV1.model_validate(block["data"])
+        if settlement.receipt.result_id != result_id:
+            return None
+        return settlement
 
     def runtime_operation(self, operation_id: UUID) -> RuntimeOperationProjection:
         with self.storage.transaction() as connection:
@@ -2558,10 +2767,13 @@ class GatewayStore:
         *,
         now: datetime,
     ) -> RuntimeResumeCostSettlementV1:
-        request = self._verified_capability_resume_cost_request(request)
-        settlement = self._derive_capability_resume_cost_settlement(request)
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
+                request = self._verified_capability_resume_cost_request_with_cursor(
+                    cursor,
+                    request,
+                )
+                settlement = self._derive_capability_resume_cost_settlement(request)
                 existing = self._factory_budget_event(
                     cursor, settlement.settlement_id, for_update=True
                 )
@@ -2609,33 +2821,27 @@ class GatewayStore:
         self,
         request: RuntimeResumeCostSettlementRequestV1,
     ) -> RuntimeResumeCostSettlementRequestV1:
-        evidence = request.result.cost_evidence
-        if evidence is None:
-            return request
-        artifacts = getattr(self, "_runtime_usage_artifacts", None)
-        snapshots = getattr(self, "_runtime_usage_pricing_snapshots", ())
-        if artifacts is None or not snapshots:
-            raise HTTPException(
-                status_code=409,
-                detail="runtime provider usage verification is unavailable",
-            )
-        try:
-            content = artifacts.read_bytes(evidence.evidence_ref)
-        except Exception:
-            raise HTTPException(
-                status_code=409,
-                detail="runtime provider usage evidence is unavailable",
-            ) from None
-        actual = self._verify_runtime_provider_usage(
-            command=request.command,
-            result_id=request.result.event_id,
-            evidence=evidence,
-            receipt_bytes=content,
-            pricing_snapshots=snapshots,
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                return self._verified_capability_resume_cost_request_with_cursor(
+                    cursor,
+                    request,
+                )
+
+    def _verified_capability_resume_cost_request_with_cursor(
+        self,
+        cursor: Any,
+        request: RuntimeResumeCostSettlementRequestV1,
+    ) -> RuntimeResumeCostSettlementRequestV1:
+        settlement = self._require_provider_settlement_for_result(
+            cursor,
+            request.command,
+            request.result,
         )
-        if actual != evidence.actual_cost_usd:
+        if settlement is None:
             raise HTTPException(
-                status_code=409, detail="runtime provider usage cost mismatch"
+                status_code=409,
+                detail="runtime provider settlement is unavailable",
             )
         return request
 

@@ -558,6 +558,12 @@ class GatewayCapabilityResumeAuthoritySource:
                 return None
             raise CapabilityResumeConflict(str(exc.detail)) from None
 
+    def runtime_provider_settlement(self, command_id: UUID, result_id: UUID):
+        try:
+            return self._store.runtime_provider_settlement(command_id, result_id)
+        except HTTPException as exc:
+            raise CapabilityResumeConflict(str(exc.detail)) from None
+
 
 __all__ = [
     "GatewayCapabilityResumeAuthoritySource",
