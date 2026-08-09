@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 from pathlib import Path
 
 import pytest
@@ -16,36 +17,38 @@ INPUTS = (
 )
 
 
-def _arguments(private_root: Path, seed_file: Path | None = None) -> list[str]:
+def _arguments(private_root: Path) -> list[str]:
     values = [
         "--repository-root", str(ROOT),
         "--private-root", str(private_root),
     ]
     for value in INPUTS:
         values.extend(("--input", value))
-    if seed_file is not None:
-        values.extend(("--seed-file", str(seed_file)))
     return values
 
 
-def test_init_uses_secret_seed_file_without_printing_it_and_replays_exactly(
+def test_init_accepts_ephemeral_stdin_seed_without_printing_or_persisting_it(
     tmp_path: Path, capsys,
 ) -> None:
     private_root = tmp_path / "private"
-    seed_file = tmp_path / "seed.bin"
-    seed = b"CAPTAIN-SECRET-SEED-MUST-NOT-PRINT" * 2
-    seed_file.write_bytes(seed)
+    seed = "CAPTAIN-SECRET-SEED-MUST-NOT-PRINT" * 2
 
-    assert main(_arguments(private_root, seed_file)) == 0
+    assert main([*_arguments(private_root), "--seed-stdin"], stdin=io.StringIO(seed + "\n")) == 0
     first = json.loads(capsys.readouterr().out)
-    assert seed.decode() not in json.dumps(first)
+    assert seed not in json.dumps(first)
     assert first["manifest_path"] == "catalog.json"
     assert len(first["manifest_sha256"]) == 64
+    assert seed.encode() not in (private_root / "catalog.json").read_bytes()
 
-    seed_file.unlink()
     assert main(_arguments(private_root)) == 0
     replay = json.loads(capsys.readouterr().out)
     assert replay == first
+
+
+def test_init_has_no_seed_argv_file_or_environment_channel(tmp_path: Path) -> None:
+    for forbidden in ("--seed", "--seed-file", "--seed-env"):
+        with pytest.raises(SystemExit):
+            main([*_arguments(tmp_path / "private"), forbidden, "secret"])
 
 
 def test_init_uses_os_random_for_first_creation_and_supports_explicit_rotation_path(

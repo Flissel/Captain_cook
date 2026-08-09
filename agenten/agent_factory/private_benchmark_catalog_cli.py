@@ -7,7 +7,8 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
-from typing import Sequence
+from typing import Sequence, TextIO
+import sys
 
 from agenten.agent_factory.input_document import load_factory_input
 from agenten.agent_factory.private_benchmark_catalog import (
@@ -16,7 +17,11 @@ from agenten.agent_factory.private_benchmark_catalog import (
 )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    stdin: TextIO | None = None,
+) -> int:
     arguments = _parser().parse_args(argv)
     repository_root = Path(arguments.repository_root).resolve(strict=True)
     private_root = Path(arguments.private_root).resolve(strict=False)
@@ -27,7 +32,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for path in input_paths
     )
     target = private_root.joinpath(*PurePosixPath(manifest_path).parts)
-    if target.is_file() and arguments.seed_file is None:
+    if target.is_file() and not arguments.seed_stdin:
         digest = hashlib.sha256(target.read_bytes()).hexdigest()
         VerifiedFilePrivateBenchmarkCatalog.open(
             private_root=private_root,
@@ -36,10 +41,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_input_sha256s=tuple(item.input_ref.sha256 for item in documents),
         )
     else:
-        seed = (
-            os.urandom(32)
-            if arguments.seed_file is None
-            else Path(arguments.seed_file).read_bytes()
+        seed = os.urandom(32) if not arguments.seed_stdin else _ephemeral_stdin_seed(
+            sys.stdin if stdin is None else stdin
         )
         reference = write_private_benchmark_catalog(
             private_root,
@@ -82,8 +85,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--private-root", required=True)
     parser.add_argument("--input", action="append", required=True)
     parser.add_argument("--manifest-path", default="catalog.json")
-    parser.add_argument("--seed-file")
+    parser.add_argument(
+        "--seed-stdin", action="store_true",
+        help="read an ephemeral seed from standard input without persisting it",
+    )
     return parser
+
+
+def _ephemeral_stdin_seed(stream: TextIO) -> bytes:
+    seed = stream.readline().rstrip("\r\n").encode("utf-8")
+    if len(seed) < 32:
+        raise ValueError("private benchmark seed requires at least 256 bits")
+    return seed
 
 
 if __name__ == "__main__":

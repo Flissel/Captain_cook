@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 
@@ -39,6 +40,13 @@ _SECRET_ASSIGNMENT = re.compile(r"\b(?P<alias>[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET
 _BEARER = re.compile(r"\bBearer\s+\S+", re.I)
 _PRIVATE_KEY = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")
 _CREDENTIAL_URL = re.compile(r"https?://[^\s/:]+:[^\s/@]+@", re.I)
+_RESERVED_PRIVATE_HEADINGS = {
+    "private benchmark cases",
+    "private benchmark case definitions",
+    "private benchmarks",
+    "private holdout cases",
+    "private expected predicates",
+}
 
 
 class FactoryInputError(ValueError):
@@ -74,15 +82,16 @@ def parse_factory_input_bytes(source: bytes, logical_name: str) -> FactoryInputD
     extras: list[InputSection] = []
     benchmark_policy_statement: str | None = None
     for name, body in ordered:
+        normalized_name = _normalized_heading(name)
+        if normalized_name in _RESERVED_PRIVATE_HEADINGS:
+            raise FactoryInputError(
+                "worker-visible input must not contain private benchmark cases"
+            )
         if name in REQUIRED_SECTIONS:
             if name in required:
                 raise FactoryInputError(f"duplicate required section: {name}")
             required[name] = body
         else:
-            if name == "Private benchmark cases":
-                raise FactoryInputError(
-                    "worker-visible input must not contain private benchmark cases"
-                )
             if name == "Private holdout policy":
                 if benchmark_policy_statement is not None:
                     raise FactoryInputError("duplicate Private holdout policy section")
@@ -152,6 +161,11 @@ def _reject_credentials(text: str) -> None:
             raise FactoryInputError(f"credential value is forbidden at line {number} for {match.group('alias')}")
         if _BEARER.search(line) or _PRIVATE_KEY.search(line) or _CREDENTIAL_URL.search(line):
             raise FactoryInputError(f"credential value is forbidden at line {number}")
+
+
+def _normalized_heading(value: str) -> str:
+    compatible = unicodedata.normalize("NFKC", value).casefold()
+    return " ".join(re.sub(r"[-_]", " ", compatible).split())
 
 
 def _level_sections(text: str) -> tuple[str, list[tuple[str, str]]]:
