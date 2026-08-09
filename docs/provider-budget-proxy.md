@@ -25,11 +25,14 @@ References:
 ## Authority and cost sequence
 
 1. Captain/Gateway creates and validates the D1 resume cost authority.
-2. The operator writes a gitignored `captain.provider-budget-context.v1` bound
+2. Gateway derives a gitignored `captain.provider-budget-context.v1` bound
    to the exact command, original command, deterministic runtime result,
    reservation, job, run, capability, prior Codex session, ceiling, and expiry.
-3. Before every provider effect, the proxy calls the official Responses input
-   token count endpoint with the same model input, tools, and schemas.
+3. Before token counting and again immediately before reservation/provider
+   dispatch, the proxy performs an authenticated Gateway readback of the exact
+   command, reservation, result, session, policy, price-card, context digest,
+   and expiry. It then calls the official Responses input token count endpoint
+   with the same model input, tools, and schemas.
 4. SQLite `BEGIN IMMEDIATE` atomically reserves the conservative worst case.
    The proxy derives `max_output_tokens` from the remaining run ceiling.
 5. The proxy forwards only `gpt-5.6-terra`, reasoning `high`, known non-hosted
@@ -77,10 +80,12 @@ live run:
      --codex-home .captain-cook\codex-provider-home
    ```
 
-6. Set `CAPTAIN_PROVIDER_PROXY_URL=http://127.0.0.1:18091` on the Runtime, then
-   launch Codex with `CODEX_HOME` set to that generated directory and only the
-   proxy client token in its environment. Explicitly remove `OPENAI_API_KEY`
-   and the Gateway provider token from the Codex child environment.
+6. Set `CAPTAIN_PROVIDER_PROXY_URL=http://127.0.0.1:18091` on the Runtime and
+   configure Gateway with the matching `CAPTAIN_PROVIDER_PROXY_RESPONSES_URL`,
+   `CAPTAIN_PROVIDER_POLICY_SHA256`, and `CAPTAIN_PROVIDER_PRICE_CARD_SHA256`.
+   The Runtime supplies immutable Codex CLI overrides for the loopback
+   Responses provider. Its child environment contains the proxy client token
+   but strips `OPENAI_API_KEY`, Gateway, provider-receipt, and Runtime secrets.
 7. The Runtime must complete proxy finalization before it posts the D1 cost
    settlement or returns the Runtime result. Require Gateway readback of the exact provider settlement,
    runtime result, and cost settlement before any success claim.

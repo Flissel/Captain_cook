@@ -55,6 +55,10 @@ class ProviderClient(Protocol):
 
 
 class GatewaySettlementClient(Protocol):
+    async def require_active_provider_authority(
+        self, context: ProviderBudgetContextV1
+    ) -> ProviderBudgetContextV1: ...
+
     async def record_provider_settlement(self, payload: dict[str, object]) -> None: ...
 
 
@@ -74,6 +78,11 @@ class ProviderBudgetProxy:
         gateway: GatewaySettlementClient,
         clock: Callable[[], datetime],
     ) -> None:
+        if (
+            context.policy_sha256 != policy.sha256
+            or context.price_card_sha256 != price_card.sha256
+        ):
+            raise ValueError("provider context policy binding is invalid")
         self.context = context
         self.policy = policy
         self.price_card = price_card
@@ -83,6 +92,17 @@ class ProviderBudgetProxy:
         self.gateway = gateway
         self.clock = clock
         self._finalize_lock = asyncio.Lock()
+
+    async def _require_active_authority(self, now: datetime) -> None:
+        try:
+            self.context.require_active(now)
+            authority = await self.gateway.require_active_provider_authority(
+                self.context
+            )
+        except Exception as exc:
+            raise BudgetRejected("provider authority is unavailable") from exc
+        if authority != self.context:
+            raise BudgetRejected("provider authority is unavailable")
 
     @property
     def pricing_snapshot(self) -> RuntimeUsagePricingSnapshotV1:
@@ -210,12 +230,14 @@ class ProviderBudgetProxy:
         self, payload: dict[str, object]
     ) -> tuple[datetime, str, Decimal, dict[str, object]]:
         now = self.clock()
-        self.context.require_active(now)
+        await self._require_active_authority(now)
         self.price_card.require_active(now)
         self.policy.require_safe()
         self._validate_request(payload)
         count_payload = {key: value for key, value in payload.items() if key not in {"stream", "background", "max_output_tokens"}}
         input_tokens = await self.provider.count_input_tokens(count_payload)
+        now = self.clock()
+        await self._require_active_authority(now)
         if input_tokens >= self.price_card.large_input_threshold_tokens:
             raise BudgetRejected(
                 f"provider input must be below {self.price_card.large_input_threshold_tokens} tokens"
@@ -250,6 +272,7 @@ class ProviderBudgetProxy:
         return now, call_id, reservation, outbound
 
     async def read(self, response_id: str, query: str = "") -> ProviderReply:
+        await self._require_active_authority(self.clock())
         reply = await self.provider.read_response(response_id, query)
         active = self.repository.active_response(response_id)
         if active is None:
@@ -274,6 +297,7 @@ class ProviderBudgetProxy:
         return reply
 
     async def cancel(self, response_id: str) -> ProviderReply:
+        await self._require_active_authority(self.clock())
         reply = await self.provider.cancel_response(response_id)
         active = self.repository.active_response(response_id)
         if active is not None:
@@ -393,6 +417,8 @@ class ProviderBudgetProxy:
         if actual > reservation:
             raise ProviderUsageUnavailable("provider usage exceeds its reservation")
         ended_at = self.clock()
+        if ended_at >= self.context.expires_at:
+            raise ProviderUsageUnavailable("provider terminal usage window is invalid")
         call_receipt = {
             "schema": "captain.provider-call-usage.v1",
             "call_id": call_id,
@@ -430,6 +456,7 @@ class ProviderBudgetProxy:
     ) -> dict[str, object]:
         if command_id != self.context.command_id or result_id != self.context.result_id:
             raise BudgetRejected("provider finalization binding is invalid")
+        await self._require_active_authority(self.clock())
         async with self._finalize_lock:
             try:
                 (

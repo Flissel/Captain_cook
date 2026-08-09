@@ -64,8 +64,12 @@ def _policy(**updates: object) -> RuntimeProviderPolicyV1:
     return RuntimeProviderPolicyV1.model_validate(values)
 
 
-def _context() -> ProviderBudgetContextV1:
+def _context(
+    *, policy: RuntimeProviderPolicyV1 | None = None, card: OpenAIPriceCardV1 | None = None
+) -> ProviderBudgetContextV1:
     command = uuid5(NAMESPACE_URL, "proxy-command")
+    policy = policy or _policy()
+    card = card or _card()
     return ProviderBudgetContextV1.model_validate(
         {
             "schema": "captain.provider-budget-context.v1",
@@ -83,6 +87,8 @@ def _context() -> ProviderBudgetContextV1:
             "cost_authority_ref": "gateway://capability-resume-authorizations/one",
             "ceiling_usd": "6.00",
             "expires_at": NOW + timedelta(hours=1),
+            "policy_sha256": policy.sha256,
+            "price_card_sha256": card.sha256,
         }
     )
 
@@ -140,6 +146,13 @@ class FakeProvider:
 class FakeGateway:
     def __init__(self) -> None:
         self.settlements: list[dict[str, object]] = []
+        self.preflights: list[ProviderBudgetContextV1] = []
+
+    async def require_active_provider_authority(
+        self, context: ProviderBudgetContextV1
+    ) -> ProviderBudgetContextV1:
+        self.preflights.append(context)
+        return context
 
     async def record_provider_settlement(self, payload: dict[str, object]) -> None:
         self.settlements.append(payload)
@@ -151,10 +164,12 @@ class FailingGateway(FakeGateway):
 
 
 def _proxy(tmp_path: Path, provider: FakeProvider, gateway: FakeGateway, **policy: object) -> ProviderBudgetProxy:
+    configured_policy = _policy(**policy)
+    card = _card()
     return ProviderBudgetProxy(
-        context=_context(),
-        policy=_policy(**policy),
-        price_card=_card(),
+        context=_context(policy=configured_policy, card=card),
+        policy=configured_policy,
+        price_card=card,
         repository=SQLiteProviderBudgetRepository(tmp_path / "budget.sqlite3"),
         cas_root=tmp_path / "cas",
         provider=provider,
@@ -172,6 +187,7 @@ async def test_exact_count_precedes_atomic_reservation_and_caps_output(tmp_path:
     )
     assert reply.status_code == 200
     assert len(provider.count_payloads) == 1
+    assert gateway.preflights == [proxy.context, proxy.context]
     assert provider.create_payloads[0]["max_output_tokens"] <= 128000
     assert gateway.settlements == []
     settlement = await proxy.finalize(
@@ -243,6 +259,33 @@ async def test_background_response_remains_reserved_until_terminal_readback(tmp_
         command_id=proxy.context.command_id, result_id=proxy.context.result_id
     )
     assert len(gateway.settlements) == 1
+
+
+@pytest.mark.asyncio
+async def test_slow_token_count_crossing_authority_expiry_has_zero_provider_effect(
+    tmp_path: Path,
+) -> None:
+    moments = iter((NOW, NOW + timedelta(hours=2)))
+    provider, gateway = FakeProvider(input_tokens=1000), FakeGateway()
+    proxy = ProviderBudgetProxy(
+        context=_context(),
+        policy=_policy(),
+        price_card=_card(),
+        repository=SQLiteProviderBudgetRepository(tmp_path / "budget.sqlite3"),
+        cas_root=tmp_path / "cas",
+        provider=provider,
+        gateway=gateway,
+        clock=lambda: next(moments),
+    )
+
+    with pytest.raises(BudgetRejected, match="provider authority is unavailable"):
+        await proxy.create(
+            {"model": "gpt-5.6-terra", "input": "build", "reasoning": {"effort": "high"}}
+        )
+
+    assert provider.count_payloads
+    assert provider.create_payloads == []
+    assert proxy.repository.projection().call_count == 0
 
 
 @pytest.mark.asyncio

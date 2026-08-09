@@ -6,6 +6,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .contracts import ProviderBudgetContextV1
+
 from .service import ProviderReply, ProviderStreamReply
 
 
@@ -138,6 +140,27 @@ class GatewayProviderSettlementHTTPClient:
         self._base_url = base_url.rstrip("/")
         self._provider_token = provider_token
         self._client = client
+
+    async def require_active_provider_authority(
+        self, context: ProviderBudgetContextV1
+    ) -> ProviderBudgetContextV1:
+        response = await self._client.post(
+            f"{self._base_url}/v1/capability-resumes/provider-authorities/preflight",
+            headers={
+                "Authorization": f"Bearer {self._provider_token}",
+                "Content-Type": "application/json",
+            },
+            json=context.model_dump(mode="json", by_alias=True),
+        )
+        if response.status_code != 200:
+            raise RuntimeError("Gateway provider authority is unavailable")
+        try:
+            returned = ProviderBudgetContextV1.model_validate(response.json())
+        except (ValueError, TypeError):
+            raise RuntimeError("Gateway provider authority is unavailable") from None
+        if returned != context:
+            raise RuntimeError("Gateway provider authority is unavailable")
+        return returned
 
     async def record_provider_settlement(self, payload: dict[str, object]) -> None:
         response = await self._client.post(
