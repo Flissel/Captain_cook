@@ -2574,8 +2574,8 @@ class GatewayStore:
             or evidence.actual_cost_usd != receipt.actual_cost_usd
             or evidence.pricing_snapshot_id != receipt.pricing_snapshot_id
             or evidence.pricing_snapshot_sha256 != receipt.pricing_snapshot_sha256
-            or evidence.started_at != receipt.started_at
-            or evidence.ended_at != receipt.ended_at
+            or evidence.started_at > receipt.started_at
+            or evidence.ended_at < receipt.ended_at
         ):
             raise HTTPException(
                 status_code=409,

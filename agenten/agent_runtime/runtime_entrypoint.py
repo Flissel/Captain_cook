@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from uuid import UUID
 
 import httpx
@@ -57,6 +57,7 @@ class RuntimeEntrypointSettings(BaseModel):
     gateway_url: str = Field(pattern=r"^https?://[^\s/]+(?::[0-9]+)?(?:/[^\s]*)?$")
     host: Literal["127.0.0.1"] = "127.0.0.1"
     port: int = Field(default=8091, ge=1, le=65535)
+    provider_proxy_url: str | None = None
 
     @classmethod
     def from_env(
@@ -85,6 +86,7 @@ class RuntimeEntrypointSettings(BaseModel):
                 gateway_token=SecretStr(source["CAPTAIN_GATEWAY_TOKEN"]),
                 gateway_url=source["CAPTAIN_GATEWAY_URL"],
                 port=port,
+                provider_proxy_url=source.get("CAPTAIN_PROVIDER_PROXY_URL") or None,
             )
         except (TypeError, ValueError, ValidationError):
             raise RuntimeConfigurationError("invalid runtime configuration") from None
@@ -159,12 +161,14 @@ class GatewayBackedRuntimeCostAuthority:
         base_url: str,
         token: str,
         client: httpx.AsyncClient,
+        provider_finalizer: "ProviderProxyRuntimeFinalizer | None" = None,
     ) -> None:
         if not base_url.strip() or not token:
             raise ValueError("Gateway cost authority configuration is incomplete")
         self._base_url = base_url.rstrip("/")
         self._token = token
         self._client = client
+        self._provider_finalizer = provider_finalizer
 
     async def authorize(
         self, command: AgentRuntimeCommand
@@ -182,6 +186,8 @@ class GatewayBackedRuntimeCostAuthority:
         result: AgentRuntimeResult,
         authority: RuntimeResumeCostAuthorityV1,
     ) -> RuntimeResumeCostSettlementV1:
+        if self._provider_finalizer is not None:
+            await self._provider_finalizer.finalize(command, result)
         request = RuntimeResumeCostSettlementRequestV1(
             command=command,
             result=result,
@@ -215,6 +221,49 @@ class GatewayBackedRuntimeCostAuthority:
             raise GatewayRuntimeError(
                 f"{operation} returned an invalid response"
             ) from None
+
+
+class ProviderProxyRuntimeFinalizer:
+    """Runtime-scoped trigger; the proxy alone derives and writes provider truth."""
+
+    def __init__(self, *, base_url: str, token: str, client: httpx.AsyncClient) -> None:
+        parsed = urlsplit(base_url)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname != "127.0.0.1"
+            or parsed.port is None
+            or parsed.path not in {"", "/"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or not token.strip()
+        ):
+            raise ValueError("provider proxy finalizer must use authenticated loopback")
+        self._base_url = base_url.rstrip("/")
+        self._token = token
+        self._client = client
+
+    async def finalize(
+        self, command: AgentRuntimeCommand, result: AgentRuntimeResult
+    ) -> None:
+        try:
+            response = await self._client.post(
+                f"{self._base_url}/v1/captain/provider-settlements/finalize",
+                headers={"Authorization": f"Bearer {self._token}"},
+                json={
+                    "command_id": str(command.event_id),
+                    "result_id": str(result.event_id),
+                },
+            )
+        except httpx.HTTPError:
+            raise GatewayRuntimeError(
+                "finalize provider settlement could not reach the proxy"
+            ) from None
+        if response.status_code != 200:
+            raise GatewayRuntimeError(
+                f"finalize provider settlement failed with proxy status {response.status_code}"
+            )
 
 
 class _UtcClock:
@@ -267,6 +316,15 @@ def compose_gateway_backed_runtime_app(
             base_url=settings.gateway_url,
             token=gateway_token,
             client=client,
+            provider_finalizer=(
+                ProviderProxyRuntimeFinalizer(
+                    base_url=settings.provider_proxy_url,
+                    token=settings.runtime_token.get_secret_value(),
+                    client=client,
+                )
+                if settings.provider_proxy_url is not None
+                else None
+            ),
         ),
     )
     return create_runtime_app(

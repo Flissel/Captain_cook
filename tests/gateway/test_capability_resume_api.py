@@ -1071,6 +1071,30 @@ def test_matching_preexisting_provider_settlement_allows_result_once() -> None:
     assert replay.replayed is True
 
 
+def test_provider_usage_may_be_contained_by_wider_runtime_process_window() -> None:
+    command = resume_command_with_cost()
+    _, result = _provider_bound_runtime(command)
+    settlement = _provider_settlement(command, result)
+    evidence = result.cost_evidence.model_copy(
+        update={
+            "started_at": datetime(2026, 8, 9, 11, 59, 59, tzinfo=timezone.utc),
+            "ended_at": datetime(2026, 8, 9, 12, 0, 2, tzinfo=timezone.utc),
+        }
+    )
+    result = result.model_copy(update={"cost_evidence": evidence})
+    store = GatewayStore.__new__(GatewayStore)
+    store._runtime_block_by_json_value = lambda *_args, **_kwargs: {
+        "data": settlement
+    }
+
+    accepted = store._require_provider_settlement_for_result(
+        object(), command, result
+    )
+
+    assert accepted.receipt.started_at >= evidence.started_at
+    assert accepted.receipt.ended_at <= evidence.ended_at
+
+
 def test_runtime_cas_receipt_cannot_establish_budget_settlement_truth() -> None:
     command = resume_command_with_cost()
     _, result = _provider_bound_runtime(command)
