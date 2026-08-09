@@ -482,11 +482,21 @@ def test_windows_identity_probe_accepts_only_explicit_absent_sentinel(
     assert WindowsProcessBackend().is_alive(812, "known-start") is False
 
 
+@pytest.mark.parametrize(
+    "probe_error",
+    (
+        OSError("secret powershell failure"),
+        UnicodeDecodeError(
+            "utf-8", b"\xffsecret", 0, 1, "secret decode failure"
+        ),
+        RuntimeError("secret runtime failure"),
+    ),
+)
 def test_windows_identity_probe_redacts_subprocess_exception(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, probe_error: Exception
 ) -> None:
     def fail(*_: object, **__: object) -> object:
-        raise OSError("secret powershell failure")
+        raise probe_error
 
     monkeypatch.setattr("subprocess.run", fail)
 
@@ -496,7 +506,7 @@ def test_windows_identity_probe_redacts_subprocess_exception(
     ) as error:
         WindowsProcessBackend().is_alive(812, "known-start")
 
-    assert "secret powershell failure" not in str(error.value)
+    assert "secret" not in str(error.value)
 
 
 def test_stop_retains_persisted_record_on_windows_identity_probe_ambiguity(
