@@ -23,6 +23,8 @@ from agenten.agent_factory.forge_contracts import (
     CreationPackageManifestV1,
     CreationPackageManifestV2,
     CreationResultV1,
+    CreationResultV2,
+    CreationJobV3,
 )
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.n8n_tools import TypedN8nTool
@@ -40,6 +42,8 @@ from minibook.swarm.pipeline_adapter import (
 )
 from tests.agent_factory.test_candidate_evaluation import _write_candidate_archive
 from tests.agent_factory.test_state_machine import job_v3
+from minibook.tests.test_team_package import _fixture as v3_package_fixture
+from minibook.swarm.team_package import seal_team_package, validate_team_package
 
 
 class Blocks:
@@ -54,6 +58,96 @@ class Blocks:
     def released_for(self, job, step):
         assert step is FactorySkillStep.BRIEF_CODEX
         return self.released_skill
+
+
+@pytest.mark.asyncio
+async def test_captain_rejects_minibook_v3_success_when_independent_readback_is_tampered(
+    tmp_path: Path,
+) -> None:
+    minibook_store, _, _, refs, gaps = v3_package_fixture(tmp_path)
+    sealed = seal_team_package(
+        validate_team_package(artifact_store=minibook_store, tool_gaps=gaps, **refs),
+        artifact_store=minibook_store,
+    )
+    authority_job = CreationJobV3.model_validate(
+        refs["authority_job"].model_dump(mode="json", by_alias=True)
+    )
+    captain_job = job_v3(mode="demo")
+    authority_job = authority_job.model_copy(
+        update={
+            "compiled_spec_ref": type(authority_job.compiled_spec_ref).model_validate(
+                captain_job.compiled_spec_ref.model_dump(mode="json")
+            ),
+            "public_assertion_ids": captain_job.acceptance_assertion_ids,
+        }
+    )
+    result = CreationResultV2(
+        creation_job_id=authority_job.creation_job_id,
+        factory_job_id=authority_job.factory_job_id,
+        correlation_id=authority_job.correlation_id,
+        subject_version=authority_job.subject_version,
+        attempt=authority_job.attempt,
+        status="succeeded",
+        team_manifest_ref=sealed.team_manifest_ref.model_dump(mode="json"),
+        candidate_manifest_ref=sealed.candidate_manifest_ref.model_dump(mode="json"),
+        source_archive_ref=sealed.source_archive_ref.model_dump(mode="json"),
+        package_manifest_ref=sealed.package_manifest_ref.model_dump(mode="json"),
+        hermes_usage_receipt_ref=sealed.hermes_usage_receipt_ref.model_dump(mode="json"),
+        codex_build_receipt_ref=sealed.codex_build_receipt_ref.model_dump(mode="json"),
+        build_evidence_refs=[ref.model_dump(mode="json") for ref in sealed.build_evidence_refs],
+        real_case_evidence_refs=[ref.model_dump(mode="json") for ref in sealed.real_case_evidence_refs],
+        cas_readback_receipt_ref=sealed.readback_receipt_ref.model_dump(mode="json"),
+        tool_gaps=[gap.model_dump(mode="json", by_alias=True) for gap in gaps],
+    )
+    minibook_store.local_path(sealed.source_archive_ref).write_bytes(b"changed-after-validation")
+
+    class V3Jobs:
+        def creation_job_for(self, _job, _attempt):
+            return authority_job
+
+    class GatewayCas:
+        @staticmethod
+        def _ref(ref):
+            return __import__(
+                "minibook.swarm.contracts", fromlist=["ArtifactRef"]
+            ).ArtifactRef.model_validate(ref.model_dump(mode="json"))
+
+        def read_bytes(self, ref):
+            return minibook_store.read_bytes(self._ref(ref))
+
+        def local_path(self, ref):
+            return minibook_store.local_path(self._ref(ref))
+
+    gateway_store = GatewayCas()
+    blocks = Blocks(_released_skill(captain_job))
+    provider = GatewayForgeCandidateProvider(
+        repository=blocks,
+        artifacts=gateway_store,
+        v3_jobs=V3Jobs(),
+    )
+    evidence_root = tmp_path / "captain-evidence"
+    validator = CandidateEvaluationFactory(
+        provider=provider,
+        evidence_store=FilesystemFactoryEvidenceStore(evidence_root),
+    )
+    lease = issue_factory_lease(
+        job=captain_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/v3-readback",
+        now=captain_job.occurred_at,
+    )
+    request = FactoryDispatch(
+        job=captain_job,
+        action=FactoryAction(kind=FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE, attempt=1),
+        role=FactoryRole.TOOL_INTEGRATOR,
+        lease=lease,
+    )
+
+    with pytest.raises(FactoryDispatchError, match="Captain CAS readback digest mismatch"):
+        await validator.record_creation_result(request, result)
+    assert blocks.items == ()
+    assert not evidence_root.exists()
 
 
 def _released_skill(factory_job) -> ReleasedHermesSkill:

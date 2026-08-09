@@ -42,6 +42,7 @@ from agenten.agent_factory.candidate_evaluation import (
     CandidateEvaluationFactory,
     FactoryCandidateProvider,
     FactoryTeamExecutionPort,
+    GatewayForgeCandidateProvider,
     ResolvedFactoryCandidate,
 )
 from agenten.agent_factory.codex_brief import CodexPromptArtifactStore
@@ -566,6 +567,12 @@ def compose_agent_factory_live(
     )
     if factory_v3_enabled != (configured_v3_workers == 1):
         raise ValueError("Factory V3 worker configuration is incomplete")
+    if (
+        factory_v3_enabled
+        and isinstance(candidate_bindings, GatewayForgeCandidateProvider)
+        and not candidate_bindings.v3_readback_configured
+    ):
+        raise ValueError("Factory V3 Captain creation-job readback authority is incomplete")
 
     repository = GatewayFactoryRepository(
         store,

@@ -20,6 +20,11 @@ def test_gateway_reads_exact_bytes_from_minibook_owned_creation_cas(
 
     assert gateway.read_bytes(reference) == b"sealed-candidate"
     assert gateway.local_path(reference) == minibook.local_path(written)
+    assert gateway.metadata(reference) == {
+        "sha256": written.sha256,
+        "media_type": "application/zip",
+        "size_bytes": len(b"sealed-candidate"),
+    }
 
 
 def test_gateway_rejects_foreign_or_tampered_minibook_creation_ref(

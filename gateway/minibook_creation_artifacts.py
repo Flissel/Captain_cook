@@ -30,6 +30,16 @@ class GatewayMinibookCreationArtifactStore:
         except CreationArtifactStoreError as exc:
             raise ValueError(str(exc)) from exc
 
+    def metadata(self, reference: ArtifactRef) -> dict[str, object]:
+        """Return verified read-only metadata; never mutate Minibook's CAS."""
+
+        content = self.read_bytes(reference)
+        return {
+            "sha256": reference.sha256,
+            "media_type": reference.media_type,
+            "size_bytes": len(content),
+        }
+
     @staticmethod
     def _convert(reference: ArtifactRef) -> MinibookArtifactRef:
         if not isinstance(reference, ArtifactRef):

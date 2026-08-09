@@ -42,6 +42,7 @@ from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.forge_contracts import (
     CreationProgressV1,
     CreationResultV1,
+    CreationResultV2,
     CreationSubmissionReceipt,
 )
 
@@ -106,14 +107,14 @@ class HermesFactoryPort(Protocol):
 class MinibookForgePort(Protocol):
     """Submit the approved build to Minibook's existing SwarmPipeline."""
 
-    async def submit(self, request: FactoryDispatch) -> CreationSubmissionReceipt | CreationResultV1:
+    async def submit(self, request: FactoryDispatch) -> CreationSubmissionReceipt | CreationResultV1 | CreationResultV2:
         """Persist a job or complete the offline compatibility execution."""
 
     async def status(self, creation_job_id: UUID) -> CreationProgressV1: ...
 
-    async def result(self, creation_job_id: UUID) -> CreationResultV1: ...
+    async def result(self, creation_job_id: UUID) -> CreationResultV1 | CreationResultV2: ...
 
-    async def wait_for_result(self, creation_job_id: UUID) -> CreationResultV1:
+    async def wait_for_result(self, creation_job_id: UUID) -> CreationResultV1 | CreationResultV2:
         """Return a bounded terminal result for an accepted async submission."""
 
 
@@ -126,7 +127,7 @@ class FactoryCandidateValidationPort(Protocol):
     async def record_creation_result(
         self,
         request: FactoryDispatch,
-        result: CreationResultV1,
+        result: CreationResultV1 | CreationResultV2,
     ) -> FactoryEvidenceBlock:
         """Validate and seal exact Forge output as agent-code evidence."""
 
@@ -640,8 +641,16 @@ class FactoryDispatcher:
                 raise FactoryDispatchError(
                     "Forge submission requires the candidate evidence validator"
                 )
+            forge_lease = None
+            if isinstance(job, AgentFactoryJobV3):
+                forge_lease = self._leases.active(
+                    job,
+                    FactoryRole.TOOL_INTEGRATOR,
+                    action.attempt,
+                    self._clock.now(),
+                )
             submission = await self._forge.submit(
-                FactoryDispatch(job=job, action=action, role=None, lease=None)
+                FactoryDispatch(job=job, action=action, role=None, lease=forge_lease)
             )
             if isinstance(submission, CreationSubmissionReceipt):
                 if submission.subject_version != job.subject_version:
@@ -653,7 +662,7 @@ class FactoryDispatcher:
                     raise FactoryDispatchError(
                         "Minibook creation result does not match the submitted creation job"
                     )
-            elif isinstance(submission, CreationResultV1):
+            elif isinstance(submission, (CreationResultV1, CreationResultV2)):
                 # The offline Forge returns no separate receipt. Its strongest
                 # available binding is validated below from correlation,
                 # subject version, attempt, status, and content references.
@@ -662,6 +671,10 @@ class FactoryDispatcher:
                 raise FactoryDispatchError(
                     "Minibook Forge did not return a creation receipt or result"
                 )
+            if isinstance(job, AgentFactoryJobV3) and not isinstance(result, CreationResultV2):
+                raise FactoryDispatchError("Captain V3 creation result must use the V3 result contract")
+            if not isinstance(job, AgentFactoryJobV3) and isinstance(result, CreationResultV2):
+                raise FactoryDispatchError("Captain V1/V2 job cannot accept a V3 creation result")
             now = self._clock.now()
             evidence_action = FactoryAction(
                 kind=FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE,

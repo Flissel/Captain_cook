@@ -4,21 +4,27 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import tempfile
-from typing import Protocol
-from uuid import UUID
+from typing import Callable, Protocol
+from uuid import UUID, uuid5
 
 import httpx
+from pydantic import BaseModel, ConfigDict
 
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError, MinibookForgePort
+from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryRole
+from agenten.agent_factory.capability_resolution import CapabilityResolution
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.forge_contracts import (
     CreationJobV1,
     CreationJobV2,
+    CreationJobV3,
     CreationProgressV1,
     CreationResultV1,
+    CreationResultV2,
     CreationSubmissionReceipt,
     ForgeBuildSkillUsageReceiptV1,
 )
@@ -39,7 +45,7 @@ class FactoryInputMaterializer(Protocol):
 
 
 class CreationJobMapper(Protocol):
-    def map(self, request: FactoryDispatch) -> CreationJobV1: ...
+    def map(self, request: FactoryDispatch) -> CreationJobV1 | CreationJobV3: ...
 
 
 class ForgeBuildSkillReceiptProvider(Protocol):
@@ -60,6 +66,151 @@ class CaptainForgeEvidencePort(Protocol):
         job: object,
         step: FactorySkillStep,
     ) -> ReleasedHermesSkill: ...
+
+
+class CaptainCreationJobV3Authority(BaseModel):
+    """Captain-owned immutable inputs that must equal the compiled V3 plan."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    command_id: UUID
+    capability_resolution: CapabilityResolution
+    compiled_spec_ref: ArtifactRef
+    lease_ref: ArtifactRef
+    blueprint_ref: ArtifactRef
+    tool_plan_ref: ArtifactRef
+    required_agent_ids: tuple[str, ...]
+    ordered_handoffs: tuple[dict[str, str], ...]
+    tool_requirements: tuple[dict[str, object], ...]
+    workspace_policy_ref: ArtifactRef
+    clarification_policy: dict[str, object]
+
+
+class CaptainCreationJobV3Mapper:
+    """Map only an active digest-bound Captain lease and compiled authority."""
+
+    def __init__(
+        self,
+        *,
+        authority: Callable[[FactoryDispatch], CaptainCreationJobV3Authority],
+        released_skill: Callable[[object, FactorySkillStep], ReleasedHermesSkill],
+    ) -> None:
+        self._authority = authority
+        self._released_skill = released_skill
+        self._mapped: dict[tuple[UUID, int], CreationJobV3] = {}
+
+    def map(self, request: FactoryDispatch) -> CreationJobV3:
+        if request.action.kind is not FactoryActionKind.SUBMIT_FORGE_JOB:
+            raise FactoryDispatchError("V3 creation job requires Captain's submit-forge action")
+        if not isinstance(request.job, AgentFactoryJobV3):
+            raise FactoryDispatchError("V3 mapper requires a Captain V3 factory job")
+        if request.role is not None or request.lease is None:
+            raise FactoryDispatchError("V3 creation job requires the active factory lease")
+        lease = request.lease
+        if (
+            lease.role is not FactoryRole.TOOL_INTEGRATOR
+            or lease.job_id != request.job.job_id
+            or lease.correlation_id != request.job.correlation_id
+            or lease.subject_version != request.job.subject_version
+            or lease.attempt != request.action.attempt
+        ):
+            raise FactoryDispatchError("V3 creation job lease identity is stale or unbound")
+        authority = self._authority(request)
+        creation_material = "\x1f".join(
+            (
+                request.job.required_capability,
+                str(request.job.subject_version),
+                request.job.input_ref.sha256,
+                request.job.compiled_spec_ref.sha256,
+                request.job.dependency_graph_ref.sha256,
+                *request.job.acceptance_assertion_ids,
+            )
+        )
+        expected_creation_key = "factory-create-" + hashlib.sha256(
+            creation_material.encode("utf-8")
+        ).hexdigest()
+        if (
+            authority.command_id != request.job.event_id
+            or authority.capability_resolution.kind != "create"
+            or authority.capability_resolution.creation_key != expected_creation_key
+            or authority.compiled_spec_ref != request.job.compiled_spec_ref
+        ):
+            raise FactoryDispatchError(
+                "V3 creation job requires the exact demonstrated Captain capability miss"
+            )
+        lease_bytes = json.dumps(
+            lease.model_dump(mode="json", by_alias=True),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        lease_sha256 = hashlib.sha256(lease_bytes).hexdigest()
+        if authority.lease_ref.sha256 != lease_sha256:
+            raise FactoryDispatchError("V3 creation job lease digest is not bound to the active lease")
+        released = self._released_skill(request.job, FactorySkillStep.BRIEF_CODEX)
+        creation_job_id = uuid5(
+            request.job.job_id,
+            f"minibook.creation-job.v3:{request.action.attempt}",
+        )
+        idempotency_key = hashlib.sha256(
+            "\x1f".join(
+                (
+                    str(request.job.job_id),
+                    str(request.job.subject_version),
+                    str(request.action.attempt),
+                    request.job.input_ref.sha256,
+                    request.job.compiled_spec_ref.sha256,
+                    authority.blueprint_ref.sha256,
+                    authority.tool_plan_ref.sha256,
+                    lease_sha256,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        mapped = CreationJobV3.model_validate(
+            {
+                "schema": "minibook.creation-job.v3",
+                "creation_job_id": creation_job_id,
+                "factory_job_id": request.job.job_id,
+                "command_id": authority.command_id,
+                "correlation_id": request.job.correlation_id,
+                "causation_id": request.job.event_id,
+                "subject_version": request.job.subject_version,
+                "attempt": request.action.attempt,
+                "idempotency_key": idempotency_key,
+                "input_ref": request.job.input_ref.model_dump(mode="json"),
+                "compiled_spec_ref": request.job.compiled_spec_ref.model_dump(mode="json"),
+                "dependency_graph_ref": request.job.dependency_graph_ref.model_dump(mode="json"),
+                "released_skill": {
+                    "skill_id": released.skill_id,
+                    "version": released.version,
+                    "content_ref": released.content_ref.model_dump(mode="json"),
+                    "content_sha256": released.content_sha256,
+                },
+                "public_assertion_ids": request.job.acceptance_assertion_ids,
+                "deadline_at": request.job.deadline_at,
+                "lease_ref": authority.lease_ref.model_dump(mode="json"),
+                "lease_sha256": lease_sha256,
+                "blueprint_ref": authority.blueprint_ref.model_dump(mode="json"),
+                "tool_plan_ref": authority.tool_plan_ref.model_dump(mode="json"),
+                "required_agent_ids": authority.required_agent_ids,
+                "ordered_handoffs": authority.ordered_handoffs,
+                "tool_requirements": authority.tool_requirements,
+                "workspace_policy_ref": authority.workspace_policy_ref.model_dump(mode="json"),
+                "clarification_policy": authority.clarification_policy,
+                "required_output_contract": "minibook.creation-result.v2",
+            }
+        )
+        key = (request.job.job_id, request.action.attempt)
+        existing = self._mapped.setdefault(key, mapped)
+        if existing != mapped:
+            raise FactoryDispatchError("V3 creation job replay conflicts with Captain authority")
+        return existing
+
+    def creation_job_for(self, job: object, attempt: int) -> CreationJobV3:
+        job_id = getattr(job, "job_id", None)
+        try:
+            return self._mapped[(job_id, attempt)]
+        except KeyError as exc:
+            raise FactoryDispatchError("Captain V3 creation job was not mapped") from exc
 
 
 class CaptainCreationJobMapper:
@@ -335,16 +486,22 @@ class MinibookForgeHttpClient(MinibookForgePort):
             raise FactoryDispatchError(f"Minibook creation status failed ({response.status_code})")
         return CreationProgressV1.model_validate(response.json())
 
-    async def result(self, creation_job_id: UUID) -> CreationResultV1:
+    async def result(self, creation_job_id: UUID) -> CreationResultV1 | CreationResultV2:
         response = await self._client.get(
             f"{self._settings.base_url}/api/v1/creation-jobs/{creation_job_id}/result",
             headers=self._headers,
         )
         if response.status_code != 200:
             raise FactoryDispatchError(f"Minibook creation result failed ({response.status_code})")
-        return CreationResultV1.model_validate(response.json())
+        payload = response.json()
+        model = (
+            CreationResultV2
+            if payload.get("schema") == "minibook.creation-result.v2"
+            else CreationResultV1
+        )
+        return model.model_validate(payload)
 
-    async def wait_for_result(self, creation_job_id: UUID) -> CreationResultV1:
+    async def wait_for_result(self, creation_job_id: UUID) -> CreationResultV1 | CreationResultV2:
         for _ in range(self._settings.max_polls):
             progress = await self.status(creation_job_id)
             if progress.status in {"succeeded", "failed", "blocked", "cancelled"}:

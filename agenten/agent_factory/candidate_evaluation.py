@@ -42,8 +42,12 @@ from agenten.agent_factory.forge_contracts import (
     CodexBuildReceiptV1,
     CreationPackageManifestV1,
     CreationPackageManifestV2,
+    CreationJobV3,
     CreationResultV1,
+    CreationResultV2,
     ForgeBuildSkillUsageReceiptV1,
+    PackageBuildEvidenceV1,
+    PackageRealCaseEvidenceV1,
     codex_build_receipt_sha256,
 )
 from agenten.agent_factory.leases import validate_factory_lease
@@ -860,7 +864,7 @@ class FactoryCandidateProvider:
     def accept_creation_result(
         self,
         job: FactoryJob,
-        result: CreationResultV1,
+        result: CreationResultV1 | CreationResultV2,
     ) -> ResolvedFactoryCandidate:
         raise NotImplementedError
 
@@ -905,6 +909,12 @@ class ForgeCandidateArtifactStore(Protocol):
     def local_path(self, reference: ArtifactRef) -> Path: ...
 
 
+class CaptainCreationJobV3Source(Protocol):
+    """Resolve the exact Captain-mapped V3 authority, never Minibook status."""
+
+    def creation_job_for(self, job: FactoryJob, attempt: int) -> CreationJobV3: ...
+
+
 class FactoryBlockSource(Protocol):
     def blocks(self, job_id: object) -> tuple[FactoryEvidenceBlock, ...]: ...
 
@@ -923,15 +933,26 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
         *,
         repository: FactoryBlockSource,
         artifacts: ForgeCandidateArtifactStore,
+        v3_jobs: CaptainCreationJobV3Source | None = None,
     ) -> None:
         self._repository = repository
         self._artifacts = artifacts
+        self._v3_jobs = v3_jobs
+        self._accepted_v3: dict[tuple[object, int], ResolvedFactoryCandidate] = {}
+
+    @property
+    def v3_readback_configured(self) -> bool:
+        return self._v3_jobs is not None
 
     def accept_creation_result(
         self,
         job: FactoryJob,
-        result: CreationResultV1,
+        result: CreationResultV1 | CreationResultV2,
     ) -> ResolvedFactoryCandidate:
+        if isinstance(result, CreationResultV2):
+            return self._accept_v3(job, result)
+        if isinstance(job, AgentFactoryJobV3) and self._v3_jobs is not None:
+            raise FactoryDispatchError("Captain V3 job rejects V1/V2 creation evidence")
         if result.package_manifest_ref is None:
             raise FactoryDispatchError("Forge package manifest reference is missing")
         if result.skill_usage_receipt_ref is None:
@@ -956,7 +977,224 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             )
         return resolved
 
+    def _accept_v3(
+        self,
+        job: FactoryJob,
+        result: CreationResultV2,
+    ) -> ResolvedFactoryCandidate:
+        if not isinstance(job, AgentFactoryJobV3) or self._v3_jobs is None:
+            raise FactoryDispatchError("Captain V3 creation authority is unavailable")
+        authority = self._v3_jobs.creation_job_for(job, result.attempt)
+        if not isinstance(authority, CreationJobV3):
+            raise FactoryDispatchError("Captain V3 creation authority is invalid")
+        if (
+            result.status != "succeeded"
+            or result.factory_job_id != job.job_id
+            or result.creation_job_id != authority.creation_job_id
+            or result.correlation_id != job.correlation_id
+            or result.subject_version != job.subject_version
+            or result.attempt != authority.attempt
+            or authority.factory_job_id != job.job_id
+            or authority.correlation_id != job.correlation_id
+            or authority.subject_version != job.subject_version
+            or authority.compiled_spec_ref.sha256 != job.compiled_spec_ref.sha256
+            or authority.public_assertion_ids != job.acceptance_assertion_ids
+        ):
+            raise FactoryDispatchError("Captain V3 result identity is stale or mixed")
+
+        required_refs = (
+            result.source_archive_ref,
+            result.package_manifest_ref,
+            result.team_manifest_ref,
+            result.candidate_manifest_ref,
+            result.hermes_usage_receipt_ref,
+            result.codex_build_receipt_ref,
+            *result.build_evidence_refs,
+            *result.real_case_evidence_refs,
+            result.cas_readback_receipt_ref,
+        )
+        if any(reference is None for reference in required_refs):
+            raise FactoryDispatchError("Captain V3 result is missing independent readback inputs")
+        typed_refs = tuple(_runtime_ref(reference) for reference in required_refs if reference is not None)
+        contents = { _artifact_identity(ref): self._read_v3_exact(ref) for ref in typed_refs }
+        source_ref = _runtime_ref(result.source_archive_ref)
+        source_bytes = contents[_artifact_identity(source_ref)]
+        try:
+            source_path = self._artifacts.local_path(source_ref)
+            if hashlib.sha256(source_path.read_bytes()).hexdigest() != source_ref.sha256:
+                raise ValueError
+            with zipfile.ZipFile(source_path) as archive:
+                infos = archive.infolist()
+                if not infos or len({item.filename for item in infos}) != len(infos):
+                    raise ValueError
+                files = {
+                    PurePosixPath(item.filename): archive.read(item)
+                    for item in infos
+                    if not item.is_dir()
+                    and not PurePosixPath(item.filename).is_absolute()
+                    and ".." not in PurePosixPath(item.filename).parts
+                }
+                if len(files) != len(infos):
+                    raise ValueError
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            raise FactoryDispatchError("Captain V3 sealed ZIP is unavailable or invalid") from exc
+
+        package_ref = _runtime_ref(result.package_manifest_ref)
+        package_bytes = contents[_artifact_identity(package_ref)]
+        try:
+            package = json.loads(package_bytes)
+            if (
+                not isinstance(package, dict)
+                or package.get("schema") != "minibook.team-package-manifest.v1"
+                or files.get(PurePosixPath("package-manifest.json")) != package_bytes
+            ):
+                raise ValueError
+            entries = package["files"]
+            children: dict[PurePosixPath, ArtifactRef] = {}
+            for entry in entries:
+                path = PurePosixPath(entry["path"])
+                ref = ArtifactRef.model_validate(
+                    {key: entry[key] for key in ("uri", "sha256", "media_type")}
+                )
+                if path in children or files.get(path) != self._read_v3_exact(ref):
+                    raise ValueError
+                children[path] = ref
+            if set(files) != {*children, PurePosixPath("package-manifest.json")}:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise FactoryDispatchError("Captain V3 package manifest or ZIP binding is invalid") from exc
+
+        top_level = {
+            PurePosixPath("team_manifest.json"): _runtime_ref(result.team_manifest_ref),
+            PurePosixPath("factory-candidate.json"): _runtime_ref(result.candidate_manifest_ref),
+            PurePosixPath("evidence/hermes-factory-skill-usage-receipt.json"): _runtime_ref(result.hermes_usage_receipt_ref),
+            PurePosixPath("evidence/codex-build-receipt.json"): _runtime_ref(result.codex_build_receipt_ref),
+        }
+        if any(children.get(path) != reference for path, reference in top_level.items()):
+            raise FactoryDispatchError("Captain V3 result refs differ from sealed package")
+
+        try:
+            team = json.loads(contents[_artifact_identity(top_level[PurePosixPath("team_manifest.json")])])
+            agents = tuple(item["agent_id"] if isinstance(item, dict) else item for item in team["agents"])
+            handoffs = tuple(
+                (item["from_agent_id"], item["to_agent_id"])
+                for item in team["handoffs"]
+            )
+            expected_handoffs = tuple(
+                (item.from_agent_id, item.to_agent_id) for item in authority.ordered_handoffs
+            )
+            tools = {item["tool_id"]: item for item in team["tools"]}
+            if agents != authority.required_agent_ids or handoffs != expected_handoffs:
+                raise ValueError
+            for requirement in authority.tool_requirements:
+                if requirement.required and (
+                    requirement.tool_id not in tools
+                    or not isinstance(tools[requirement.tool_id].get("input_schema"), dict)
+                    or not isinstance(tools[requirement.tool_id].get("output_schema"), dict)
+                ):
+                    raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise FactoryDispatchError("Captain V3 team topology or required tools are invalid") from exc
+
+        candidate_ref = _runtime_ref(result.candidate_manifest_ref)
+        try:
+            candidate_payload = json.loads(contents[_artifact_identity(candidate_ref)])
+            expected_authority = {
+                "compiled_spec_ref": authority.compiled_spec_ref.model_dump(mode="json"),
+                "required_agent_ids": list(authority.required_agent_ids),
+                "ordered_handoffs": [item.model_dump(mode="json") for item in authority.ordered_handoffs],
+                "tool_requirements": [item.model_dump(mode="json") for item in authority.tool_requirements],
+                "public_assertion_ids": list(authority.public_assertion_ids),
+                "allowed_optional_tool_gaps": [item.tool_id for item in authority.tool_requirements if not item.required],
+            }
+            if any(candidate_payload.get(key) != value for key, value in expected_authority.items()):
+                raise ValueError
+            if candidate_payload.get("team_manifest_sha256") != top_level[PurePosixPath("team_manifest.json")].sha256:
+                raise ValueError
+            runtime_payload = {
+                key: value
+                for key, value in candidate_payload.items()
+                if key in FactoryCandidateManifest.model_fields or key == "schema"
+            }
+            runtime_payload["source_archive_ref"] = source_ref.model_dump(mode="json")
+            candidate = FactoryCandidateManifest.model_validate(runtime_payload)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise FactoryDispatchError("Captain V3 candidate binding is invalid") from exc
+
+        self._validate_v3_receipts(job, authority, result, contents)
+        receipt_ref = _runtime_ref(result.cas_readback_receipt_ref)
+        try:
+            receipt = json.loads(contents[_artifact_identity(receipt_ref)])
+            actual = {
+                (item["uri"], item["sha256"], item["media_type"])
+                for item in receipt["artifacts"]
+                if item.get("verified") is True
+            }
+            expected = {
+                _artifact_identity(reference)
+                for reference in (*children.values(), package_ref, source_ref)
+            }
+            if receipt.get("schema") != "minibook.cas-readback-receipt.v1" or actual != expected:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise FactoryDispatchError("Captain V3 Minibook readback receipt is invalid") from exc
+        resolved = ResolvedFactoryCandidate(candidate=candidate, source_archive=source_path)
+        self._accepted_v3[(job.job_id, result.attempt)] = resolved
+        return resolved
+
+    def _read_v3_exact(self, reference: ArtifactRef) -> bytes:
+        try:
+            content = self._artifacts.read_bytes(reference)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise FactoryDispatchError("Captain CAS readback digest mismatch") from exc
+        if hashlib.sha256(content).hexdigest() != reference.sha256:
+            raise FactoryDispatchError("Captain CAS readback digest mismatch")
+        return content
+
+    @staticmethod
+    def _validate_v3_receipts(
+        job: AgentFactoryJobV3,
+        authority: CreationJobV3,
+        result: CreationResultV2,
+        contents: dict[tuple[str, str, str], bytes],
+    ) -> None:
+        try:
+            hermes_ref = _runtime_ref(result.hermes_usage_receipt_ref)
+            hermes = ForgeBuildSkillUsageReceiptV1.model_validate_json(contents[_artifact_identity(hermes_ref)])
+            codex_ref = _runtime_ref(result.codex_build_receipt_ref)
+            codex = CodexBuildReceiptV1.model_validate_json(contents[_artifact_identity(codex_ref)])
+            builds = tuple(
+                PackageBuildEvidenceV1.model_validate_json(contents[_artifact_identity(_runtime_ref(ref))])
+                for ref in result.build_evidence_refs
+            )
+            cases = tuple(
+                PackageRealCaseEvidenceV1.model_validate_json(contents[_artifact_identity(_runtime_ref(ref))])
+                for ref in result.real_case_evidence_refs
+            )
+        except (KeyError, ValueError) as exc:
+            raise FactoryDispatchError("Captain V3 build or test evidence is invalid") from exc
+        common = (authority.creation_job_id, job.job_id, job.correlation_id, job.subject_version, result.attempt)
+        if (
+            (hermes.creation_job_id, hermes.factory_job_id, hermes.correlation_id, hermes.subject_version, hermes.attempt) != common
+            or (codex.creation_job_id, codex.factory_job_id, codex.correlation_id, codex.subject_version, codex.attempt) != common
+            or hermes.public_assertion_ids != job.acceptance_assertion_ids
+            or codex.acceptance_assertion_ids != job.acceptance_assertion_ids
+            or any((item.creation_job_id, item.factory_job_id, item.correlation_id, item.subject_version, item.attempt) != common for item in (*builds, *cases))
+            or any(item.outcome != "passed" for item in (*builds, *cases))
+            or any(item.assertion_ids != job.acceptance_assertion_ids for item in cases)
+        ):
+            raise FactoryDispatchError("Captain V3 build or test evidence is stale or failed")
+
     def candidate_for(self, job: FactoryJob) -> ResolvedFactoryCandidate:
+        if self._v3_jobs is not None and isinstance(job, AgentFactoryJobV3):
+            candidates = tuple(
+                (attempt, candidate)
+                for (job_id, attempt), candidate in self._accepted_v3.items()
+                if job_id == job.job_id
+            )
+            if not candidates:
+                raise FileNotFoundError("authoritative Gateway V3 candidate reference is unavailable")
+            return max(candidates, key=lambda item: item[0])[1]
         block = self._authoritative_block(job)
         resolved, _ = self._resolve_block(job, block)
         return resolved
@@ -1464,7 +1702,7 @@ class CandidateEvaluationFactory:
     async def record_creation_result(
         self,
         request: FactoryDispatch,
-        result: CreationResultV1,
+        result: CreationResultV1 | CreationResultV2,
     ) -> FactoryEvidenceBlock:
         if request.action.kind is not FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE:
             raise FactoryDispatchError(
@@ -1494,13 +1732,12 @@ class CandidateEvaluationFactory:
             raise FactoryDispatchError(
                 "Minibook CreationResultV1 did not produce successful agent code"
             )
-        if not result.artifact_refs:
+        if isinstance(result, CreationResultV1) and not result.artifact_refs:
             raise FactoryDispatchError(
                 "successful Minibook CreationResultV1 has no generated code artifacts"
             )
         self._provider.accept_creation_result(request.job, result)
         assert result.package_manifest_ref is not None
-        assert result.skill_usage_receipt_ref is not None
         content = json.dumps(
             result.model_dump(mode="json", by_alias=True, exclude_none=True),
             sort_keys=True,
@@ -1511,17 +1748,41 @@ class CandidateEvaluationFactory:
         package_manifest_ref = ArtifactRef.model_validate(
             result.package_manifest_ref.model_dump(mode="json")
         )
-        artifact_refs = tuple(
-            ArtifactRef.model_validate(reference.model_dump(mode="json"))
-            for reference in result.artifact_refs
-        )
-        forge_evidence_refs = tuple(
-            ArtifactRef.model_validate(reference.model_dump(mode="json"))
-            for reference in result.evidence_refs
-        )
-        skill_usage_receipt_ref = ArtifactRef.model_validate(
-            result.skill_usage_receipt_ref.model_dump(mode="json")
-        )
+        if isinstance(result, CreationResultV2):
+            artifact_refs = tuple(
+                ArtifactRef.model_validate(reference.model_dump(mode="json"))
+                for reference in (
+                    result.team_manifest_ref,
+                    result.candidate_manifest_ref,
+                    result.source_archive_ref,
+                )
+                if reference is not None
+            )
+            forge_evidence_refs = tuple(
+                ArtifactRef.model_validate(reference.model_dump(mode="json"))
+                for reference in (
+                    result.hermes_usage_receipt_ref,
+                    result.codex_build_receipt_ref,
+                    *result.build_evidence_refs,
+                    *result.real_case_evidence_refs,
+                    result.cas_readback_receipt_ref,
+                )
+                if reference is not None
+            )
+        else:
+            assert result.skill_usage_receipt_ref is not None
+            artifact_refs = tuple(
+                ArtifactRef.model_validate(reference.model_dump(mode="json"))
+                for reference in result.artifact_refs
+            )
+            forge_evidence_refs = tuple(
+                ArtifactRef.model_validate(reference.model_dump(mode="json"))
+                for reference in result.evidence_refs
+            ) + (
+                ArtifactRef.model_validate(
+                    result.skill_usage_receipt_ref.model_dump(mode="json")
+                ),
+            )
         return FactoryEvidenceBlock(
             schema_name="captain.agent-factory-block.v1",
             event_id=uuid5(
@@ -1539,7 +1800,7 @@ class CandidateEvaluationFactory:
             role=role,
             status=FactoryBlockStatus.SUCCEEDED,
             artifact_refs=(package_manifest_ref, *artifact_refs),
-            evidence_refs=(sealed, *forge_evidence_refs, skill_usage_receipt_ref),
+            evidence_refs=(sealed, *forge_evidence_refs),
             assertion_ids=(),
             lease_id=request.lease.lease_id,
         )

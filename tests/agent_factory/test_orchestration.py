@@ -10,7 +10,8 @@ from agenten.agent_factory.contracts import (
     FactoryRole,
 )
 from agenten.agent_factory.orchestration import FactoryDispatchError, FactoryDispatcher
-from agenten.agent_factory.forge_contracts import CreationResultV1, CreationSubmissionReceipt
+from agenten.agent_factory.forge_contracts import CreationResultV1, CreationResultV2, CreationSubmissionReceipt
+from tests.agent_factory.test_state_machine import job_v3
 from agenten.agent_factory.leases import issue_factory_lease, validate_factory_lease
 from agenten.agent_factory.service import FactoryCoordinator, InMemoryFactoryRepository
 from agenten.agent_factory.state_machine import FactoryActionKind
@@ -18,7 +19,7 @@ from agenten.agent_factory.skill_sequence import FactoryImprovementAuthorization
 from agenten.agent_factory.skill_workflow_contracts import TeamEvaluationV1
 from agenten.agent_runtime.contracts import ArtifactRef
 from tests.agent_factory.test_skill_workflow_contracts import evaluation_payload
-from tests.agent_factory.test_state_machine import block, job
+from tests.agent_factory.test_state_machine import block, job, workflow_block
 
 
 class Hermes:
@@ -158,6 +159,31 @@ async def test_dispatches_forge_only_after_tool_candidate_evidence() -> None:
     assert validator.creation_results[0][0].action.kind is FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE
     assert validator.creation_results[0][0].role is FactoryRole.TOOL_INTEGRATOR
     assert coordinator.projection(factory_job.job_id).phase is FactoryPhase.AGENT_CODE_CREATED
+
+
+@pytest.mark.asyncio
+async def test_v3_forge_submission_receives_active_lease_and_rejects_v1_result() -> None:
+    coordinator = FactoryCoordinator(InMemoryFactoryRepository())
+    factory_job = job_v3(mode="demo")
+    coordinator.register(factory_job)
+    for phase in (
+        FactoryPhase.FORGE_REQUESTED,
+        FactoryPhase.BLUEPRINT_CREATED,
+        FactoryPhase.TOOL_CANDIDATE_TESTED,
+    ):
+        coordinator.record(workflow_block(phase))
+    legacy = _creation_result(factory_job)
+    forge, validator = Forge(legacy), CandidateValidator()
+
+    with pytest.raises(FactoryDispatchError, match="V3 creation result"):
+        await dispatcher(coordinator, Hermes(), forge, validator).dispatch_next(
+            factory_job.job_id
+        )
+
+    assert forge.requests[0].lease is not None
+    assert forge.requests[0].lease.role is FactoryRole.TOOL_INTEGRATOR
+    assert validator.creation_results == []
+    assert coordinator.projection(factory_job.job_id).phase is FactoryPhase.TOOL_CANDIDATE_TESTED
 
 
 @pytest.mark.asyncio
