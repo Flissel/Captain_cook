@@ -274,6 +274,37 @@ def _require_committed_repository_bytes(
             "runtime adapter module is not repository-owned"
         ) from None
 
+    git_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+
+    git_marker = repository_root / ".git"
+    try:
+        if git_marker.is_dir():
+            expected_git_dir = git_marker.resolve(strict=True)
+        elif git_marker.is_file():
+            git_marker_lines = git_marker.read_text(encoding="utf-8").splitlines()
+            if len(git_marker_lines) != 1 or not git_marker_lines[0].startswith(
+                "gitdir: "
+            ):
+                raise RuntimeAdapterManifestError(
+                    "runtime adapter repository identity could not be verified"
+                )
+            expected_git_dir = Path(git_marker_lines[0].removeprefix("gitdir: "))
+            if not expected_git_dir.is_absolute():
+                expected_git_dir = repository_root / expected_git_dir
+            expected_git_dir = expected_git_dir.resolve(strict=True)
+        else:
+            raise RuntimeAdapterManifestError(
+                "runtime adapter repository identity could not be verified"
+            )
+    except (OSError, UnicodeError):
+        raise RuntimeAdapterManifestError(
+            "runtime adapter repository identity could not be verified"
+        ) from None
+
     def git_output(
         *arguments: str,
         allowed_returncodes: tuple[int, ...] = (0,),
@@ -284,6 +315,7 @@ def _require_committed_repository_bytes(
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
+                env=git_environment,
             )
         except OSError:
             raise RuntimeAdapterManifestError(
@@ -294,6 +326,29 @@ def _require_committed_repository_bytes(
                 "runtime adapter module is not committed and repository-owned"
             )
         return result.stdout
+
+    def resolved_git_path(output: bytes) -> Path:
+        try:
+            return Path(os.fsdecode(output.strip())).resolve(strict=True)
+        except (OSError, ValueError):
+            raise RuntimeAdapterManifestError(
+                "runtime adapter repository identity could not be verified"
+            ) from None
+
+    actual_repository_root = resolved_git_path(
+        git_output("rev-parse", "--show-toplevel")
+    )
+    actual_git_dir = resolved_git_path(
+        git_output("rev-parse", "--absolute-git-dir")
+    )
+    if (
+        actual_repository_root != repository_root
+        or actual_git_dir != expected_git_dir
+    ):
+        raise RuntimeAdapterManifestError(
+            "runtime adapter repository identity does not match "
+            "the expected repository"
+        )
 
     external_attributes = git_output(
         "config",

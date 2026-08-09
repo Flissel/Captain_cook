@@ -246,6 +246,54 @@ def test_authority_loader_rejects_dirty_adapter_before_module_effect(
     assert not marker.exists()
 
 
+def test_authority_loader_ignores_inherited_git_repository_overrides_before_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _repository(tmp_path)
+    adapter = _commit_adapter(repository)
+    marker = tmp_path / "module-effect"
+    redirected_source = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('effect')\n"
+        f"{VALID_AUTHORITY_ADAPTER}\n"
+    )
+
+    alternate_repository = tmp_path / "alternate-repository"
+    alternate_repository.mkdir()
+    _git(alternate_repository, "init", "--quiet")
+    _git(
+        alternate_repository,
+        "config",
+        "user.email",
+        "authority-loader@example.invalid",
+    )
+    _git(alternate_repository, "config", "user.name", "Authority Loader Test")
+    alternate_adapter = alternate_repository / adapter.name
+    alternate_adapter.write_text(redirected_source, encoding="utf-8")
+    _git(alternate_repository, "add", alternate_adapter.name)
+    _git(alternate_repository, "commit", "--quiet", "-m", "test: redirect git")
+
+    adapter.write_text(redirected_source, encoding="utf-8")
+    monkeypatch.setenv("GIT_DIR", str(alternate_repository / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(alternate_repository))
+    monkeypatch.setenv(
+        "GIT_INDEX_FILE",
+        str(alternate_repository / ".git" / "index"),
+    )
+
+    with pytest.raises(
+        CapabilityLiveProductionConfigurationError,
+        match="committed|dirty|repository",
+    ):
+        build_current_authority_capability_live_runner_from_environment(
+            repository_root=repository,
+            environment=_environment(adapter),
+        )
+
+    assert not marker.exists()
+
+
 def test_authority_loader_rejects_custom_clean_filter_before_module_effect(
     tmp_path: Path,
 ) -> None:
