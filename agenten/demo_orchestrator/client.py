@@ -46,6 +46,7 @@ class JsonHttpPort(Protocol):
 
 
 ProgressReporter = Callable[[dict[str, object]], None]
+PaidPreflight = Callable[[float], str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,12 +65,15 @@ class CapabilityDemoClient:
         http: JsonHttpPort | None = None,
         reporter: ProgressReporter = print,
         monotonic: Callable[[], float] = time.monotonic,
+        paid_preflight: PaidPreflight | None = None,
     ) -> None:
         self._configuration = configuration
         self._supervisor = supervisor
         self._http = http or UrllibJsonHttp()
         self._report = reporter
         self._monotonic = monotonic
+        self._paid_preflight = paid_preflight
+        self._minibook_evidence_url_template: str | None = None
         self._state_path = configuration.state_root / "current-run.json"
 
     def run(
@@ -80,14 +84,15 @@ class CapabilityDemoClient:
         timeout_seconds: float,
     ) -> dict[str, object]:
         budget = _require_paid_authority(allow_paid_run, maximum_cost_usd)
-        authority = self._build_authority(budget)
         deadline = self._deadline(timeout_seconds)
+        self._minibook_evidence_url_template = self._prepare_paid_run(deadline)
+        authority = self._build_authority(budget)
         state = self._new_state(authority)
         self._save_state(state)
         try:
             checkpoint = self._request(
                 "POST",
-                f"{self._configuration.bundle.gateway_base_url}/v1/capability-assemblies",
+                f"{self._configuration.gateway_base_url}/v1/capability-assemblies",
                 token=self._gateway_token(),
                 payload=authority.submit,
                 deadline=deadline,
@@ -110,6 +115,8 @@ class CapabilityDemoClient:
         timeout_seconds: float,
     ) -> dict[str, object]:
         budget = _require_paid_authority(allow_paid_run, maximum_cost_usd)
+        deadline = self._deadline(timeout_seconds)
+        self._minibook_evidence_url_template = self._prepare_paid_run(deadline)
         state = self._load_state()
         if state.get("bundle_sha256") != self._configuration.bundle_sha256:
             raise DemoClientError("saved demo run belongs to a different sealed bundle")
@@ -122,7 +129,6 @@ class CapabilityDemoClient:
         authority = self._build_authority(budget)
         if authority.assembly_id != assembly_id:
             raise DemoClientError("saved demo request identity changed")
-        deadline = self._deadline(timeout_seconds)
         try:
             checkpoint = self._request(
                 "GET",
@@ -219,15 +225,15 @@ class CapabilityDemoClient:
             payload=None,
             deadline=deadline,
         )
-        minibook_url = self._configuration.bundle.minibook_evidence_url_template.format(
+        if self._minibook_evidence_url_template is None:
+            raise DemoClientError("paid authority preflight was not completed")
+        minibook_url = self._minibook_evidence_url_template.format(
             assembly_id=authority.assembly_id
         )
         minibook_evidence = self._request(
             "GET",
             minibook_url,
-            token=self._configuration.environment[
-                self._configuration.bundle.minibook_token_env
-            ],
+            token=self._configuration.authority_token("MINIBOOK_PROJECTION_API_KEY"),
             payload=None,
             deadline=deadline,
         )
@@ -284,13 +290,13 @@ class CapabilityDemoClient:
 
     def _build_authority(self, budget: Decimal) -> _RunAuthority:
         ordered_digests = [
-            self._configuration.bundle.canonical_inputs[path]
+            self._configuration.canonical_input_digests[path]
             for path in CANONICAL_INPUT_PATHS
         ]
         seed = "\n".join(
             (
                 "captain.capability-demo-request.v1",
-                self._configuration.bundle.repository_revision,
+                self._configuration.repository_revision,
                 self._configuration.bundle_sha256,
                 f"{budget:.2f}",
                 *ordered_digests,
@@ -379,15 +385,47 @@ class CapabilityDemoClient:
 
     def _projection_url(self, assembly_id: UUID) -> str:
         return (
-            f"{self._configuration.bundle.gateway_base_url}"
+            f"{self._configuration.gateway_base_url}"
             f"/v1/capability-assemblies/{assembly_id}"
         )
 
     def _gateway_token(self) -> str:
-        token = self._configuration.environment.get("CAPTAIN_GATEWAY_TOKEN", "")
-        if not token:
-            raise DemoClientError("Captain Gateway token is unavailable")
-        return token
+        return self._configuration.authority_token("CAPTAIN_GATEWAY_TOKEN")
+
+    def _prepare_paid_run(self, deadline: float) -> str:
+        if self._paid_preflight is not None:
+            return self._paid_preflight(deadline)
+        template = self._configuration.require_minibook_evidence_readback()
+        self._configuration.require_private_benchmark_catalog()
+        self._configuration.require_runtime_restart_control()
+        bindings = self._configuration.health_bindings()
+        tokens = {
+            binding.token_name: self._configuration.authority_token(binding.token_name)
+            for binding in bindings
+        }
+        self._configuration.authority_token("MINIBOOK_PROJECTION_API_KEY")
+        for binding in bindings:
+            response = self._request(
+                "GET",
+                binding.health_url,
+                token=tokens[binding.token_name],
+                payload=None,
+                deadline=deadline,
+            )
+            if response.get("status") not in {"ok", "ready"}:
+                raise DemoClientError(
+                    f"authenticated {binding.service} health is not ready"
+                )
+        assembly_health = self._request(
+            "GET",
+            f"{self._configuration.gateway_base_url}/v1/capability-assemblies/health",
+            token=self._gateway_token(),
+            payload=None,
+            deadline=deadline,
+        )
+        if assembly_health.get("status") not in {"ok", "ready"}:
+            raise DemoClientError("Captain assembly authority is not ready")
+        return template
 
     def _deadline(self, timeout_seconds: float) -> float:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:

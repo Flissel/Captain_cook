@@ -58,27 +58,13 @@ class DefaultDemoActions:
 
     def start(self, timeout_seconds: float) -> dict[str, object]:
         configuration = load_demo_configuration(self._repository_root)
-        records = ManagedProcessSupervisor(configuration).start_all(
-            timeout_seconds=timeout_seconds
-        )
-        return {
-            "schema": "captain.demo-operator-result.v1",
-            "status": "ready",
-            "services": [record.service for record in records],
-        }
+        configuration.require_operator_process_bootstrap()
+        raise DemoConfigurationError("D11 operator process bootstrap is unavailable")
 
     def status(self, timeout_seconds: float) -> dict[str, object]:
         configuration = load_demo_configuration(self._repository_root)
-        records = ManagedProcessSupervisor(configuration).status(
-            timeout_seconds=timeout_seconds
-        )
-        names = [record.service for record in records]
-        expected = [service.name for service in configuration.bundle.services]
-        return {
-            "schema": "captain.demo-operator-result.v1",
-            "status": "ready" if names == expected else "degraded",
-            "services": names,
-        }
+        configuration.require_operator_process_bootstrap()
+        raise DemoConfigurationError("D11 operator process bootstrap is unavailable")
 
     def run(
         self, *, allow_paid_run: bool, maximum_cost_usd: str, timeout_seconds: float
@@ -110,11 +96,6 @@ class DefaultDemoActions:
     ) -> dict[str, object]:
         configuration = load_demo_configuration(self._repository_root)
         supervisor = ManagedProcessSupervisor(configuration)
-        healthy = supervisor.status(timeout_seconds=min(timeout_seconds, 5))
-        if [record.service for record in healthy] != [
-            service.name for service in configuration.bundle.services
-        ]:
-            raise DemoProcessError("all sealed demo services must be healthy before a paid run")
         client = CapabilityDemoClient(
             configuration,
             supervisor=supervisor,

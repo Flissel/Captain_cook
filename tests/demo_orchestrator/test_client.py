@@ -14,8 +14,13 @@ from agenten.demo_orchestrator.client import (
     DemoTimeout,
     UrllibJsonHttp,
 )
+from agenten.demo_orchestrator.configuration import AuthorityHealthBinding, DemoConfigurationError
 from agenten.demo_orchestrator.processes import DemoProcessTimeout
 from tests.demo_orchestrator.test_processes import _configuration
+
+
+def _test_preflight(_: float) -> str:
+    return "http://127.0.0.1:19004/v1/projections/{assembly_id}"
 
 
 class FakeSupervisor:
@@ -126,6 +131,7 @@ def test_paid_gate_and_six_dollar_ceiling_stop_before_http(tmp_path: Path) -> No
         supervisor=FakeSupervisor(),
         http=http,
         reporter=lambda _: None,
+        paid_preflight=_test_preflight,
     )
 
     with pytest.raises(DemoClientError, match="explicit paid-run authorization"):
@@ -148,6 +154,7 @@ def test_run_posts_canonical_inputs_advances_single_slices_restarts_and_verifies
         supervisor=supervisor,
         http=http,
         reporter=progress.append,
+        paid_preflight=_test_preflight,
     )
 
     evidence = client.run(
@@ -169,6 +176,9 @@ def test_run_posts_canonical_inputs_advances_single_slices_restarts_and_verifies
         "2.00",
         "2.00",
     ]
+    assert len({item["correlation_id"] for item in submit["inputs"]}) == 3
+    assert len({item["reservation"]["reservation_id"] for item in submit["inputs"]}) == 3
+    assert len({item["input_id"] for item in submit["inputs"]}) == 3
     advances = [call for call in http.calls if call[1].endswith("/advances")]
     assert len(advances) == 24
     assert all(call[3] is not None and call[3]["maximum_slices"] == 1 for call in advances)
@@ -187,6 +197,7 @@ def test_timeout_is_persisted_as_124_and_resume_keeps_same_assembly(tmp_path: Pa
         supervisor=supervisor,
         http=http,
         reporter=lambda _: None,
+        paid_preflight=_test_preflight,
     )
 
     with pytest.raises(DemoTimeout) as error:
@@ -220,6 +231,7 @@ def test_gateway_and_minibook_evidence_mismatch_fails_closed(tmp_path: Path) -> 
         supervisor=FakeSupervisor(),
         http=FakeAssemblyHttp(mismatch=True),
         reporter=lambda _: None,
+        paid_preflight=_test_preflight,
     )
 
     with pytest.raises(DemoClientError, match="Minibook evidence does not equal Gateway"):
@@ -257,6 +269,7 @@ def test_runtime_restart_timeout_is_persisted_as_terminal_124(tmp_path: Path) ->
         supervisor=TimeoutSupervisor(),
         http=http,
         reporter=lambda _: None,
+        paid_preflight=_test_preflight,
     )
 
     with pytest.raises(DemoTimeout) as error:
@@ -267,3 +280,80 @@ def test_runtime_restart_timeout_is_persisted_as_terminal_124(tmp_path: Path) ->
         (configuration.state_root / "current-run.json").read_text(encoding="utf-8")
     )
     assert state["last_exit_code"] == 124
+
+
+def test_real_paid_preflight_blocks_missing_minibook_readback_before_http(
+    tmp_path: Path,
+) -> None:
+    configuration = _configuration(tmp_path)
+    http = FakeAssemblyHttp()
+    client = CapabilityDemoClient(
+        configuration,
+        supervisor=FakeSupervisor(),
+        http=http,
+        reporter=lambda _: None,
+    )
+
+    with pytest.raises(
+        DemoConfigurationError,
+        match="D11 Minibook assembly evidence readback capability is unavailable",
+    ):
+        client.run(
+            allow_paid_run=True,
+            maximum_cost_usd="6.00",
+            timeout_seconds=30,
+        )
+
+    assert http.calls == []
+
+
+def test_missing_health_authority_causes_zero_http_and_zero_advances(
+    tmp_path: Path,
+) -> None:
+    class MissingAuthorityConfiguration:
+        state_root = tmp_path
+        gateway_base_url = "http://127.0.0.1:19000"
+
+        @staticmethod
+        def require_minibook_evidence_readback() -> str:
+            return "http://127.0.0.1:19004/v1/projections/{assembly_id}"
+
+        @staticmethod
+        def require_private_benchmark_catalog() -> object:
+            return object()
+
+        @staticmethod
+        def require_runtime_restart_control() -> object:
+            return object()
+
+        @staticmethod
+        def health_bindings() -> tuple[AuthorityHealthBinding, ...]:
+            return (
+                AuthorityHealthBinding(
+                    service="gateway",
+                    health_url="http://127.0.0.1:19000/healthz",
+                    token_name="CAPTAIN_GATEWAY_TOKEN",
+                ),
+            )
+
+        @staticmethod
+        def authority_token(name: str) -> str:
+            raise DemoConfigurationError(f"required authority is unavailable: {name}")
+
+    http = FakeAssemblyHttp()
+    client = CapabilityDemoClient(
+        MissingAuthorityConfiguration(),  # type: ignore[arg-type]
+        supervisor=FakeSupervisor(),
+        http=http,
+        reporter=lambda _: None,
+    )
+
+    with pytest.raises(DemoConfigurationError, match="required authority is unavailable"):
+        client.run(
+            allow_paid_run=True,
+            maximum_cost_usd="6.00",
+            timeout_seconds=30,
+        )
+
+    assert http.calls == []
+    assert http.completed == 0
