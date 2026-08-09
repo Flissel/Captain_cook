@@ -147,6 +147,7 @@ class CapabilityResumeExecutionRequest(_FrozenAuthority):
     run_id: UUID
     input_id: str = Field(min_length=1)
     maximum_cost_usd: Decimal
+    booked_cost_usd: Decimal
     correlation_id: UUID
     capability_id: str = Field(min_length=1)
     capability_version: int = Field(ge=1, strict=True)
@@ -160,6 +161,11 @@ class CapabilityResumeExecutionRequest(_FrozenAuthority):
         if amount <= 0:
             raise ValueError("resume maximum cost must be positive")
         return amount
+
+    @field_validator("booked_cost_usd", mode="before")
+    @classmethod
+    def require_booked_cost(cls, value: object) -> Decimal:
+        return _nonnegative_decimal(value, "resume booked cost")
 
 
 class CapabilityFactoryPort(Protocol):

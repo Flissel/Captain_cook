@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from contextlib import contextmanager
-from typing import Any, TypeVar
+from datetime import datetime, timezone
+from typing import Any, Callable, TypeVar
 from uuid import UUID
 
 from fastapi import HTTPException
 from pydantic import BaseModel
 
+from agenten.agent_factory.contracts import FactoryPhase
+from agenten.agent_factory.execution_budget import FactoryBudgetReservationV1
+from agenten.agent_runtime.contracts import (
+    AgentRuntimeCommand,
+    AgentRuntimeResult,
+    CapabilityGrant,
+    CapabilityGrantRevocation,
+)
 from gateway.capability_live_pipeline import CapabilityResumeExecutionRequest
 from gateway.capability_resume_contracts import (
     CapabilityResumeAuthorizationRecordV1,
     CapabilityResumeDispatchStartedV1,
-    CapabilityResumeDispatchFailureV1,
     CapabilityResumeSourceSnapshotV1,
     CapabilityResumeTerminalV1,
 )
@@ -23,13 +32,13 @@ from gateway.capability_resume_service import (
     CapabilityResumeNotFound,
     CapabilityResumeUnavailable,
 )
+from gateway.contracts import RuntimeOperationProjection
 from gateway.store import GatewayStore
 
 
 AUTHORIZATION_BLOCK = "capability_resume_authorization"
 DISPATCH_BLOCK = "capability_resume_dispatch_started"
 TERMINAL_BLOCK = "capability_resume_terminal"
-FAILURE_BLOCK = "capability_resume_dispatch_failure"
 ResumeRecord = TypeVar("ResumeRecord", bound=BaseModel)
 
 
@@ -48,6 +57,77 @@ class GatewayCapabilityResumeRepository:
             str(reservation_id),
         )
         return self._parse(row, CapabilityResumeAuthorizationRecordV1)
+
+    def authorize_once(
+        self,
+        request: CapabilityResumeExecutionRequest,
+        source: Any,
+        build: Callable[
+            [CapabilityResumeSourceSnapshotV1], CapabilityResumeAuthorizationRecordV1
+        ],
+    ) -> CapabilityResumeAuthorizationRecordV1:
+        lock_digest = hashlib.sha256(
+            str(request.reservation_id).encode("utf-8")
+        ).hexdigest()[:32]
+        lock_name = f"captain:cap-resume:{lock_digest}"
+        with self._record_lock(lock_name):
+            with self._store.storage.transaction() as connection:
+                with connection.cursor() as cursor:
+                    existing = self._find_with_cursor(
+                        cursor,
+                        AUTHORIZATION_BLOCK,
+                        "$.request.reservation_id",
+                        str(request.reservation_id),
+                        for_update=True,
+                    )
+                    if existing is not None:
+                        parsed = CapabilityResumeAuthorizationRecordV1.model_validate(
+                            existing["data"]
+                        )
+                        if parsed.request != request:
+                            raise CapabilityResumeConflict(
+                                "capability resume reservation binding does not match"
+                            )
+                        return parsed
+                    resolve_for_update = getattr(source, "resolve_for_update", None)
+                    if not callable(resolve_for_update):
+                        raise CapabilityResumeUnavailable(
+                            "atomic capability resume authority is unavailable"
+                        )
+                    snapshot = resolve_for_update(cursor, request, reserve=True)
+                    record = build(snapshot)
+                    canonical = record.model_dump(mode="json", by_alias=True)
+                    index = self._store._next_index(cursor)
+                    block = self._store._new_block(
+                        cursor,
+                        index=index,
+                        block_type=AUTHORIZATION_BLOCK,
+                        data=canonical,
+                        status="recorded",
+                        parent_index=None,
+                        metadata={"schema": canonical["schema"]},
+                    )
+                    self._store._insert(cursor, block)
+                    cursor.execute(
+                        """INSERT INTO capability_resume_authorizations
+                           (authorization_receipt_id, reservation_id, run_id, input_id,
+                            job_id, maximum_cost_usd, booked_cost_usd,
+                            resume_ceiling_usd, block_index, payload)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (
+                            str(record.authorization.authorization_receipt_id),
+                            str(request.reservation_id),
+                            str(request.run_id),
+                            request.input_id,
+                            str(request.job_id),
+                            request.maximum_cost_usd,
+                            request.booked_cost_usd,
+                            snapshot.resume_budget_usd,
+                            index,
+                            json.dumps(canonical, sort_keys=True),
+                        ),
+                    )
+                    return record
 
     def authorization(
         self, receipt_id: UUID
@@ -101,41 +181,6 @@ class GatewayCapabilityResumeRepository:
         )
         return not replayed
 
-    def dispatch_failure(
-        self, receipt_id: UUID
-    ) -> CapabilityResumeDispatchFailureV1 | None:
-        row = self._find(
-            FAILURE_BLOCK,
-            "$.authorization_receipt_id",
-            str(receipt_id),
-        )
-        return self._parse(row, CapabilityResumeDispatchFailureV1)
-
-    def record_dispatch_failure(
-        self, failure: CapabilityResumeDispatchFailureV1
-    ) -> CapabilityResumeDispatchFailureV1:
-        if not self.dispatch_started(failure.authorization_receipt_id):
-            raise CapabilityResumeConflict(
-                "capability resume failure has no dispatch fence"
-            )
-        persisted, _ = self._append_unique(
-            FAILURE_BLOCK,
-            failure,
-            keys=(
-                ("$.authorization_receipt_id", str(failure.authorization_receipt_id)),
-                ("$.failure_id", str(failure.failure_id)),
-            ),
-            model=CapabilityResumeDispatchFailureV1,
-            conflicts=(
-                (
-                    TERMINAL_BLOCK,
-                    "$.authorization_receipt_id",
-                    str(failure.authorization_receipt_id),
-                ),
-            ),
-        )
-        return persisted
-
     def terminal(self, receipt_id: UUID) -> CapabilityResumeTerminalV1 | None:
         row = self._find(
             TERMINAL_BLOCK,
@@ -161,13 +206,6 @@ class GatewayCapabilityResumeRepository:
                 ),
             ),
             model=CapabilityResumeTerminalV1,
-            conflicts=(
-                (
-                    FAILURE_BLOCK,
-                    "$.authorization_receipt_id",
-                    str(terminal.authorization_receipt_id),
-                ),
-            ),
         )
         return persisted
 
@@ -309,15 +347,13 @@ class GatewayCapabilityResumeRepository:
 class GatewayCapabilityResumeAuthoritySource:
     """Resolve resume inputs only from current Gateway projections."""
 
-    def __init__(self, store: GatewayStore, *, checkpoints: Any) -> None:
+    def __init__(self, store: GatewayStore) -> None:
         self._store = store
-        self._checkpoints = checkpoints
 
     def resolve(
         self, request: CapabilityResumeExecutionRequest
     ) -> CapabilityResumeSourceSnapshotV1:
         try:
-            plan = self._checkpoints.load_plan(request.run_id)
             job_projection = self._store.factory_job(request.job_id)
             operation = self._store.runtime_operation(
                 request.original_execution_command_id
@@ -331,22 +367,143 @@ class GatewayCapabilityResumeAuthoritySource:
                 ) from None
             raise CapabilityResumeConflict(str(exc.detail)) from None
 
-        job = job_projection.job
-        if plan is None:
-            raise CapabilityResumeUnavailable(
-                "persisted Captain live reservation is unavailable"
-            )
-        matching_items = tuple(
-            item
-            for item in plan.items
-            if item.reservation.reservation_id == request.reservation_id
+        return self._snapshot(
+            request,
+            job_projection=job_projection,
+            operation=operation,
+            budget=budget,
+            artifacts=artifacts,
         )
-        if len(matching_items) != 1:
-            raise CapabilityResumeConflict(
-                "capability resume reservation is not unambiguous"
+
+    def resolve_for_update(
+        self,
+        cursor: Any,
+        request: CapabilityResumeExecutionRequest,
+        *,
+        reserve: bool,
+    ) -> CapabilityResumeSourceSnapshotV1:
+        try:
+            job, job_block = self._store._factory_budget_job(
+                cursor, request.job_id, for_update=True
             )
-        plan_item = matching_items[0]
-        reservation = plan_item.reservation
+            job_projection = self._store._factory_projection(cursor, job)
+            command_block = self._store._runtime_block_by_json_value(
+                cursor,
+                block_type="agent_runtime_command",
+                field="event_id",
+                value=str(request.original_execution_command_id),
+                for_update=True,
+            )
+            result_block = self._store._runtime_block_by_json_value(
+                cursor,
+                block_type="agent_runtime_result",
+                field="command_id",
+                value=str(request.original_execution_command_id),
+                for_update=True,
+            )
+            grant_block = self._store._runtime_block_by_json_value(
+                cursor,
+                block_type="agent_runtime_grant",
+                field="command_id",
+                value=str(request.original_execution_command_id),
+                for_update=True,
+            )
+            revocation_block = self._store._runtime_block_by_json_value(
+                cursor,
+                block_type="agent_runtime_grant_revocation",
+                field="command_id",
+                value=str(request.original_execution_command_id),
+                for_update=True,
+            )
+            if command_block is None:
+                raise CapabilityResumeUnavailable(
+                    "original persisted runtime command is unavailable"
+                )
+            operation = RuntimeOperationProjection(
+                operation_id=request.original_execution_command_id,
+                command=AgentRuntimeCommand.model_validate(command_block["data"]),
+                grant=(
+                    CapabilityGrant.model_validate(grant_block["data"])
+                    if grant_block is not None
+                    else None
+                ),
+                revocation=(
+                    CapabilityGrantRevocation.model_validate(revocation_block["data"])
+                    if revocation_block is not None
+                    else None
+                ),
+                result=(
+                    AgentRuntimeResult.model_validate(result_block["data"])
+                    if result_block is not None
+                    else None
+                ),
+            )
+            budget = self._store._factory_budget_projection(
+                cursor, job, for_update=True
+            )
+            artifacts = self._store._factory_workflow_artifacts_for_job(
+                cursor, request.job_id, for_update=True
+            )
+            snapshot = self._snapshot(
+                request,
+                job_projection=job_projection,
+                operation=operation,
+                budget=budget,
+                artifacts=artifacts,
+            )
+            if reserve:
+                if self._store._factory_budget_event(
+                    cursor, request.reservation_id, for_update=True
+                ) is not None:
+                    raise CapabilityResumeConflict(
+                        "capability resume budget reservation already exists"
+                    )
+                reserved_at = datetime.now(timezone.utc)
+                reservation = FactoryBudgetReservationV1(
+                    schema_name="captain.factory-budget-reservation.v1",
+                    reservation_id=request.reservation_id,
+                    job_id=request.job_id,
+                    correlation_id=request.correlation_id,
+                    subject_version=request.capability_version,
+                    execution_policy_sha256=(
+                        self._store._factory_execution_policy_sha256(job)
+                    ),
+                    attempt=job_projection.attempt,
+                    requested_usd=snapshot.resume_budget_usd,
+                    reserved_at=reserved_at,
+                    expires_at=job.deadline_at,
+                )
+                self._store._assert_budget_reservation(job, reservation)
+                canonical = reservation.model_dump(mode="json", by_alias=True)
+                self._store._insert_factory_budget_event(
+                    cursor,
+                    event_id=reservation.reservation_id,
+                    reservation_id=reservation.reservation_id,
+                    job_id=reservation.job_id,
+                    event_kind="reservation",
+                    digest=self._store._canonical_model_sha256(reservation),
+                    payload=canonical,
+                    parent_index=job_block["index"],
+                    schema_name=reservation.schema_name,
+                )
+            return snapshot
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                raise CapabilityResumeUnavailable(
+                    "capability resume Gateway authority is unavailable"
+                ) from None
+            raise CapabilityResumeConflict(str(exc.detail)) from None
+
+    @staticmethod
+    def _snapshot(
+        request: CapabilityResumeExecutionRequest,
+        *,
+        job_projection: Any,
+        operation: RuntimeOperationProjection,
+        budget: Any,
+        artifacts: tuple[Any, ...],
+    ) -> CapabilityResumeSourceSnapshotV1:
+        job = job_projection.job
         result = operation.result
         matching_outcomes = tuple(
             outcome
@@ -362,13 +519,10 @@ class GatewayCapabilityResumeAuthoritySource:
             )
         outcome = matching_outcomes[0]
         if (
-            job.correlation_id != request.correlation_id
-            or plan.run_id != request.run_id
-            or plan_item.input.input_id != request.input_id
-            or plan_item.correlation_id != request.correlation_id
-            or reservation.run_id != request.run_id
-            or reservation.input_id != request.input_id
-            or reservation.maximum_cost_usd != request.maximum_cost_usd
+            getattr(job_projection, "phase", None) is not FactoryPhase.CAPABILITY_PROMOTED
+            or job.correlation_id != request.correlation_id
+            or budget.limit_usd != request.maximum_cost_usd
+            or budget.consumed_usd != request.booked_cost_usd
             or job.required_capability != request.capability_id
             or job.subject_version != request.capability_version
             or operation.operation_id != request.original_execution_command_id
@@ -377,7 +531,7 @@ class GatewayCapabilityResumeAuthoritySource:
             or outcome.correlation_id != request.correlation_id
             or outcome.capability_id != request.capability_id
             or outcome.capability_version != request.capability_version
-            or budget.consumed_usd > reservation.maximum_cost_usd
+            or budget.remaining_usd <= 0
         ):
             raise CapabilityResumeConflict(
                 "capability resume request binding does not match Gateway truth"
@@ -388,7 +542,11 @@ class GatewayCapabilityResumeAuthoritySource:
             capability_id=job.required_capability,
             capability_version=job.subject_version,
             booked_cost_usd=budget.consumed_usd,
-            reservation=reservation,
+            reservation_id=request.reservation_id,
+            run_id=request.run_id,
+            input_id=request.input_id,
+            maximum_cost_usd=budget.limit_usd,
+            resume_budget_usd=budget.remaining_usd,
             original_operation=operation,
         )
 

@@ -12,6 +12,8 @@ from gateway.capability_resume_client import (
     GatewayCapabilityResumeClientError,
 )
 from gateway.app import create_app
+from gateway.capability_resume_contracts import CapabilityResumeTerminalV1
+from gateway.capability_resume_service import CapabilityResumeDispatchFailed
 from gateway.settings import GatewaySettings
 
 
@@ -89,6 +91,7 @@ def _authorization_request() -> dict[str, object]:
         "run_id": str(uuid5(NAMESPACE_URL, "resume-api-run")),
         "input_id": "input-one",
         "maximum_cost_usd": "2.00",
+        "booked_cost_usd": "1.25",
         "correlation_id": str(uuid5(NAMESPACE_URL, "resume-api-correlation")),
         "capability_id": "claims-capability",
         "capability_version": 3,
@@ -249,3 +252,52 @@ def test_default_app_composes_authenticated_runtime_resume_executor(monkeypatch)
 
     assert captured["base_url"] == "https://runtime.test"
     assert captured["token"] == "runtime-resume-test-token"
+
+
+@pytest.mark.parametrize("operation", ("dispatch", "readback"))
+def test_resume_terminal_runtime_failure_is_translated_to_502(operation: str) -> None:
+    service = RecordingResumeService()
+    authorization = service.authorize(
+        CapabilityResumeExecutionRequest.model_validate(
+            {
+                **_authorization_request(),
+                "job_id": uuid5(NAMESPACE_URL, "resume-api-job"),
+                "reservation_id": uuid5(NAMESPACE_URL, "resume-api-reservation"),
+                "run_id": uuid5(NAMESPACE_URL, "resume-api-run"),
+                "correlation_id": uuid5(NAMESPACE_URL, "resume-api-correlation"),
+                "original_execution_command_id": uuid5(
+                    NAMESPACE_URL, "resume-api-original-command"
+                ),
+                "original_execution_result_id": uuid5(
+                    NAMESPACE_URL, "resume-api-original-result"
+                ),
+            },
+            strict=True,
+        )
+    )
+    failed = service._execution(authorization).model_copy(
+        update={"terminal_status": "failed"}
+    )
+    error = CapabilityResumeDispatchFailed(
+        CapabilityResumeTerminalV1(
+            authorization_receipt_id=authorization.authorization_receipt_id,
+            execution=failed,
+        )
+    )
+
+    async def dispatch(_authorization):
+        raise error
+
+    def readback(_authorization):
+        raise error
+
+    service.dispatch = dispatch  # type: ignore[method-assign]
+    service.readback = readback  # type: ignore[method-assign]
+    response = _client(service).post(
+        f"/v1/capability-resumes/{'dispatches' if operation == 'dispatch' else 'readbacks'}",
+        json=authorization.model_dump(mode="json"),
+        headers={"Authorization": f"Bearer {CAPTAIN_TOKEN}"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["failure_id"] == str(failed.execution_result_id)

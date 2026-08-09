@@ -519,6 +519,9 @@ class AgentFactoryLiveComposition:
     ) -> BusinessBenchmarkSummaryV1 | None:
         return self.repository.business_benchmark_summary_by_artifact(reference)
 
+    def runtime_operation(self, command_id: UUID):
+        return self.repository.runtime_operation(command_id)
+
     async def run(
         self,
         job_id: UUID,

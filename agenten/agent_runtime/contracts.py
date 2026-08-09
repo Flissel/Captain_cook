@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import Any, Literal
 from uuid import UUID
@@ -94,6 +95,9 @@ class AgentRuntimeCommandPayload(_FrozenContract):
     integration_intent: IntegrationIntent = IntegrationIntent.NONE
     capability_profile: CapabilityProfile
     limits: RuntimeLimits
+    maximum_cost_usd: Decimal | None = None
+    budget_reservation_id: UUID | None = None
+    cost_authority_ref: str | None = Field(default=None, min_length=1)
 
     @field_validator("workspace_ref")
     @classmethod
@@ -144,6 +148,19 @@ class AgentRuntimeCommandPayload(_FrozenContract):
             CapabilityProfile.FACTORY_TOOL_INTEGRATOR,
         }:
             raise ValueError("Codex operations require a builder profile")
+        cost_fields = (
+            self.maximum_cost_usd,
+            self.budget_reservation_id,
+            self.cost_authority_ref,
+        )
+        if any(value is not None for value in cost_fields) and not all(
+            value is not None for value in cost_fields
+        ):
+            raise ValueError("runtime cost authority must be complete")
+        if self.maximum_cost_usd is not None and (
+            not self.maximum_cost_usd.is_finite() or self.maximum_cost_usd <= 0
+        ):
+            raise ValueError("runtime maximum cost must be finite and positive")
         return self
 
 

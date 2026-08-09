@@ -521,6 +521,7 @@ def test_gateway_resume_adapter_returns_only_gateway_observed_authorities() -> N
         run_id=RUN_ID,
         input_id="input-one",
         maximum_cost_usd=Decimal("2.00"),
+        booked_cost_usd=Decimal("1.25"),
         correlation_id=correlation_id,
         capability_id="incident-command",
         capability_version=1,

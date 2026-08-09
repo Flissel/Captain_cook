@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path as FilesystemPath
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from threading import Lock
@@ -111,9 +110,6 @@ from gateway.integration_setup_contracts import (
     build_integration_setup_surface,
 )
 from agenten.agent_runtime.http_executor import AgentRuntimeHttpExecutor
-from agenten.agent_factory.capability_live_runner import (
-    FilesystemCapabilityLiveCheckpointStore,
-)
 from gateway.capability_live_pipeline import (
     CapabilityExecutionAuthority,
     CapabilityResumeAuthorization,
@@ -441,12 +437,6 @@ def create_app(
                         )
                     authority = GatewayCapabilityResumeAuthoritySource(
                         gateway,
-                        checkpoints=FilesystemCapabilityLiveCheckpointStore(
-                            FilesystemPath.cwd()
-                            / ".captain-cook"
-                            / "live-demo"
-                            / "checkpoints"
-                        ),
                     )
                     resume_service = CapabilityResumeService(
                         repository=GatewayCapabilityResumeRepository(gateway),
@@ -469,8 +459,8 @@ def create_app(
             return HTTPException(
                 status_code=502,
                 detail={
-                    "code": error.failure.failure_kind,
-                    "failure_id": str(error.failure.failure_id),
+                    "code": "authoritative_runtime_failure",
+                    "failure_id": str(error.failure.execution.execution_result_id),
                 },
             )
         return HTTPException(status_code=503, detail="capability resume unavailable")
@@ -1049,6 +1039,7 @@ def create_app(
             CapabilityResumeConflict,
             CapabilityResumeNotFound,
             CapabilityResumeUnavailable,
+            CapabilityResumeDispatchFailed,
         ) as exc:
             raise translate_capability_resume_error(exc) from None
 
@@ -1068,6 +1059,7 @@ def create_app(
             CapabilityResumeConflict,
             CapabilityResumeNotFound,
             CapabilityResumeUnavailable,
+            CapabilityResumeDispatchFailed,
         ) as exc:
             raise translate_capability_resume_error(exc) from None
 
@@ -1085,6 +1077,7 @@ def create_app(
             CapabilityResumeConflict,
             CapabilityResumeNotFound,
             CapabilityResumeUnavailable,
+            CapabilityResumeDispatchFailed,
         ) as exc:
             raise translate_capability_resume_error(exc) from None
 

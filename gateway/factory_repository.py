@@ -144,6 +144,9 @@ class GatewayFactoryRepository(FactoryRepository):
     ) -> FactoryBudgetProjection:
         return self._translate(lambda: self._store.factory_budget(job_id))
 
+    def runtime_operation(self, command_id: UUID):
+        return self._translate(lambda: self._store.runtime_operation(command_id))
+
     def workflow_usage_receipts(
         self,
         job_id: UUID,

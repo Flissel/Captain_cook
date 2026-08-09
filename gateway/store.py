@@ -447,6 +447,30 @@ class GatewayStore:
                 )
                 cursor.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS capability_resume_authorizations (
+                        authorization_receipt_id CHAR(36) NOT NULL PRIMARY KEY,
+                        reservation_id CHAR(36) NOT NULL UNIQUE,
+                        run_id CHAR(36) NOT NULL,
+                        input_id VARCHAR(255) NOT NULL,
+                        job_id CHAR(36) NOT NULL,
+                        maximum_cost_usd DECIMAL(18, 6) NOT NULL,
+                        booked_cost_usd DECIMAL(18, 6) NOT NULL,
+                        resume_ceiling_usd DECIMAL(18, 6) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        UNIQUE KEY uq_capability_resume_run_input (run_id, input_id),
+                        CONSTRAINT chk_capability_resume_costs CHECK (
+                            maximum_cost_usd = booked_cost_usd + resume_ceiling_usd
+                            AND booked_cost_usd >= 0
+                            AND resume_ceiling_usd > 0
+                        ),
+                        CONSTRAINT fk_capability_resume_authorization_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS factory_workflow_artifacts (
                         invocation_id CHAR(36) NOT NULL PRIMARY KEY,
                         job_id CHAR(36) NOT NULL,

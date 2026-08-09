@@ -17,7 +17,11 @@ from agenten.agent_factory.skill_workflow_contracts import (
     TeamEvaluationV1,
     TeamExecutionEvidenceV1,
 )
-from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_runtime.contracts import (
+    ArtifactRef,
+    RuntimeOperation,
+    RuntimeStatus,
+)
 from agenten.delivery.minibook_events import (
     MinibookProjectionAcknowledgementV1,
     MinibookProjectionEvent,
@@ -48,6 +52,8 @@ class CapabilityWorkflowCompositionPort(Protocol):
     def workflow_artifacts(self, job_id: UUID) -> tuple[object, ...]: ...
 
     def workflow_budget_projection(self, job_id: UUID) -> object: ...
+
+    def runtime_operation(self, command_id: UUID) -> object: ...
 
     def business_benchmark_summary_by_artifact(self, reference: ArtifactRef) -> object | None: ...
 
@@ -177,6 +183,7 @@ class RecordedFactoryCapabilityExecutionAdapter:
         release: CapabilityFactoryAuthority,
     ) -> CapabilityExecutionAuthority | None:
         capability = request.capability
+        projection = self._composition.projection(release.job_id)
         if (
             capability.job_id != release.job_id
             or capability.correlation_id != release.correlation_id
@@ -184,6 +191,7 @@ class RecordedFactoryCapabilityExecutionAdapter:
             or capability.capability_version != release.capability_version
             or request.reservation.run_id != request.run_id
             or request.reservation.input_id != capability.input_id
+            or getattr(projection, "phase", None) is not FactoryPhase.CAPABILITY_PROMOTED
         ):
             raise CapabilityLiveAuthorityUnavailable(
                 "restart capability changed the stable release binding"
@@ -192,21 +200,25 @@ class RecordedFactoryCapabilityExecutionAdapter:
             raise CapabilityLiveAuthorityUnavailable(
                 "restart authorization receipt is unavailable"
             )
-        if capability.execution_command_id is None or capability.execution_result_id is None:
+        resumable = self._resumable_execution(release)
+        if resumable is None:
             raise CapabilityLiveAuthorityUnavailable(
-                "restart original execution evidence is incomplete"
+                "restart resumable Runtime execution is unavailable"
             )
+        failed_run, operation = resumable
+        budget = self._composition.workflow_budget_projection(release.job_id)
         authorization_request = CapabilityResumeExecutionRequest(
             job_id=release.job_id,
             reservation_id=request.reservation.reservation_id,
             run_id=request.run_id,
             input_id=request.input.input_id,
-            maximum_cost_usd=request.reservation.maximum_cost_usd,
+            maximum_cost_usd=budget.limit_usd,
+            booked_cost_usd=budget.consumed_usd,
             correlation_id=release.correlation_id,
             capability_id=release.capability_id,
             capability_version=release.capability_version,
-            original_execution_command_id=capability.execution_command_id,
-            original_execution_result_id=capability.execution_result_id,
+            original_execution_command_id=failed_run.execution_outcome.command_id,
+            original_execution_result_id=operation.result.event_id,
         )
         authorization = await self._resume_execution.authorize_resume(
             authorization_request
@@ -260,6 +272,44 @@ class RecordedFactoryCapabilityExecutionAdapter:
                 "restart read-back does not match dispatched result"
             )
         return readback
+
+    def _resumable_execution(
+        self,
+        release: CapabilityFactoryAuthority,
+    ) -> tuple[TeamExecutionEvidenceV1, object] | None:
+        candidates: list[tuple[TeamExecutionEvidenceV1, object]] = []
+        for artifact in self._composition.workflow_artifacts(release.job_id):
+            if not isinstance(artifact, TeamExecutionEvidenceV1):
+                continue
+            outcome = artifact.execution_outcome
+            if artifact.status == "succeeded":
+                continue
+            operation = self._composition.runtime_operation(outcome.command_id)
+            result = getattr(operation, "result", None)
+            command = getattr(operation, "command", None)
+            if (
+                result is None
+                or command is None
+                or getattr(operation, "operation_id", None) != outcome.command_id
+                or result.event_id != outcome.result_id
+                or result.command_id != outcome.command_id
+                or command.payload.operation is not RuntimeOperation.CODEX_RUN
+                or result.operation is not RuntimeOperation.CODEX_RUN
+                or result.correlation_id != release.correlation_id
+                or result.subject_version != release.capability_version
+                or not result.evidence_refs
+            ):
+                continue
+            resumable = result.status in {RuntimeStatus.FAILED, RuntimeStatus.CANCELLED}
+            timed_out = (
+                result.status is RuntimeStatus.INFRASTRUCTURE_FAILED
+                and result.error == "codex execution timed out (exit 124)"
+            )
+            if resumable or timed_out:
+                candidates.append((artifact, operation))
+        if len(candidates) != 1:
+            return None
+        return candidates[0]
 
     @staticmethod
     def _require_fresh_resume(

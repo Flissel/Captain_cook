@@ -43,7 +43,13 @@ from agenten.agent_factory.state_machine import (
     FactoryLifecycleStatus,
     FactoryProjection,
 )
-from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_runtime.contracts import (
+    AgentRuntimeCommand,
+    AgentRuntimeResult,
+    ArtifactRef,
+    RuntimeOperation,
+    RuntimeStatus,
+)
 from agenten.delivery.minibook_events import (
     MinibookProjectionAcknowledgementV1,
     minibook_projection_acknowledgement_id,
@@ -61,7 +67,7 @@ from gateway.capability_live_pipeline import (
     CapabilityLiveAuthorityUnavailable,
     CapabilityResumeAuthorization,
 )
-from gateway.contracts import FactoryJobProjection
+from gateway.contracts import FactoryJobProjection, RuntimeOperationProjection
 from gateway.registry_feed import factory_promotion_projection
 
 
@@ -131,7 +137,7 @@ def _job() -> AgentFactoryJobV3:
         execution_policy=FactoryExecutionPolicyV1.model_construct(
             mode="release",
             live_execution=True,
-            max_cost_usd=Decimal("1.00"),
+            max_cost_usd=Decimal("1.50"),
             max_runtime_seconds=900,
             required_live_runs=3,
             allowed_models=("gpt-5.6-terra",),
@@ -175,6 +181,77 @@ def _runs() -> tuple[TeamExecutionEvidenceV1, ...]:
             status="succeeded",
         )
         for index in range(1, 4)
+    )
+
+
+def _failed_run() -> TeamExecutionEvidenceV1:
+    return TeamExecutionEvidenceV1.model_construct(
+        invocation=SimpleNamespace(),
+        invocation_id=_uuid("invocation:failed"),
+        job_id=JOB_ID,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        attempt=1,
+        occurred_at=NOW,
+        producer="hermes",
+        artifact_ref=_ref("team-execution", "failed"),
+        evidence_refs=(_ref("team-execution-evidence", "failed"),),
+        acceptance_assertion_ids=("business_value",),
+        run_number=4,
+        candidate_ref=_ref("candidate", "sealed"),
+        holdout_ref=SimpleNamespace(),
+        execution_outcome=ExecutionOutcomeV1.model_construct(
+            capability_id="capability-sequential-n8n",
+            capability_version=1,
+            team_version=1,
+            correlation_id=CORRELATION_ID,
+            command_id=_uuid("command:failed"),
+            result_id=_uuid("result:failed"),
+            business_output={"status": "failed"},
+            output_ref=None,
+            assertion_outcomes=(),
+            evidence_refs=(_ref("runtime", "failed"),),
+            status="failed",
+        ),
+        usage_receipt_refs=(_ref("usage", "failed"),),
+        status="failed",
+        termination_reason="runtime timed out",
+    )
+
+
+def _failed_operation() -> RuntimeOperationProjection:
+    command = AgentRuntimeCommand.model_construct(
+        event_id=_failed_run().execution_outcome.command_id,
+        correlation_id=CORRELATION_ID,
+        causation_id=None,
+        occurred_at=NOW,
+        producer="captain",
+        subject_id="capability-task",
+        subject_version=1,
+        payload=SimpleNamespace(operation=RuntimeOperation.CODEX_RUN),
+    )
+    result = AgentRuntimeResult.model_construct(
+        event_id=_failed_run().execution_outcome.result_id,
+        command_id=command.event_id,
+        correlation_id=CORRELATION_ID,
+        occurred_at=NOW,
+        producer="agent-runtime",
+        subject_id=command.subject_id,
+        subject_version=1,
+        grant_id="grant-failed",
+        operation=RuntimeOperation.CODEX_RUN,
+        status=RuntimeStatus.INFRASTRUCTURE_FAILED,
+        session_id="session-failed",
+        artifact_refs=(),
+        evidence_refs=(_ref("runtime-terminal", "failed"),),
+        error="codex execution timed out (exit 124)",
+    )
+    return RuntimeOperationProjection.model_construct(
+        operation_id=command.event_id,
+        command=command,
+        grant=None,
+        revocation=None,
+        result=result,
     )
 
 
@@ -296,11 +373,20 @@ class _Composition:
 
     def workflow_artifacts(self, job_id: UUID) -> tuple[object, ...]:
         assert job_id == JOB_ID
-        return (*_runs(), _evaluation())
+        return (*_runs(), _failed_run(), _evaluation())
 
     def workflow_budget_projection(self, job_id: UUID) -> object:
         assert job_id == JOB_ID
-        return SimpleNamespace(consumed_usd=Decimal("1.00"))
+        return SimpleNamespace(
+            limit_usd=Decimal("1.50"),
+            consumed_usd=Decimal("1.00"),
+            reserved_usd=Decimal("0.00"),
+            remaining_usd=Decimal("0.50"),
+        )
+
+    def runtime_operation(self, command_id: UUID) -> RuntimeOperationProjection:
+        assert command_id == _failed_run().execution_outcome.command_id
+        return _failed_operation()
 
     def business_benchmark_summary_by_artifact(
         self,
@@ -435,14 +521,19 @@ class _ResumeGateway:
         self.dispatched = dispatched
         self.readback = readback
         self.calls: list[str] = []
+        self.request: object | None = None
 
     async def authorize_resume(self, request: object) -> CapabilityResumeAuthorization | None:
         self.calls.append("authorize")
+        self.request = request
         assert getattr(request, "job_id") == JOB_ID
         assert getattr(request, "reservation_id") == _request(
             CapabilityLiveStage.PROJECT
         ).reservation.reservation_id
-        assert getattr(request, "original_execution_command_id") == _capability().execution_command_id
+        assert getattr(request, "original_execution_command_id") == _failed_run().execution_outcome.command_id
+        assert getattr(request, "original_execution_result_id") == _failed_run().execution_outcome.result_id
+        assert getattr(request, "booked_cost_usd") == Decimal("1.00")
+        assert getattr(request, "maximum_cost_usd") == Decimal("1.50")
         return self.authorization
 
     async def dispatch_resume(
@@ -497,6 +588,37 @@ def test_restart_dispatches_a_new_gateway_authorized_execution_and_reads_it_back
     assert gateway.calls == ["authorize", "dispatch", "readback"]
     assert authority.execution_command_id != capability.execution_command_id
     assert authority.execution_result_id != capability.execution_result_id
+    assert gateway.request is not None
+
+
+def test_restart_rejects_pre_promotion_execution_before_resume_effects() -> None:
+    capability = _capability()
+    authorization = _resume_authorization(capability)
+    execution = _resumed_execution(capability, authorization)
+    gateway = _ResumeGateway(
+        authorization=authorization,
+        dispatched=execution,
+        readback=execution,
+    )
+    adapter = RecordedFactoryCapabilityExecutionAdapter(
+        composition=_Composition(promoted=False),
+        resume_execution=gateway,
+    )
+
+    with pytest.raises(CapabilityLiveAuthorityUnavailable, match="stable release"):
+        asyncio.run(
+            adapter.restart_and_resume(
+                CapabilityLiveRestartRequest(
+                    run_id=RUN_ID,
+                    input=_request(CapabilityLiveStage.PROJECT).input,
+                    reservation=_request(CapabilityLiveStage.PROJECT).reservation,
+                    capability=capability,
+                ),
+                _release(),
+            )
+        )
+
+    assert gateway.calls == []
 
 
 @pytest.mark.parametrize(

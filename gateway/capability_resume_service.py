@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Protocol
+from typing import Callable, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from agenten.agent_runtime.contracts import (
@@ -21,7 +21,6 @@ from gateway.capability_live_pipeline import (
 from gateway.capability_resume_contracts import (
     CapabilityResumeAuthorizationRecordV1,
     CapabilityResumeDispatchStartedV1,
-    CapabilityResumeDispatchFailureV1,
     CapabilityResumeSourceSnapshotV1,
     CapabilityResumeTerminalV1,
 )
@@ -45,14 +44,23 @@ class CapabilityResumeUnavailable(CapabilityResumeError):
 
 
 class CapabilityResumeDispatchFailed(CapabilityResumeError):
-    """A single runtime effect failed without producing Runtime truth."""
+    """Authoritative Runtime truth reports a terminal failed outcome."""
 
-    def __init__(self, failure: CapabilityResumeDispatchFailureV1) -> None:
+    def __init__(self, failure: CapabilityResumeTerminalV1) -> None:
         super().__init__("capability resume dispatch failed")
         self.failure = failure
 
 
 class CapabilityResumeRepository(Protocol):
+    def authorize_once(
+        self,
+        request: CapabilityResumeExecutionRequest,
+        source: "CapabilityResumeAuthoritySource",
+        build: Callable[
+            [CapabilityResumeSourceSnapshotV1], CapabilityResumeAuthorizationRecordV1
+        ],
+    ) -> CapabilityResumeAuthorizationRecordV1: ...
+
     def authorization_for_reservation(
         self, reservation_id: UUID
     ) -> CapabilityResumeAuthorizationRecordV1 | None: ...
@@ -68,14 +76,6 @@ class CapabilityResumeRepository(Protocol):
     def dispatch_started(self, receipt_id: UUID) -> bool: ...
 
     def record_dispatch_started(self, receipt_id: UUID) -> bool: ...
-
-    def dispatch_failure(
-        self, receipt_id: UUID
-    ) -> CapabilityResumeDispatchFailureV1 | None: ...
-
-    def record_dispatch_failure(
-        self, failure: CapabilityResumeDispatchFailureV1
-    ) -> CapabilityResumeDispatchFailureV1: ...
 
     def terminal(self, receipt_id: UUID) -> CapabilityResumeTerminalV1 | None: ...
 
@@ -119,17 +119,18 @@ class CapabilityResumeService:
     def authorize(
         self, request: CapabilityResumeExecutionRequest
     ) -> CapabilityResumeAuthorization:
-        existing = self._repository.authorization_for_reservation(
-            request.reservation_id
+        persisted = self._repository.authorize_once(
+            request,
+            self._authority_source,
+            lambda snapshot: self._authorization_record(request, snapshot),
         )
-        if existing is not None:
-            if existing.request != request:
-                raise CapabilityResumeConflict(
-                    "capability resume reservation binding does not match"
-                )
-            return existing.authorization
+        return persisted.authorization
 
-        snapshot = self._authority_source.resolve(request)
+    def _authorization_record(
+        self,
+        request: CapabilityResumeExecutionRequest,
+        snapshot: CapabilityResumeSourceSnapshotV1,
+    ) -> CapabilityResumeAuthorizationRecordV1:
         self._require_request_binding(request, snapshot)
         original = snapshot.original_operation
         result = original.result
@@ -167,24 +168,25 @@ class CapabilityResumeService:
             subject_id=original.command.subject_id,
             subject_version=original.command.subject_version,
             payload=original.command.payload.model_copy(
-                update={"operation": RuntimeOperation.CODEX_RESUME}
+                update={
+                    "operation": RuntimeOperation.CODEX_RESUME,
+                    "maximum_cost_usd": snapshot.resume_budget_usd,
+                    "budget_reservation_id": request.reservation_id,
+                    "cost_authority_ref": (
+                        "gateway://capability-resume-authorizations/"
+                        f"{authorization_id}"
+                    ),
+                }
             ),
         )
         record = CapabilityResumeAuthorizationRecordV1(
             request=request,
             authorization=authorization,
             resume_command=resume_command,
-            booked_cost_usd=snapshot.reservation.maximum_cost_usd,
-            resume_budget_usd=(
-                snapshot.reservation.maximum_cost_usd - snapshot.booked_cost_usd
-            ),
+            booked_cost_usd=snapshot.booked_cost_usd,
+            resume_budget_usd=snapshot.resume_budget_usd,
         )
-        persisted = self._repository.record_authorization(record)
-        if persisted != record:
-            raise CapabilityResumeConflict(
-                "persisted capability resume authorization does not match"
-            )
-        return persisted.authorization
+        return record
 
     async def dispatch(
         self, authorization: CapabilityResumeAuthorization
@@ -194,12 +196,7 @@ class CapabilityResumeService:
             authorization.authorization_receipt_id
         )
         if terminal is not None:
-            return terminal.execution
-        failure = self._repository.dispatch_failure(
-            authorization.authorization_receipt_id
-        )
-        if failure is not None:
-            raise CapabilityResumeDispatchFailed(failure)
+            return self._terminal_execution(terminal)
         if self._repository.dispatch_started(
             authorization.authorization_receipt_id
         ):
@@ -218,17 +215,8 @@ class CapabilityResumeService:
             try:
                 return self._recover(record)
             except CapabilityResumeUnavailable:
-                failure = CapabilityResumeDispatchFailureV1(
-                    failure_id=uuid5(
-                        authorization.authorization_receipt_id,
-                        "captain.capability-resume-dispatch-failure.v1",
-                    ),
-                    authorization_receipt_id=authorization.authorization_receipt_id,
-                    execution_command_id=record.resume_command.event_id,
-                    failure_kind="runtime_effect_failed_without_persisted_result",
-                )
-                raise CapabilityResumeDispatchFailed(
-                    self._repository.record_dispatch_failure(failure)
+                raise CapabilityResumeUnavailable(
+                    "capability resume outcome is ambiguous pending Runtime readback"
                 ) from None
         return self._recover(record)
 
@@ -240,12 +228,7 @@ class CapabilityResumeService:
             authorization.authorization_receipt_id
         )
         if terminal is not None:
-            return terminal.execution
-        failure = self._repository.dispatch_failure(
-            authorization.authorization_receipt_id
-        )
-        if failure is not None:
-            raise CapabilityResumeDispatchFailed(failure)
+            return self._terminal_execution(terminal)
         if not self._repository.dispatch_started(
             authorization.authorization_receipt_id
         ):
@@ -310,7 +293,15 @@ class CapabilityResumeService:
             raise CapabilityResumeConflict(
                 "persisted capability resume terminal does not match"
             )
-        return persisted.execution
+        return self._terminal_execution(persisted)
+
+    @staticmethod
+    def _terminal_execution(
+        terminal: CapabilityResumeTerminalV1,
+    ) -> CapabilityExecutionAuthority:
+        if terminal.execution.terminal_status == "failed":
+            raise CapabilityResumeDispatchFailed(terminal)
+        return terminal.execution
 
     @staticmethod
     def _require_request_binding(
@@ -321,10 +312,11 @@ class CapabilityResumeService:
         result = operation.result
         if (
             request.job_id != snapshot.job_id
-            or request.reservation_id != snapshot.reservation.reservation_id
-            or request.run_id != snapshot.reservation.run_id
-            or request.input_id != snapshot.reservation.input_id
-            or request.maximum_cost_usd != snapshot.reservation.maximum_cost_usd
+            or request.reservation_id != snapshot.reservation_id
+            or request.run_id != snapshot.run_id
+            or request.input_id != snapshot.input_id
+            or request.maximum_cost_usd != snapshot.maximum_cost_usd
+            or request.booked_cost_usd != snapshot.booked_cost_usd
             or request.correlation_id != snapshot.correlation_id
             or request.capability_id != snapshot.capability_id
             or request.capability_version != snapshot.capability_version
@@ -337,7 +329,10 @@ class CapabilityResumeService:
             or operation.command.correlation_id != request.correlation_id
             or result.subject_version != request.capability_version
             or operation.command.subject_version != request.capability_version
-            or snapshot.booked_cost_usd > snapshot.reservation.maximum_cost_usd
+            or snapshot.booked_cost_usd > snapshot.maximum_cost_usd
+            or snapshot.resume_budget_usd
+            != snapshot.maximum_cost_usd - snapshot.booked_cost_usd
+            or snapshot.resume_budget_usd <= 0
         ):
             raise CapabilityResumeConflict(
                 "capability resume request binding does not match Gateway truth"
