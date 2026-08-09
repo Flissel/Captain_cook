@@ -24,6 +24,14 @@ AGENTS = (
     "executive_brief_writer",
 )
 HANDOFFS = tuple(zip(AGENTS, AGENTS[1:]))
+AUTHORITY = {
+    "assignment_id": "00000000-0000-0000-0000-000000000201",
+    "creation_job_id": "00000000-0000-0000-0000-000000000401",
+    "factory_job_id": "00000000-0000-0000-0000-000000000301",
+    "correlation_id": "00000000-0000-0000-0000-000000000302",
+    "subject_version": 1,
+    "attempt": 1,
+}
 
 
 def _json(value: object) -> bytes:
@@ -36,10 +44,10 @@ def _archive(overrides: dict[str, bytes] | None = None) -> bytes:
         "src/tools/account_snapshot_reader.py": b"def read(value: dict) -> dict:\n    return value\n",
         "src/tools/opportunity_scoring_rules.py": b"def score(value: int) -> int:\n    return value\n",
         "tests/test_team.py": b"from src.team import TEAM\n\ndef test_team():\n    assert TEAM == 'sales_pipeline_brief'\n",
-        "evidence/build.json": _json({"schema": "minibook.build-evidence.v1", "status": "passed"}),
-        "evidence/real-case.json": _json({"schema": "minibook.real-case-evidence.v1", "status": "passed", "assertion_ids": ["deterministic_rank"]}),
-        "evidence/hermes-factory-skill-usage-receipt.json": _json({"schema": "hermes.factory-skill-usage-receipt.v1", "status": "passed"}),
-        "evidence/codex-build-receipt.json": _json({"schema": "captain.codex-build-receipt.v1", "status": "passed"}),
+        "evidence/build.json": _receipt("minibook.build-evidence.v1"),
+        "evidence/real-case.json": _receipt("minibook.real-case-evidence.v1", assertion_ids=["deterministic_rank"]),
+        "evidence/hermes-factory-skill-usage-receipt.json": _receipt("hermes.factory-skill-usage-receipt.v1"),
+        "evidence/codex-build-receipt.json": _receipt("captain.codex-build-receipt.v1"),
         "factory-candidate.json": _json({"schema": "captain.factory-candidate.v1", "team_manifest_sha256": "BOUND_AT_SEAL"}),
     }
     files.update(overrides or {})
@@ -48,6 +56,10 @@ def _archive(overrides: dict[str, bytes] | None = None) -> bytes:
         for name, content in files.items():
             package.writestr(name, content)
     return stream.getvalue()
+
+
+def _receipt(schema: str, **extra: object) -> bytes:
+    return _json({"schema": schema, "status": "passed", **AUTHORITY, **extra})
 
 
 def _fixture(tmp_path: Path):
@@ -75,7 +87,7 @@ def _fixture(tmp_path: Path):
         "source_files": ["src/team.py", "src/tools/account_snapshot_reader.py", "src/tools/opportunity_scoring_rules.py"],
         "test_files": ["tests/test_team.py"],
     }
-    refs = {
+    refs: dict[str, object] = {
         "compiled_spec_ref": store.put(_json(compiled), "application/json", namespace="compiled-spec"),
         "team_manifest_ref": store.put(_json(manifest), "application/json", namespace="team-manifest"),
         "source_archive_ref": store.put(_archive(), "application/zip", namespace="source"),
@@ -96,6 +108,33 @@ def _fixture(tmp_path: Path):
         }
     )
     refs["authority_job"] = CreationJobV3.model_validate(job_payload)
+    from minibook.swarm.contracts import FactoryBuildAssignmentV2
+
+    refs["authority_assignment"] = FactoryBuildAssignmentV2.model_validate(
+        {
+            **AUTHORITY,
+            "checkpoint_version": 1,
+            "effect_key": "9" * 64,
+            "workspace_ref": "workspace://captain/minibook-v3",
+            "workspace_policy_sha256": job_payload["workspace_policy_ref"]["sha256"],
+            "required_agent_ids": list(AGENTS),
+            "ordered_handoffs": compiled["ordered_handoffs"],
+            "tool_requirements": compiled["tool_requirements"],
+            "allowed_output_roots": ["src", "tests", "evidence"],
+            "allowed_commands": [["python", "-m", "compileall", "src"], ["python", "-m", "pytest"]],
+            "limits": {"max_wall_clock_seconds": 60, "max_provider_cost_usd": 1.0, "max_retries": 0, "max_files": 32},
+            "lease_ref": job_payload["lease_ref"],
+            "deadline_at": job_payload["deadline_at"],
+        }
+    )
+    refs.update(
+        {
+            "hermes_usage_receipt_ref": store.put(_receipt("hermes.factory-skill-usage-receipt.v1"), "application/json", namespace="receipt"),
+            "codex_build_receipt_ref": store.put(_receipt("captain.codex-build-receipt.v1"), "application/json", namespace="receipt"),
+            "build_evidence_refs": (store.put(_receipt("minibook.build-evidence.v1"), "application/json", namespace="evidence"),),
+            "test_evidence_refs": (store.put(_receipt("minibook.real-case-evidence.v1", assertion_ids=["deterministic_rank"]), "application/json", namespace="evidence"),),
+        }
+    )
     gaps = (ToolGapMarkerV1(schema="TODO_TOOL.v1", gap_id="industry_signal_reader", severity="optional", evidence_ref=store.put(_json({"status": "unresolved"}), "application/json", namespace="tool-gap"), status="unresolved"),)
     return store, compiled, manifest, refs, gaps
 
@@ -132,7 +171,12 @@ def test_validate_team_package_rejects_compiled_contract_or_executable_drift(tmp
     elif mutation == "untyped_tool": changed_manifest["tools"][0]["input_schema"] = {}
     elif mutation == "empty_source": archive_override["src/team.py"] = b""
     elif mutation == "syntax": archive_override["src/team.py"] = b"def broken(:\n"
-    elif mutation == "failed_test": archive_override["tests/test_team.py"] = b"def test_team():\n    assert False\n"
+    elif mutation == "failed_test":
+        failed = _receipt("minibook.real-case-evidence.v1", status="failed", assertion_ids=["deterministic_rank"])
+        archive_override["evidence/real-case.json"] = failed
+        refs["test_evidence_refs"] = (
+            store.put(failed, "application/json", namespace="evidence"),
+        )
     elif mutation == "weights": archive_override["src/tools/opportunity_scoring_rules.py"] = b"SCORING_WEIGHTS = {'invented': 1}\n"
     elif mutation == "gap": changed_gaps = ()
     refs["team_manifest_ref"] = store.put(_json(changed_manifest), "application/json", namespace="team-manifest")
@@ -180,7 +224,14 @@ async def test_v3_validator_promotes_only_after_public_cas_readback(tmp_path: Pa
         "cas_readback_receipt_ref": sealed.readback_receipt_ref.model_dump(mode="json"),
     }
     validator = TeamPackageV3Validator()
-    outcome = await validator.validate(job, {"sealed_team_package": package}, store)
+    outcome = await validator.validate(
+        job,
+        {
+            "sealed_team_package": package,
+            "authority_assignment": refs["authority_assignment"].model_dump(mode="json"),
+        },
+        store,
+    )
     assert outcome.snapshot["team_package_validated"] is True
     assert validator.assemble_result(job, outcome.snapshot).status == "succeeded"
 
@@ -188,11 +239,11 @@ async def test_v3_validator_promotes_only_after_public_cas_readback(tmp_path: Pa
 def test_validate_team_package_binds_referenced_receipt_bytes(tmp_path: Path) -> None:
     store, _, _, refs, gaps = _fixture(tmp_path)
     foreign = store.put(_json({"schema": "hermes.factory-skill-usage-receipt.v1", "status": "passed", "foreign": True}), "application/json", namespace="receipt")
+    refs["hermes_usage_receipt_ref"] = foreign
     with pytest.raises(TeamPackageError, match="referenced evidence"):
         validate_team_package(
             artifact_store=store,
             tool_gaps=gaps,
-            hermes_usage_receipt_ref=foreign,
             **refs,
         )
 
@@ -259,7 +310,9 @@ async def test_final_validation_rejects_package_under_foreign_job_authority(tmp_
     foreign_payload["deadline_at"] = "2099-08-09T12:00:00Z"
     foreign = CreationJobV3.model_validate(foreign_payload)
     with pytest.raises((ValueError, TeamPackageError), match="agents|authority"):
-        await TeamPackageV3Validator().validate(foreign, _sealed_snapshot(sealed), store)
+        await TeamPackageV3Validator().validate(
+            foreign, _sealed_snapshot(sealed, refs["authority_assignment"]), store
+        )
 
 
 @pytest.mark.asyncio
@@ -278,7 +331,7 @@ async def test_final_validation_rereads_every_manifest_child(tmp_path: Path) -> 
             {key: source_entry[key] for key in ("uri", "sha256", "media_type")}
         )
     ).write_bytes(b"TEAM = 'tampered'\n")
-    snapshot = _sealed_snapshot(sealed)
+    snapshot = _sealed_snapshot(sealed, refs["authority_assignment"])
     with pytest.raises(Exception, match="digest"):
         await TeamPackageV3Validator().validate(refs["authority_job"], snapshot, store)
 
@@ -293,14 +346,15 @@ async def test_final_validation_requires_exact_complete_readback_ref_set(tmp_pat
     receipt = dict(sealed.readback_receipt)
     receipt["artifacts"] = receipt["artifacts"][:-1]
     replacement = store.put(_json(receipt), "application/json", namespace="cas-readback")
-    snapshot = _sealed_snapshot(sealed)
+    snapshot = _sealed_snapshot(sealed, refs["authority_assignment"])
     snapshot["sealed_team_package"]["cas_readback_receipt_ref"] = replacement.model_dump(mode="json")
     with pytest.raises(ValueError, match="readback receipt"):
         await TeamPackageV3Validator().validate(refs["authority_job"], snapshot, store)
 
 
-def _sealed_snapshot(sealed: object) -> dict[str, object]:
+def _sealed_snapshot(sealed: object, assignment: object) -> dict[str, object]:
     return {
+        "authority_assignment": assignment.model_dump(mode="json"),
         "sealed_team_package": {
             "team_manifest_ref": sealed.team_manifest_ref.model_dump(mode="json"),
             "candidate_manifest_ref": sealed.candidate_manifest_ref.model_dump(mode="json"),
@@ -313,3 +367,109 @@ def _sealed_snapshot(sealed: object) -> dict[str, object]:
             "cas_readback_receipt_ref": sealed.readback_receipt_ref.model_dump(mode="json"),
         }
     }
+
+
+def test_worker_controlled_test_is_never_executed_on_host(tmp_path: Path) -> None:
+    store, _, _, refs, gaps = _fixture(tmp_path)
+    marker = tmp_path / "host-side-effect.txt"
+    malicious = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
+        "def test_receipt_only():\n    assert True\n"
+    ).encode()
+    refs["source_archive_ref"] = store.put(
+        _archive({"tests/test_team.py": malicious}), "application/zip", namespace="source"
+    )
+
+    validate_team_package(artifact_store=store, tool_gaps=gaps, **refs)
+
+    assert not marker.exists()
+
+
+def test_archive_file_limit_is_enforced_before_decompression(tmp_path: Path) -> None:
+    store, _, _, refs, gaps = _fixture(tmp_path)
+    assignment = refs["authority_assignment"]
+    refs["authority_assignment"] = assignment.model_copy(
+        update={"limits": assignment.limits.model_copy(update={"max_files": 5})}
+    )
+    with pytest.raises(TeamPackageError, match="file limit"):
+        validate_team_package(artifact_store=store, tool_gaps=gaps, **refs)
+
+
+def test_archive_rejects_excessive_member_or_compression_ratio(tmp_path: Path) -> None:
+    store, _, manifest, refs, gaps = _fixture(tmp_path)
+    manifest["source_files"].append("src/oversized.py")
+    refs["team_manifest_ref"] = store.put(_json(manifest), "application/json", namespace="team-manifest")
+    refs["source_archive_ref"] = store.put(
+        _archive({"src/oversized.py": b"#" + b"x" * (3 * 1024 * 1024)}),
+        "application/zip",
+        namespace="source",
+    )
+    with pytest.raises(TeamPackageError, match="size|compression"):
+        validate_team_package(artifact_store=store, tool_gaps=gaps, **refs)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    (
+        ("src/team.py", "src/TEAM.py"),
+        ("src/caf\N{LATIN SMALL LETTER E WITH ACUTE}.py", "src/cafe\N{COMBINING ACUTE ACCENT}.py"),
+    ),
+)
+def test_archive_rejects_casefold_or_unicode_normalization_collision(
+    tmp_path: Path, first: str, second: str
+) -> None:
+    store, _, manifest, refs, gaps = _fixture(tmp_path)
+    if first not in manifest["source_files"]:
+        manifest["source_files"].append(first)
+    manifest["source_files"].append(second)
+    refs["team_manifest_ref"] = store.put(_json(manifest), "application/json", namespace="team-manifest")
+    refs["source_archive_ref"] = store.put(
+        _archive({first: b"VALUE = 1\n", second: b"VALUE = 1\n"}),
+        "application/zip",
+        namespace="source",
+    )
+    with pytest.raises(TeamPackageError, match="collision|normalized"):
+        validate_team_package(artifact_store=store, tool_gaps=gaps, **refs)
+
+
+@pytest.mark.parametrize("unsafe", ("src/CON.py", "src/trailing.py. ", "src/tool.py:stream"))
+def test_archive_rejects_windows_reserved_or_unsafe_names(
+    tmp_path: Path, unsafe: str
+) -> None:
+    store, _, manifest, refs, gaps = _fixture(tmp_path)
+    manifest["source_files"].append(unsafe)
+    refs["team_manifest_ref"] = store.put(_json(manifest), "application/json", namespace="team-manifest")
+    refs["source_archive_ref"] = store.put(
+        _archive({unsafe: b"VALUE = 1\n"}), "application/zip", namespace="source"
+    )
+    with pytest.raises(TeamPackageError, match="Windows|unsafe"):
+        validate_team_package(artifact_store=store, tool_gaps=gaps, **refs)
+
+
+def test_exact_topology_rejects_malformed_extra_agent_entry(tmp_path: Path) -> None:
+    store, _, manifest, refs, gaps = _fixture(tmp_path)
+    manifest["agents"].append(7)
+    refs["team_manifest_ref"] = store.put(_json(manifest), "application/json", namespace="team-manifest")
+    with pytest.raises(TeamPackageError, match="agent"):
+        validate_team_package(artifact_store=store, tool_gaps=gaps, **refs)
+
+
+def test_identical_content_paths_seal_with_one_receipt_identity(tmp_path: Path) -> None:
+    store, _, manifest, refs, gaps = _fixture(tmp_path)
+    manifest["source_files"].append("src/team_copy.py")
+    refs["team_manifest_ref"] = store.put(_json(manifest), "application/json", namespace="team-manifest")
+    refs["source_archive_ref"] = store.put(
+        _archive({"src/team_copy.py": b"TEAM = 'sales_pipeline_brief'\n"}),
+        "application/zip",
+        namespace="source",
+    )
+    sealed = seal_team_package(
+        validate_team_package(artifact_store=store, tool_gaps=gaps, **refs),
+        artifact_store=store,
+    )
+    package_manifest = json.loads(store.read_bytes(sealed.package_manifest_ref))
+    entries = {item["path"]: item for item in package_manifest["files"]}
+    assert entries["src/team.py"]["uri"] == entries["src/team_copy.py"]["uri"]
+    identities = [(item["uri"], item["sha256"], item["media_type"]) for item in sealed.readback_receipt["artifacts"]]
+    assert len(identities) == len(set(identities))

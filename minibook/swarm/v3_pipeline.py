@@ -95,6 +95,7 @@ class TeamPackageV3Validator:
         validate_build_effect_binding(assignment, effect)
         validated = validate_team_package(
             authority_job=job,
+            authority_assignment=assignment,
             compiled_spec_ref=job.compiled_spec_ref,
             team_manifest_ref=effect.preliminary_team_manifest_ref,
             source_archive_ref=effect.source_archive_ref,
@@ -129,6 +130,7 @@ class TeamPackageV3Validator:
             snapshot=snapshot
             | {
                 "sealed_team_package": serialized,
+                "authority_assignment": assignment.model_dump(mode="json"),
                 "tool_gaps": [gap.model_dump(mode="json", by_alias=True) for gap in effect.tool_gaps],
             }
         )
@@ -142,6 +144,12 @@ class TeamPackageV3Validator:
         package = snapshot.get("sealed_team_package")
         if not isinstance(package, dict):
             raise ValueError("V3 sealed team package is unavailable")
+        try:
+            authority_assignment = FactoryBuildAssignmentV2.model_validate(
+                snapshot.get("authority_assignment")
+            )
+        except Exception as exc:
+            raise ValueError("V3 assignment authority is unavailable") from exc
         validated_snapshot = snapshot | {"team_package_validated": True}
         result = self.assemble_result(job, validated_snapshot)
         if result.status != "succeeded":
@@ -149,6 +157,7 @@ class TeamPackageV3Validator:
         verify_sealed_team_package(
             result,
             authority_job=job,
+            authority_assignment=authority_assignment,
             artifact_store=artifact_store,
         )
         return StepOutcome(snapshot=validated_snapshot)

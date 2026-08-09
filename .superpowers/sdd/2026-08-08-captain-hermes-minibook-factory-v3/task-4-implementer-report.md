@@ -56,3 +56,26 @@ Corrections make the typed `CreationJobV3` mandatory, bind its compiled-spec ref
 - Corrected Task 2/3 regression GREEN: `103 passed`.
 - Corrected full Minibook GREEN: `241 passed, 1 deselected`.
 - Corrected compileall and `git diff --check`: exit 0.
+
+## Quality security correction
+
+The quality review identified one critical host-execution flaw and four package-hardening gaps. A separate TDD cycle began at `ee52200`:
+
+- RED: `35 failed, 1 passed` after making assignment authority and the new security mutations mandatory.
+- The malicious worker-controlled test wrote a host marker under the previous subprocess pytest path.
+- Archive file/size/ratio limits, casefold and Unicode-normalization collisions, Windows reserved/ADS/trailing names, malformed agent entries, and duplicate-content paths were each covered behaviorally.
+- Intermediate GREEN debugging preserved named fail-closed errors and moved final assignment authority into the durable snapshot.
+
+Execution authority is now receipt-only for Task 4:
+
+- The validator never launches pytest, imports worker modules, creates a worker filesystem, or invokes a subprocess.
+- Declared Python is bounded by archive/member/total/list limits, UTF-8 decoded, AST parsed, and compiled to bytecode without execution.
+- Passing build, test, and real-case receipts are mandatory CAS references, byte-equal to packaged evidence, and exactly bound to the durable `CreationJobV3` and `FactoryBuildAssignmentV2` identities.
+- No sandbox executor port is needed in this scope and no unsandboxed fallback exists. Any future execution requirement must inject a separately reviewed sandbox executor enforcing environment allowlisting, filesystem/network isolation, resource limits, bounded output, and process-tree termination.
+
+Resource and path admission now applies assignment `limits.max_files` before decompression, plus hard compressed archive, per-member, total-uncompressed, compression-ratio, manifest-byte, and declared-list ceilings. Paths reject Unicode/casefold collisions, non-normalized Unicode, Windows reserved names, trailing dots/spaces, ADS, symlinks, traversal, and duplicate paths before any content read. Strict manifest parsing rejects malformed entries rather than filtering them. CAS readback deduplicates identical content identities while the manifest retains both distinct paths.
+
+- Final security focused GREEN: `54 passed`.
+- Final security Task 2/3 regression GREEN: `103 passed`.
+- Final security full Minibook GREEN: `251 passed, 1 deselected`.
+- Final security compileall and `git diff --check`: exit 0.

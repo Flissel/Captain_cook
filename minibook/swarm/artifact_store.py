@@ -76,7 +76,7 @@ class FilesystemCreationArtifactStore:
         for reference in references:
             identity = (reference.uri, reference.sha256, reference.media_type)
             if identity in seen:
-                raise CreationArtifactStoreError("creation artifact readback is duplicated")
+                continue
             seen.add(identity)
             content = self.read_bytes(reference)
             digest = hashlib.sha256(content).hexdigest()

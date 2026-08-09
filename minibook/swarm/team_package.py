@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import io
 import json
-import os
 import re
 import stat
-import subprocess
-import sys
-import tempfile
+import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -22,6 +20,7 @@ from .contracts import (
     ArtifactRef,
     CreationJobV3,
     CreationResultV2,
+    FactoryBuildAssignmentV2,
     FactoryToolRequirementV1,
     ToolGapMarkerV1,
 )
@@ -64,33 +63,54 @@ _FORBIDDEN_REQUIRED_TOOL_MARKERS = (
 _INVENTED_SCORING = re.compile(
     rb"(?:SCORING_WEIGHTS|scoring_weights|weights\s*=)", re.IGNORECASE
 )
+_MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
+_MAX_MEMBER_BYTES = 2 * 1024 * 1024
+_MAX_TOTAL_UNCOMPRESSED_BYTES = 8 * 1024 * 1024
+_MAX_COMPRESSION_RATIO = 200
+_MAX_MANIFEST_BYTES = 1024 * 1024
+_MAX_DECLARED_FILES = 4096
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{value}" for value in range(1, 10)),
+    *(f"LPT{value}" for value in range(1, 10)),
+}
 
 
 def validate_team_package(
     *,
     authority_job: CreationJobV3,
+    authority_assignment: FactoryBuildAssignmentV2,
     compiled_spec_ref: ArtifactRef,
     team_manifest_ref: ArtifactRef,
     source_archive_ref: ArtifactRef,
     artifact_store: FilesystemCreationArtifactStore,
     tool_gaps: Iterable[ToolGapMarkerV1] = (),
-    hermes_usage_receipt_ref: ArtifactRef | None = None,
-    codex_build_receipt_ref: ArtifactRef | None = None,
-    build_evidence_refs: Iterable[ArtifactRef] = (),
-    test_evidence_refs: Iterable[ArtifactRef] = (),
+    hermes_usage_receipt_ref: ArtifactRef,
+    codex_build_receipt_ref: ArtifactRef,
+    build_evidence_refs: Iterable[ArtifactRef],
+    test_evidence_refs: Iterable[ArtifactRef],
 ) -> ValidatedTeamPackage:
     """Read all authoritative bytes from CAS and execute the declared local gates."""
 
     if not isinstance(authority_job, CreationJobV3):
         raise TypeError("team package authority must be CreationJobV3")
+    if not isinstance(authority_assignment, FactoryBuildAssignmentV2):
+        raise TypeError("team package assignment authority is invalid")
+    _bind_assignment_authority(authority_job, authority_assignment)
     if compiled_spec_ref != authority_job.compiled_spec_ref:
         raise TeamPackageError("compiled specification ref differs from CreationJobV3 authority")
     compiled = _json_object(artifact_store.read_bytes(compiled_spec_ref), "compiled specification")
     _bind_compiled_authority(compiled, authority_job)
     manifest_bytes = artifact_store.read_bytes(team_manifest_ref)
-    manifest = _json_object(manifest_bytes, "team manifest")
+    manifest = _parse_team_manifest(
+        _json_object(manifest_bytes, "team manifest"),
+        max_files=min(authority_assignment.limits.max_files, _MAX_DECLARED_FILES),
+    )
     archive_bytes = artifact_store.read_bytes(source_archive_ref)
-    files = _read_safe_zip(archive_bytes)
+    files = _read_safe_zip(
+        archive_bytes,
+        max_files=authority_assignment.limits.max_files,
+    )
     archived_manifest = files.get(PurePosixPath("team_manifest.json"))
     if archived_manifest is not None and _canonical_json(_json_object(archived_manifest, "archived team manifest")) != _canonical_json(manifest):
         raise TeamPackageError("team manifest drift between archive and authoritative reference")
@@ -101,18 +121,27 @@ def validate_team_package(
     _require_closed_safe_file_set(manifest, files)
     _validate_tools(compiled, manifest, files)
     typed_gaps = tuple(tool_gaps)
+    typed_build_evidence_refs = tuple(build_evidence_refs)
+    typed_test_evidence_refs = tuple(test_evidence_refs)
+    if not typed_build_evidence_refs or not typed_test_evidence_refs:
+        raise TeamPackageError("authorized build and real-case evidence refs are required")
     _validate_gaps(compiled, typed_gaps)
     _validate_declared_files(manifest, files)
-    _require_receipts(compiled, files)
+    _require_receipts(
+        compiled,
+        files,
+        authority_job=authority_job,
+        authority_assignment=authority_assignment,
+    )
     _bind_referenced_evidence(
         artifact_store,
         files,
         hermes_usage_receipt_ref=hermes_usage_receipt_ref,
         codex_build_receipt_ref=codex_build_receipt_ref,
-        build_evidence_refs=tuple(build_evidence_refs),
-        test_evidence_refs=tuple(test_evidence_refs),
+        build_evidence_refs=typed_build_evidence_refs,
+        test_evidence_refs=typed_test_evidence_refs,
     )
-    _execute_python_gates(files, manifest)
+    _parse_and_compile_without_execution(files, manifest)
     return ValidatedTeamPackage(authority_job, compiled, manifest, files, typed_gaps)
 
 
@@ -214,10 +243,12 @@ def verify_sealed_team_package(
     result: CreationResultV2,
     *,
     authority_job: CreationJobV3,
+    authority_assignment: FactoryBuildAssignmentV2,
     artifact_store: FilesystemCreationArtifactStore,
 ) -> None:
     """Re-read and cross-bind the final ZIP, manifest, receipt, and every CAS child."""
 
+    _bind_assignment_authority(authority_job, authority_assignment)
     if result.status != "succeeded":
         raise ValueError("sealed package result is not successful")
     top_level = (
@@ -235,7 +266,10 @@ def verify_sealed_team_package(
         raise ValueError("sealed package top-level refs are incomplete")
     typed_top_level = tuple(reference for reference in top_level if reference is not None)
     archive_bytes = artifact_store.read_bytes(result.source_archive_ref)  # type: ignore[arg-type]
-    archive_files = _read_safe_zip(archive_bytes)
+    archive_files = _read_safe_zip(
+        archive_bytes,
+        max_files=authority_assignment.limits.max_files + 2,
+    )
     manifest_bytes = artifact_store.read_bytes(result.package_manifest_ref)  # type: ignore[arg-type]
     if archive_files.get(PurePosixPath("package-manifest.json")) != manifest_bytes:
         raise ValueError("package manifest does not match sealed archive")
@@ -387,6 +421,79 @@ def _bind_compiled_authority(
         raise TeamPackageError("compiled specification differs from CreationJobV3 authority")
 
 
+def _bind_assignment_authority(
+    job: CreationJobV3, assignment: FactoryBuildAssignmentV2
+) -> None:
+    if (
+        assignment.assignment_id != job.command_id
+        or assignment.creation_job_id != job.creation_job_id
+        or assignment.factory_job_id != job.factory_job_id
+        or assignment.correlation_id != job.correlation_id
+        or assignment.subject_version != job.subject_version
+        or assignment.attempt != job.attempt
+        or assignment.required_agent_ids != job.required_agent_ids
+        or assignment.ordered_handoffs != job.ordered_handoffs
+        or assignment.tool_requirements != job.tool_requirements
+        or assignment.workspace_policy_sha256 != job.workspace_policy_ref.sha256
+        or assignment.lease_ref != job.lease_ref
+        or assignment.deadline_at != job.deadline_at
+    ):
+        raise TeamPackageError("FactoryBuildAssignmentV2 differs from CreationJobV3 authority")
+
+
+def _parse_team_manifest(
+    value: dict[str, Any], *, max_files: int
+) -> dict[str, Any]:
+    allowed_keys = {
+        "schema", "agents", "handoffs", "tools", "source_files", "test_files"
+    }
+    if set(value) != allowed_keys or value.get("schema") != "minibook.team-manifest.v2":
+        raise TeamPackageError("team manifest schema or fields are invalid")
+    agents = _require_list(value.get("agents"), "team agents")
+    if len(agents) > max_files:
+        raise TeamPackageError("team manifest agent list limit exceeded")
+    for item in agents:
+        if not isinstance(item, dict) or set(item) != {"agent_id"}:
+            raise TeamPackageError("team agent entry is malformed")
+        _require_string(item.get("agent_id"), "agent id")
+    handoffs = _require_list(value.get("handoffs"), "team handoffs")
+    if len(handoffs) > max_files:
+        raise TeamPackageError("team manifest handoff list limit exceeded")
+    for item in handoffs:
+        _handoff(item)
+    tools = _require_list(value.get("tools"), "team tools")
+    if len(tools) > max_files:
+        raise TeamPackageError("team manifest tool list limit exceeded")
+    tool_keys = {
+        "tool_id", "input_schema", "output_schema", "implementation_path", "test_path"
+    }
+    for item in tools:
+        if not isinstance(item, dict) or set(item) != tool_keys:
+            raise TeamPackageError("team tool entry is malformed")
+        _require_string(item.get("tool_id"), "tool id")
+        if any(
+            not isinstance(item.get(field), dict)
+            or not isinstance(item[field].get("type"), str)
+            for field in ("input_schema", "output_schema")
+        ):
+            raise TeamPackageError("team tool schema is untyped")
+        _safe_path(item.get("implementation_path"), "tool implementation")
+        _safe_path(item.get("test_path"), "tool test")
+    source_files = _require_list(value.get("source_files"), "source files")
+    test_files = _require_list(value.get("test_files"), "test files")
+    if (
+        len(source_files) > max_files
+        or len(test_files) > max_files
+        or len(source_files) + len(test_files) > max_files
+    ):
+        raise TeamPackageError("team manifest declared file limit exceeded")
+    for field, entries in (("source", source_files), ("test", test_files)):
+        paths = tuple(_safe_path(item, f"{field} file") for item in entries)
+        if len(paths) != len(set(paths)):
+            raise TeamPackageError(f"team manifest contains duplicate {field} paths")
+    return value
+
+
 def _require_closed_safe_file_set(
     manifest: Mapping[str, Any], files: Mapping[PurePosixPath, bytes]
 ) -> None:
@@ -476,7 +583,13 @@ def _validate_declared_files(manifest: Mapping[str, Any], files: Mapping[PurePos
                 raise TeamPackageError(f"declared file is empty: {path}")
 
 
-def _require_receipts(compiled: Mapping[str, Any], files: Mapping[PurePosixPath, bytes]) -> None:
+def _require_receipts(
+    compiled: Mapping[str, Any],
+    files: Mapping[PurePosixPath, bytes],
+    *,
+    authority_job: CreationJobV3,
+    authority_assignment: FactoryBuildAssignmentV2,
+) -> None:
     required = (
         "evidence/build.json",
         "evidence/real-case.json",
@@ -488,6 +601,18 @@ def _require_receipts(compiled: Mapping[str, Any], files: Mapping[PurePosixPath,
     for name, value in receipts.items():
         if name.startswith("evidence/") and value.get("status") not in {"passed", "succeeded"}:
             raise TeamPackageError(f"declared evidence did not pass: {name}")
+        expected_authority = {
+            "assignment_id": str(authority_assignment.assignment_id),
+            "creation_job_id": str(authority_job.creation_job_id),
+            "factory_job_id": str(authority_job.factory_job_id),
+            "correlation_id": str(authority_job.correlation_id),
+            "subject_version": authority_job.subject_version,
+            "attempt": authority_job.attempt,
+        }
+        if name.startswith("evidence/") and any(
+            value.get(key) != expected for key, expected in expected_authority.items()
+        ):
+            raise TeamPackageError(f"declared evidence authority is invalid: {name}")
     assertions = tuple(_require_strings(compiled.get("public_assertion_ids"), "public assertions"))
     if tuple(receipts["evidence/real-case.json"].get("assertion_ids", ())) != assertions:
         raise TeamPackageError("real-case evidence does not match compiled assertions")
@@ -513,8 +638,6 @@ def _bind_referenced_evidence(
         ),
     )
     for reference, paths in bindings:
-        if reference is None:
-            continue
         content = artifact_store.read_bytes(reference)
         if all(content != _required_file(files, path) for path in paths):
             raise TeamPackageError("referenced evidence does not match package bytes")
@@ -531,35 +654,70 @@ def _bind_referenced_evidence(
             raise TeamPackageError("referenced evidence does not match package bytes")
 
 
-def _execute_python_gates(files: Mapping[PurePosixPath, bytes], manifest: Mapping[str, Any]) -> None:
-    with tempfile.TemporaryDirectory(prefix="minibook-team-package-") as raw:
-        root = Path(raw)
-        for path, content in files.items():
-            target = root.joinpath(*path.parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-        compile_result = subprocess.run([sys.executable, "-m", "compileall", "-q", "src"], cwd=root, capture_output=True, text=True, timeout=60, check=False)
-        if compile_result.returncode != 0:
-            raise TeamPackageError("declared Python source failed compileall")
-        tests = [str(_safe_path(value, "test file")) for value in _require_list(manifest.get("test_files"), "test files")]
-        environment = os.environ.copy()
-        environment["PYTHONPATH"] = str(root)
-        test_result = subprocess.run([sys.executable, "-m", "pytest", "-q", "--no-cov", *tests], cwd=root, env=environment, capture_output=True, text=True, timeout=60, check=False)
-        if test_result.returncode != 0:
-            raise TeamPackageError("declared tests failed")
+def _parse_and_compile_without_execution(
+    files: Mapping[PurePosixPath, bytes], manifest: Mapping[str, Any]
+) -> None:
+    declared = (
+        *_require_list(manifest.get("source_files"), "source files"),
+        *_require_list(manifest.get("test_files"), "test files"),
+    )
+    for raw_path in declared:
+        path = _safe_path(raw_path, "Python file")
+        content = _required_file(files, path)
+        try:
+            source = content.decode("utf-8")
+            tree = ast.parse(source, filename=str(path), mode="exec")
+            compile(tree, str(path), "exec", dont_inherit=True, optimize=0)
+        except (UnicodeDecodeError, SyntaxError, ValueError, MemoryError, RecursionError) as exc:
+            raise TeamPackageError("declared Python source failed safe compilation") from exc
 
 
-def _read_safe_zip(content: bytes) -> dict[PurePosixPath, bytes]:
+def _read_safe_zip(content: bytes, *, max_files: int) -> dict[PurePosixPath, bytes]:
+    if len(content) > _MAX_ARCHIVE_BYTES:
+        raise TeamPackageError("source archive compressed size limit exceeded")
     result: dict[PurePosixPath, bytes] = {}
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
-            for info in archive.infolist():
+            infos = archive.infolist()
+            if len(infos) > min(max_files, _MAX_DECLARED_FILES):
+                raise TeamPackageError("source archive file limit exceeded")
+            total_size = 0
+            normalized_names: set[str] = set()
+            for info in infos:
+                normalized_key = unicodedata.normalize("NFC", info.filename).casefold()
+                if normalized_key in normalized_names:
+                    raise TeamPackageError("source archive path collision is unsafe")
+                normalized_names.add(normalized_key)
                 path = _safe_path(info.filename, "archive member")
                 mode = (info.external_attr >> 16) & 0o170000
                 if info.is_dir() or mode == stat.S_IFLNK or info.flag_bits & 0x1 or path in result:
                     raise TeamPackageError("source archive contains an unsafe member")
-                result[path] = archive.read(info)
-    except (zipfile.BadZipFile, RuntimeError) as exc:
+                if info.file_size > _MAX_MEMBER_BYTES:
+                    raise TeamPackageError("source archive member size limit exceeded")
+                total_size += info.file_size
+                if total_size > _MAX_TOTAL_UNCOMPRESSED_BYTES:
+                    raise TeamPackageError("source archive total size limit exceeded")
+                if info.file_size and info.file_size / max(info.compress_size, 1) > _MAX_COMPRESSION_RATIO:
+                    raise TeamPackageError("source archive compression ratio limit exceeded")
+            for info in infos:
+                path = _safe_path(info.filename, "archive member")
+                with archive.open(info, "r") as handle:
+                    chunks: list[bytes] = []
+                    read_size = 0
+                    while True:
+                        chunk = handle.read(min(64 * 1024, _MAX_MEMBER_BYTES + 1 - read_size))
+                        if not chunk:
+                            break
+                        read_size += len(chunk)
+                        if read_size > _MAX_MEMBER_BYTES:
+                            raise TeamPackageError("source archive member size limit exceeded")
+                        chunks.append(chunk)
+                if read_size != info.file_size:
+                    raise TeamPackageError("source archive member size changed during read")
+                result[path] = b"".join(chunks)
+    except TeamPackageError:
+        raise
+    except (zipfile.BadZipFile, RuntimeError, OSError) as exc:
         raise TeamPackageError("source archive is invalid") from exc
     if not result:
         raise TeamPackageError("source archive is empty")
@@ -567,6 +725,8 @@ def _read_safe_zip(content: bytes) -> dict[PurePosixPath, bytes]:
 
 
 def _json_object(content: bytes, label: str) -> dict[str, Any]:
+    if len(content) > _MAX_MANIFEST_BYTES:
+        raise TeamPackageError(f"{label} size limit exceeded")
     try:
         value = json.loads(content)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -586,9 +746,17 @@ def _canonical_json(value: Mapping[str, Any]) -> bytes:
 def _safe_path(value: object, label: str) -> PurePosixPath:
     if not isinstance(value, str) or not value or "\\" in value or re.match(r"^[A-Za-z]:", value):
         raise TeamPackageError(f"{label} path is unsafe")
+    if unicodedata.normalize("NFC", value) != value:
+        raise TeamPackageError(f"{label} path is not Unicode-normalized")
     path = PurePosixPath(value)
     if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
         raise TeamPackageError(f"{label} path is unsafe")
+    for part in path.parts:
+        if part.endswith((".", " ")) or ":" in part:
+            raise TeamPackageError(f"{label} path contains a Windows-unsafe name")
+        stem = part.split(".", 1)[0].upper()
+        if stem in _WINDOWS_RESERVED:
+            raise TeamPackageError(f"{label} path contains a Windows reserved name")
     return path
 
 
