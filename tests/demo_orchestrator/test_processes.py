@@ -313,6 +313,33 @@ def test_stop_fails_when_exact_managed_process_remains_alive(tmp_path: Path) -> 
     assert backend.processes
 
 
+def test_supervisor_stop_retains_and_raises_for_still_alive_exact_process(
+    tmp_path: Path,
+) -> None:
+    configuration = _configuration(tmp_path)
+    backend = FakeBackend()
+    supervisor = ManagedProcessSupervisor(
+        configuration, plan=_plan(configuration), backend=backend
+    )
+    records = supervisor.start_all(timeout_seconds=1)
+    backend.leave_process_alive = True
+
+    with pytest.raises(
+        DemoProcessError,
+        match="managed process termination could not be verified",
+    ):
+        supervisor.stop()
+
+    persisted = json.loads(
+        (configuration.state_root / "managed-processes.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert {item["pid"] for item in persisted["processes"]} == {
+        item.pid for item in records
+    }
+
+
 def test_missing_service_executable_fails_before_compose_or_process_mutation(
     tmp_path: Path,
 ) -> None:

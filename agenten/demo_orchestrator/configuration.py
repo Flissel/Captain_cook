@@ -255,7 +255,7 @@ def _validate_d11_manifest(manifest: object) -> None:
         "runtime": ("CAPTAIN_RUNTIME_TOKEN", "/health", None),
         "provider_proxy": (
             "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
-            "/healthz",
+            "/v1/healthz",
             None,
         ),
         "minibook": ("MINIBOOK_API_KEY", "/health", None),
