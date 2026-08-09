@@ -7,6 +7,7 @@ import hmac
 import inspect
 import json
 import os
+import subprocess
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -256,6 +257,81 @@ def _load_verified_module(path: Path, content: bytes, digest: str) -> ModuleType
         sys.modules.pop(module_name, None)
         raise RuntimeAdapterManifestError("runtime adapter module import failed") from None
     return module
+
+
+def _require_committed_repository_bytes(
+    path: Path,
+    content: bytes,
+    *,
+    repository_root: Path,
+) -> None:
+    """Require the opened regular-file bytes to equal both HEAD and the index."""
+
+    try:
+        relative_path = path.relative_to(repository_root).as_posix()
+    except ValueError:
+        raise RuntimeAdapterManifestError(
+            "runtime adapter module is not repository-owned"
+        ) from None
+
+    def git_output(*arguments: str, input_bytes: bytes | None = None) -> bytes:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repository_root), *arguments],
+                check=False,
+                input=input_bytes,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            raise RuntimeAdapterManifestError(
+                "runtime adapter module committed bytes could not be verified"
+            ) from None
+        if result.returncode != 0:
+            raise RuntimeAdapterManifestError(
+                "runtime adapter module is not committed and repository-owned"
+            )
+        return result.stdout
+
+    head_identity = git_output("rev-parse", f"HEAD:{relative_path}").strip()
+    index_identity = git_output("rev-parse", f":{relative_path}").strip()
+    opened_identity = git_output(
+        "hash-object",
+        f"--path={relative_path}",
+        "--stdin",
+        input_bytes=content,
+    ).strip()
+    if not (
+        hmac.compare_digest(opened_identity, head_identity)
+        and hmac.compare_digest(opened_identity, index_identity)
+    ):
+        raise RuntimeAdapterManifestError(
+            "runtime adapter module is dirty or differs from committed bytes"
+        )
+
+
+def load_verified_repository_module(
+    module_path: str | Path,
+    *,
+    expected_sha256: str,
+    repository_root: Path,
+) -> ModuleType:
+    """Single-open a repo-confined module and execute only clean HEAD bytes."""
+
+    root = repository_root.resolve(strict=True)
+    path, content = _read_authorized_file(
+        module_path,
+        repository_root=root,
+        description="runtime adapter module",
+    )
+    expected_digest = _require_sha256(
+        expected_sha256,
+        description="runtime adapter module",
+    )
+    if not hmac.compare_digest(_sha256(content), expected_digest):
+        raise RuntimeAdapterManifestError("runtime adapter module digest mismatch")
+    _require_committed_repository_bytes(path, content, repository_root=root)
+    return _load_verified_module(path, content, expected_digest)
 
 
 def _validate_binding(value: object) -> RuntimeAdapterBinding:

@@ -8,15 +8,17 @@ fakes.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
+import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from types import ModuleType
 
 from agenten.agent_factory.capability_live_runner import CapabilityLiveRunner
+from agenten.agent_runtime.production_bootstrap import (
+    RuntimeAdapterManifestError,
+    load_verified_repository_module,
+)
 from gateway.agent_factory_live_composition import (
     AgentFactoryLiveComposition,
     GatewayCapabilityLiveCompositionError,
@@ -143,36 +145,23 @@ def build_current_authority_capability_live_runner_from_environment(
         raise CapabilityLiveProductionConfigurationError(
             "current capability live authority adapter is blocked"
         )
-    adapter_path = (root / relative_path).resolve(strict=True)
-    if not adapter_path.is_relative_to(root) or not adapter_path.is_file():
-        raise CapabilityLiveProductionConfigurationError(
-            "current capability live authority adapter is unavailable"
-        )
     try:
-        source = adapter_path.read_bytes()
-    except OSError as exc:
-        raise CapabilityLiveProductionConfigurationError(
-            "current capability live authority adapter is unavailable"
-        ) from exc
-    if not hmac.compare_digest(hashlib.sha256(source).hexdigest(), expected_digest):
-        raise CapabilityLiveProductionConfigurationError(
-            "current capability live authority adapter digest changed"
+        module = load_verified_repository_module(
+            relative_path,
+            expected_sha256=expected_digest,
+            repository_root=root,
         )
-    module = ModuleType(
-        f"_captain_capability_authorities_{expected_digest[:16]}"
-    )
-    module.__file__ = str(adapter_path)
-    try:
-        exec(compile(source, str(adapter_path), "exec", dont_inherit=True), module.__dict__)
-    except Exception as exc:
+    except RuntimeAdapterManifestError as exc:
         raise CapabilityLiveProductionConfigurationError(
-            "current capability live authority adapter could not load"
-        ) from exc
+            f"current capability live authority adapter {exc}"
+        ) from None
     factory = getattr(module, "build_capability_live_authorities", None)
-    if not callable(factory):
-        raise CapabilityLiveProductionConfigurationError(
-            "current capability live authority adapter factory is unavailable"
-        )
+    _require_method_contract(
+        factory,
+        qualified_name="factory build_capability_live_authorities",
+        argument_count=1,
+        asynchronous=False,
+    )
     try:
         authorities = factory(
             CapabilityLiveAuthorityAdapterContext(
@@ -188,6 +177,7 @@ def build_current_authority_capability_live_runner_from_environment(
         raise CapabilityLiveProductionConfigurationError(
             "current capability live authority adapter returned invalid authorities"
         )
+    _validate_authority_bindings(authorities)
     return build_current_authority_capability_live_runner(
         repository_root=root,
         authorities=authorities,
@@ -197,6 +187,71 @@ def build_current_authority_capability_live_runner_from_environment(
 
 def _is_sha256(value: str) -> bool:
     return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _require_method_contract(
+    method: object,
+    *,
+    qualified_name: str,
+    argument_count: int,
+    asynchronous: bool,
+) -> None:
+    if not callable(method):
+        raise CapabilityLiveProductionConfigurationError(
+            f"current capability live authority {qualified_name} must be callable"
+        )
+    if inspect.iscoroutinefunction(method) is not asynchronous:
+        requirement = "async" if asynchronous else "synchronous"
+        raise CapabilityLiveProductionConfigurationError(
+            f"current capability live authority {qualified_name} must be {requirement}"
+        )
+    arguments = [object()] * argument_count
+    try:
+        signature = inspect.signature(method)
+        signature.bind(*arguments)
+    except (TypeError, ValueError):
+        raise CapabilityLiveProductionConfigurationError(
+            f"current capability live authority {qualified_name} has an invalid signature"
+        ) from None
+    for invalid_arguments in (arguments[:-1], [*arguments, object()]):
+        try:
+            signature.bind(*invalid_arguments)
+        except TypeError:
+            continue
+        raise CapabilityLiveProductionConfigurationError(
+            f"current capability live authority {qualified_name} has an invalid signature"
+        )
+
+
+def _validate_authority_bindings(
+    authorities: CapabilityLiveCurrentAuthorities,
+) -> None:
+    if not isinstance(authorities.factory, AgentFactoryLiveComposition):
+        raise CapabilityLiveProductionConfigurationError(
+            "current capability live authority factory binding is invalid"
+        )
+    method_contracts = (
+        (authorities.factory, "factory.run", 1, True),
+        (authorities.factory, "factory.projection", 1, False),
+        (authorities.provisioning, "provisioning.provision", 1, False),
+        (authorities.provisioning, "provisioning.binding_for", 1, False),
+        (authorities.minibook_effects, "minibook_effects.project_and_ack", 1, True),
+        (authorities.minibook_effects, "minibook_effects.readback", 1, True),
+        (authorities.resume_execution, "resume_execution.authorize_resume", 1, True),
+        (authorities.resume_execution, "resume_execution.dispatch_resume", 1, True),
+        (authorities.resume_execution, "resume_execution.readback_resume", 1, True),
+    )
+    for binding, qualified_name, argument_count, asynchronous in method_contracts:
+        try:
+            method = getattr(binding, qualified_name.rsplit(".", 1)[1])
+        except Exception:
+            method = None
+        _require_method_contract(
+            method,
+            qualified_name=qualified_name,
+            argument_count=argument_count,
+            asynchronous=asynchronous,
+        )
 
 
 __all__ = [

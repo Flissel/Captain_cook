@@ -6,6 +6,7 @@ from decimal import Decimal
 import hashlib
 import importlib
 from pathlib import Path
+import subprocess
 from uuid import UUID, uuid5
 
 import pytest
@@ -359,19 +360,47 @@ def test_default_entrypoint_loads_digest_bound_current_authorities(
 ) -> None:
     adapter = tmp_path / "capability_authorities.py"
     source = """
+from gateway.agent_factory_live_composition import AgentFactoryLiveComposition
 from gateway.capability_live_production_builder import CapabilityLiveCurrentAuthorities
 from gateway.capability_live_runtime_resume import GatewayCapabilityResumeExecutionAdapter
 
+class Provisioning:
+    def provision(self, request):
+        raise NotImplementedError
+
+    def binding_for(self, request):
+        raise NotImplementedError
+
+class ProjectionEffects:
+    async def project_and_ack(self, event):
+        raise NotImplementedError
+
+    async def readback(self, event_id):
+        raise NotImplementedError
 
 def build_capability_live_authorities(context):
     return CapabilityLiveCurrentAuthorities(
-        factory=object(),
-        provisioning=object(),
-        minibook_effects=object(),
+        factory=object.__new__(AgentFactoryLiveComposition),
+        provisioning=Provisioning(),
+        minibook_effects=ProjectionEffects(),
         resume_execution=GatewayCapabilityResumeExecutionAdapter(gateway=object()),
     )
 """.strip()
     adapter.write_text(source, encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "init", "--quiet"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", adapter.name], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "--quiet", "-m", "test adapter"],
+        check=True,
+    )
     monkeypatch.setenv("CAPTAIN_GATEWAY_URL", "http://127.0.0.1:8090")
     monkeypatch.setenv("CAPTAIN_GATEWAY_TOKEN", "test-token")
     monkeypatch.setenv("CAPTAIN_BENCHMARK_PROVIDER", "openai")
