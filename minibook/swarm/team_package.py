@@ -21,8 +21,14 @@ from .contracts import (
     CreationJobV3,
     CreationResultV2,
     FactoryBuildAssignmentV2,
+    FactoryBuildEffectV2,
     FactoryToolRequirementV1,
+    ForgeBuildSkillUsageReceiptV1,
+    CodexBuildReceiptV1,
+    PackageBuildEvidenceV1,
+    PackageRealCaseEvidenceV1,
     ToolGapMarkerV1,
+    validate_build_effect_binding,
 )
 from .creation_export import CreationExportError, _build_deterministic_zip
 
@@ -80,6 +86,7 @@ def validate_team_package(
     *,
     authority_job: CreationJobV3,
     authority_assignment: FactoryBuildAssignmentV2,
+    authority_effect: FactoryBuildEffectV2,
     compiled_spec_ref: ArtifactRef,
     team_manifest_ref: ArtifactRef,
     source_archive_ref: ArtifactRef,
@@ -97,6 +104,7 @@ def validate_team_package(
     if not isinstance(authority_assignment, FactoryBuildAssignmentV2):
         raise TypeError("team package assignment authority is invalid")
     _bind_assignment_authority(authority_job, authority_assignment)
+    validate_build_effect_binding(authority_assignment, authority_effect)
     if compiled_spec_ref != authority_job.compiled_spec_ref:
         raise TeamPackageError("compiled specification ref differs from CreationJobV3 authority")
     compiled = _json_object(artifact_store.read_bytes(compiled_spec_ref), "compiled specification")
@@ -127,21 +135,15 @@ def validate_team_package(
         raise TeamPackageError("authorized build and real-case evidence refs are required")
     _validate_gaps(compiled, typed_gaps)
     _validate_declared_files(manifest, files)
-    _require_receipts(
-        compiled,
-        files,
-        authority_job=authority_job,
-        authority_assignment=authority_assignment,
-    )
-    _bind_referenced_evidence(
-        artifact_store,
-        files,
-        hermes_usage_receipt_ref=hermes_usage_receipt_ref,
-        codex_build_receipt_ref=codex_build_receipt_ref,
-        build_evidence_refs=typed_build_evidence_refs,
-        test_evidence_refs=typed_test_evidence_refs,
-    )
     _parse_and_compile_without_execution(files, manifest)
+    authority_files = _validate_typed_receipts(
+        artifact_store=artifact_store, job=authority_job,
+        assignment=authority_assignment, effect=authority_effect,
+        manifest=manifest, hermes_ref=hermes_usage_receipt_ref,
+        codex_ref=codex_build_receipt_ref, build_refs=typed_build_evidence_refs,
+        real_refs=typed_test_evidence_refs,
+    )
+    files = dict(files) | authority_files
     return ValidatedTeamPackage(authority_job, compiled, manifest, files, typed_gaps)
 
 
@@ -523,10 +525,6 @@ def _require_closed_safe_file_set(
     canonical = {
         PurePosixPath("factory-candidate.json"),
         PurePosixPath("team_manifest.json"),
-        PurePosixPath("evidence/build.json"),
-        PurePosixPath("evidence/real-case.json"),
-        PurePosixPath("evidence/hermes-factory-skill-usage-receipt.json"),
-        PurePosixPath("evidence/codex-build-receipt.json"),
     }
     allowed = {*source_paths, *test_paths, *canonical}
     if not set(files).issubset(allowed):
@@ -539,6 +537,29 @@ def _require_closed_safe_file_set(
             raise TeamPackageError("tool implementation is not a declared source file")
         if _safe_path(tool.get("test_path"), "tool test") not in test_paths:
             raise TeamPackageError("tool test is not a declared test file")
+
+
+def _validate_typed_receipts(*, artifact_store: FilesystemCreationArtifactStore, job: CreationJobV3, assignment: FactoryBuildAssignmentV2, effect: FactoryBuildEffectV2, manifest: Mapping[str, Any], hermes_ref: ArtifactRef, codex_ref: ArtifactRef, build_refs: tuple[ArtifactRef, ...], real_refs: tuple[ArtifactRef, ...]) -> dict[PurePosixPath, bytes]:
+    if hermes_ref != effect.hermes_usage_receipt_ref or codex_ref != effect.codex_build_receipt_ref or build_refs != effect.build_evidence_refs or real_refs != effect.test_evidence_refs:
+        raise TeamPackageError("receipt refs differ from authorized build effect")
+    try:
+        hermes_bytes = artifact_store.read_bytes(hermes_ref); hermes = ForgeBuildSkillUsageReceiptV1.model_validate_json(hermes_bytes)
+        codex_bytes = artifact_store.read_bytes(codex_ref); codex = CodexBuildReceiptV1.model_validate_json(codex_bytes)
+        if len(build_refs) != 1 or len(real_refs) != 1: raise ValueError("exactly one build and real-case evidence required")
+        build_bytes = artifact_store.read_bytes(build_refs[0]); build = PackageBuildEvidenceV1.model_validate_json(build_bytes)
+        real_bytes = artifact_store.read_bytes(real_refs[0]); real = PackageRealCaseEvidenceV1.model_validate_json(real_bytes)
+    except Exception as exc:
+        raise TeamPackageError("typed package receipt is invalid") from exc
+    common = (assignment.assignment_id, job.creation_job_id, job.factory_job_id, job.correlation_id, job.subject_version, job.attempt)
+    for receipt in (codex, build, real):
+        if (receipt.assignment_id, receipt.creation_job_id, receipt.factory_job_id, receipt.correlation_id, receipt.subject_version, receipt.attempt) != common: raise TeamPackageError("typed receipt authority differs")
+    if (hermes.creation_job_id, hermes.factory_job_id, hermes.correlation_id, hermes.subject_version, hermes.attempt, hermes.idempotency_key, hermes.released_skill, hermes.public_assertion_ids) != (job.creation_job_id, job.factory_job_id, job.correlation_id, job.subject_version, job.attempt, job.idempotency_key, job.released_skill, job.public_assertion_ids): raise TeamPackageError("Hermes receipt authority differs")
+    if hermes.evidence_refs != (job.compiled_spec_ref, job.blueprint_ref, job.tool_plan_ref): raise TeamPackageError("Hermes evidence refs differ")
+    if codex.idempotency_key != assignment.effect_key or codex.workspace_ref != assignment.workspace_ref or codex.codex_session_ref != effect.codex_session_ref or codex.workspace_snapshot_ref != effect.workspace_snapshot_ref or codex.source_archive_ref != effect.source_archive_ref or codex.candidate_manifest_ref != effect.preliminary_team_manifest_ref or codex.test_evidence_refs != effect.test_evidence_refs or codex.acceptance_assertion_ids != job.public_assertion_ids: raise TeamPackageError("Codex receipt binding differs")
+    for evidence in (build, real):
+        if evidence.checkpoint_version != assignment.checkpoint_version or evidence.effect_key != assignment.effect_key or evidence.source_archive_ref != effect.source_archive_ref or evidence.codex_session_ref != effect.codex_session_ref: raise TeamPackageError("package evidence binding differs")
+    if build.workspace_snapshot_ref != effect.workspace_snapshot_ref or real.assertion_ids != job.public_assertion_ids or real.declared_test_paths != tuple(manifest["test_files"]) or real.evidence_refs != effect.build_evidence_refs: raise TeamPackageError("real-case evidence binding differs")
+    return {PurePosixPath("evidence/hermes-factory-skill-usage-receipt.json"): hermes_bytes, PurePosixPath("evidence/codex-build-receipt.json"): codex_bytes, PurePosixPath("evidence/build.json"): build_bytes, PurePosixPath("evidence/real-case.json"): real_bytes}
 
 
 def _validate_tools(compiled: Mapping[str, Any], manifest: Mapping[str, Any], files: Mapping[PurePosixPath, bytes]) -> None:

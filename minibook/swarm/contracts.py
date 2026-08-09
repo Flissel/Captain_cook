@@ -449,6 +449,42 @@ class AgentHandoffV1(_FrozenContract):
         return self
 
 
+class PackageBuildEvidenceV1(_FrozenContract):
+    schema_name: Literal["captain.package-build-evidence.v1"] = Field(default="captain.package-build-evidence.v1", alias="schema", serialization_alias="schema")
+    producer: Literal["captain"]
+    outcome: Literal["passed"]
+    assignment_id: UUID; creation_job_id: UUID; factory_job_id: UUID; correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True); checkpoint_version: int = Field(ge=1, strict=True); attempt: int = Field(ge=1, le=5, strict=True)
+    effect_key: str = Field(pattern=SHA256_PATTERN)
+    source_archive_ref: ArtifactRef; codex_session_ref: ArtifactRef; workspace_snapshot_ref: ArtifactRef
+    completed_at: datetime
+    @model_validator(mode="after")
+    def safe(self) -> "PackageBuildEvidenceV1":
+        if self.source_archive_ref.media_type != "application/zip" or self.workspace_snapshot_ref.media_type != "application/zip": raise ValueError("package build archives must be ZIP")
+        if self.completed_at.tzinfo is None or self.completed_at.utcoffset() != timezone.utc.utcoffset(self.completed_at): raise ValueError("completed_at must be UTC")
+        return self
+
+
+class PackageRealCaseEvidenceV1(_FrozenContract):
+    schema_name: Literal["captain.package-real-case-evidence.v1"] = Field(default="captain.package-real-case-evidence.v1", alias="schema", serialization_alias="schema")
+    producer: Literal["captain"]
+    outcome: Literal["passed"]
+    assignment_id: UUID; creation_job_id: UUID; factory_job_id: UUID; correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True); checkpoint_version: int = Field(ge=1, strict=True); attempt: int = Field(ge=1, le=5, strict=True)
+    effect_key: str = Field(pattern=SHA256_PATTERN)
+    source_archive_ref: ArtifactRef; codex_session_ref: ArtifactRef
+    assertion_ids: tuple[str, ...] = Field(min_length=1)
+    declared_test_paths: tuple[str, ...] = Field(min_length=1)
+    evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+    completed_at: datetime
+    @model_validator(mode="after")
+    def safe(self) -> "PackageRealCaseEvidenceV1":
+        if self.source_archive_ref.media_type != "application/zip": raise ValueError("real-case source must be ZIP")
+        if len(self.assertion_ids) != len(set(self.assertion_ids)) or len(self.declared_test_paths) != len(set(self.declared_test_paths)): raise ValueError("real-case assertions and test paths must be unique")
+        if self.completed_at.tzinfo is None or self.completed_at.utcoffset() != timezone.utc.utcoffset(self.completed_at): raise ValueError("completed_at must be UTC")
+        return self
+
+
 class FactoryToolRequirementV1(_FrozenContract):
     tool_id: str = Field(pattern=IDENTIFIER_PATTERN)
     required: bool

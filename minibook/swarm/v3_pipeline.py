@@ -96,6 +96,7 @@ class TeamPackageV3Validator:
         validated = validate_team_package(
             authority_job=job,
             authority_assignment=assignment,
+            authority_effect=effect,
             compiled_spec_ref=job.compiled_spec_ref,
             team_manifest_ref=effect.preliminary_team_manifest_ref,
             source_archive_ref=effect.source_archive_ref,

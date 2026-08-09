@@ -44,10 +44,6 @@ def _archive(overrides: dict[str, bytes] | None = None) -> bytes:
         "src/tools/account_snapshot_reader.py": b"def read(value: dict) -> dict:\n    return value\n",
         "src/tools/opportunity_scoring_rules.py": b"def score(value: int) -> int:\n    return value\n",
         "tests/test_team.py": b"from src.team import TEAM\n\ndef test_team():\n    assert TEAM == 'sales_pipeline_brief'\n",
-        "evidence/build.json": _receipt("minibook.build-evidence.v1"),
-        "evidence/real-case.json": _receipt("minibook.real-case-evidence.v1", assertion_ids=["deterministic_rank"]),
-        "evidence/hermes-factory-skill-usage-receipt.json": _receipt("hermes.factory-skill-usage-receipt.v1"),
-        "evidence/codex-build-receipt.json": _receipt("captain.codex-build-receipt.v1"),
         "factory-candidate.json": _json({"schema": "captain.factory-candidate.v1", "team_manifest_sha256": "BOUND_AT_SEAL"}),
     }
     files.update(overrides or {})
@@ -127,15 +123,23 @@ def _fixture(tmp_path: Path):
             "deadline_at": job_payload["deadline_at"],
         }
     )
-    refs.update(
-        {
-            "hermes_usage_receipt_ref": store.put(_receipt("hermes.factory-skill-usage-receipt.v1"), "application/json", namespace="receipt"),
-            "codex_build_receipt_ref": store.put(_receipt("captain.codex-build-receipt.v1"), "application/json", namespace="receipt"),
-            "build_evidence_refs": (store.put(_receipt("minibook.build-evidence.v1"), "application/json", namespace="evidence"),),
-            "test_evidence_refs": (store.put(_receipt("minibook.real-case-evidence.v1", assertion_ids=["deterministic_rank"]), "application/json", namespace="evidence"),),
-        }
-    )
     gaps = (ToolGapMarkerV1(schema="TODO_TOOL.v1", gap_id="industry_signal_reader", severity="optional", evidence_ref=store.put(_json({"status": "unresolved"}), "application/json", namespace="tool-gap"), status="unresolved"),)
+    assignment = refs["authority_assignment"]
+    job = refs["authority_job"]
+    session_ref = store.put(_json({"session": "sealed"}), "application/json", namespace="session")
+    snapshot_ref = store.put(b"snapshot", "application/zip", namespace="snapshot")
+    common = {**AUTHORITY, "checkpoint_version": 1, "effect_key": "9" * 64, "source_archive_ref": refs["source_archive_ref"].model_dump(mode="json"), "codex_session_ref": session_ref.model_dump(mode="json"), "completed_at": "2026-08-09T08:00:00Z"}
+    build_bytes = _json({"schema": "captain.package-build-evidence.v1", "producer": "captain", "outcome": "passed", **common, "workspace_snapshot_ref": snapshot_ref.model_dump(mode="json")})
+    build_ref = store.put(build_bytes, "application/json", namespace="evidence")
+    real_bytes = _json({"schema": "captain.package-real-case-evidence.v1", "producer": "captain", "outcome": "passed", **common, "assertion_ids": ["deterministic_rank"], "declared_test_paths": ["tests/test_team.py"], "evidence_refs": [build_ref.model_dump(mode="json")]})
+    real_ref = store.put(real_bytes, "application/json", namespace="evidence")
+    hermes_bytes = _json({"schema": "hermes.forge-build-skill-usage-receipt.v1", "producer": "hermes", "outcome": "fulfilled", "creation_job_id": str(job.creation_job_id), "factory_job_id": str(job.factory_job_id), "correlation_id": str(job.correlation_id), "subject_version": job.subject_version, "attempt": job.attempt, "idempotency_key": job.idempotency_key, "released_skill": job.released_skill.model_dump(mode="json"), "public_assertion_ids": list(job.public_assertion_ids), "evidence_refs": [job.compiled_spec_ref.model_dump(mode="json"), job.blueprint_ref.model_dump(mode="json"), job.tool_plan_ref.model_dump(mode="json")]})
+    hermes_ref = store.put(hermes_bytes, "application/json", namespace="receipt")
+    codex_bytes = _json({"schema": "captain.codex-build-receipt.v1", "receipt_id": "00000000-0000-0000-0000-000000000601", "producer": "captain", "outcome": "sealed", **AUTHORITY, "idempotency_key": assignment.effect_key, "seal_idempotency_key": "a" * 64, "build_brief_ref": job.blueprint_ref.model_dump(mode="json"), "codex_session_ref": session_ref.model_dump(mode="json"), "workspace_ref": assignment.workspace_ref, "workspace_snapshot_ref": snapshot_ref.model_dump(mode="json"), "source_archive_ref": refs["source_archive_ref"].model_dump(mode="json"), "candidate_manifest_ref": refs["team_manifest_ref"].model_dump(mode="json"), "test_evidence_refs": [real_ref.model_dump(mode="json")], "acceptance_assertion_ids": list(job.public_assertion_ids), "completed_at": "2026-08-09T08:00:00Z"})
+    codex_ref = store.put(codex_bytes, "application/json", namespace="receipt")
+    from minibook.swarm.contracts import FactoryBuildEffectV2
+    effect = FactoryBuildEffectV2.model_validate({**AUTHORITY, "checkpoint_version": 1, "effect_key": assignment.effect_key, "hermes_usage_receipt_ref": hermes_ref.model_dump(mode="json"), "codex_build_receipt_ref": codex_ref.model_dump(mode="json"), "codex_session_ref": session_ref.model_dump(mode="json"), "workspace_snapshot_ref": snapshot_ref.model_dump(mode="json"), "source_archive_ref": refs["source_archive_ref"].model_dump(mode="json"), "preliminary_team_manifest_ref": refs["team_manifest_ref"].model_dump(mode="json"), "build_evidence_refs": [build_ref.model_dump(mode="json")], "test_evidence_refs": [real_ref.model_dump(mode="json")], "tool_gaps": [gap.model_dump(mode="json", by_alias=True) for gap in gaps]})
+    refs.update({"authority_effect": effect, "hermes_usage_receipt_ref": hermes_ref, "codex_build_receipt_ref": codex_ref, "build_evidence_refs": (build_ref,), "test_evidence_refs": (real_ref,)})
     return store, compiled, manifest, refs, gaps
 
 
@@ -240,7 +244,7 @@ def test_validate_team_package_binds_referenced_receipt_bytes(tmp_path: Path) ->
     store, _, _, refs, gaps = _fixture(tmp_path)
     foreign = store.put(_json({"schema": "hermes.factory-skill-usage-receipt.v1", "status": "passed", "foreign": True}), "application/json", namespace="receipt")
     refs["hermes_usage_receipt_ref"] = foreign
-    with pytest.raises(TeamPackageError, match="referenced evidence"):
+    with pytest.raises(TeamPackageError, match="receipt refs"):
         validate_team_package(
             artifact_store=store,
             tool_gaps=gaps,
@@ -390,7 +394,7 @@ def test_archive_file_limit_is_enforced_before_decompression(tmp_path: Path) -> 
     store, _, _, refs, gaps = _fixture(tmp_path)
     assignment = refs["authority_assignment"]
     refs["authority_assignment"] = assignment.model_copy(
-        update={"limits": assignment.limits.model_copy(update={"max_files": 5})}
+        update={"limits": assignment.limits.model_copy(update={"max_files": 4})}
     )
     with pytest.raises(TeamPackageError, match="file limit"):
         validate_team_package(artifact_store=store, tool_gaps=gaps, **refs)
@@ -473,3 +477,28 @@ def test_identical_content_paths_seal_with_one_receipt_identity(tmp_path: Path) 
     assert entries["src/team.py"]["uri"] == entries["src/team_copy.py"]["uri"]
     identities = [(item["uri"], item["sha256"], item["media_type"]) for item in sealed.readback_receipt["artifacts"]]
     assert len(identities) == len(set(identities))
+
+
+@pytest.mark.parametrize("mutation", ("schema", "producer", "effect", "session", "archive"))
+def test_typed_codex_receipt_rejects_forged_authority(tmp_path: Path, mutation: str) -> None:
+    store, _, _, refs, gaps = _fixture(tmp_path)
+    payload = json.loads(store.read_bytes(refs["codex_build_receipt_ref"]))
+    if mutation == "schema": payload["schema"] = "captain.codex-build-receipt.v0"
+    elif mutation == "producer": payload["producer"] = "hermes"
+    elif mutation == "effect": payload["idempotency_key"] = "0" * 64
+    elif mutation == "session": payload["codex_session_ref"] = payload["build_brief_ref"]
+    else: payload["source_archive_ref"] = payload["workspace_snapshot_ref"]
+    forged = store.put(_json(payload), "application/json", namespace="receipt")
+    refs["codex_build_receipt_ref"] = forged
+    refs["authority_effect"] = refs["authority_effect"].model_copy(update={"codex_build_receipt_ref": forged})
+    with pytest.raises(TeamPackageError, match="typed|Codex"):
+        validate_team_package(artifact_store=store, tool_gaps=gaps, **refs)
+
+
+def test_minimal_known_id_receipt_is_not_authority(tmp_path: Path) -> None:
+    store, _, _, refs, gaps = _fixture(tmp_path)
+    forged = store.put(_json({"schema": "hermes.forge-build-skill-usage-receipt.v1", "producer": "hermes", "outcome": "fulfilled", **AUTHORITY}), "application/json", namespace="receipt")
+    refs["hermes_usage_receipt_ref"] = forged
+    refs["authority_effect"] = refs["authority_effect"].model_copy(update={"hermes_usage_receipt_ref": forged})
+    with pytest.raises(TeamPackageError, match="typed"):
+        validate_team_package(artifact_store=store, tool_gaps=gaps, **refs)

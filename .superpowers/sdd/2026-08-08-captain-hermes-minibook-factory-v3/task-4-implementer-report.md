@@ -79,3 +79,12 @@ Resource and path admission now applies assignment `limits.max_files` before dec
 - Final security Task 2/3 regression GREEN: `103 passed`.
 - Final security full Minibook GREEN: `251 passed, 1 deselected`.
 - Final security compileall and `git diff --check`: exit 0.
+
+## Typed receipt authority correction
+
+- RED: strict package build/real-case evidence imports failed because no exact contracts existed; generic known-ID/status JSON remained forgeable.
+- Reused strict mirrored `ForgeBuildSkillUsageReceiptV1` and `CodexBuildReceiptV1` unchanged.
+- Added only the absent narrow mirrored Captain `PackageBuildEvidenceV1` and `PackageRealCaseEvidenceV1` contracts.
+- Authority is now `CreationJobV3 -> FactoryBuildAssignmentV2 -> FactoryBuildEffectV2 -> exact CAS receipt refs -> strict typed payloads`. Hermes binds producer/outcome, released skill, idempotency, public assertions and compiled/blueprint/tool-plan refs. Codex binds Captain sealing, assignment effect key, workspace/session/snapshot/source/manifest/test refs and assertions. Build/real-case evidence binds Captain producer/passed outcome, checkpoint/effect/source/session, plus snapshot or exact declared test paths/assertions/build evidence.
+- Authentic archive-binding receipts remain external CAS inputs, avoiding a source-archive digest cycle; Minibook adds their verified bytes to the final sealed package. Worker-supplied authority-receipt member collisions fail closed.
+- GREEN: focused contracts/package `95 passed`; root mirror contracts `9 passed`; related `104 passed`; full Minibook `258 passed, 1 deselected`.

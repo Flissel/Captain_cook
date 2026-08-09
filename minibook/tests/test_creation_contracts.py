@@ -18,6 +18,27 @@ from minibook.swarm.contracts import (
     validate_action_response_binding,
     validate_build_effect_binding,
 )
+from minibook.swarm.contracts import PackageBuildEvidenceV1, PackageRealCaseEvidenceV1
+
+
+def test_package_evidence_contracts_are_strict_and_authority_bound() -> None:
+    common = {
+        "producer": "captain", "outcome": "passed",
+        "assignment_id": "00000000-0000-0000-0000-000000000501",
+        "creation_job_id": "00000000-0000-0000-0000-000000000401",
+        "factory_job_id": "00000000-0000-0000-0000-000000000301",
+        "correlation_id": "00000000-0000-0000-0000-000000000302",
+        "subject_version": 1, "checkpoint_version": 3, "attempt": 1,
+        "effect_key": "3" * 64,
+        "source_archive_ref": {"uri": "artifact://source/" + "8" * 64, "sha256": "8" * 64, "media_type": "application/zip"},
+        "codex_session_ref": {"uri": "artifact://session/" + "6" * 64, "sha256": "6" * 64, "media_type": "application/json"},
+        "completed_at": "2026-08-09T08:00:00Z",
+    }
+    build = PackageBuildEvidenceV1.model_validate({"schema": "captain.package-build-evidence.v1", **common, "workspace_snapshot_ref": {"uri": "artifact://snapshot/" + "7" * 64, "sha256": "7" * 64, "media_type": "application/zip"}})
+    real = PackageRealCaseEvidenceV1.model_validate({"schema": "captain.package-real-case-evidence.v1", **common, "assertion_ids": ["deterministic_rank"], "declared_test_paths": ["tests/test_team.py"], "evidence_refs": [{"uri": "artifact://build/" + "9" * 64, "sha256": "9" * 64, "media_type": "application/json"}]})
+    assert build.outcome == real.outcome == "passed"
+    with pytest.raises(Exception):
+        PackageBuildEvidenceV1.model_validate(build.model_dump(mode="json", by_alias=True) | {"extra": True})
 
 
 FIXTURES = Path(__file__).parents[2] / "tests" / "fixtures" / "contracts"
