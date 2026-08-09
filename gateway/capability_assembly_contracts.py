@@ -73,7 +73,6 @@ class CapabilityAssemblyInputRequest(_FrozenContract):
 
     input_id: str = Field(pattern=IDENTIFIER_PATTERN)
     repository_path: str = Field(min_length=1, max_length=512)
-    conversation_pattern: Literal["sequential", "selector_group_chat", "swarm"]
     correlation_id: UUID
     reservation: CapabilityLiveReservation
 
@@ -117,12 +116,6 @@ class CapabilityAssemblySubmitRequest(_FrozenContract):
 
     @model_validator(mode="after")
     def require_exact_three_input_envelope(self) -> "CapabilityAssemblySubmitRequest":
-        if tuple(item.conversation_pattern for item in self.inputs) != (
-            "sequential",
-            "selector_group_chat",
-            "swarm",
-        ):
-            raise ValueError("assembly requires the three distinct conversation patterns")
         if len({item.input_id for item in self.inputs}) != 3:
             raise ValueError("assembly requires three distinct input IDs")
         if len({item.repository_path for item in self.inputs}) != 3:
@@ -458,7 +451,7 @@ class CapabilityAssemblyAdvanceRequest(_FrozenContract):
 
 
 class CapabilityAssemblyInputAdmissionPort(Protocol):
-    """Read exact repository bytes and return their content-addressed input."""
+    """Compile exact repository bytes into a content-addressed, classified input."""
 
     def admit(
         self,

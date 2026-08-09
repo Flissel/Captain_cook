@@ -66,7 +66,6 @@ def _ref(label: str) -> ArtifactRef:
 def _input_request(
     index: int,
     *,
-    pattern: str,
     path: str,
     assembly_id: UUID = ASSEMBLY_ID,
 ) -> CapabilityAssemblyInputRequest:
@@ -74,7 +73,6 @@ def _input_request(
     return CapabilityAssemblyInputRequest(
         input_id=input_id,
         repository_path=path,
-        conversation_pattern=pattern,
         correlation_id=_id(f"correlation-{index}"),
         reservation=CapabilityLiveReservation(
             reservation_id=_id(f"reservation-{index}"),
@@ -97,19 +95,16 @@ def _submission(
         inputs=(
             _input_request(
                 1,
-                pattern="sequential",
                 path="examples/customer-a/TO_BE_BUILT.md",
                 assembly_id=assembly_id,
             ),
             _input_request(
                 2,
-                pattern="selector_group_chat",
                 path="examples/customer-b/TO_BE_BUILT.md",
                 assembly_id=assembly_id,
             ),
             _input_request(
                 3,
-                pattern="swarm",
                 path="products/customer-c/TO_BE_BUILT.md",
                 assembly_id=assembly_id,
             ),
@@ -190,6 +185,11 @@ class _Admission:
 
     def admit(self, request: CapabilityAssemblyInputRequest) -> CapabilityAssemblyAdmittedInput:
         self.calls.append(request)
+        pattern = {
+            "examples/customer-a/TO_BE_BUILT.md": "sequential",
+            "examples/customer-b/TO_BE_BUILT.md": "selector_group_chat",
+            "products/customer-c/TO_BE_BUILT.md": "swarm",
+        }[request.repository_path]
         semantics = {
             "sequential": dict(
                 integration_intent="n8n",
@@ -209,12 +209,12 @@ class _Admission:
                 human_escalation_required=False,
                 required_tool_marker="TODO_TOOL.v1",
             ),
-        }[request.conversation_pattern]
+        }[pattern]
         return CapabilityAssemblyAdmittedInput(
             repository_path=request.repository_path,
             input=CapabilityLiveInput(
                 input_id=request.input_id,
-                conversation_pattern=request.conversation_pattern,
+                conversation_pattern=pattern,
                 source_ref=_ref(f"source-{request.input_id}"),
                 **semantics,
             ),
@@ -510,6 +510,48 @@ def test_submit_admits_exactly_three_repository_inputs_and_replays_without_readm
     assert len(admission.calls) == 3
 
 
+def test_submit_request_does_not_accept_client_claimed_conversation_patterns() -> None:
+    payload = _submission().model_dump(mode="json", by_alias=True)
+    request = CapabilityAssemblySubmitRequest.model_validate_json(json.dumps(payload))
+    assert all(not hasattr(item, "conversation_pattern") for item in request.inputs)
+
+    payload["inputs"][0]["conversation_pattern"] = "sequential"
+    with pytest.raises(ValueError, match="(?i)extra inputs are not permitted"):
+        CapabilityAssemblySubmitRequest.model_validate_json(json.dumps(payload))
+
+
+def test_submit_rejects_missing_compiler_pattern_before_append_or_effect() -> None:
+    class DuplicatePatternAdmission(_Admission):
+        def admit(
+            self,
+            request: CapabilityAssemblyInputRequest,
+        ) -> CapabilityAssemblyAdmittedInput:
+            admitted = super().admit(request)
+            if request.input_id != "input-2":
+                return admitted
+            return CapabilityAssemblyAdmittedInput(
+                repository_path=admitted.repository_path,
+                input=CapabilityLiveInput(
+                    input_id=admitted.input.input_id,
+                    conversation_pattern="swarm",
+                    source_ref=admitted.input.source_ref,
+                    integration_intent="none",
+                    conflicting_input=False,
+                    human_escalation_required=False,
+                    required_tool_marker="TODO_TOOL.v1",
+                ),
+            )
+
+    admission = DuplicatePatternAdmission()
+    controller, repository, _, factory, *_ = _controller(admission=admission)
+
+    with pytest.raises(CapabilityAssemblyConflict, match="compiler.*conversation patterns"):
+        controller.submit(_submission())
+
+    assert repository.history(ASSEMBLY_ID) == ()
+    assert factory.calls == []
+
+
 def test_submit_rejects_changed_idempotent_replay_and_noncanonical_paths() -> None:
     controller, *_ = _controller()
     controller.submit(_submission())
@@ -519,7 +561,7 @@ def test_submit_rejects_changed_idempotent_replay_and_noncanonical_paths() -> No
         controller.submit(changed)
 
     with pytest.raises(ValueError, match="repository-relative TO_BE_BUILT.md"):
-        _input_request(1, pattern="sequential", path="C:/outside/TO_BE_BUILT.md")
+        _input_request(1, path="C:/outside/TO_BE_BUILT.md")
 
 
 def test_submit_rejects_duplicate_admitted_source_digest_before_persistence() -> None:

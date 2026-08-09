@@ -141,12 +141,19 @@ class CapabilityAssemblyController:
             if (
                 observed.repository_path != expected.repository_path
                 or observed.input.input_id != expected.input_id
-                or observed.input.conversation_pattern != expected.conversation_pattern
             ):
                 raise CapabilityAssemblyConflict(
-                    "input admission changed repository or conversation authority"
+                    "input admission changed repository authority"
                 )
         self._require_distinct_sources(admitted)
+        if tuple(item.input.conversation_pattern for item in admitted) != (
+            "sequential",
+            "selector_group_chat",
+            "swarm",
+        ):
+            raise CapabilityAssemblyConflict(
+                "input compiler did not classify the three required conversation patterns"
+            )
         checkpoint = CapabilityAssemblyCheckpoint(
             assembly_id=request.assembly_id,
             request=request,
