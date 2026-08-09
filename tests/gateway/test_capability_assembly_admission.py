@@ -15,6 +15,7 @@ from agenten.agent_factory.capability_live_runner import (
     CapabilityLiveReservation,
 )
 from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
+from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from gateway.capability_assembly_admission import (
     CapabilityAssemblyAdmissionError,
     RepositoryCapabilityAssemblyInputAdmission,
@@ -94,6 +95,9 @@ def _admission(
         repository_root=root,
         expected_repository_revision=revision or _git("rev-parse", "HEAD", cwd=root),
         expected_sha256_by_path=expected_sha256_by_path,
+        compiled_tool_gaps_by_source_sha256={
+            digest: () for digest in expected_sha256_by_path.values()
+        },
         holdout_store=store if store is not None else InMemoryPrivateHoldoutStore(),
         subject_version=1,
     )
@@ -112,6 +116,31 @@ def _init_repo(tmp_path: Path, source: Path) -> tuple[Path, str, str]:
     revision = _git("rev-parse", "HEAD", cwd=root)
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     return root, revision, digest
+
+
+def _tool_gap(label: str, *, severity: str, assertion_id: str) -> ToolGapMarker:
+    def ref(kind: str):
+        digest = hashlib.sha256(f"{label}:{kind}".encode()).hexdigest()
+        from agenten.agent_runtime.contracts import ArtifactRef
+
+        return ArtifactRef(
+            uri=f"artifact://tool-gap/{digest}",
+            sha256=digest,
+            media_type="application/json",
+        )
+
+    return ToolGapMarker(
+        schema="TODO_TOOL.v1",
+        gap_id=f"gap-{label}",
+        severity=severity,
+        input_contract_ref=ref("input"),
+        output_contract_ref=ref("output"),
+        least_privilege_capability=f"capability-{label}",
+        implementation_options=(),
+        acceptance_assertion_ids=(assertion_id,),
+        evidence_ref=ref("evidence"),
+        status="unresolved",
+    )
 
 
 def test_admits_three_real_canonical_inputs_without_inventing_tool_intent() -> None:
@@ -151,7 +180,7 @@ def test_admits_three_real_canonical_inputs_without_inventing_tool_intent() -> N
             for item in canonical.document.integrations
             if item.required
         ) == required_integrations
-        assert canonical.required_tool_markers == ()
+        assert canonical.tool_gaps == ()
         assert canonical.document.authority_boundaries
         assert canonical.document.stop_conditions
         assert any(
@@ -343,6 +372,108 @@ def test_missing_ambiguous_and_credential_bearing_pattern_fail_before_effects(
         assert len(store) == 0
 
 
+def test_explanatory_todo_tool_text_does_not_create_a_structured_gap(
+    tmp_path: Path,
+) -> None:
+    source = Path(__file__).resolve().parents[2] / _DEMO_INPUTS[0][1]
+    body = source.read_text(encoding="utf-8").replace(
+        "## Helpful resources",
+        "## Tool gap explanation\n"
+        "TODO_TOOL.v1 is an evaluation output and is not a requested marker here.\n\n"
+        "## Helpful resources",
+    )
+    root, revision, digest = _init_repo_text(tmp_path, body)
+
+    admitted = _admission(
+        root,
+        expected_sha256_by_path={"input/TO_BE_BUILT.md": digest},
+        revision=revision,
+    ).admit(_request("input/TO_BE_BUILT.md"))
+
+    assert admitted.input.tool_gaps == ()
+    assert admitted.input.required_tool_gaps == ()
+
+
+def test_structured_tool_gaps_preserve_distinct_identity_and_required_only(
+    tmp_path: Path,
+) -> None:
+    source = Path(__file__).resolve().parents[2] / _DEMO_INPUTS[0][1]
+    root, revision, digest = _init_repo(tmp_path, source)
+    preliminary = _admission(
+        root,
+        expected_sha256_by_path={"input/TO_BE_BUILT.md": digest},
+        revision=revision,
+    ).admit(_request("input/TO_BE_BUILT.md"))
+    assertion_id = preliminary.input.compiled_specification.assertion_ids[0]
+    required = _tool_gap("required-reader", severity="required", assertion_id=assertion_id)
+    optional = _tool_gap("optional-enrichment", severity="optional", assertion_id=assertion_id)
+    admission = RepositoryCapabilityAssemblyInputAdmission(
+        repository_root=root,
+        expected_repository_revision=revision,
+        expected_sha256_by_path={"input/TO_BE_BUILT.md": digest},
+        compiled_tool_gaps_by_source_sha256={digest: (required, optional)},
+        holdout_store=InMemoryPrivateHoldoutStore(),
+        subject_version=1,
+    )
+
+    admitted = admission.admit(_request("input/TO_BE_BUILT.md"))
+    restored = CapabilityAssemblyAdmittedInput.model_validate_json(
+        canonical_assembly_model_bytes(admitted)
+    )
+
+    assert admitted.input.tool_gaps == (required, optional)
+    assert admitted.input.required_tool_gaps == (required,)
+    assert restored.input.tool_gaps == (required, optional)
+    assert restored.input.required_tool_gaps == (required,)
+
+
+def test_head_move_with_identical_input_bytes_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Path(__file__).resolve().parents[2] / _DEMO_INPUTS[0][1]
+    root, first_revision, digest = _init_repo(tmp_path, source)
+    _git("commit", "--allow-empty", "-m", "test: second revision", cwd=root)
+    second_revision = _git("rev-parse", "HEAD", cwd=root)
+    _git("checkout", "--detach", first_revision, cwd=root)
+    original_run = subprocess.run
+    moved = False
+
+    def move_head_between_revision_checks(command, *args, **kwargs):
+        nonlocal moved
+        if (
+            not moved
+            and isinstance(command, list)
+            and command[-2] == "show"
+            and command[-1].startswith(f"{first_revision}:")
+        ):
+            result = original_run(command, *args, **kwargs)
+            original_run(
+                ["git", "-C", str(root), "checkout", "--detach", second_revision],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            moved = True
+            return result
+        return original_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", move_head_between_revision_checks)
+    store = InMemoryPrivateHoldoutStore()
+    admission = _admission(
+        root,
+        expected_sha256_by_path={"input/TO_BE_BUILT.md": digest},
+        revision=first_revision,
+        store=store,
+    )
+
+    with pytest.raises(CapabilityAssemblyAdmissionError, match="revision mismatch"):
+        admission.admit(_request("input/TO_BE_BUILT.md"))
+
+    assert moved is True
+    assert len(store) == 0
+
+
 def test_invalid_port_configuration_has_no_holdout_effects(tmp_path: Path) -> None:
     store = InMemoryPrivateHoldoutStore()
     with pytest.raises(ValueError, match="revision"):
@@ -350,7 +481,15 @@ def test_invalid_port_configuration_has_no_holdout_effects(tmp_path: Path) -> No
             repository_root=tmp_path,
             expected_repository_revision="not-a-revision",
             expected_sha256_by_path={},
+            compiled_tool_gaps_by_source_sha256={},
             holdout_store=store,
             subject_version=1,
         )
     assert len(store) == 0
+
+
+def _init_repo_text(tmp_path: Path, body: str) -> tuple[Path, str, str]:
+    source = tmp_path / "source" / "TO_BE_BUILT.md"
+    source.parent.mkdir(parents=True)
+    source.write_text(body, encoding="utf-8", newline="\n")
+    return _init_repo(tmp_path, source)

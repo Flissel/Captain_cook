@@ -13,17 +13,24 @@ from pathlib import PurePosixPath
 from typing import Literal, Protocol
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from agenten.agent_factory.capability_live_runner import (
     CAPABILITY_LIVE_STAGES,
     CapabilityLiveCapabilityEvidence,
-    CapabilityLiveInput,
     CapabilityLiveReservation,
     CapabilityLiveStage,
 )
 from agenten.agent_factory.input_compiler import CompiledFactorySpecification
 from agenten.agent_factory.input_contracts import FactoryInputDocumentV2
+from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN, SHA256_PATTERN
 from gateway.capability_live_pipeline import (
     CapabilityBusinessBenchmarkAuthority,
@@ -149,7 +156,7 @@ class CapabilityAssemblyCanonicalInput(_FrozenContract):
     conversation_pattern: Literal["sequential", "selector_group_chat", "swarm"]
     document: FactoryInputDocumentV2
     compiled_specification: CompiledFactorySpecification
-    required_tool_markers: tuple[Literal["TODO_TOOL.v1"], ...] = ()
+    tool_gaps: tuple[ToolGapMarker, ...] = ()
 
     @property
     def source_ref(self) -> ArtifactRef:
@@ -159,10 +166,36 @@ class CapabilityAssemblyCanonicalInput(_FrozenContract):
     def n8n_required(self) -> bool:
         return any(integration.required for integration in self.document.integrations)
 
+    @property
+    def required_tool_gaps(self) -> tuple[ToolGapMarker, ...]:
+        return tuple(
+            marker
+            for marker in self.tool_gaps
+            if marker.severity == "required" and marker.status == "unresolved"
+        )
+
+    @field_serializer("compiled_specification")
+    def serialize_compiled_specification(
+        self,
+        value: CompiledFactorySpecification,
+    ) -> dict[str, object]:
+        return value.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_computed_fields=True,
+        )
+
     @model_validator(mode="after")
     def require_compiler_source_binding(self) -> "CapabilityAssemblyCanonicalInput":
         if self.compiled_specification.source_ref != self.document.input_ref:
             raise ValueError("compiled specification changed canonical source authority")
+        gap_ids = tuple(marker.gap_id for marker in self.tool_gaps)
+        if len(gap_ids) != len(set(gap_ids)):
+            raise ValueError("canonical input contains duplicate tool gap identities")
+        assertion_ids = set(self.compiled_specification.assertion_ids)
+        for marker in self.tool_gaps:
+            if not set(marker.acceptance_assertion_ids).issubset(assertion_ids):
+                raise ValueError("tool gap changed compiled acceptance authority")
         return self
 
 
@@ -170,12 +203,35 @@ class CapabilityAssemblyAdmittedInput(_FrozenContract):
     """Read-only admission result for exact repository-owned source bytes."""
 
     repository_path: str = Field(min_length=1, max_length=512)
-    input: CapabilityAssemblyCanonicalInput | CapabilityLiveInput
+    input: CapabilityAssemblyCanonicalInput
 
     @field_validator("repository_path")
     @classmethod
     def require_canonical_path(cls, value: str) -> str:
         return CapabilityAssemblyInputRequest.require_repository_relative_input(value)
+
+
+class CapabilityAssemblyStageRequest(_FrozenContract):
+    """One compiler-bound assembly stage request, separate from the legacy demo."""
+
+    run_id: UUID
+    input: CapabilityAssemblyCanonicalInput
+    correlation_id: UUID
+    reservation: CapabilityLiveReservation
+    stage: CapabilityLiveStage
+    controlled_recovery_required: bool
+    suite_ref: ArtifactRef | None = None
+    hermes_result_ref: ArtifactRef | None = None
+    retry_number: int = Field(default=0, ge=0, le=5, strict=True)
+
+    @model_validator(mode="after")
+    def require_plan_binding(self) -> "CapabilityAssemblyStageRequest":
+        if (
+            self.reservation.run_id != self.run_id
+            or self.reservation.input_id != self.input.input_id
+        ):
+            raise ValueError("assembly stage request does not match its budget reservation")
+        return self
 
 
 class CapabilityAssemblyItemState(_FrozenContract):
@@ -490,6 +546,51 @@ class CapabilityAssemblyInputAdmissionPort(Protocol):
     ) -> CapabilityAssemblyAdmittedInput: ...
 
 
+class CapabilityAssemblyFactoryPort(Protocol):
+    async def scaffold(
+        self, request: CapabilityAssemblyStageRequest
+    ) -> CapabilityFactoryAuthority | None: ...
+
+    async def implement(
+        self, request: CapabilityAssemblyStageRequest
+    ) -> CapabilityFactoryAuthority | None: ...
+
+    async def seal(
+        self, request: CapabilityAssemblyStageRequest
+    ) -> CapabilityFactoryAuthority | None: ...
+
+    async def promote(
+        self, request: CapabilityAssemblyStageRequest
+    ) -> CapabilityFactoryAuthority | None: ...
+
+    async def released(
+        self, request: CapabilityAssemblyStageRequest
+    ) -> CapabilityFactoryAuthority | None: ...
+
+
+class CapabilityAssemblyBusinessBenchmarkPort(Protocol):
+    async def evaluate(
+        self, request: CapabilityAssemblyStageRequest
+    ) -> CapabilityBusinessBenchmarkAuthority | None: ...
+
+
+class CapabilityAssemblyExecutionPort(Protocol):
+    async def execute(
+        self,
+        request: CapabilityAssemblyStageRequest,
+        release: CapabilityFactoryAuthority,
+    ) -> CapabilityExecutionAuthority | None: ...
+
+
+class CapabilityAssemblyProjectionPort(Protocol):
+    async def project_and_readback(
+        self,
+        request: CapabilityAssemblyStageRequest,
+        release: CapabilityFactoryAuthority,
+        execution: CapabilityExecutionAuthority,
+    ) -> CapabilityProjectionAuthority | None: ...
+
+
 class CapabilityAssemblyReconciliationPort(Protocol):
     """Read external truth for a durably started slice without re-executing it."""
 
@@ -576,7 +677,10 @@ __all__ = [
     "CapabilityAssemblyCanonicalInput",
     "CapabilityAssemblyAdvanceReceipt",
     "CapabilityAssemblyAdvanceRequest",
+    "CapabilityAssemblyBusinessBenchmarkPort",
     "CapabilityAssemblyCheckpoint",
+    "CapabilityAssemblyExecutionPort",
+    "CapabilityAssemblyFactoryPort",
     "CapabilityAssemblyInputAdmissionPort",
     "CapabilityAssemblyInputRequest",
     "CapabilityAssemblyItemState",
@@ -585,10 +689,12 @@ __all__ = [
     "CapabilityAssemblyReconciliationPort",
     "CapabilityAssemblyReconciliationRequest",
     "CapabilityAssemblyRepositoryPort",
+    "CapabilityAssemblyProjectionPort",
     "CapabilityAssemblyNoEffectRetryAuthorization",
     "CapabilityAssemblySlice",
     "CapabilityAssemblySliceKind",
     "CapabilityAssemblyStatus",
+    "CapabilityAssemblyStageRequest",
     "CapabilityAssemblySubmitRequest",
     "CapabilityAssemblyWriteConflict",
     "assembly_request_sha256",

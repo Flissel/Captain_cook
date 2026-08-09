@@ -266,6 +266,7 @@ def _require_committed_repository_bytes(
     content: bytes,
     *,
     repository_root: Path,
+    expected_repository_revision: str | None = None,
 ) -> None:
     """Require the opened regular-file bytes to equal both HEAD and the index."""
 
@@ -352,6 +353,23 @@ def _require_committed_repository_bytes(
             "the expected repository"
         )
 
+    initial_revision_bytes = git_output("rev-parse", "HEAD").strip()
+    try:
+        initial_revision = initial_revision_bytes.decode("ascii")
+    except UnicodeDecodeError:
+        raise RuntimeAdapterManifestError(
+            "runtime adapter repository revision could not be verified"
+        ) from None
+    if re.fullmatch(_REVISION_PATTERN, initial_revision) is None:
+        raise RuntimeAdapterManifestError(
+            "runtime adapter repository revision could not be verified"
+        )
+    if (
+        expected_repository_revision is not None
+        and not hmac.compare_digest(initial_revision, expected_repository_revision)
+    ):
+        raise RuntimeAdapterManifestError("repository revision mismatch")
+
     external_attributes = git_output(
         "config",
         "--get",
@@ -415,8 +433,13 @@ def _require_committed_repository_bytes(
             "runtime adapter Git attributes are dirty"
         )
 
-    head_content = git_output("show", f"HEAD:{relative_path}")
-    index_content = git_output("show", f":{relative_path}")
+    head_content = git_output("show", f"{initial_revision}:{relative_path}")
+    index_blob = git_output("rev-parse", f":{relative_path}").strip()
+    if re.fullmatch(rb"[0-9a-f]{40,64}", index_blob) is None:
+        raise RuntimeAdapterManifestError(
+            "runtime adapter index identity could not be verified"
+        )
+    index_content = git_output("cat-file", "blob", os.fsdecode(index_blob))
 
     def normalize_eol(value: bytes) -> bytes:
         normalized = value.replace(b"\r\n", b"\n")
@@ -434,6 +457,13 @@ def _require_committed_repository_bytes(
         raise RuntimeAdapterManifestError(
             "runtime adapter module is dirty or differs from committed bytes"
         )
+    final_revision = git_output("rev-parse", "HEAD").strip()
+    final_index_blob = git_output("rev-parse", f":{relative_path}").strip()
+    if not (
+        hmac.compare_digest(final_revision, initial_revision_bytes)
+        and hmac.compare_digest(final_index_blob, index_blob)
+    ):
+        raise RuntimeAdapterManifestError("repository revision mismatch")
 
 
 def load_verified_repository_module(
@@ -491,32 +521,12 @@ def read_verified_repository_bytes(
     if not hmac.compare_digest(_sha256(content), expected_digest):
         raise RuntimeAdapterManifestError("repository input digest mismatch")
 
-    git_environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.upper().startswith("GIT_")
-    }
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=git_environment,
-        )
-    except OSError:
-        raise RuntimeAdapterManifestError(
-            "repository revision could not be verified"
-        ) from None
-    if result.returncode != 0:
-        raise RuntimeAdapterManifestError(
-            "repository revision could not be verified"
-        )
-    observed_revision = os.fsdecode(result.stdout.strip())
-    if not hmac.compare_digest(observed_revision, expected_repository_revision):
-        raise RuntimeAdapterManifestError("repository revision mismatch")
-
-    _require_committed_repository_bytes(path, content, repository_root=root)
+    _require_committed_repository_bytes(
+        path,
+        content,
+        repository_root=root,
+        expected_repository_revision=expected_repository_revision,
+    )
     return path, content
 
 

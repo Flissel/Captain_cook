@@ -22,7 +22,6 @@ from agenten.agent_factory.capability_live_runner import (
     CapabilityLiveDemoEvidence,
     CapabilityLiveRestartEvidence,
     CapabilityLiveStage,
-    CapabilityLiveStageRequest,
     validate_live_demo_evidence,
 )
 from gateway.capability_assembly_contracts import (
@@ -31,7 +30,12 @@ from gateway.capability_assembly_contracts import (
     CapabilityAssemblyActiveAdvance,
     CapabilityAssemblyAdvanceReceipt,
     CapabilityAssemblyAdvanceRequest,
+    CapabilityAssemblyBusinessBenchmarkPort,
     CapabilityAssemblyCheckpoint,
+    CapabilityAssemblyExecutionPort,
+    CapabilityAssemblyFactoryPort,
+    CapabilityAssemblyAdmittedInput,
+    CapabilityAssemblyCanonicalInput,
     CapabilityAssemblyInputAdmissionPort,
     CapabilityAssemblyItemState,
     CapabilityAssemblyNoEffectRetryAuthorization,
@@ -39,9 +43,11 @@ from gateway.capability_assembly_contracts import (
     CapabilityAssemblyReconciliationPort,
     CapabilityAssemblyReconciliationRequest,
     CapabilityAssemblyRepositoryPort,
+    CapabilityAssemblyProjectionPort,
     CapabilityAssemblySlice,
     CapabilityAssemblySliceKind,
     CapabilityAssemblyStatus,
+    CapabilityAssemblyStageRequest,
     CapabilityAssemblySubmitRequest,
     CapabilityAssemblyWriteConflict,
     assembly_request_sha256,
@@ -50,15 +56,11 @@ from gateway.capability_assembly_contracts import (
 from gateway.capability_live_current_adapters import CapabilityResumeExecutionPort
 from gateway.capability_live_pipeline import (
     CapabilityBusinessBenchmarkAuthority,
-    CapabilityBusinessBenchmarkPort,
     CapabilityExecutionAuthority,
     CapabilityFactoryAuthority,
-    CapabilityFactoryPort,
     CapabilityProjectionAuthority,
-    CapabilityProjectionPort,
     CapabilityResumeAuthorization,
     CapabilityResumeExecutionRequest,
-    PromotedCapabilityExecutionPort,
 )
 
 
@@ -85,12 +87,12 @@ class CapabilityAssemblyController:
         *,
         repository: CapabilityAssemblyRepositoryPort,
         admission: CapabilityAssemblyInputAdmissionPort,
-        factory: CapabilityFactoryPort,
-        benchmark: CapabilityBusinessBenchmarkPort,
+        factory: CapabilityAssemblyFactoryPort,
+        benchmark: CapabilityAssemblyBusinessBenchmarkPort,
         resume: CapabilityResumeExecutionPort,
         reconciliation: CapabilityAssemblyReconciliationPort,
-        execution: PromotedCapabilityExecutionPort,
-        minibook_projection: CapabilityProjectionPort,
+        execution: CapabilityAssemblyExecutionPort,
+        minibook_projection: CapabilityAssemblyProjectionPort,
     ) -> None:
         if any(
             port is None
@@ -138,6 +140,13 @@ class CapabilityAssemblyController:
 
         admitted = tuple(self._admission.admit(item) for item in request.inputs)
         for expected, observed in zip(request.inputs, admitted, strict=True):
+            if (
+                not isinstance(observed, CapabilityAssemblyAdmittedInput)
+                or not isinstance(observed.input, CapabilityAssemblyCanonicalInput)
+            ):
+                raise CapabilityAssemblyConflict(
+                    "input admission did not return a canonical assembly input"
+                )
             if (
                 observed.repository_path != expected.repository_path
                 or observed.input.input_id != expected.input_id
@@ -636,7 +645,7 @@ class CapabilityAssemblyController:
         stage: CapabilityLiveStage,
     ) -> CapabilityAssemblyCheckpoint:
         item = current.items[input_index]
-        request = CapabilityLiveStageRequest(
+        request = CapabilityAssemblyStageRequest(
             run_id=current.assembly_id,
             input=item.admitted.input,
             correlation_id=item.request.correlation_id,
@@ -1356,7 +1365,7 @@ class CapabilityAssemblyController:
 
     @staticmethod
     def _require_factory(
-        request: CapabilityLiveStageRequest,
+        request: CapabilityAssemblyStageRequest,
         authority: CapabilityFactoryAuthority | None,
         *,
         expected: CapabilityLiveStage,
@@ -1412,7 +1421,7 @@ class CapabilityAssemblyController:
 
     @staticmethod
     def _require_execution(
-        request: CapabilityLiveStageRequest,
+        request: CapabilityAssemblyStageRequest,
         release: CapabilityFactoryAuthority,
         execution: CapabilityExecutionAuthority | None,
         *,
@@ -1552,8 +1561,8 @@ class CapabilityAssemblyController:
         current: CapabilityAssemblyCheckpoint,
         item: CapabilityAssemblyItemState,
         stage: CapabilityLiveStage,
-    ) -> CapabilityLiveStageRequest:
-        return CapabilityLiveStageRequest(
+    ) -> CapabilityAssemblyStageRequest:
+        return CapabilityAssemblyStageRequest(
             run_id=current.assembly_id,
             input=item.admitted.input,
             correlation_id=item.request.correlation_id,
@@ -1591,7 +1600,11 @@ def _slice_for_ordinal(
 
 
 def _validated_copy(value: _ModelT, **updates: object) -> _ModelT:
-    payload = value.model_dump(mode="python", by_alias=True)
+    payload = value.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_computed_fields=True,
+    )
     payload.update(updates)
     return type(value).model_validate(payload)
 

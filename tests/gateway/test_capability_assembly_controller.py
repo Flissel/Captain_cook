@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import lru_cache
+from pathlib import Path
 from threading import Barrier, RLock
+from types import SimpleNamespace
 from uuid import UUID, uuid5
 
 import pytest
@@ -16,11 +20,17 @@ from agenten.agent_factory.capability_live_runner import (
     CapabilityLiveReservation,
     CapabilityLiveStage,
 )
+from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
+from agenten.agent_factory.input_compiler import FactoryInputCompiler
+from agenten.agent_factory.input_document import load_factory_input
+from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.capability_assembly_contracts import (
+    ASSEMBLY_TOTAL_SLICES,
     CapabilityAssemblyAdmittedInput,
     CapabilityAssemblyAdvanceRequest,
     CapabilityAssemblyCheckpoint,
+    CapabilityAssemblyCanonicalInput,
     CapabilityAssemblyInputRequest,
     CapabilityAssemblyNoEffectRetryAuthorization,
     CapabilityAssemblyReconciliationOutcome,
@@ -36,6 +46,9 @@ from gateway.capability_assembly_controller import (
     CapabilityAssemblyConflict,
     CapabilityAssemblyController,
     CapabilityAssemblyIncomplete,
+)
+from gateway.capability_assembly_admission import (
+    RepositoryCapabilityAssemblyInputAdmission,
 )
 from gateway.capability_live_pipeline import (
     CapabilityBusinessBenchmarkAuthority,
@@ -185,45 +198,77 @@ class _Admission:
 
     def admit(self, request: CapabilityAssemblyInputRequest) -> CapabilityAssemblyAdmittedInput:
         self.calls.append(request)
-        pattern = {
-            "examples/customer-a/TO_BE_BUILT.md": "sequential",
-            "examples/customer-b/TO_BE_BUILT.md": "selector_group_chat",
-            "products/customer-c/TO_BE_BUILT.md": "swarm",
-        }[request.repository_path]
-        semantics = {
-            "sequential": dict(
-                integration_intent="n8n",
-                conflicting_input=False,
-                human_escalation_required=False,
-                required_tool_marker=None,
-            ),
-            "selector_group_chat": dict(
-                integration_intent="none",
-                conflicting_input=True,
-                human_escalation_required=True,
-                required_tool_marker=None,
-            ),
-            "swarm": dict(
-                integration_intent="none",
-                conflicting_input=False,
-                human_escalation_required=False,
-                required_tool_marker="TODO_TOOL.v1",
-            ),
-        }[pattern]
         return CapabilityAssemblyAdmittedInput(
             repository_path=request.repository_path,
-            input=CapabilityLiveInput(
-                input_id=request.input_id,
-                conversation_pattern=pattern,
-                source_ref=_ref(f"source-{request.input_id}"),
-                **semantics,
-            ),
+            input=_canonical_fixture(request.repository_path, request.input_id),
         )
+
+
+@lru_cache(maxsize=3)
+def _canonical_fixture(
+    repository_path: str,
+    input_id: str,
+) -> CapabilityAssemblyCanonicalInput:
+    relative_path, pattern = {
+        "examples/customer-a/TO_BE_BUILT.md": (
+            "demo_inputs/agent_factory/sales_pipeline_brief/TO_BE_BUILT.md",
+            "sequential",
+        ),
+        "examples/customer-b/TO_BE_BUILT.md": (
+            "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md",
+            "selector_group_chat",
+        ),
+        "products/customer-c/TO_BE_BUILT.md": (
+            "demo_inputs/agent_factory/claims_resolution/TO_BE_BUILT.md",
+            "swarm",
+        ),
+    }[repository_path]
+    document = load_factory_input(Path(__file__).resolve().parents[2] / relative_path)
+    compiled = FactoryInputCompiler(
+        holdout_store=InMemoryPrivateHoldoutStore()
+    ).compile(document, subject_version=1)
+    return CapabilityAssemblyCanonicalInput(
+        input_id=input_id,
+        conversation_pattern=pattern,
+        document=document,
+        compiled_specification=compiled,
+        tool_gaps=(),
+    )
+
+
+def _tool_gap(label: str, assertion_id: str) -> ToolGapMarker:
+    return ToolGapMarker(
+        schema="TODO_TOOL.v1",
+        gap_id=f"gap-{label}",
+        severity="required",
+        input_contract_ref=_ref(f"{label}-input"),
+        output_contract_ref=_ref(f"{label}-output"),
+        least_privilege_capability=f"capability-{label}",
+        implementation_options=(),
+        acceptance_assertion_ids=(assertion_id,),
+        evidence_ref=_ref(f"{label}-evidence"),
+        status="unresolved",
+    )
+
+
+def _with_source_ref(
+    value: CapabilityAssemblyCanonicalInput,
+    source_ref: ArtifactRef,
+) -> CapabilityAssemblyCanonicalInput:
+    return value.model_copy(
+        update={
+            "document": value.document.model_copy(update={"input_ref": source_ref}),
+            "compiled_specification": value.compiled_specification.model_copy(
+                update={"source_ref": source_ref}
+            ),
+        }
+    )
 
 
 class _Factory:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.requests: list[object] = []
 
     async def scaffold(self, request):
         return self._authority(request, "scaffold")
@@ -235,6 +280,7 @@ class _Factory:
         return self._authority(request, "seal")
 
     async def promote(self, request):
+        self.requests.append(request)
         self.calls.append(("promote", request.input.input_id))
         return CapabilityFactoryAuthority(
             stage=request.stage,
@@ -266,6 +312,7 @@ class _Factory:
         raise AssertionError("controller must use its persisted promotion authority")
 
     def _authority(self, request, label: str) -> CapabilityFactoryAuthority:
+        self.requests.append(request)
         self.calls.append((label, request.input.input_id))
         return CapabilityFactoryAuthority(
             stage=request.stage,
@@ -287,8 +334,10 @@ class _Factory:
 class _Benchmark:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.requests: list[object] = []
 
     async def evaluate(self, request):
+        self.requests.append(request)
         self.calls.append(request.input.input_id)
         return CapabilityBusinessBenchmarkAuthority(
             stage=CapabilityLiveStage.EVALUATE,
@@ -314,8 +363,10 @@ class _Benchmark:
 class _Execution:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.requests: list[object] = []
 
     async def execute(self, request, release):
+        self.requests.append(request)
         self.calls.append(request.input.input_id)
         return CapabilityExecutionAuthority(
             job_id=release.job_id,
@@ -335,8 +386,10 @@ class _Execution:
 class _Projection:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.requests: list[object] = []
 
     async def project_and_readback(self, request, release, execution):
+        self.requests.append(request)
         self.calls.append(request.input.input_id)
         return CapabilityProjectionAuthority(
             job_id=release.job_id,
@@ -510,6 +563,122 @@ def test_submit_admits_exactly_three_repository_inputs_and_replays_without_readm
     assert len(admission.calls) == 3
 
 
+def test_real_canonical_admission_reaches_every_offline_stage_without_legacy_coercion() -> None:
+    root = Path(__file__).resolve().parents[2]
+    paths = (
+        "demo_inputs/agent_factory/sales_pipeline_brief/TO_BE_BUILT.md",
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md",
+        "demo_inputs/agent_factory/claims_resolution/TO_BE_BUILT.md",
+    )
+    digests = {
+        paths[0]: "d53c45d5868f8e50a6621b027d94d756540203384480bb27f0604de001329c7d",
+        paths[1]: "8aacc6bec6f1edf80fdaa9cc8fd2bb0e4d5fecf3c3d4c338780669337415b7f8",
+        paths[2]: "9f5162497153e6a2a2225f28704a887435b9c23265511bbac96f30736ed4ae08",
+    }
+    revision = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    required_gap = _tool_gap("sales-reader", "assert-316a43846a95")
+    admission = RepositoryCapabilityAssemblyInputAdmission(
+        repository_root=root,
+        expected_repository_revision=revision,
+        expected_sha256_by_path=digests,
+        compiled_tool_gaps_by_source_sha256={
+            digests[paths[0]]: (required_gap,),
+            digests[paths[1]]: (),
+            digests[paths[2]]: (),
+        },
+        holdout_store=InMemoryPrivateHoldoutStore(),
+        subject_version=1,
+    )
+    submission = CapabilityAssemblySubmitRequest(
+        assembly_id=ASSEMBLY_ID,
+        idempotency_key="c" * 64,
+        maximum_cost_usd=Decimal("6.00"),
+        inputs=tuple(
+            _input_request(index, path=path)
+            for index, path in enumerate(paths, start=1)
+        ),
+    )
+    controller, _, _, factory, benchmark, execution, projection, *_ = _controller(
+        admission=admission
+    )
+    controller.submit(submission)
+
+    first = _advance(controller, operation="real-canonical-first", maximum_slices=1)
+
+    assert first.executed_slices == 1
+    assert type(factory.requests[0]).__name__ == "CapabilityAssemblyStageRequest"
+    while controller.projection(ASSEMBLY_ID).completed_slices < ASSEMBLY_TOTAL_SLICES:
+        completed = controller.projection(ASSEMBLY_ID).completed_slices
+        _advance(
+            controller,
+            operation=f"real-canonical-{completed}",
+            maximum_slices=min(8, ASSEMBLY_TOTAL_SLICES - completed),
+        )
+    requests = (
+        *factory.requests,
+        *benchmark.requests,
+        *execution.requests,
+        *projection.requests,
+    )
+    assert len(requests) == 21
+    assert all(hasattr(request.input, "compiled_specification") for request in requests)
+    assert all(hasattr(request.input, "document") for request in requests)
+    assert all(request.input.document.authority_boundaries for request in requests)
+    assert all(request.input.document.stop_conditions for request in requests)
+    sales_requests = tuple(
+        request for request in requests if request.input.input_id == "input-1"
+    )
+    assert all(request.input.n8n_required is False for request in sales_requests)
+    assert all(request.input.tool_gaps == (required_gap,) for request in sales_requests)
+    assert all(
+        request.input.required_tool_gaps == (required_gap,) for request in sales_requests
+    )
+    assert all(
+        request.input.n8n_required is True
+        for request in requests
+        if request.input.input_id in {"input-2", "input-3"}
+    )
+    assert controller.final_evidence(ASSEMBLY_ID).status == "ready_to_use"
+
+
+def test_legacy_admission_is_rejected_before_first_append_or_effect() -> None:
+    class _LegacyAdmission(_Admission):
+        def admit(self, request):
+            pattern = {
+                "examples/customer-a/TO_BE_BUILT.md": "sequential",
+                "examples/customer-b/TO_BE_BUILT.md": "selector_group_chat",
+                "products/customer-c/TO_BE_BUILT.md": "swarm",
+            }[request.repository_path]
+            semantics = {
+                "sequential": ("n8n", False, False, None),
+                "selector_group_chat": ("none", True, True, None),
+                "swarm": ("none", False, False, "TODO_TOOL.v1"),
+            }[pattern]
+            return SimpleNamespace(
+                repository_path=request.repository_path,
+                input=CapabilityLiveInput(
+                    input_id=request.input_id,
+                    conversation_pattern=pattern,
+                    source_ref=_ref(f"legacy-{request.input_id}"),
+                    integration_intent=semantics[0],
+                    conflicting_input=semantics[1],
+                    human_escalation_required=semantics[2],
+                    required_tool_marker=semantics[3],
+                ),
+            )
+
+    controller, repository, _, factory, *_ = _controller(admission=_LegacyAdmission())
+
+    with pytest.raises(CapabilityAssemblyConflict, match="canonical"):
+        controller.submit(_submission())
+
+    assert repository.history(ASSEMBLY_ID) == ()
+    assert factory.calls == []
+
+
 def test_submit_request_does_not_accept_client_claimed_conversation_patterns() -> None:
     payload = _submission().model_dump(mode="json", by_alias=True)
     request = CapabilityAssemblySubmitRequest.model_validate_json(json.dumps(payload))
@@ -531,14 +700,8 @@ def test_submit_rejects_missing_compiler_pattern_before_append_or_effect() -> No
                 return admitted
             return CapabilityAssemblyAdmittedInput(
                 repository_path=admitted.repository_path,
-                input=CapabilityLiveInput(
-                    input_id=admitted.input.input_id,
-                    conversation_pattern="swarm",
-                    source_ref=admitted.input.source_ref,
-                    integration_intent="none",
-                    conflicting_input=False,
-                    human_escalation_required=False,
-                    required_tool_marker="TODO_TOOL.v1",
+                input=admitted.input.model_copy(
+                    update={"conversation_pattern": "swarm"}
                 ),
             )
 
@@ -570,8 +733,9 @@ def test_submit_rejects_duplicate_admitted_source_digest_before_persistence() ->
             admitted = super().admit(request)
             return admitted.model_copy(
                 update={
-                    "input": admitted.input.model_copy(
-                        update={"source_ref": _ref("same-source-bytes")}
+                    "input": _with_source_ref(
+                        admitted.input,
+                        _ref("same-source-bytes"),
                     )
                 }
             )
@@ -592,8 +756,9 @@ def test_persisted_projection_rejects_duplicate_admitted_source_identity() -> No
     controller.submit(_submission())
     first = repo._records[ASSEMBLY_ID][0].checkpoint
     items = list(first.items)
-    duplicate_input = items[1].admitted.input.model_copy(
-        update={"source_ref": items[0].admitted.input.source_ref}
+    duplicate_input = _with_source_ref(
+        items[1].admitted.input,
+        items[0].admitted.input.source_ref,
     )
     duplicate_admission = items[1].admitted.model_copy(
         update={"input": duplicate_input}

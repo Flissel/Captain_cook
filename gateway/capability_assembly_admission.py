@@ -12,6 +12,7 @@ from agenten.agent_factory.input_document import (
     FactoryInputError,
     parse_factory_input_bytes,
 )
+from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_runtime.production_bootstrap import (
     RuntimeAdapterManifestError,
     read_verified_repository_bytes,
@@ -49,6 +50,9 @@ class RepositoryCapabilityAssemblyInputAdmission:
         repository_root: Path,
         expected_repository_revision: str,
         expected_sha256_by_path: Mapping[str, str],
+        compiled_tool_gaps_by_source_sha256: Mapping[
+            str, tuple[ToolGapMarker, ...]
+        ],
         holdout_store: PrivateHoldoutStore,
         subject_version: int,
     ) -> None:
@@ -66,10 +70,23 @@ class RepositoryCapabilityAssemblyInputAdmission:
             configured[canonical] = digest
         if len(configured) != len(expected_sha256_by_path):
             raise ValueError("expected source paths are not unique")
+        expected_source_digests = set(configured.values())
+        if set(compiled_tool_gaps_by_source_sha256) != expected_source_digests:
+            raise ValueError(
+                "compiled tool-gap output must bind every expected source digest"
+            )
+        compiled_tool_gaps: dict[str, tuple[ToolGapMarker, ...]] = {}
+        for digest, markers in compiled_tool_gaps_by_source_sha256.items():
+            if _SHA256.fullmatch(digest) is None:
+                raise ValueError("compiled tool-gap source digest is invalid")
+            compiled_tool_gaps[digest] = tuple(
+                ToolGapMarker.model_validate(marker) for marker in markers
+            )
 
         self._repository_root = repository_root.resolve(strict=True)
         self._expected_repository_revision = expected_repository_revision
         self._expected_sha256_by_path = configured
+        self._compiled_tool_gaps_by_source_sha256 = compiled_tool_gaps
         self._compiler = FactoryInputCompiler(holdout_store=holdout_store)
         self._subject_version = subject_version
 
@@ -95,9 +112,6 @@ class RepositoryCapabilityAssemblyInputAdmission:
                 logical_name="TO_BE_BUILT.md",
             )
             pattern = _conversation_pattern(source)
-            required_tool_markers = (
-                ("TODO_TOOL.v1",) if b"TODO_TOOL.v1" in source else ()
-            )
             compiled = self._compiler.compile(
                 document,
                 subject_version=self._subject_version,
@@ -107,7 +121,7 @@ class RepositoryCapabilityAssemblyInputAdmission:
                 conversation_pattern=pattern,
                 document=document,
                 compiled_specification=compiled,
-                required_tool_markers=required_tool_markers,
+                tool_gaps=self._compiled_tool_gaps_by_source_sha256[expected_digest],
             )
         except (FactoryInputError, RuntimeAdapterManifestError, ValueError) as exc:
             raise CapabilityAssemblyAdmissionError(str(exc)) from None
