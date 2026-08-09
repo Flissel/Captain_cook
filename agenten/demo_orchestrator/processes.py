@@ -22,6 +22,12 @@ class DemoProcessError(RuntimeError):
     """A process cannot be safely started, reused, restarted, or stopped."""
 
 
+class DemoProcessTimeout(DemoProcessError):
+    """A bounded process wait expired and must remain terminal exit 124."""
+
+    exit_code = 124
+
+
 @dataclass(frozen=True, slots=True)
 class SpawnedProcess:
     pid: int
@@ -61,6 +67,10 @@ class ProcessBackend(Protocol):
     ) -> bool: ...
 
     def terminate(self, pid: int, start_identity: str) -> bool: ...
+
+    def wait_until_gone(
+        self, pid: int, start_identity: str, timeout_seconds: float
+    ) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,26 +127,45 @@ class ManagedProcessSupervisor:
                         "start_identity": spawned.start_identity,
                     }
                 )
+                records[item.service.name] = record
+                started.append(record)
+                self._save_records(
+                    tuple(
+                        records[name]
+                        for name in self._service_names()
+                        if name in records
+                    )
+                )
                 token = item.environment[item.service.health_token_env]
                 if not self._backend.wait_authenticated_health(
                     item.service.health_url, token, timeout_seconds
                 ):
-                    raise DemoProcessError(
-                        f"authenticated health failed for {item.service.name}"
+                    raise DemoProcessTimeout(
+                        f"authenticated health timed out for {item.service.name}"
                     )
                 owner = self._backend.listener_pid(item.service.port)
                 if owner != spawned.pid:
                     raise DemoProcessError(
                         f"listener ownership mismatch for {item.service.name}"
                     )
-                records[item.service.name] = record
-                started.append(record)
-                self._save_records(tuple(records[name] for name in self._service_names() if name in records))
-        except Exception:
+        except Exception as original:
+            orphaned: list[ManagedProcessRecord] = []
             for record in reversed(started):
                 self._backend.terminate(record.pid, record.start_identity)
-                records.pop(record.service, None)
+                if self._backend.wait_until_gone(
+                    record.pid,
+                    record.start_identity,
+                    max(0.1, min(timeout_seconds, 5.0)),
+                ):
+                    records.pop(record.service, None)
+                else:
+                    orphaned.append(record)
             self._save_records(tuple(records[name] for name in self._service_names() if name in records))
+            if orphaned:
+                names = ", ".join(record.service for record in reversed(orphaned))
+                raise DemoProcessError(
+                    f"orphaned managed process {names} after failed start"
+                ) from original
             raise
         result = tuple(records[name] for name in self._service_names())
         self._save_records(result)
@@ -158,6 +187,10 @@ class ManagedProcessSupervisor:
             raise DemoProcessError("managed Runtime listener identity changed")
         if not self._backend.terminate(existing.pid, existing.start_identity):
             raise DemoProcessError("managed Runtime could not be stopped")
+        if not self._backend.wait_until_gone(
+            existing.pid, existing.start_identity, timeout_seconds
+        ):
+            raise DemoProcessTimeout("managed Runtime stop timed out")
         if self._backend.listener_pid(existing.port) is not None:
             raise DemoProcessError("Runtime port remained occupied after managed stop")
         spawned = self._backend.spawn(
@@ -173,18 +206,39 @@ class ManagedProcessSupervisor:
                 "start_identity": spawned.start_identity,
             }
         )
+        records["runtime"] = replacement
+        self._save_records(
+            tuple(records[name] for name in self._service_names() if name in records)
+        )
         token = prepared.environment[prepared.service.health_token_env]
-        if (
-            not self._backend.wait_authenticated_health(
-                prepared.service.health_url, token, timeout_seconds
-            )
-            or self._backend.listener_pid(prepared.service.port) != spawned.pid
+        if not self._backend.wait_authenticated_health(
+            prepared.service.health_url, token, timeout_seconds
         ):
             self._backend.terminate(spawned.pid, spawned.start_identity)
-            records.pop("runtime", None)
+            gone = self._backend.wait_until_gone(
+                spawned.pid, spawned.start_identity, timeout_seconds
+            )
+            if gone:
+                records.pop("runtime", None)
             self._save_records(tuple(records[name] for name in self._service_names() if name in records))
-            raise DemoProcessError("restarted Runtime failed identity or health verification")
-        records["runtime"] = replacement
+            if not gone:
+                raise DemoProcessError(
+                    "orphaned managed process runtime after failed restart"
+                )
+            raise DemoProcessTimeout("restarted Runtime health timed out")
+        if self._backend.listener_pid(prepared.service.port) != spawned.pid:
+            self._backend.terminate(spawned.pid, spawned.start_identity)
+            gone = self._backend.wait_until_gone(
+                spawned.pid, spawned.start_identity, timeout_seconds
+            )
+            if gone:
+                records.pop("runtime", None)
+            self._save_records(tuple(records[name] for name in self._service_names() if name in records))
+            if not gone:
+                raise DemoProcessError(
+                    "orphaned managed process runtime after failed restart"
+                )
+            raise DemoProcessError("restarted Runtime listener identity is invalid")
         self._save_records(tuple(records[name] for name in self._service_names() if name in records))
         return replacement
 
@@ -242,17 +296,23 @@ class ManagedProcessSupervisor:
             owner = self._backend.listener_pid(item.service.port)
             prior = existing.get(item.service.name)
             exact = prior == item.record
-            reusable = bool(
+            reusable = False
+            exact_alive_listener = bool(
                 exact
                 and prior is not None
                 and self._backend.is_alive(prior.pid, prior.start_identity)
                 and owner == prior.pid
-                and self._backend.wait_authenticated_health(
+            )
+            if exact_alive_listener:
+                if not self._backend.wait_authenticated_health(
                     item.service.health_url,
                     item.environment[item.service.health_token_env],
                     timeout_seconds,
-                )
-            )
+                ):
+                    raise DemoProcessTimeout(
+                        f"authenticated health timed out for {item.service.name}"
+                    )
+                reusable = True
             if not reusable and owner is not None:
                 raise DemoProcessError(
                     f"foreign listener occupies required port {item.service.port}"
@@ -409,9 +469,10 @@ class WindowsProcessBackend:
 
     def listener_pid(self, port: int) -> int | None:
         script = (
-            "$items=@(Get-NetTCPConnection -LocalAddress '127.0.0.1' "
-            f"-LocalPort {port} -State Listen -ErrorAction SilentlyContinue);"
-            "if($items.Count -gt 1){exit 9};if($items.Count -eq 1){$items[0].OwningProcess}"
+            f"$items=@(Get-NetTCPConnection -LocalPort {port} "
+            "-State Listen -ErrorAction SilentlyContinue);"
+            "$owners=@($items | Select-Object -ExpandProperty OwningProcess -Unique);"
+            "if($owners.Count -gt 1){exit 9};if($owners.Count -eq 1){$owners[0]}"
         )
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", script],
@@ -423,8 +484,10 @@ class WindowsProcessBackend:
             raise DemoProcessError(f"multiple listeners occupy required port {port}")
         if result.returncode != 0:
             raise DemoProcessError(f"could not inspect listener port {port}")
-        value = result.stdout.strip()
-        return int(value) if value else None
+        values = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        if len(values) > 1:
+            raise DemoProcessError(f"multiple listeners occupy required port {port}")
+        return int(next(iter(values))) if values else None
 
     def is_alive(self, pid: int, start_identity: str) -> bool:
         return self._start_identity(pid) == start_identity
@@ -474,12 +537,24 @@ class WindowsProcessBackend:
         if not self.is_alive(pid, start_identity):
             return False
         result = subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T"],
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
             capture_output=True,
             text=True,
             check=False,
         )
         return result.returncode == 0
+
+    def wait_until_gone(
+        self, pid: int, start_identity: str, timeout_seconds: float
+    ) -> bool:
+        import time
+
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if not self.is_alive(pid, start_identity):
+                return True
+            time.sleep(0.05)
+        return not self.is_alive(pid, start_identity)
 
     @staticmethod
     def _start_identity(pid: int) -> str | None:
@@ -516,7 +591,10 @@ def stop_managed_processes(
     stopped: list[ManagedProcessRecord] = []
     remaining: list[ManagedProcessRecord] = []
     for record in reversed(records):
-        if selected_backend.terminate(record.pid, record.start_identity):
+        selected_backend.terminate(record.pid, record.start_identity)
+        if selected_backend.wait_until_gone(
+            record.pid, record.start_identity, 5.0
+        ):
             stopped.append(record)
         else:
             remaining.append(record)
@@ -567,6 +645,7 @@ def _atomic_write_json(path: Path, payload: object) -> None:
 
 __all__ = [
     "DemoProcessError",
+    "DemoProcessTimeout",
     "ManagedProcessRecord",
     "ManagedProcessSupervisor",
     "SpawnedProcess",

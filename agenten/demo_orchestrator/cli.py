@@ -19,6 +19,7 @@ from .configuration import (
 )
 from .processes import (
     DemoProcessError,
+    DemoProcessTimeout,
     ManagedProcessSupervisor,
     stop_managed_processes,
 )
@@ -194,7 +195,7 @@ def main(
             )
         else:
             result = actions.stop()
-    except DemoTimeout as exc:
+    except (DemoTimeout, DemoProcessTimeout) as exc:
         print(str(exc), file=sys.stderr)
         return 124
     except (DemoConfigurationError, DemoProcessError, DemoClientError) as exc:

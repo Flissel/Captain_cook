@@ -10,6 +10,7 @@ import pytest
 
 from agenten.demo_orchestrator.cli import main
 from agenten.demo_orchestrator.client import DemoTimeout
+from agenten.demo_orchestrator.processes import DemoProcessTimeout
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -123,6 +124,19 @@ def test_cli_preserves_timeout_exit_124(tmp_path: Path) -> None:
             "--max-cost-usd",
             "6.00",
         ],
+        actions_factory=lambda _: TimeoutActions(),
+    )
+
+    assert exit_code == 124
+
+
+def test_cli_preserves_service_health_timeout_exit_124(tmp_path: Path) -> None:
+    class TimeoutActions(FakeActions):
+        def start(self, timeout_seconds: float) -> dict[str, object]:
+            raise DemoProcessTimeout("authenticated health timed out")
+
+    exit_code = main(
+        ["start", "--repository-root", str(tmp_path)],
         actions_factory=lambda _: TimeoutActions(),
     )
 

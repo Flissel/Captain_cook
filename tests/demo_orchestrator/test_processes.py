@@ -12,8 +12,10 @@ from agenten.demo_orchestrator.configuration import DemoConfiguration
 from agenten.demo_orchestrator.contracts import CANONICAL_INPUT_PATHS, DemoBundleV1
 from agenten.demo_orchestrator.processes import (
     DemoProcessError,
+    DemoProcessTimeout,
     ManagedProcessSupervisor,
     SpawnedProcess,
+    WindowsProcessBackend,
     stop_managed_processes,
 )
 
@@ -103,6 +105,9 @@ class FakeBackend:
         self.listeners: dict[int, int] = {}
         self.processes: dict[int, str] = {}
         self.next_pid = 500
+        self.health_result = True
+        self.health_callback = None
+        self.leave_process_alive = False
 
     def validate_compose(self, files: tuple[Path, ...], project: str) -> None:
         assert files
@@ -138,15 +143,24 @@ class FakeBackend:
     def wait_authenticated_health(self, url: str, token: str, timeout_seconds: float) -> bool:
         assert token.endswith("secret")
         self.events.append(f"health:{url}")
-        return True
+        if self.health_callback is not None:
+            self.health_callback()
+        return self.health_result
 
     def terminate(self, pid: int, start_identity: str) -> bool:
         self.events.append(f"terminate:{pid}:{start_identity}")
         if self.processes.get(pid) != start_identity:
             return False
-        del self.processes[pid]
-        self.listeners = {port: owner for port, owner in self.listeners.items() if owner != pid}
+        if not self.leave_process_alive:
+            del self.processes[pid]
+            self.listeners = {port: owner for port, owner in self.listeners.items() if owner != pid}
         return True
+
+    def wait_until_gone(
+        self, pid: int, start_identity: str, timeout_seconds: float
+    ) -> bool:
+        self.events.append(f"wait-gone:{pid}:{start_identity}")
+        return not self.is_alive(pid, start_identity)
 
 
 def test_start_preflights_every_service_before_dependency_ordered_mutation(
@@ -292,3 +306,82 @@ def test_missing_service_executable_fails_before_compose_or_process_mutation(
         ManagedProcessSupervisor(changed, backend=backend).start_all(timeout_seconds=1)
 
     assert not any(event.startswith("mutate:") for event in backend.events)
+
+
+def test_spawn_identity_is_persisted_before_health_and_reaped_on_timeout(
+    tmp_path: Path,
+) -> None:
+    configuration = _configuration(tmp_path)
+    backend = FakeBackend()
+    backend.health_result = False
+    observed: list[dict[str, object]] = []
+
+    def observe_state() -> None:
+        observed.append(
+            json.loads(
+                (configuration.state_root / "managed-processes.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        )
+
+    backend.health_callback = observe_state
+
+    with pytest.raises(DemoProcessTimeout, match="authenticated health timed out"):
+        ManagedProcessSupervisor(configuration, backend=backend).start_all(
+            timeout_seconds=1
+        )
+
+    assert observed[0]["processes"][0]["pid"] == 500
+    assert backend.processes == {}
+    final_state = json.loads(
+        (configuration.state_root / "managed-processes.json").read_text(encoding="utf-8")
+    )
+    assert final_state["processes"] == []
+    assert "terminate:500:start-500" in backend.events
+    assert "wait-gone:500:start-500" in backend.events
+
+
+def test_failed_spawn_cleanup_retains_identity_when_exact_process_cannot_be_reaped(
+    tmp_path: Path,
+) -> None:
+    configuration = _configuration(tmp_path)
+    backend = FakeBackend()
+    backend.health_result = False
+    backend.leave_process_alive = True
+
+    with pytest.raises(DemoProcessError, match="orphaned managed process gateway"):
+        ManagedProcessSupervisor(configuration, backend=backend).start_all(
+            timeout_seconds=1
+        )
+
+    state = json.loads(
+        (configuration.state_root / "managed-processes.json").read_text(encoding="utf-8")
+    )
+    assert state["processes"][0]["pid"] == 500
+    assert backend.processes == {500: "start-500"}
+
+
+def test_windows_listener_probe_accepts_duplicate_wildcard_rows_for_one_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Result:
+        returncode = 0
+        stdout = "321\n321\n"
+
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: Result())
+
+    assert WindowsProcessBackend().listener_pid(19000) == 321
+
+
+def test_windows_listener_probe_rejects_multiple_owning_processes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Result:
+        returncode = 9
+        stdout = ""
+
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: Result())
+
+    with pytest.raises(DemoProcessError, match="multiple listeners"):
+        WindowsProcessBackend().listener_pid(19000)
