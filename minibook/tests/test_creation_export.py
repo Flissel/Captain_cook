@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from minibook.swarm.creation_export import CreationExportError
+from minibook.swarm.creation_export import build_creation_export
 from minibook.swarm.pipeline import SwarmPipeline
 from minibook.swarm.pipeline_adapter import CreationExportBundle
 
@@ -163,3 +164,9 @@ async def test_creation_export_rejects_symlinks(
 
     with pytest.raises(CreationExportError, match="symlink"):
         await pipeline.step_creation_export(_SessionMustNotBeUsed())
+
+
+def test_strict_creation_export_requires_complete_v3_safe_file_set(tmp_path: Path) -> None:
+    _write_required_files(tmp_path)
+    with pytest.raises(CreationExportError, match="team_manifest.json"):
+        build_creation_export(tmp_path, required_paths=("team_manifest.json",))

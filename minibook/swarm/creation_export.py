@@ -125,6 +125,8 @@ def read_captain_sealed_source_archive(
 
 def build_creation_export(
     output_path: Path,
+    *,
+    required_paths: tuple[str, ...] = (),
 ) -> tuple[bytes, dict[str, Any], bytes]:
     """Return deterministic archive bytes plus validated Factory evidence.
 
@@ -163,6 +165,17 @@ def build_creation_export(
     # Presence is checked again against the safe file set: a required file may
     # exist but still be disallowed (for example because it is a symlink).
     for required in (_CANDIDATE_MANIFEST, _SKILL_USAGE_RECEIPT):
+        if required not in archive_contents:
+            raise CreationExportError(f"required creation evidence is missing: {required}")
+    for raw_required in required_paths:
+        required = PurePosixPath(raw_required)
+        if (
+            required.is_absolute()
+            or not required.parts
+            or ".." in required.parts
+            or required.as_posix() != raw_required.replace("\\", "/")
+        ):
+            raise CreationExportError("required creation evidence path is unsafe")
         if required not in archive_contents:
             raise CreationExportError(f"required creation evidence is missing: {required}")
 

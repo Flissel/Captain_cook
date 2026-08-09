@@ -6,13 +6,17 @@ from typing import Any, Protocol
 
 from .artifact_store import FilesystemCreationArtifactStore
 from .contracts import (
+    CreationFailure,
     CreationJobV3,
     CreationResultV2,
     FactoryBuildAssignmentV2,
     FactoryBuildEffectV2,
+    ToolGapMarkerV1,
+    validate_build_effect_binding,
 )
 from .job_store import CreationJobStore
 from .runner import StepOutcome
+from .team_package import seal_team_package, validate_team_package
 
 
 class V3CreationValidator(Protocol):
@@ -39,6 +43,156 @@ class V3CreationValidator(Protocol):
     def assemble_result(
         self, job: CreationJobV3, snapshot: dict[str, Any]
     ) -> CreationResultV2: ...
+
+
+class TeamPackageV3Validator:
+    """Production validator that turns a durable build effect into sealed CAS output."""
+
+    def build_assignment(
+        self, job: CreationJobV3, checkpoint_version: int, effect_key: str
+    ) -> FactoryBuildAssignmentV2:
+        return FactoryBuildAssignmentV2(
+            assignment_id=job.command_id,
+            creation_job_id=job.creation_job_id,
+            factory_job_id=job.factory_job_id,
+            correlation_id=job.correlation_id,
+            subject_version=job.subject_version,
+            checkpoint_version=checkpoint_version,
+            attempt=job.attempt,
+            effect_key=effect_key,
+            workspace_ref=f"workspace://captain/minibook-v3/{job.creation_job_id}",
+            workspace_policy_sha256=job.workspace_policy_ref.sha256,
+            required_agent_ids=job.required_agent_ids,
+            ordered_handoffs=job.ordered_handoffs,
+            tool_requirements=job.tool_requirements,
+            allowed_output_roots=("src", "tests", "evidence"),
+            allowed_commands=(
+                ("python", "-m", "compileall", "src"),
+                ("python", "-m", "pytest"),
+            ),
+            limits={
+                "max_wall_clock_seconds": 300,
+                "max_provider_cost_usd": 5.0,
+                "max_retries": 0,
+                "max_files": 4096,
+            },
+            lease_ref=job.lease_ref,
+            deadline_at=job.deadline_at,
+        )
+
+    async def validate_build_effect(
+        self,
+        job: CreationJobV3,
+        assignment: FactoryBuildAssignmentV2,
+        effect: FactoryBuildEffectV2,
+        artifact_store: FilesystemCreationArtifactStore,
+        snapshot: dict[str, Any],
+    ) -> StepOutcome:
+        validate_build_effect_binding(assignment, effect)
+        validated = validate_team_package(
+            compiled_spec_ref=job.compiled_spec_ref,
+            team_manifest_ref=effect.preliminary_team_manifest_ref,
+            source_archive_ref=effect.source_archive_ref,
+            artifact_store=artifact_store,
+            tool_gaps=effect.tool_gaps,
+            hermes_usage_receipt_ref=effect.hermes_usage_receipt_ref,
+            codex_build_receipt_ref=effect.codex_build_receipt_ref,
+            build_evidence_refs=effect.build_evidence_refs,
+            test_evidence_refs=effect.test_evidence_refs,
+        )
+        sealed = seal_team_package(validated, artifact_store=artifact_store)
+        refs = {
+            "team_manifest_ref": sealed.team_manifest_ref,
+            "candidate_manifest_ref": sealed.candidate_manifest_ref,
+            "source_archive_ref": sealed.source_archive_ref,
+            "package_manifest_ref": sealed.package_manifest_ref,
+            "hermes_usage_receipt_ref": sealed.hermes_usage_receipt_ref,
+            "codex_build_receipt_ref": sealed.codex_build_receipt_ref,
+            "build_evidence_refs": sealed.build_evidence_refs,
+            "real_case_evidence_refs": sealed.real_case_evidence_refs,
+            "cas_readback_receipt_ref": sealed.readback_receipt_ref,
+        }
+        serialized = {
+            key: (
+                [item.model_dump(mode="json") for item in value]
+                if isinstance(value, tuple)
+                else value.model_dump(mode="json")
+            )
+            for key, value in refs.items()
+        }
+        return StepOutcome(
+            snapshot=snapshot
+            | {
+                "sealed_team_package": serialized,
+                "tool_gaps": [gap.model_dump(mode="json", by_alias=True) for gap in effect.tool_gaps],
+            }
+        )
+
+    async def validate(
+        self,
+        job: CreationJobV3,
+        snapshot: dict[str, Any],
+        artifact_store: FilesystemCreationArtifactStore,
+    ) -> StepOutcome:
+        package = snapshot.get("sealed_team_package")
+        if not isinstance(package, dict):
+            raise ValueError("V3 sealed team package is unavailable")
+        validated_snapshot = snapshot | {"team_package_validated": True}
+        result = self.assemble_result(job, validated_snapshot)
+        if result.status != "succeeded":
+            raise ValueError("V3 sealed team package is incomplete")
+        refs = (
+            result.team_manifest_ref,
+            result.candidate_manifest_ref,
+            result.source_archive_ref,
+            result.package_manifest_ref,
+            result.hermes_usage_receipt_ref,
+            result.codex_build_receipt_ref,
+            *result.build_evidence_refs,
+            *result.real_case_evidence_refs,
+            result.cas_readback_receipt_ref,
+        )
+        artifact_store.build_readback_receipt(ref for ref in refs if ref is not None)
+        return StepOutcome(snapshot=validated_snapshot)
+
+    def assemble_result(
+        self, job: CreationJobV3, snapshot: dict[str, Any]
+    ) -> CreationResultV2:
+        package = snapshot.get("sealed_team_package")
+        if not isinstance(package, dict) or snapshot.get("team_package_validated") is not True:
+            return CreationResultV2(
+                creation_job_id=job.creation_job_id,
+                factory_job_id=job.factory_job_id,
+                correlation_id=job.correlation_id,
+                subject_version=job.subject_version,
+                attempt=job.attempt,
+                status="blocked",
+                failure=CreationFailure(
+                    code="validation_failed",
+                    summary="sealed team package evidence is incomplete",
+                ),
+            )
+        return CreationResultV2(
+            creation_job_id=job.creation_job_id,
+            factory_job_id=job.factory_job_id,
+            correlation_id=job.correlation_id,
+            subject_version=job.subject_version,
+            attempt=job.attempt,
+            status="succeeded",
+            team_manifest_ref=package.get("team_manifest_ref"),
+            candidate_manifest_ref=package.get("candidate_manifest_ref"),
+            source_archive_ref=package.get("source_archive_ref"),
+            package_manifest_ref=package.get("package_manifest_ref"),
+            hermes_usage_receipt_ref=package.get("hermes_usage_receipt_ref"),
+            codex_build_receipt_ref=package.get("codex_build_receipt_ref"),
+            build_evidence_refs=package.get("build_evidence_refs", ()),
+            real_case_evidence_refs=package.get("real_case_evidence_refs", ()),
+            cas_readback_receipt_ref=package.get("cas_readback_receipt_ref"),
+            tool_gaps=tuple(
+                ToolGapMarkerV1.model_validate(value)
+                for value in snapshot.get("tool_gaps", ())
+            ),
+        )
 
 
 class V3CreationPipeline:
@@ -146,4 +300,4 @@ class V3CreationPipeline:
         return result
 
 
-__all__ = ["V3CreationPipeline", "V3CreationValidator"]
+__all__ = ["TeamPackageV3Validator", "V3CreationPipeline", "V3CreationValidator"]

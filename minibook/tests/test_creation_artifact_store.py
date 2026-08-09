@@ -39,3 +39,11 @@ def test_creation_artifact_store_rejects_unsafe_namespaces(
 
     with pytest.raises(ValueError, match="namespace"):
         store.put(b"content", "application/json", namespace=namespace)
+
+
+def test_creation_artifact_store_readback_receipt_fails_on_tampering(tmp_path: Path) -> None:
+    store = FilesystemCreationArtifactStore(tmp_path / "cas")
+    reference = store.put(b"sealed", "application/json", namespace="evidence")
+    store.local_path(reference).write_bytes(b"changed")
+    with pytest.raises(CreationArtifactStoreError, match="digest"):
+        store.build_readback_receipt((reference,))
