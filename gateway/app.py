@@ -107,6 +107,25 @@ from gateway.integration_setup_contracts import (
     IntegrationSetupSurfaceV1,
     build_integration_setup_surface,
 )
+from gateway.capability_live_pipeline import (
+    CapabilityExecutionAuthority,
+    CapabilityResumeAuthorization,
+)
+from gateway.capability_resume_repository import (
+    GatewayCapabilityResumeAuthoritySource,
+    GatewayCapabilityResumeRepository,
+)
+from gateway.capability_resume_contracts import (
+    CapabilityResumeAuthorizationHttpRequest,
+    CapabilityResumeAuthorizeHttpRequest,
+)
+from gateway.capability_resume_service import (
+    CapabilityResumeConflict,
+    CapabilityResumeExecutor,
+    CapabilityResumeNotFound,
+    CapabilityResumeService,
+    CapabilityResumeUnavailable,
+)
 from gateway.portal_live_contracts import (
     PortalLiveEvidenceQueryV1,
     PortalLiveEvidenceV1,
@@ -270,6 +289,8 @@ def create_app(
     portal_credential_source: PortalCredentialMetadataSource | None = None,
     portal_verification_source: PortalCredentialVerificationSource | None = None,
     portal_clock: Callable[[], datetime] | None = None,
+    capability_resume_service: CapabilityResumeService | None = None,
+    capability_resume_executor: CapabilityResumeExecutor | None = None,
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
@@ -306,6 +327,8 @@ def create_app(
     store: GatewayStore | None = gateway_store or (
         configured_store(storage, settings) if storage else None
     )
+    resume_service = capability_resume_service
+    resume_service_lock = Lock()
     portal_clock = portal_clock or (lambda: datetime.now(timezone.utc))
     portal_control_boot_id = str(uuid4())
     sink_calls: list[dict[str, Any]] = []
@@ -351,6 +374,13 @@ def create_app(
                 status_code=422,
                 content={"detail": "invalid factory request"},
             )
+        if request.method == "POST" and path.startswith(
+            "/v1/capability-resumes/"
+        ):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "invalid capability resume request"},
+            )
         if (
             request.method == "POST"
             and path.startswith("/batches/")
@@ -372,6 +402,30 @@ def create_app(
                     dsn = configured.ledger_dsn.get_secret_value()
                     store = configured_store(MariaDBStorage(dsn), configured)
         return store
+
+    def get_capability_resume_service() -> CapabilityResumeService:
+        nonlocal resume_service
+        if resume_service is None:
+            with resume_service_lock:
+                if resume_service is None:
+                    gateway = get_store()
+                    authority = GatewayCapabilityResumeAuthoritySource(gateway)
+                    resume_service = CapabilityResumeService(
+                        repository=GatewayCapabilityResumeRepository(gateway),
+                        authority_source=authority,
+                        runtime_reader=authority,
+                        executor=capability_resume_executor,
+                    )
+        return resume_service
+
+    def translate_capability_resume_error(error: Exception) -> HTTPException:
+        if isinstance(error, CapabilityResumeNotFound):
+            return HTTPException(status_code=404, detail=str(error))
+        if isinstance(error, CapabilityResumeConflict):
+            return HTTPException(status_code=409, detail=str(error))
+        if isinstance(error, CapabilityResumeUnavailable):
+            return HTTPException(status_code=409, detail=str(error))
+        return HTTPException(status_code=503, detail="capability resume unavailable")
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -929,6 +983,62 @@ def create_app(
             get_store().record_minibook_projection_rebuild_receipt,
             receipt,
         )
+
+    @app.post(
+        "/v1/capability-resumes/authorizations",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def authorize_capability_resume(
+        request: CapabilityResumeAuthorizeHttpRequest,
+        _: GatewayRole = Depends(require_captain),
+    ) -> CapabilityResumeAuthorization:
+        try:
+            return await run_in_threadpool(
+                get_capability_resume_service().authorize,
+                request.to_domain(),
+            )
+        except (
+            CapabilityResumeConflict,
+            CapabilityResumeNotFound,
+            CapabilityResumeUnavailable,
+        ) as exc:
+            raise translate_capability_resume_error(exc) from None
+
+    @app.post(
+        "/v1/capability-resumes/dispatches",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def dispatch_capability_resume(
+        authorization: CapabilityResumeAuthorizationHttpRequest,
+        _: GatewayRole = Depends(require_captain),
+    ) -> CapabilityExecutionAuthority:
+        try:
+            return await get_capability_resume_service().dispatch(
+                authorization.to_domain()
+            )
+        except (
+            CapabilityResumeConflict,
+            CapabilityResumeNotFound,
+            CapabilityResumeUnavailable,
+        ) as exc:
+            raise translate_capability_resume_error(exc) from None
+
+    @app.post("/v1/capability-resumes/readbacks")
+    async def readback_capability_resume(
+        authorization: CapabilityResumeAuthorizationHttpRequest,
+        _: GatewayRole = Depends(require_captain),
+    ) -> CapabilityExecutionAuthority:
+        try:
+            return await run_in_threadpool(
+                get_capability_resume_service().readback,
+                authorization.to_domain(),
+            )
+        except (
+            CapabilityResumeConflict,
+            CapabilityResumeNotFound,
+            CapabilityResumeUnavailable,
+        ) as exc:
+            raise translate_capability_resume_error(exc) from None
 
     @app.post("/v1/runtime/commands", status_code=status.HTTP_202_ACCEPTED)
     async def accept_runtime_command(
