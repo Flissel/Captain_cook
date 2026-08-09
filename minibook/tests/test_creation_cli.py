@@ -7,6 +7,9 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
+import importlib
+import sys
+import types
 
 from agenten.agent_factory.forge_contracts import (
     CodexBuildReceiptV1 as CaptainCodexBuildReceiptV1,
@@ -16,9 +19,11 @@ from minibook.swarm.contracts import (
     CodexBuildReceiptV1,
     CreationJobV1,
     CreationJobV2,
+    CreationJobV3,
     CreationPackageManifestV2,
     CreationResultV1,
 )
+from minibook.swarm.v3_pipeline import V3CreationPipeline
 from minibook.swarm.creation_cli import (
     install_creation_skill_receipt,
     load_creation_job,
@@ -473,3 +478,62 @@ def test_creation_cli_reads_legacy_v1_and_new_v2_jobs(tmp_path: Path) -> None:
         load_creation_job(FIXTURE_ROOT / "minibook_creation_job.v1.json"),
         CreationJobV1,
     )
+
+
+def _reload_main() -> object:
+    sys.modules.pop("minibook.src.main", None)
+    return importlib.import_module("minibook.src.main")
+
+
+def test_v3_startup_fails_closed_when_required_composition_is_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINIBOOK_CREATION_DB", str(tmp_path / "creation.sqlite3"))
+    monkeypatch.setenv("MINIBOOK_CREATION_V3_ENABLED", "1")
+    monkeypatch.delenv("MINIBOOK_CREATION_CAS_ROOT", raising=False)
+    monkeypatch.delenv("MINIBOOK_CREATION_V3_VALIDATOR", raising=False)
+    monkeypatch.delenv("MINIBOOK_CREATION_WORKER_TOKEN", raising=False)
+    monkeypatch.delenv("MINIBOOK_CREATION_WORKER_ID", raising=False)
+    with pytest.raises(RuntimeError, match="V3 creation configuration is incomplete"):
+        _reload_main()
+
+
+def test_v3_startup_constructs_pipeline_only_with_all_explicit_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Validator:
+        async def validate(self, *_args: object) -> object:
+            raise NotImplementedError
+
+        def assemble_result(self, *_args: object) -> object:
+            raise NotImplementedError
+
+    validator_module = types.ModuleType("test_v3_validator")
+    validator_module.validator = Validator()
+    monkeypatch.setitem(sys.modules, "test_v3_validator", validator_module)
+    monkeypatch.setenv("MINIBOOK_CREATION_DB", str(tmp_path / "creation.sqlite3"))
+    monkeypatch.setenv("MINIBOOK_CREATION_V3_ENABLED", "1")
+    monkeypatch.setenv("MINIBOOK_CREATION_CAS_ROOT", str(tmp_path / "cas"))
+    monkeypatch.setenv("MINIBOOK_CREATION_V3_VALIDATOR", "test_v3_validator:validator")
+    monkeypatch.setenv("MINIBOOK_CREATION_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setenv("MINIBOOK_CREATION_WORKER_ID", "hermes-factory")
+    module = _reload_main()
+    job = CreationJobV3.model_validate_json(
+        (FIXTURE_ROOT / "minibook_creation_job.v3.json").read_text(encoding="utf-8")
+    )
+    module._creation_store.submit(job)
+    runner = module._creation_runner_for(job.creation_job_id)
+    assert isinstance(runner.pipeline, V3CreationPipeline)
+
+
+def test_disabled_creation_does_not_import_forge_docker_or_llm_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MINIBOOK_CREATION_DB", raising=False)
+    monkeypatch.delenv("MINIBOOK_CREATION_V3_ENABLED", raising=False)
+    before = set(sys.modules)
+    _reload_main()
+    imported = set(sys.modules) - before
+    assert not any(name in imported for name in {
+        "minibook.swarm.pipeline", "minibook.swarm.docker_ops", "anthropic", "openai",
+    })
