@@ -291,6 +291,13 @@ def create_app(
 ) -> FastAPI:
     if (factory_action_projection is None) != (factory_continuation_scheduler is None):
         raise ValueError("factory action projection and continuation scheduler must be configured together")
+    if (
+        settings is not None
+        and settings.factory_action_inbox_enabled
+        and factory_action_resume_dispatcher is None
+        and factory_action_projection is None
+    ):
+        raise ValueError("factory action inbox default composition is incomplete")
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
     resume_service_lock = Lock()
@@ -347,8 +354,9 @@ def create_app(
         try:
             yield
         finally:
-            if owned_resume_service is not None:
-                owned_resume_service.close()
+            close_resume = getattr(resume_dispatcher, "close", None)
+            if close_resume is not None:
+                close_resume()
             stop = getattr(mirror, "stop", None)
             if stop:
                 await stop()
@@ -752,18 +760,22 @@ def create_app(
         principal: PortalPrincipalV1 = Depends(require_portal_principal),
     ) -> FactoryActionResponseV1:
         try:
+            resume_dispatcher = get_factory_action_resume_dispatcher()
+            if resume_dispatcher is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="factory action resume capability is disabled",
+                )
             answered = get_store().answer_portal_factory_action(
                 request_id=request_id,
                 principal=principal,
                 response=response,
                 now=portal_clock(),
             )
-            resume_dispatcher = get_factory_action_resume_dispatcher()
-            if resume_dispatcher is not None:
-                resume_dispatcher.enqueue(
-                    request_id=request_id,
-                    tenant_id=principal.organization_id,
-                )
+            resume_dispatcher.enqueue(
+                request_id=request_id,
+                tenant_id=principal.organization_id,
+            )
             return answered
         except LookupError:
             raise HTTPException(status_code=404, detail="factory action not found") from None

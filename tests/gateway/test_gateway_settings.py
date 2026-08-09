@@ -92,11 +92,19 @@ def test_settings_reject_ambiguous_role_tokens_without_echoing_them() -> None:
         ("GATEWAY_CLAIM_TTL_SECONDS", "0"),
         ("GATEWAY_CLAIM_TTL_SECONDS", "not-a-duration"),
         ("CAPTAIN_N8N_URL", "http://user:secret@localhost:5679"),
+        ("CAPTAIN_FACTORY_ACTION_INBOX_ENABLED", "yes"),
     ),
 )
 def test_settings_fail_closed_on_invalid_explicit_values(name: str, value: str) -> None:
     with pytest.raises(GatewayConfigurationError):
         GatewaySettings.from_env(valid_environment(**{name: value}))
+
+
+def test_settings_require_explicit_action_inbox_enablement() -> None:
+    assert GatewaySettings.from_env(valid_environment()).factory_action_inbox_enabled is False
+    assert GatewaySettings.from_env(
+        valid_environment(CAPTAIN_FACTORY_ACTION_INBOX_ENABLED="true")
+    ).factory_action_inbox_enabled is True
 
 
 def test_settings_model_is_frozen_and_strict() -> None:

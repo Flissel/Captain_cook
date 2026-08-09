@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from contextlib import contextmanager
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
@@ -20,6 +22,8 @@ from gateway.factory_action_store import (
     _canonical,
     _canonical_request_payload,
     _db_row,
+    _normalize_legacy_db_row,
+    MariaDBFactoryActionRepository,
 )
 from tests.support.mariadb import assert_isolated_test_database
 
@@ -132,6 +136,18 @@ def canonical_db_row() -> dict[str, object]:
         "continuation_acknowledged_at": None,
         "consumed_at": None,
     }
+
+
+def expected_effect_key(request: FactoryActionRequestV1, phase: str, response_sha256: str) -> str:
+    material = {
+        "phase": phase,
+        "request_sha256": hashlib.sha256(_canonical(request)).hexdigest(),
+        "response_sha256": response_sha256,
+        "safe_checkpoint_sha256": request.safe_checkpoint_sha256,
+    }
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 @pytest.fixture
@@ -277,6 +293,108 @@ def test_db_row_rejects_rehashed_response_identity_drift() -> None:
     row["response_payload"] = encoded.decode()
     row["response_sha256"] = hashlib.sha256(encoded).hexdigest()
     with pytest.raises(ValueError, match="response binding"):
+        _db_row(row)
+
+
+def test_legacy_raw_request_row_is_canonically_backfilled_without_content_drift() -> None:
+    request = pending_request()
+    legacy = canonical_db_row()
+    legacy["request_payload"] = _canonical(request).decode()
+    legacy["request_sha256"] = None
+    legacy["resume_phase"] = None
+
+    normalized = _normalize_legacy_db_row(legacy)
+
+    assert normalized["request_payload"] == _canonical_request_payload(
+        request, "tenant-a"
+    ).decode()
+    assert normalized["request_sha256"] == hashlib.sha256(_canonical(request)).hexdigest()
+    assert normalized["resume_phase"] == "answered"
+    assert _db_row(normalized).request == request
+
+
+def test_schema_migration_backfills_legacy_row_under_one_locked_transaction() -> None:
+    request = pending_request()
+    legacy = canonical_db_row()
+    legacy["request_payload"] = _canonical(request).decode()
+    legacy["request_sha256"] = None
+    legacy["resume_phase"] = None
+
+    class Cursor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def execute(self, query, parameters=None):
+            self.calls.append((" ".join(str(query).split()), parameters))
+
+        def fetchall(self):
+            return [legacy]
+
+    cursor = Cursor()
+
+    class Connection:
+        def cursor(self):
+            return cursor
+
+    class Storage:
+        @contextmanager
+        def transaction(self):
+            yield Connection()
+
+    MariaDBFactoryActionRepository(Storage())  # type: ignore[arg-type]
+
+    select_call = next(query for query, _ in cursor.calls if query.startswith("SELECT *"))
+    update_call = next((query, params) for query, params in cursor.calls if query.startswith("UPDATE"))
+    assert select_call.endswith("FOR UPDATE")
+    assert update_call[1][0] == _canonical_request_payload(request, "tenant-a").decode()
+    assert update_call[1][1] == hashlib.sha256(_canonical(request)).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("phase", "status", "extra_column", "extra_value"),
+    [
+        ("answered", "answered", "consumed_at", NOW.replace(tzinfo=None)),
+        ("projection_intent", "answered", "continuation_idempotency_key", "a" * 64),
+        ("projection_acknowledged", "answered", "continuation_acknowledged_at", NOW.replace(tzinfo=None)),
+        ("continuation_intent", "answered", "consumed_at", NOW.replace(tzinfo=None)),
+    ],
+)
+def test_db_row_rejects_every_incoherent_extra_phase_column(
+    phase: str, status: str, extra_column: str, extra_value: object
+) -> None:
+    row = canonical_db_row()
+    response_sha256 = str(row["response_sha256"])
+    row.update({"resume_phase": phase, "status": status})
+    if phase != "answered":
+        row["projection_idempotency_key"] = expected_effect_key(
+            pending_request(), "projection", response_sha256
+        )
+    if phase in {"projection_acknowledged", "continuation_intent"}:
+        row["projection_acknowledged_at"] = NOW.replace(tzinfo=None)
+    if phase == "continuation_intent":
+        row["continuation_idempotency_key"] = expected_effect_key(
+            pending_request(), "continuation", response_sha256
+        )
+    row[extra_column] = extra_value
+    with pytest.raises(ValueError, match="factory action durable row"):
+        _db_row(row)
+
+
+def test_db_row_rejects_arbitrary_effect_keys_even_when_phase_shape_is_valid() -> None:
+    row = canonical_db_row()
+    row.update(
+        {
+            "resume_phase": "projection_intent",
+            "projection_idempotency_key": "f" * 64,
+        }
+    )
+    with pytest.raises(ValueError, match="effect key mismatch"):
         _db_row(row)
 def test_create_list_read_and_restart_are_tenant_scoped(storage: MariaDBStorage) -> None:
     request = pending_request()

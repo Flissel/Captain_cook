@@ -233,6 +233,19 @@ class RecordingResumeDispatcher:
         self.enqueued.append((request_id, tenant_id))
 
 
+class LifecycleResumeDispatcher(RecordingResumeDispatcher):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recovered = 0
+        self.closed = 0
+
+    def recover(self) -> None:
+        self.recovered += 1
+
+    def close(self) -> None:
+        self.closed += 1
+
+
 def settings() -> GatewaySettings:
     return GatewaySettings(
         ledger_dsn=SecretStr("mysql://unused:unused@127.0.0.1:3306/captain_test"),
@@ -249,13 +262,17 @@ def client_for(
     store: FakePortalGatewayStore,
     *,
     resume_dispatcher: RecordingResumeDispatcher | None = None,
+    action_resume_enabled: bool = True,
 ) -> TestClient:
+    configured_dispatcher = resume_dispatcher
+    if action_resume_enabled and configured_dispatcher is None:
+        configured_dispatcher = RecordingResumeDispatcher()
     application = create_app(
         gateway_store=store,
         mirror=NullMirror(),
         settings=settings(),
         portal_clock=lambda: NOW,
-        factory_action_resume_dispatcher=resume_dispatcher,
+        factory_action_resume_dispatcher=configured_dispatcher,
     )
     application.state.portal_token_verifier = StaticVerifier(principal)
     return TestClient(application)
@@ -314,6 +331,48 @@ def test_answer_dispatches_durable_resume_without_running_it_in_http_handler() -
         )
     assert answered.status_code == 200
     assert dispatcher.enqueued == [(store.factory_action.request_id, "org-a")]
+
+
+def test_answer_fails_closed_before_persisting_when_action_resume_is_disabled() -> None:
+    store = FakePortalGatewayStore()
+    principal = PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+    response_payload = FactoryActionResponseV1.model_validate_json(
+        (Path(__file__).parents[1] / "fixtures" / "contracts" / "factory_action_response.v1.json").read_text(encoding="utf-8")
+    ).model_dump(mode="json", by_alias=True)
+
+    with client_for(principal, store, action_resume_enabled=False) as client:
+        answered = client.post(
+            f"/v1/portal/factory-actions/{store.factory_action.request_id}/responses",
+            headers=auth(),
+            json=response_payload,
+        )
+
+    assert answered.status_code == 503
+    assert store.factory_answer is None
+
+
+def test_enabled_action_inbox_rejects_partial_default_composition() -> None:
+    enabled = settings().model_copy(update={"factory_action_inbox_enabled": True})
+    with pytest.raises(ValueError, match="action inbox.*incomplete"):
+        create_app(
+            gateway_store=FakePortalGatewayStore(),
+            mirror=NullMirror(),
+            settings=enabled,
+        )
+
+
+def test_action_resume_recovery_starts_and_stops_with_app_lifecycle() -> None:
+    dispatcher = LifecycleResumeDispatcher()
+    application = create_app(
+        gateway_store=FakePortalGatewayStore(),
+        mirror=NullMirror(),
+        settings=settings().model_copy(update={"factory_action_inbox_enabled": True}),
+        factory_action_resume_dispatcher=dispatcher,
+    )
+    with TestClient(application):
+        assert dispatcher.recovered == 1
+        assert dispatcher.closed == 0
+    assert dispatcher.closed == 1
 
 
 def test_org_b_cannot_read_org_a_setup_or_issue_org_a_ticket() -> None:

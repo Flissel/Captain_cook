@@ -40,6 +40,7 @@ class GatewaySettings(BaseModel):
     captain_gateway_token: SecretStr
     worker_gateway_token: SecretStr
     approval_enabled: bool = False
+    factory_action_inbox_enabled: bool = False
     host: Literal["127.0.0.1"] = "127.0.0.1"
     port: int = Field(default=8090, ge=1, le=65535)
     claim_ttl_seconds: int = Field(default=5_400, ge=1, le=86_400)
@@ -267,6 +268,13 @@ class GatewaySettings(BaseModel):
             raise GatewayConfigurationError("invalid gateway configuration")
         approval_enabled = approval_raw.lower() == "true"
 
+        action_inbox_raw = source.get(
+            "CAPTAIN_FACTORY_ACTION_INBOX_ENABLED", "false"
+        )
+        if action_inbox_raw.lower() not in {"true", "false"}:
+            raise GatewayConfigurationError("invalid gateway configuration")
+        action_inbox_enabled = action_inbox_raw.lower() == "true"
+
         portal_n8n_raw = source.get(
             "CAPTAIN_PORTAL_N8N_ADAPTERS_ENABLED",
             "false",
@@ -309,6 +317,7 @@ class GatewaySettings(BaseModel):
                 captain_gateway_token=SecretStr(captain_token),
                 worker_gateway_token=SecretStr(worker_token),
                 approval_enabled=approval_enabled,
+                factory_action_inbox_enabled=action_inbox_enabled,
                 port=port,
                 claim_ttl_seconds=claim_ttl_seconds,
                 captain_n8n_ui_url=source.get(

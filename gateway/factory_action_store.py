@@ -212,7 +212,7 @@ class FactoryActionStore:
             assert row is not None and row.response is not None
             if row.resume_phase == "answered":
                 row.projection_idempotency_key = _effect_key(
-                    request_id, "projection", row.response_sha256
+                    row.request, "projection", row.response_sha256
                 )
                 row.resume_phase = "projection_intent"
             return _resume_record(row)
@@ -249,7 +249,7 @@ class FactoryActionStore:
             assert row is not None
             if row.resume_phase == "projection_acknowledged":
                 row.continuation_idempotency_key = _effect_key(
-                    request_id, "continuation", row.response_sha256
+                    row.request, "continuation", row.response_sha256
                 )
                 row.resume_phase = "continuation_intent"
             if row.resume_phase not in {"continuation_intent", "continuation_acknowledged"}:
@@ -343,6 +343,30 @@ class MariaDBFactoryActionRepository:
                 ):
                     cursor.execute(
                         f"ALTER TABLE factory_action_inbox ADD COLUMN IF NOT EXISTS {definition}"
+                    )
+                cursor.execute("SELECT * FROM factory_action_inbox FOR UPDATE")
+                for persisted in cursor.fetchall():
+                    normalized = _normalize_legacy_db_row(persisted)
+                    if normalized == persisted:
+                        continue
+                    cursor.execute(
+                        """UPDATE factory_action_inbox SET request_payload = %s,
+                           request_sha256 = %s, response_payload = %s,
+                           response_sha256 = %s, resume_phase = %s,
+                           projection_idempotency_key = %s,
+                           projection_acknowledged_at = %s,
+                           continuation_idempotency_key = %s,
+                           continuation_acknowledged_at = %s
+                           WHERE request_id = %s""",
+                        (
+                            normalized["request_payload"], normalized["request_sha256"],
+                            normalized.get("response_payload"), normalized.get("response_sha256"),
+                            normalized.get("resume_phase"), normalized.get("projection_idempotency_key"),
+                            normalized.get("projection_acknowledged_at"),
+                            normalized.get("continuation_idempotency_key"),
+                            normalized.get("continuation_acknowledged_at"),
+                            normalized["request_id"],
+                        ),
                     )
 
     def create(self, row: FactoryActionRow) -> FactoryActionRow:
@@ -460,7 +484,86 @@ def _canonical(model: FactoryActionRequestV1 | FactoryActionResponseV1) -> bytes
     ).encode("utf-8")
 
 
+def _normalize_legacy_db_row(row: dict[str, object]) -> dict[str, object]:
+    """Compatibility seam for pre-resume Action Inbox rows."""
+    normalized = dict(row)
+    request_bytes = _json_bytes(normalized["request_payload"])
+    try:
+        decoded = json.loads(request_bytes)
+    except json.JSONDecodeError as error:
+        raise FactoryActionDurabilityError(
+            "factory action durable row request invalid"
+        ) from error
+    if isinstance(decoded, dict) and set(decoded) == {"request", "tenant_id"}:
+        return normalized
+    try:
+        request = FactoryActionRequestV1.model_validate(decoded)
+    except (TypeError, ValueError) as error:
+        raise FactoryActionDurabilityError(
+            "factory action durable row request invalid"
+        ) from error
+    tenant_id = str(normalized.get("tenant_id", ""))
+    if not tenant_id:
+        raise FactoryActionDurabilityError("factory action durable row tenant mismatch")
+    request_digest = hashlib.sha256(_canonical(request)).hexdigest()
+    existing_request_digest = normalized.get("request_sha256")
+    if existing_request_digest not in {None, request_digest}:
+        raise FactoryActionDurabilityError(
+            "factory action durable row request hash mismatch"
+        )
+    response_payload = normalized.get("response_payload")
+    response_digest: str | None = None
+    if response_payload is not None:
+        try:
+            response = FactoryActionResponseV1.model_validate_json(
+                _json_bytes(response_payload)
+            )
+        except ValueError as error:
+            raise FactoryActionDurabilityError(
+                "factory action durable row response invalid"
+            ) from error
+        response_payload = _canonical(response).decode("utf-8")
+        response_digest = hashlib.sha256(response_payload.encode("utf-8")).hexdigest()
+        existing_response_digest = normalized.get("response_sha256")
+        if existing_response_digest not in {None, response_digest}:
+            raise FactoryActionDurabilityError(
+                "factory action durable row response hash mismatch"
+            )
+    status = str(normalized.get("status"))
+    consumed_at = normalized.get("consumed_at")
+    normalized.update(
+        {
+            "request_payload": _canonical_request_payload(request, tenant_id).decode("utf-8"),
+            "request_sha256": request_digest,
+            "response_payload": response_payload,
+            "response_sha256": response_digest,
+        }
+    )
+    if status == "answered" and response_digest is not None:
+        normalized["resume_phase"] = "answered"
+    elif status == "consumed" and response_digest is not None and consumed_at is not None:
+        normalized.update(
+            {
+                "resume_phase": "continuation_acknowledged",
+                "projection_idempotency_key": _effect_key(
+                    request, "projection", response_digest
+                ),
+                "projection_acknowledged_at": consumed_at,
+                "continuation_idempotency_key": _effect_key(
+                    request, "continuation", response_digest
+                ),
+                "continuation_acknowledged_at": consumed_at,
+            }
+        )
+    elif status not in {"pending", "expired"}:
+        raise FactoryActionDurabilityError(
+            "factory action durable legacy row state mismatch"
+        )
+    return normalized
+
+
 def _db_row(row: dict[str, object]) -> FactoryActionRow:
+    row = _normalize_legacy_db_row(row)
     request_bytes = _json_bytes(row["request_payload"])
     try:
         envelope = json.loads(request_bytes)
@@ -548,15 +651,47 @@ def _db_row(row: dict[str, object]) -> FactoryActionRow:
         continuation_acknowledged_at=_optional_aware(row.get("continuation_acknowledged_at")),
         consumed_at=(None if consumed is None else _aware_utc(consumed)),  # type: ignore[arg-type]
     )
+    expected_projection_key = (
+        None
+        if result.resume_phase in {None, "answered"}
+        else _effect_key(result.request, "projection", result.response_sha256)
+    )
+    expected_continuation_key = (
+        _effect_key(result.request, "continuation", result.response_sha256)
+        if result.resume_phase in {"continuation_intent", "continuation_acknowledged"}
+        else None
+    )
+    if (
+        result.projection_idempotency_key != expected_projection_key
+        or result.continuation_idempotency_key != expected_continuation_key
+    ):
+        raise FactoryActionDurabilityError(
+            "factory action durable row effect key mismatch"
+        )
     if result.tenant_id == "" or not _valid_phase_columns(result):
         raise FactoryActionDurabilityError("factory action durable row phase mismatch")
     return result
 
 
-def _effect_key(request_id: UUID, effect: str, response_sha256: str | None) -> str:
+def _effect_key(
+    request: FactoryActionRequestV1,
+    phase: Literal["projection", "continuation"],
+    response_sha256: str | None,
+) -> str:
     if response_sha256 is None:
         raise FactoryActionDurabilityError("factory action durable row response hash missing")
-    return hashlib.sha256(f"{request_id}:{effect}:{response_sha256}".encode()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "phase": phase,
+                "request_sha256": hashlib.sha256(_canonical(request)).hexdigest(),
+                "response_sha256": response_sha256,
+                "safe_checkpoint_sha256": request.safe_checkpoint_sha256,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _canonical_request_payload(request: FactoryActionRequestV1, tenant_id: str) -> bytes:
@@ -578,7 +713,7 @@ def _resume_record(row: FactoryActionRow) -> FactoryActionResumeRecord:
     ):
         raise FactoryActionDurabilityError("factory action durable row resume state incomplete")
     continuation_key = row.continuation_idempotency_key or _effect_key(
-        row.request.request_id, "continuation", row.response_sha256
+        row.request, "continuation", row.response_sha256
     )
     return FactoryActionResumeRecord(
         request=row.request,
@@ -594,21 +729,57 @@ def _optional_aware(value: object) -> datetime | None:
 
 
 def _valid_phase_columns(row: FactoryActionRow) -> bool:
+    projection_key = row.projection_idempotency_key
+    projection_at = row.projection_acknowledged_at
+    continuation_key = row.continuation_idempotency_key
+    continuation_at = row.continuation_acknowledged_at
+    consumed_at = row.consumed_at
+    if row.resume_phase is None:
+        return (
+            row.status in {"pending", "expired"}
+            and row.response is None
+            and row.response_sha256 is None
+            and projection_key is None
+            and projection_at is None
+            and continuation_key is None
+            and continuation_at is None
+            and consumed_at is None
+        )
     if row.resume_phase == "answered":
-        return row.projection_idempotency_key is None
+        return (
+            row.status == "answered"
+            and row.response is not None
+            and projection_key is None
+            and projection_at is None
+            and continuation_key is None
+            and continuation_at is None
+            and consumed_at is None
+        )
     if row.resume_phase == "projection_intent":
-        return row.projection_idempotency_key is not None and row.projection_acknowledged_at is None
+        return (
+            row.status == "answered" and projection_key is not None
+            and projection_at is None and continuation_key is None
+            and continuation_at is None and consumed_at is None
+        )
     if row.resume_phase == "projection_acknowledged":
-        return row.projection_idempotency_key is not None and row.projection_acknowledged_at is not None
+        return (
+            row.status == "answered" and projection_key is not None
+            and projection_at is not None and continuation_key is None
+            and continuation_at is None and consumed_at is None
+        )
     if row.resume_phase == "continuation_intent":
         return (
-            row.projection_acknowledged_at is not None
-            and row.continuation_idempotency_key is not None
-            and row.continuation_acknowledged_at is None
+            row.status == "answered" and projection_key is not None
+            and projection_at is not None and continuation_key is not None
+            and continuation_at is None and consumed_at is None
         )
     if row.resume_phase == "continuation_acknowledged":
-        return row.continuation_acknowledged_at is not None and row.consumed_at is not None
-    return row.resume_phase is None
+        return (
+            row.status == "consumed" and projection_key is not None
+            and projection_at is not None and continuation_key is not None
+            and continuation_at is not None and consumed_at is not None
+        )
+    return False
 
 
 def _json_bytes(value: object) -> bytes:
