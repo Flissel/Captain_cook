@@ -76,6 +76,16 @@ private suite reference
   -> redacted Minibook aggregate projection
 ```
 
+`TO_BE_BUILT.md` carries only the public benchmark policy: category/count
+requirements, evaluator dimensions, ruleset references, and stable public
+source keys. Concrete setups, actions, expected predicates, expected outputs,
+and hidden routing/order are forbidden in that worker-visible input. Captain
+generates those definitions from a secret local seed and stores them in a
+digest-pinned private catalog. Production opens that catalog once from a
+dedicated root outside every repository/worktree and binds it to the exact
+admitted input SHA-256 values before any Gateway schema or provider effect.
+Jobs and public compiler output contain only content-addressed holdout refs.
+
 The summary is committed before the evaluation so the evaluation can reference
 an exact, resolvable artifact. Captain/Gateway alone accepts that summary,
 recomputes the release decision, and writes `ready_to_use`. A failed but exactly
