@@ -40,3 +40,19 @@
 - Confirmed symlink/path traversal, unsafe ZIP members, archive/manifest drift, failed compile/tests/evidence, undeclared gaps, and CAS tampering fail closed.
 - Corrected the validation/readback ordering defect found during self-review and added a behavioral regression test.
 - No live provider, Hermes worker, Captain promotion, network execution, or ready-to-use claim is made.
+
+## Spec correction commit
+
+Four P1 review findings were reproduced with mutation tests before correction:
+
+- RED: a compiled one-agent contract plus one-agent manifest could substitute for the four-agent topology frozen by `CreationJobV3`.
+- RED: undeclared `.env`, secret, transcript, build metadata, and reserved publisher files were accepted as archive members.
+- RED: incoming `package-manifest.json` and Minibook readback receipt names were not independently reserved.
+- RED: final validation did not traverse every publisher-manifest child or require the receipt's exact complete derived ref set; a sealed source child could be changed without that final walk.
+
+Corrections make the typed `CreationJobV3` mandatory, bind its compiled-spec ref and exact topology/tools/assertions/optional-gap policy, close input membership to declared `src/` and `tests/` files plus fixed canonical evidence, reject sensitive/reserved names, and make final validation cross-check canonical ZIP/manifest/receipt bytes, every child CAS object, all top-level refs, candidate authority, and exact receipt membership.
+
+- Corrected focused GREEN: `44 passed`.
+- Corrected Task 2/3 regression GREEN: `103 passed`.
+- Corrected full Minibook GREEN: `241 passed, 1 deselected`.
+- Corrected compileall and `git diff --check`: exit 0.

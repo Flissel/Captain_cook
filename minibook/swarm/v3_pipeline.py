@@ -16,7 +16,11 @@ from .contracts import (
 )
 from .job_store import CreationJobStore
 from .runner import StepOutcome
-from .team_package import seal_team_package, validate_team_package
+from .team_package import (
+    seal_team_package,
+    validate_team_package,
+    verify_sealed_team_package,
+)
 
 
 class V3CreationValidator(Protocol):
@@ -90,6 +94,7 @@ class TeamPackageV3Validator:
     ) -> StepOutcome:
         validate_build_effect_binding(assignment, effect)
         validated = validate_team_package(
+            authority_job=job,
             compiled_spec_ref=job.compiled_spec_ref,
             team_manifest_ref=effect.preliminary_team_manifest_ref,
             source_archive_ref=effect.source_archive_ref,
@@ -141,18 +146,11 @@ class TeamPackageV3Validator:
         result = self.assemble_result(job, validated_snapshot)
         if result.status != "succeeded":
             raise ValueError("V3 sealed team package is incomplete")
-        refs = (
-            result.team_manifest_ref,
-            result.candidate_manifest_ref,
-            result.source_archive_ref,
-            result.package_manifest_ref,
-            result.hermes_usage_receipt_ref,
-            result.codex_build_receipt_ref,
-            *result.build_evidence_refs,
-            *result.real_case_evidence_refs,
-            result.cas_readback_receipt_ref,
+        verify_sealed_team_package(
+            result,
+            authority_job=job,
+            artifact_store=artifact_store,
         )
-        artifact_store.build_readback_receipt(ref for ref in refs if ref is not None)
         return StepOutcome(snapshot=validated_snapshot)
 
     def assemble_result(

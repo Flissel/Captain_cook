@@ -17,7 +17,14 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
 from .artifact_store import FilesystemCreationArtifactStore
-from .contracts import AgentHandoffV1, ArtifactRef, ToolGapMarkerV1
+from .contracts import (
+    AgentHandoffV1,
+    ArtifactRef,
+    CreationJobV3,
+    CreationResultV2,
+    FactoryToolRequirementV1,
+    ToolGapMarkerV1,
+)
 from .creation_export import CreationExportError, _build_deterministic_zip
 
 
@@ -27,6 +34,7 @@ class TeamPackageError(RuntimeError):
 
 @dataclass(frozen=True)
 class ValidatedTeamPackage:
+    authority_job: CreationJobV3
     compiled_spec: dict[str, Any]
     team_manifest: dict[str, Any]
     files: Mapping[PurePosixPath, bytes]
@@ -60,6 +68,7 @@ _INVENTED_SCORING = re.compile(
 
 def validate_team_package(
     *,
+    authority_job: CreationJobV3,
     compiled_spec_ref: ArtifactRef,
     team_manifest_ref: ArtifactRef,
     source_archive_ref: ArtifactRef,
@@ -72,7 +81,12 @@ def validate_team_package(
 ) -> ValidatedTeamPackage:
     """Read all authoritative bytes from CAS and execute the declared local gates."""
 
+    if not isinstance(authority_job, CreationJobV3):
+        raise TypeError("team package authority must be CreationJobV3")
+    if compiled_spec_ref != authority_job.compiled_spec_ref:
+        raise TeamPackageError("compiled specification ref differs from CreationJobV3 authority")
     compiled = _json_object(artifact_store.read_bytes(compiled_spec_ref), "compiled specification")
+    _bind_compiled_authority(compiled, authority_job)
     manifest_bytes = artifact_store.read_bytes(team_manifest_ref)
     manifest = _json_object(manifest_bytes, "team manifest")
     archive_bytes = artifact_store.read_bytes(source_archive_ref)
@@ -84,6 +98,7 @@ def validate_team_package(
     required_agents = tuple(_require_strings(compiled.get("required_agent_ids"), "compiled agents"))
     required_handoffs = tuple(_handoff(item) for item in _require_list(compiled.get("ordered_handoffs"), "compiled handoffs"))
     require_exact_topology(manifest, required_agents, required_handoffs)
+    _require_closed_safe_file_set(manifest, files)
     _validate_tools(compiled, manifest, files)
     typed_gaps = tuple(tool_gaps)
     _validate_gaps(compiled, typed_gaps)
@@ -98,7 +113,7 @@ def validate_team_package(
         test_evidence_refs=tuple(test_evidence_refs),
     )
     _execute_python_gates(files, manifest)
-    return ValidatedTeamPackage(compiled, manifest, files, typed_gaps)
+    return ValidatedTeamPackage(authority_job, compiled, manifest, files, typed_gaps)
 
 
 def require_exact_topology(
@@ -134,9 +149,20 @@ def seal_team_package(
     if candidate.get("schema") != "captain.factory-candidate.v1":
         raise TeamPackageError("candidate manifest schema is invalid")
     candidate["team_manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
-    candidate["required_agent_ids"] = validated.compiled_spec["required_agent_ids"]
-    candidate["ordered_handoffs"] = validated.compiled_spec["ordered_handoffs"]
-    candidate["tool_requirements"] = validated.compiled_spec["tool_requirements"]
+    candidate["compiled_spec_ref"] = validated.authority_job.compiled_spec_ref.model_dump(mode="json")
+    candidate["required_agent_ids"] = list(validated.authority_job.required_agent_ids)
+    candidate["ordered_handoffs"] = [
+        value.model_dump(mode="json") for value in validated.authority_job.ordered_handoffs
+    ]
+    candidate["tool_requirements"] = [
+        value.model_dump(mode="json") for value in validated.authority_job.tool_requirements
+    ]
+    candidate["public_assertion_ids"] = list(validated.authority_job.public_assertion_ids)
+    candidate["allowed_optional_tool_gaps"] = [
+        value.tool_id
+        for value in validated.authority_job.tool_requirements
+        if not value.required
+    ]
     candidate["artifacts"] = [
         {
             "path": str(path),
@@ -182,6 +208,230 @@ def seal_team_package(
         readback_receipt_ref=receipt_ref,
         readback_receipt=receipt,
     )
+
+
+def verify_sealed_team_package(
+    result: CreationResultV2,
+    *,
+    authority_job: CreationJobV3,
+    artifact_store: FilesystemCreationArtifactStore,
+) -> None:
+    """Re-read and cross-bind the final ZIP, manifest, receipt, and every CAS child."""
+
+    if result.status != "succeeded":
+        raise ValueError("sealed package result is not successful")
+    top_level = (
+        result.team_manifest_ref,
+        result.candidate_manifest_ref,
+        result.source_archive_ref,
+        result.package_manifest_ref,
+        result.hermes_usage_receipt_ref,
+        result.codex_build_receipt_ref,
+        *result.build_evidence_refs,
+        *result.real_case_evidence_refs,
+        result.cas_readback_receipt_ref,
+    )
+    if any(reference is None for reference in top_level):
+        raise ValueError("sealed package top-level refs are incomplete")
+    typed_top_level = tuple(reference for reference in top_level if reference is not None)
+    archive_bytes = artifact_store.read_bytes(result.source_archive_ref)  # type: ignore[arg-type]
+    archive_files = _read_safe_zip(archive_bytes)
+    manifest_bytes = artifact_store.read_bytes(result.package_manifest_ref)  # type: ignore[arg-type]
+    if archive_files.get(PurePosixPath("package-manifest.json")) != manifest_bytes:
+        raise ValueError("package manifest does not match sealed archive")
+    package_manifest = _json_object(manifest_bytes, "package manifest")
+    if package_manifest.get("schema") != "minibook.team-package-manifest.v1":
+        raise ValueError("package manifest schema is invalid")
+    if manifest_bytes != _canonical_json(package_manifest):
+        raise ValueError("package manifest is not canonical")
+    entries = package_manifest.get("files")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("package manifest files are invalid")
+    children: dict[PurePosixPath, ArtifactRef] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("package manifest child is invalid")
+        path = _safe_path(entry.get("path"), "package manifest child")
+        if path == PurePosixPath("package-manifest.json") or path in children:
+            raise ValueError("package manifest child path is reserved or duplicated")
+        try:
+            reference = ArtifactRef.model_validate(
+                {key: entry.get(key) for key in ("uri", "sha256", "media_type")}
+            )
+        except Exception as exc:
+            raise ValueError("package manifest child ref is invalid") from exc
+        child_bytes = artifact_store.read_bytes(reference)
+        if archive_files.get(path) != child_bytes:
+            raise ValueError("package manifest child differs from sealed archive")
+        children[path] = reference
+    if set(archive_files) != {*children, PurePosixPath("package-manifest.json")}:
+        raise ValueError("sealed archive members differ from package manifest")
+
+    expected_top_level_children = {
+        PurePosixPath("team_manifest.json"): result.team_manifest_ref,
+        PurePosixPath("factory-candidate.json"): result.candidate_manifest_ref,
+        PurePosixPath("evidence/hermes-factory-skill-usage-receipt.json"): result.hermes_usage_receipt_ref,
+        PurePosixPath("evidence/codex-build-receipt.json"): result.codex_build_receipt_ref,
+    }
+    for path, reference in expected_top_level_children.items():
+        if children.get(path) != reference:
+            raise ValueError("top-level ref differs from package manifest child")
+    team_manifest = _json_object(
+        artifact_store.read_bytes(result.team_manifest_ref),  # type: ignore[arg-type]
+        "team manifest",
+    )
+    require_exact_topology(
+        team_manifest,
+        authority_job.required_agent_ids,
+        authority_job.ordered_handoffs,
+    )
+    candidate = _json_object(
+        artifact_store.read_bytes(result.candidate_manifest_ref),  # type: ignore[arg-type]
+        "candidate manifest",
+    )
+    expected_candidate_authority = {
+        "compiled_spec_ref": authority_job.compiled_spec_ref.model_dump(mode="json"),
+        "required_agent_ids": list(authority_job.required_agent_ids),
+        "ordered_handoffs": [
+            value.model_dump(mode="json") for value in authority_job.ordered_handoffs
+        ],
+        "tool_requirements": [
+            value.model_dump(mode="json") for value in authority_job.tool_requirements
+        ],
+        "public_assertion_ids": list(authority_job.public_assertion_ids),
+        "allowed_optional_tool_gaps": [
+            value.tool_id for value in authority_job.tool_requirements if not value.required
+        ],
+    }
+    if any(candidate.get(key) != value for key, value in expected_candidate_authority.items()):
+        raise ValueError("candidate package differs from CreationJobV3 authority")
+    if candidate.get("team_manifest_sha256") != hashlib.sha256(
+        artifact_store.read_bytes(result.team_manifest_ref)  # type: ignore[arg-type]
+    ).hexdigest():
+        raise ValueError("candidate team manifest binding differs from authority")
+    if tuple(reference for path, reference in children.items() if str(path).startswith("evidence/build")) != result.build_evidence_refs:
+        raise ValueError("build evidence refs differ from package manifest")
+    if tuple(reference for path, reference in children.items() if str(path).startswith("evidence/real-case")) != result.real_case_evidence_refs:
+        raise ValueError("real-case refs differ from package manifest")
+
+    receipt_bytes = artifact_store.read_bytes(result.cas_readback_receipt_ref)  # type: ignore[arg-type]
+    receipt = _json_object(receipt_bytes, "CAS readback receipt")
+    if receipt.get("schema") != "minibook.cas-readback-receipt.v1" or receipt_bytes != _canonical_json(receipt):
+        raise ValueError("CAS readback receipt is invalid or noncanonical")
+    receipt_entries = receipt.get("artifacts")
+    if not isinstance(receipt_entries, list):
+        raise ValueError("CAS readback receipt artifacts are invalid")
+    actual_receipt: set[tuple[str, str, str]] = set()
+    for item in receipt_entries:
+        if not isinstance(item, dict) or item.get("verified") is not True:
+            raise ValueError("CAS readback receipt contains an unverified artifact")
+        try:
+            reference = ArtifactRef.model_validate(
+                {key: item.get(key) for key in ("uri", "sha256", "media_type")}
+            )
+        except Exception as exc:
+            raise ValueError("CAS readback receipt artifact is invalid") from exc
+        identity = (reference.uri, reference.sha256, reference.media_type)
+        if identity in actual_receipt:
+            raise ValueError("CAS readback receipt contains duplicate artifacts")
+        actual_receipt.add(identity)
+    expected_receipt_refs = (*children.values(), result.package_manifest_ref, result.source_archive_ref)
+    expected_receipt = {
+        (reference.uri, reference.sha256, reference.media_type)
+        for reference in expected_receipt_refs
+        if reference is not None
+    }
+    if actual_receipt != expected_receipt or len(receipt_entries) != len(expected_receipt):
+        raise ValueError("CAS readback receipt does not contain the exact complete ref set")
+    artifact_store.build_readback_receipt(typed_top_level)
+
+
+def _bind_compiled_authority(
+    compiled: Mapping[str, Any], authority_job: CreationJobV3
+) -> None:
+    compiled_agents = _require_strings(compiled.get("required_agent_ids"), "compiled agents")
+    compiled_handoffs = tuple(
+        _handoff(item)
+        for item in _require_list(compiled.get("ordered_handoffs"), "compiled handoffs")
+    )
+    try:
+        compiled_tools = tuple(
+            FactoryToolRequirementV1.model_validate(item)
+            for item in _require_list(
+                compiled.get("tool_requirements"), "compiled tool requirements"
+            )
+        )
+    except Exception as exc:
+        raise TeamPackageError("compiled tool requirements are invalid") from exc
+    compiled_assertions = _require_strings(
+        compiled.get("public_assertion_ids"), "compiled public assertions"
+    )
+    expected_optional = tuple(
+        requirement.tool_id
+        for requirement in authority_job.tool_requirements
+        if not requirement.required
+    )
+    allowed_optional = tuple(
+        _require_strings(
+            compiled.get("allowed_optional_tool_gaps", []),
+            "compiled optional tool gap policy",
+        )
+    )
+    if (
+        compiled_agents != authority_job.required_agent_ids
+        or compiled_handoffs != authority_job.ordered_handoffs
+        or compiled_tools != authority_job.tool_requirements
+        or compiled_assertions != authority_job.public_assertion_ids
+        or allowed_optional != expected_optional
+    ):
+        raise TeamPackageError("compiled specification differs from CreationJobV3 authority")
+
+
+def _require_closed_safe_file_set(
+    manifest: Mapping[str, Any], files: Mapping[PurePosixPath, bytes]
+) -> None:
+    source_paths = tuple(
+        _safe_path(value, "source file")
+        for value in _require_list(manifest.get("source_files"), "source files")
+    )
+    test_paths = tuple(
+        _safe_path(value, "test file")
+        for value in _require_list(manifest.get("test_files"), "test files")
+    )
+    if any(path.parts[0] != "src" for path in source_paths):
+        raise TeamPackageError("declared source file is outside the safe source root")
+    if any(path.parts[0] != "tests" for path in test_paths):
+        raise TeamPackageError("declared test file is outside the safe test root")
+    for path in (*source_paths, *test_paths):
+        lowered = tuple(part.casefold() for part in path.parts)
+        filename = lowered[-1]
+        if (
+            any(part in {".git", "__pycache__", "secrets", "credentials", "logs"} for part in lowered)
+            or any(part == ".env" or part.startswith(".env.") for part in lowered)
+            or any("transcript" in part or "secret" in part or "credential" in part or "password" in part for part in lowered)
+            or filename in {"token", "token.txt", "token.json"}
+            or PurePosixPath(filename).suffix in {".log", ".pyc", ".pyo"}
+        ):
+            raise TeamPackageError("declared package path uses a forbidden sensitive name")
+    canonical = {
+        PurePosixPath("factory-candidate.json"),
+        PurePosixPath("team_manifest.json"),
+        PurePosixPath("evidence/build.json"),
+        PurePosixPath("evidence/real-case.json"),
+        PurePosixPath("evidence/hermes-factory-skill-usage-receipt.json"),
+        PurePosixPath("evidence/codex-build-receipt.json"),
+    }
+    allowed = {*source_paths, *test_paths, *canonical}
+    if not set(files).issubset(allowed):
+        raise TeamPackageError("source archive contains a member outside the closed safe file set")
+    tools = _require_list(manifest.get("tools"), "team tools")
+    for tool in tools:
+        if not isinstance(tool, dict):
+            raise TeamPackageError("team tool declaration is invalid")
+        if _safe_path(tool.get("implementation_path"), "tool implementation") not in source_paths:
+            raise TeamPackageError("tool implementation is not a declared source file")
+        if _safe_path(tool.get("test_path"), "tool test") not in test_paths:
+            raise TeamPackageError("tool test is not a declared test file")
 
 
 def _validate_tools(compiled: Mapping[str, Any], manifest: Mapping[str, Any], files: Mapping[PurePosixPath, bytes]) -> None:
@@ -382,4 +632,5 @@ __all__ = [
     "require_exact_topology",
     "seal_team_package",
     "validate_team_package",
+    "verify_sealed_team_package",
 ]
