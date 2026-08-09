@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
+import hashlib
+import importlib
 from pathlib import Path
 from uuid import UUID, uuid5
 
@@ -25,6 +28,7 @@ from agenten.agent_factory.service import FactoryRepositoryError
 from agenten.agent_runtime.captain_production_adapters import (
     ContentAddressedArtifactAdapter,
 )
+from agenten.agent_runtime.contracts import ArtifactRef
 
 
 NOW = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
@@ -175,11 +179,14 @@ def test_production_builder_binds_the_current_resume_execution_port(
         CapabilityLiveCurrentAuthorities,
         build_current_authority_capability_live_runner,
     )
+    from gateway.capability_live_runtime_resume import (
+        GatewayCapabilityResumeExecutionAdapter,
+    )
 
     composition = object()
     provisioning = object()
     projection = object()
-    resume_execution = object()
+    resume_execution = GatewayCapabilityResumeExecutionAdapter(gateway=object())
 
     runner = build_current_authority_capability_live_runner(
         repository_root=tmp_path,
@@ -344,3 +351,152 @@ def test_provisioner_preflights_n8n_writers_before_registering_a_factory_job(
 
     assert repository.jobs == {}
     assert repository.batches == []
+
+
+def test_default_entrypoint_loads_digest_bound_current_authorities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = tmp_path / "capability_authorities.py"
+    source = """
+from gateway.capability_live_production_builder import CapabilityLiveCurrentAuthorities
+from gateway.capability_live_runtime_resume import GatewayCapabilityResumeExecutionAdapter
+
+
+def build_capability_live_authorities(context):
+    return CapabilityLiveCurrentAuthorities(
+        factory=object(),
+        provisioning=object(),
+        minibook_effects=object(),
+        resume_execution=GatewayCapabilityResumeExecutionAdapter(gateway=object()),
+    )
+""".strip()
+    adapter.write_text(source, encoding="utf-8")
+    monkeypatch.setenv("CAPTAIN_GATEWAY_URL", "http://127.0.0.1:8090")
+    monkeypatch.setenv("CAPTAIN_GATEWAY_TOKEN", "test-token")
+    monkeypatch.setenv("CAPTAIN_BENCHMARK_PROVIDER", "openai")
+    monkeypatch.setenv("CAPTAIN_BENCHMARK_MODEL", "gpt-5.6-terra")
+    monkeypatch.setenv("MINIBOOK_BACKEND_URL", "http://127.0.0.1:3456")
+    monkeypatch.setenv("MINIBOOK_PROJECTION_API_KEY", "test-projection-key")
+    monkeypatch.setenv("CAPTAIN_CAPABILITY_LIVE_ADAPTER", adapter.name)
+    monkeypatch.setenv(
+        "CAPTAIN_CAPABILITY_LIVE_ADAPTER_SHA256",
+        hashlib.sha256(adapter.read_bytes()).hexdigest(),
+    )
+
+    entrypoint = importlib.import_module(
+        "agenten.agent_factory.capability_live_entrypoint"
+    )
+    runner = entrypoint._compose_current_gateway_runner(tmp_path)
+
+    assert runner._pipeline._execution._resume_execution is not None
+
+
+def test_default_entrypoint_blocks_when_current_authority_env_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entrypoint = importlib.import_module(
+        "agenten.agent_factory.capability_live_entrypoint"
+    )
+    for name in (
+        "CAPTAIN_GATEWAY_URL",
+        "CAPTAIN_GATEWAY_TOKEN",
+        "CAPTAIN_BENCHMARK_PROVIDER",
+        "CAPTAIN_BENCHMARK_MODEL",
+        "MINIBOOK_BACKEND_URL",
+        "MINIBOOK_PROJECTION_API_KEY",
+        "CAPTAIN_CAPABILITY_LIVE_ADAPTER",
+        "CAPTAIN_CAPABILITY_LIVE_ADAPTER_SHA256",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(
+        entrypoint.CapabilityLiveEntrypointError,
+        match="configuration is blocked",
+    ):
+        entrypoint._compose_current_gateway_runner(tmp_path)
+
+
+def test_gateway_resume_adapter_returns_only_gateway_observed_authorities() -> None:
+    from gateway.capability_live_pipeline import (
+        CapabilityExecutionAuthority,
+        CapabilityResumeAuthorization,
+        CapabilityResumeExecutionRequest,
+    )
+    from gateway.capability_live_runtime_resume import (
+        GatewayCapabilityResumeExecutionAdapter,
+    )
+
+    job_id = uuid5(RUN_ID, "resume-job")
+    reservation_id = uuid5(RUN_ID, "resume-reservation")
+    correlation_id = uuid5(RUN_ID, "resume-correlation")
+    authorization = CapabilityResumeAuthorization(
+        job_id=job_id,
+        reservation_id=reservation_id,
+        correlation_id=correlation_id,
+        capability_id="incident-command",
+        capability_version=1,
+        authorization_receipt_id=uuid5(RUN_ID, "gateway-authorization"),
+        evidence_refs=(
+            ArtifactRef(
+                uri="artifact://resume/" + "a" * 64,
+                sha256="a" * 64,
+                media_type="application/json",
+            ),
+        ),
+    )
+    execution = CapabilityExecutionAuthority(
+        job_id=job_id,
+        correlation_id=correlation_id,
+        capability_id="incident-command",
+        capability_version=1,
+        execution_authority_id=authorization.authorization_receipt_id,
+        execution_command_id=uuid5(RUN_ID, "gateway-command"),
+        execution_result_id=uuid5(RUN_ID, "gateway-result"),
+        evidence_refs=(
+            ArtifactRef(
+                uri="artifact://resume/" + "b" * 64,
+                sha256="b" * 64,
+                media_type="application/json",
+            ),
+        ),
+        booked_cost_usd=Decimal("0.33"),
+        terminal_status="succeeded",
+        replayed=False,
+    )
+
+    class Gateway:
+        async def authorize_resume(
+            self, request: CapabilityResumeExecutionRequest
+        ) -> CapabilityResumeAuthorization | None:
+            assert request.job_id == job_id
+            return authorization
+
+        async def dispatch_resume(
+            self, observed: CapabilityResumeAuthorization
+        ) -> CapabilityExecutionAuthority | None:
+            assert observed is authorization
+            return execution
+
+        async def readback_resume(
+            self, observed: CapabilityResumeAuthorization
+        ) -> CapabilityExecutionAuthority | None:
+            assert observed is authorization
+            return execution
+
+    adapter = GatewayCapabilityResumeExecutionAdapter(gateway=Gateway())
+    request = CapabilityResumeExecutionRequest(
+        job_id=job_id,
+        reservation_id=reservation_id,
+        correlation_id=correlation_id,
+        capability_id="incident-command",
+        capability_version=1,
+        original_execution_command_id=uuid5(RUN_ID, "original-command"),
+        original_execution_result_id=uuid5(RUN_ID, "original-result"),
+    )
+
+    observed = asyncio.run(adapter.authorize_resume(request))
+    assert observed == authorization
+    assert asyncio.run(adapter.dispatch_resume(authorization)) == execution
+    assert asyncio.run(adapter.readback_resume(authorization)) == execution

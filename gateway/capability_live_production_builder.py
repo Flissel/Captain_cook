@@ -8,10 +8,13 @@ fakes.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import ModuleType
 
 from agenten.agent_factory.capability_live_runner import CapabilityLiveRunner
 from gateway.agent_factory_live_composition import (
@@ -22,7 +25,9 @@ from gateway.agent_factory_live_composition import (
 from gateway.capability_live_factory_adapter import CapabilityFactoryProvisioningPort
 from gateway.capability_live_current_adapters import (
     CapabilityProjectionEffectsPort,
-    CapabilityResumeExecutionPort,
+)
+from gateway.capability_live_runtime_resume import (
+    GatewayCapabilityResumeExecutionAdapter,
 )
 
 
@@ -39,7 +44,15 @@ class CapabilityLiveCurrentAuthorities:
     factory: AgentFactoryLiveComposition
     provisioning: CapabilityFactoryProvisioningPort
     minibook_effects: CapabilityProjectionEffectsPort
-    resume_execution: CapabilityResumeExecutionPort
+    resume_execution: GatewayCapabilityResumeExecutionAdapter
+
+
+@dataclass(frozen=True)
+class CapabilityLiveAuthorityAdapterContext:
+    """Verified local context supplied to the configured authority factory."""
+
+    repository_root: Path
+    settings: "CapabilityLiveProductionSettings"
 
 
 @dataclass(frozen=True)
@@ -107,9 +120,90 @@ def build_current_authority_capability_live_runner(
     )
 
 
+def build_current_authority_capability_live_runner_from_environment(
+    *,
+    repository_root: Path,
+    environment: Mapping[str, str],
+    clock: Callable[[], datetime] | None = None,
+) -> CapabilityLiveRunner:
+    """Load a digest-bound local authority factory before composing the runner.
+
+    The configured module supplies real Factory, projection, and runtime ports;
+    this assembly validates local configuration and module bytes only.  It does
+    not contact Gateway, Minibook, providers, or n8n while bootstrapping.
+    """
+
+    root = repository_root.resolve(strict=True)
+    settings = CapabilityLiveProductionSettings.from_environment(environment)
+    relative_path = environment.get("CAPTAIN_CAPABILITY_LIVE_ADAPTER", "").strip()
+    expected_digest = environment.get(
+        "CAPTAIN_CAPABILITY_LIVE_ADAPTER_SHA256", ""
+    ).strip()
+    if not relative_path or not _is_sha256(expected_digest):
+        raise CapabilityLiveProductionConfigurationError(
+            "current capability live authority adapter is blocked"
+        )
+    adapter_path = (root / relative_path).resolve(strict=True)
+    if not adapter_path.is_relative_to(root) or not adapter_path.is_file():
+        raise CapabilityLiveProductionConfigurationError(
+            "current capability live authority adapter is unavailable"
+        )
+    try:
+        source = adapter_path.read_bytes()
+    except OSError as exc:
+        raise CapabilityLiveProductionConfigurationError(
+            "current capability live authority adapter is unavailable"
+        ) from exc
+    if not hmac.compare_digest(hashlib.sha256(source).hexdigest(), expected_digest):
+        raise CapabilityLiveProductionConfigurationError(
+            "current capability live authority adapter digest changed"
+        )
+    module = ModuleType(
+        f"_captain_capability_authorities_{expected_digest[:16]}"
+    )
+    module.__file__ = str(adapter_path)
+    try:
+        exec(compile(source, str(adapter_path), "exec", dont_inherit=True), module.__dict__)
+    except Exception as exc:
+        raise CapabilityLiveProductionConfigurationError(
+            "current capability live authority adapter could not load"
+        ) from exc
+    factory = getattr(module, "build_capability_live_authorities", None)
+    if not callable(factory):
+        raise CapabilityLiveProductionConfigurationError(
+            "current capability live authority adapter factory is unavailable"
+        )
+    try:
+        authorities = factory(
+            CapabilityLiveAuthorityAdapterContext(
+                repository_root=root,
+                settings=settings,
+            )
+        )
+    except Exception as exc:
+        raise CapabilityLiveProductionConfigurationError(
+            "current capability live authority adapter could not compose"
+        ) from exc
+    if not isinstance(authorities, CapabilityLiveCurrentAuthorities):
+        raise CapabilityLiveProductionConfigurationError(
+            "current capability live authority adapter returned invalid authorities"
+        )
+    return build_current_authority_capability_live_runner(
+        repository_root=root,
+        authorities=authorities,
+        clock=clock,
+    )
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
 __all__ = [
+    "CapabilityLiveAuthorityAdapterContext",
     "CapabilityLiveCurrentAuthorities",
     "CapabilityLiveProductionConfigurationError",
     "CapabilityLiveProductionSettings",
     "build_current_authority_capability_live_runner",
+    "build_current_authority_capability_live_runner_from_environment",
 ]

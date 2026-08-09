@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from collections.abc import Callable, Sequence
 from decimal import Decimal, InvalidOperation
@@ -266,18 +267,19 @@ def _positive_decimal(value: object) -> Decimal:
 
 
 def _compose_current_gateway_runner(repository_root: Path) -> CapabilityLiveRunnerPort:
-    """Reach the production Gateway composition and preserve its fail-closed gap."""
+    """Load the configured current-authority graph for the normal CLI path."""
 
-    from gateway.agent_factory_live_composition import (
-        GatewayCapabilityLiveCompositionError,
-        compose_gateway_capability_live_runner,
+    from gateway.capability_live_production_builder import (
+        CapabilityLiveProductionConfigurationError,
+        build_current_authority_capability_live_runner_from_environment,
     )
 
     try:
-        return compose_gateway_capability_live_runner(
+        return build_current_authority_capability_live_runner_from_environment(
             repository_root=repository_root,
+            environment=os.environ,
         )
-    except GatewayCapabilityLiveCompositionError as exc:
+    except CapabilityLiveProductionConfigurationError as exc:
         raise CapabilityLiveEntrypointError(str(exc)) from exc
 
 
