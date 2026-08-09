@@ -56,6 +56,7 @@ from gateway.capability_live_pipeline import (
     CapabilityFactoryAuthority,
     CapabilityProjectionAuthority,
     CapabilityResumeAuthorization,
+    CapabilityResumeExecutionRequest,
 )
 
 
@@ -408,11 +409,13 @@ class _Resume:
     def __init__(self, *, available: bool = True) -> None:
         self.available = available
         self.calls: list[str] = []
+        self.requests: list[CapabilityResumeExecutionRequest] = []
         self.authorization: CapabilityResumeAuthorization | None = None
         self.execution: CapabilityExecutionAuthority | None = None
 
-    async def authorize_resume(self, request):
+    async def authorize_resume(self, request: CapabilityResumeExecutionRequest):
         self.calls.append("authorize")
+        self.requests.append(request)
         if not self.available:
             return None
         self.authorization = CapabilityResumeAuthorization(
@@ -979,6 +982,14 @@ def test_complete_assembly_returns_validated_final_evidence_and_uses_d1_chain() 
     assert execution.calls == ["input-1", "input-2", "input-3"]
     assert projection.calls == ["input-1", "input-2", "input-3"]
     assert resume.calls == ["authorize", "dispatch", "readback"]
+    assert len(resume.requests) == 1
+    assert resume.requests[0].run_id == ASSEMBLY_ID
+    assert resume.requests[0].input_id == "input-1"
+    assert resume.requests[0].maximum_cost_usd == Decimal("2.00")
+    assert resume.requests[0].booked_cost_usd == Decimal("1.00")
+    assert evidence.restart.resume_actual_spend_usd == Decimal("0")
+    assert evidence.restart.total_booked_cost_usd == Decimal("1.00")
+    assert evidence.restart.resume_budget_violation is False
 
 
 def test_missing_d1_authority_fails_closed_without_final_evidence() -> None:

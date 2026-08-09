@@ -320,6 +320,11 @@ class CapabilityAssemblyController:
             resumed_execution_result_id=resumed.execution_result_id,
             projection_event_id=first.projection_event_id,
             projection_readback_id=first.projection_readback_id,
+            resume_actual_spend_usd=(
+                resumed.resume_actual_spend_usd or Decimal("0")
+            ),
+            total_booked_cost_usd=resumed.booked_cost_usd,
+            resume_budget_violation=resumed.resume_budget_violation,
         )
         booked = sum(
             (capability.booked_cost_usd for capability in capabilities),
@@ -725,10 +730,15 @@ class CapabilityAssemblyController:
         first = self._completed_capability(current.items[0])
         if first.execution_command_id is None or first.execution_result_id is None:
             raise CapabilityAssemblyIncomplete("original execution evidence is unavailable")
+        reservation = current.items[0].request.reservation
         authorization = await self._resume.authorize_resume(
             CapabilityResumeExecutionRequest(
                 job_id=first.job_id,
-                reservation_id=current.items[0].request.reservation.reservation_id,
+                reservation_id=reservation.reservation_id,
+                run_id=reservation.run_id,
+                input_id=current.items[0].request.input_id,
+                maximum_cost_usd=reservation.maximum_cost_usd,
+                booked_cost_usd=first.booked_cost_usd,
                 correlation_id=first.correlation_id,
                 capability_id=first.capability_id,
                 capability_version=first.capability_version,
