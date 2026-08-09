@@ -310,6 +310,13 @@ class CapabilityProductionProcessBindingV1(BaseModel):
     health_url: str
     execute_url: str | None = None
     authentication: Literal["bearer"] = "bearer"
+    credential_env: Literal[
+        "CAPTAIN_GATEWAY_TOKEN",
+        "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+        "CAPTAIN_RUNTIME_TOKEN",
+        "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
+        "MINIBOOK_API_KEY",
+    ]
 
 
 class CapabilityProductionBundleManifestV1(BaseModel):
@@ -408,14 +415,27 @@ def load_capability_production_bundle_manifest(
         "provider_context_reference_header": "X-Captain-Provider-Context-Ref",
         "provider_policy_sha256": raw["CAPTAIN_PROVIDER_POLICY_SHA256"],
         "provider_price_card_sha256": raw["CAPTAIN_PROVIDER_PRICE_CARD_SHA256"],
-        "gateway": _process_binding("gateway", gateway, f"{gateway}/healthz"),
+        "gateway": _process_binding(
+            "gateway", gateway, f"{gateway}/v1/capability-assemblies/health",
+            credential_env="CAPTAIN_GATEWAY_TOKEN",
+        ),
         "benchmark": _process_binding(
             "benchmark", benchmark.removesuffix("/v1/execute"),
             benchmark.removesuffix("/v1/execute") + "/healthz", benchmark,
+            credential_env="CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
         ),
-        "runtime": _process_binding("runtime", runtime, f"{runtime}/healthz"),
-        "provider_proxy": _process_binding("provider_proxy", provider, f"{provider}/healthz"),
-        "minibook": _process_binding("minibook", minibook, f"{minibook}/healthz"),
+        "runtime": _process_binding(
+            "runtime", runtime, f"{runtime}/health",
+            credential_env="CAPTAIN_RUNTIME_TOKEN",
+        ),
+        "provider_proxy": _process_binding(
+            "provider_proxy", provider, f"{provider}/healthz",
+            credential_env="CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
+        ),
+        "minibook": _process_binding(
+            "minibook", minibook, f"{minibook}/health",
+            credential_env="MINIBOOK_API_KEY",
+        ),
     }
     digest = hashlib.sha256(
         json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
@@ -426,7 +446,8 @@ def load_capability_production_bundle_manifest(
 
 
 def _process_binding(
-    service: str, base_url: str, health_url: str, execute_url: str | None = None
+    service: str, base_url: str, health_url: str, execute_url: str | None = None,
+    *, credential_env: str,
 ) -> dict[str, object]:
     return {
         "service": service,
@@ -434,6 +455,7 @@ def _process_binding(
         "health_url": health_url,
         "execute_url": execute_url,
         "authentication": "bearer",
+        "credential_env": credential_env,
     }
 
 
@@ -832,7 +854,7 @@ def _benchmark_payload(request: GenericBenchmarkRecordingRequest) -> dict[str, o
 
 
 class GatewayGenericCapabilityPromotion:
-    """Delegate promotion to the existing workflow promotion implementation."""
+    """Issue a Gateway promotion only after the persisted generic benchmark gate."""
 
     def __init__(
         self,
@@ -860,9 +882,6 @@ class GatewayGenericCapabilityPromotion:
             binding.job.job_id,
             stop_before_action=FactoryActionKind.VALIDATE_FOR_PROMOTION,
         )
-        result = await self._adapter.promote(converted)
-        if not isinstance(result, CapabilityFactoryAuthority):
-            raise CapabilityLiveAuthorityUnavailable("Factory promotion is unavailable")
         if request.suite_ref is None:  # type: ignore[union-attr]
             raise CapabilityLiveAuthorityUnavailable("generic benchmark suite is unavailable")
         receipt = self._recorder.receipt_for(
@@ -873,15 +892,39 @@ class GatewayGenericCapabilityPromotion:
             job_id=binding.job.job_id,
             suite_sha256=request.suite_ref.sha256,  # type: ignore[union-attr]
         )
-        return result.model_copy(
-            update={
-                "benchmark_authority_id": receipt.authority_id,
-                "benchmark_summary_ref": receipt.summary_ref,
-                "normal_trace_ids": traces,
-                "evidence_refs": tuple(
-                    dict.fromkeys((*result.evidence_refs, *receipt.evidence_refs))
-                ),
-            }
+        if request.hermes_result_ref is None:  # type: ignore[union-attr]
+            raise CapabilityLiveAuthorityUnavailable("Hermes release evidence is unavailable")
+        try:
+            projection_event = self.gateway_store.record_generic_capability_promotion(
+                job_id=binding.job.job_id,
+                suite_sha256=request.suite_ref.sha256,  # type: ignore[union-attr]
+                occurred_at=self._adapter._clock(),
+            )
+            release_id = UUID(str(projection_event["event_id"]))
+            booked = self._factory.workflow_budget_projection(
+                binding.job.job_id
+            ).consumed_usd
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway generic promotion authority is unavailable"
+            ) from None
+        return CapabilityFactoryAuthority(
+            stage=CapabilityLiveStage.PROMOTE,
+            input_id=request.input.input_id,  # type: ignore[union-attr]
+            source_ref=request.input.source_ref,  # type: ignore[union-attr]
+            job_id=binding.job.job_id,
+            correlation_id=binding.job.correlation_id,
+            subject_version=binding.job.subject_version,
+            capability_id=binding.job.required_capability,
+            capability_version=binding.job.subject_version,
+            suite_ref=request.suite_ref,  # type: ignore[arg-type,union-attr]
+            hermes_result_ref=request.hermes_result_ref,  # type: ignore[arg-type,union-attr]
+            evidence_refs=receipt.evidence_refs,
+            booked_cost_usd=booked,
+            normal_trace_ids=traces,
+            benchmark_authority_id=receipt.authority_id,
+            benchmark_summary_ref=receipt.summary_ref,
+            release_authority_id=release_id,
         )
 
 
@@ -914,28 +957,21 @@ class GatewayCapabilityProjectionAuthority:
         self.gateway_store = gateway_store
 
     async def projection_event(self, event_id: UUID) -> MinibookProjectionEvent | None:
+        generic = self.gateway_store.generic_capability_promotion(event_id)
+        if generic is not None:
+            try:
+                return MinibookProjectionEvent.model_validate(generic)
+            except ValueError:
+                raise CapabilityLiveAuthorityUnavailable(
+                    "Gateway generic promotion event is invalid"
+                ) from None
         source = self.gateway_store.factory_promotion_source(event_id)
         if source is None:
             return None
         block, job = source
         summary = _promotion_benchmark_summary(self.gateway_store, block)
         event = factory_promotion_projection(block, job, benchmark_summary=summary)
-        generic_summary_sha256 = _one_generic_summary_sha256(
-            self.gateway_store, UUID(str(block["job_id"]))
-        )
-        material = "|".join(
-            (
-                str(block["job_id"]),
-                str(job["required_capability"]),
-                str(block["subject_version"]),
-                str(block["event_id"]),
-                generic_summary_sha256,
-            )
-        )
-        digest = f"sha256:{hashlib.sha256(material.encode()).hexdigest()}"
-        return event.model_copy(
-            update={"payload": event.payload.model_copy(update={"artifact_digest": digest})}
-        )
+        return event
 
     async def capability_promotion_event(
         self, release: CapabilityFactoryAuthority
@@ -959,16 +995,26 @@ class GatewayCapabilityProjectionAuthority:
     async def projection_readback(
         self, event_id: UUID
     ) -> CapabilityProjectionReadback | None:
-        source = self.gateway_store.factory_promotion_source(event_id)
         event = await self.projection_event(event_id)
-        if source is None or event is None:
+        if event is None:
             return None
-        block, _ = source
+        generic = self.gateway_store.generic_capability_promotion(event_id)
+        source = None if generic is not None else self.gateway_store.factory_promotion_source(event_id)
+        if generic is not None:
+            job_id = UUID(str(event.subject_id).removeprefix("subject:"))
+            project_id = f"factory:{job_id}"
+            run_id = "generic-benchmark-promotion"
+        elif source is not None:
+            block, _ = source
+            project_id = f"factory:{block['job_id']}"
+            run_id = f"attempt:{block['attempt']}"
+        else:
+            return None
         mirrors = tuple(
             item
             for item in self.gateway_store.delivery_events(
-                project_id=f"factory:{block['job_id']}",
-                run_id=f"attempt:{block['attempt']}",
+                project_id=project_id,
+                run_id=run_id,
             )
             if item.event_type == "registry_mirror"
             and item.trace.trace_id == f"minibook-projection:{event_id}"
@@ -1028,20 +1074,6 @@ def _promotion_benchmark_summary(store: GatewayStore, block: dict[str, Any]):
     if summary is None:
         raise CapabilityLiveAuthorityUnavailable("Factory benchmark summary is unavailable")
     return summary
-
-
-def _one_generic_summary_sha256(store: GatewayStore, job_id: UUID) -> str:
-    with store.storage.transaction() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT summary_sha256 FROM capability_generic_benchmarks "
-                "WHERE job_id = %s ORDER BY created_at",
-                (str(job_id),),
-            )
-            rows = tuple(cursor.fetchall())
-    if len(rows) != 1 or _SHA256.fullmatch(str(rows[0]["summary_sha256"])) is None:
-        raise CapabilityLiveAuthorityUnavailable("generic benchmark summary is ambiguous")
-    return str(rows[0]["summary_sha256"])
 
 
 @dataclass(frozen=True)

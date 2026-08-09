@@ -36,12 +36,19 @@ def test_operator_manifest_is_digest_bound_and_contains_real_process_contracts()
     assert manifest.schema_name == "captain.capability-production-bundle-manifest.v1"
     assert manifest.provider_supervisor_mode == "dynamic_gateway_context_v1"
     assert manifest.provider_context_reference_header == "X-Captain-Provider-Context-Ref"
-    assert manifest.gateway.health_url == "http://127.0.0.1:8090/healthz"
+    assert manifest.gateway.health_url == (
+        "http://127.0.0.1:8090/v1/capability-assemblies/health"
+    )
     assert manifest.benchmark.execute_url == "http://127.0.0.1:8092/v1/execute"
     assert manifest.benchmark.health_url == "http://127.0.0.1:8092/healthz"
     assert manifest.provider_proxy.health_url == "http://127.0.0.1:18091/v1/healthz"
-    assert manifest.runtime.health_url == "http://127.0.0.1:8091/healthz"
-    assert manifest.minibook.health_url == "http://127.0.0.1:8080/healthz"
+    assert manifest.runtime.health_url == "http://127.0.0.1:8091/health"
+    assert manifest.minibook.health_url == "http://127.0.0.1:8080/health"
+    assert manifest.gateway.credential_env == "CAPTAIN_GATEWAY_TOKEN"
+    assert manifest.benchmark.credential_env == "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN"
+    assert manifest.runtime.credential_env == "CAPTAIN_RUNTIME_TOKEN"
+    assert manifest.provider_proxy.credential_env == "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"
+    assert manifest.minibook.credential_env == "MINIBOOK_API_KEY"
     assert len(manifest.manifest_sha256) == 64
     assert manifest.manifest_sha256 == load_capability_production_bundle_manifest(
         environment=environment
@@ -66,4 +73,3 @@ def test_operator_manifest_fails_closed_before_probe_on_missing_or_reused_creden
         match="configuration is incomplete",
     ):
         load_capability_production_bundle_manifest(environment=environment)
-
