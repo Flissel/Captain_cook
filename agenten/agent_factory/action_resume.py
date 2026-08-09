@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Protocol
+from threading import Lock
+from typing import Callable, Literal, Protocol
 from uuid import UUID
 
 from agenten.agent_factory.forge_contracts import (
@@ -12,23 +15,47 @@ from agenten.agent_factory.forge_contracts import (
 )
 
 
-class FactoryActionConsumer(Protocol):
-    def get(
-        self, request_id: UUID, *, tenant_id: str, now: datetime
-    ) -> FactoryActionRequestV1: ...
+@dataclass(frozen=True)
+class FactoryActionResumeRecord:
+    request: FactoryActionRequestV1
+    response: FactoryActionResponseV1
+    phase: Literal[
+        "answered",
+        "projection_intent",
+        "projection_acknowledged",
+        "continuation_intent",
+        "continuation_acknowledged",
+    ]
+    projection_idempotency_key: str
+    continuation_idempotency_key: str
 
-    def consume(
+
+class FactoryActionConsumer(Protocol):
+    def prepare_projection(
+        self, request_id: UUID, *, tenant_id: str, now: datetime
+    ) -> FactoryActionResumeRecord: ...
+
+    def acknowledge_projection(
         self,
         request_id: UUID,
         *,
         tenant_id: str,
-        factory_job_id: UUID,
-        creation_job_id: UUID,
-        correlation_id: UUID,
-        expected_subject_version: int,
-        safe_checkpoint_sha256: str,
+        idempotency_key: str,
         now: datetime,
-    ) -> FactoryActionResponseV1: ...
+    ) -> FactoryActionResumeRecord: ...
+
+    def prepare_continuation(
+        self, request_id: UUID, *, tenant_id: str, now: datetime
+    ) -> FactoryActionResumeRecord: ...
+
+    def acknowledge_continuation(
+        self,
+        request_id: UUID,
+        *,
+        tenant_id: str,
+        idempotency_key: str,
+        now: datetime,
+    ) -> FactoryActionResumeRecord: ...
 
 
 class FactoryActionProjection(Protocol):
@@ -57,37 +84,91 @@ class FactoryActionResumeCoordinator:
 
     def resume(self, *, request_id: UUID, tenant_id: str) -> FactoryActionResponseV1:
         now = self._clock()
-        request = self._store.get(request_id, tenant_id=tenant_id, now=now)
-        response = self._store.consume(
-            request_id,
-            tenant_id=tenant_id,
-            factory_job_id=request.factory_job_id,
-            creation_job_id=request.creation_job_id,
-            correlation_id=request.correlation_id,
-            expected_subject_version=request.expected_subject_version,
-            safe_checkpoint_sha256=request.safe_checkpoint_sha256,
-            now=now,
+        state = self._store.prepare_projection(
+            request_id, tenant_id=tenant_id, now=now
         )
-        self._projection.project_factory_action(
-            {
-                "schema": "minibook.factory-action-projection.v1",
-                "request_id": str(request.request_id),
-                "factory_job_id": str(request.factory_job_id),
-                "creation_job_id": str(request.creation_job_id),
-                "correlation_id": str(request.correlation_id),
-                "request_type": request.request_type,
-                "status": "consumed",
-                "safe_checkpoint_sha256": request.safe_checkpoint_sha256,
-            }
+        request = state.request
+        if state.phase == "projection_intent":
+            self._projection.project_factory_action(
+                {
+                    "schema": "minibook.factory-action-projection.v1",
+                    "idempotency_key": state.projection_idempotency_key,
+                    "request_id": str(request.request_id),
+                    "factory_job_id": str(request.factory_job_id),
+                    "creation_job_id": str(request.creation_job_id),
+                    "correlation_id": str(request.correlation_id),
+                    "request_type": request.request_type,
+                    "status": "answered",
+                    "safe_checkpoint_sha256": request.safe_checkpoint_sha256,
+                }
+            )
+            state = self._store.acknowledge_projection(
+                request_id,
+                tenant_id=tenant_id,
+                idempotency_key=state.projection_idempotency_key,
+                now=self._clock(),
+            )
+        if state.phase in {"projection_acknowledged", "continuation_intent"}:
+            state = self._store.prepare_continuation(
+                request_id, tenant_id=tenant_id, now=self._clock()
+            )
+        if state.phase == "continuation_intent":
+            response = state.response
+            self._scheduler.schedule_factory_continuation(
+                idempotency_key=state.continuation_idempotency_key,
+                factory_job_id=request.factory_job_id,
+                creation_job_id=request.creation_job_id,
+                correlation_id=request.correlation_id,
+                expected_subject_version=request.expected_subject_version,
+                safe_checkpoint_ref=request.safe_checkpoint_ref,
+                approved_scope=response.approved_scope,
+                credential_ref=response.credential_ref,
+                answer_metadata=response.answer_metadata,
+            )
+            state = self._store.acknowledge_continuation(
+                request_id,
+                tenant_id=tenant_id,
+                idempotency_key=state.continuation_idempotency_key,
+                now=self._clock(),
+            )
+        return state.response
+
+
+class FactoryActionResumeService:
+    """Submit durable resume work to a dedicated worker without blocking HTTP."""
+
+    def __init__(
+        self,
+        *,
+        coordinator: FactoryActionResumeCoordinator,
+        recovery_source: Callable[[], tuple[tuple[UUID, str], ...]] | None = None,
+    ) -> None:
+        self._coordinator = coordinator
+        self._recovery_source = recovery_source or (lambda: ())
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="factory-action-resume"
         )
-        self._scheduler.schedule_factory_continuation(
-            factory_job_id=request.factory_job_id,
-            creation_job_id=request.creation_job_id,
-            correlation_id=request.correlation_id,
-            expected_subject_version=request.expected_subject_version,
-            safe_checkpoint_ref=request.safe_checkpoint_ref,
-            approved_scope=response.approved_scope,
-            credential_ref=response.credential_ref,
-            answer_metadata=response.answer_metadata,
+        self._lock = Lock()
+        self._futures: set[Future[object]] = set()
+
+    def enqueue(self, *, request_id: UUID, tenant_id: str) -> None:
+        future = self._executor.submit(
+            self._coordinator.resume, request_id=request_id, tenant_id=tenant_id
         )
-        return response
+        with self._lock:
+            self._futures.add(future)
+        future.add_done_callback(self._completed)
+
+    def recover(self) -> None:
+        for request_id, tenant_id in self._recovery_source():
+            self.enqueue(request_id=request_id, tenant_id=tenant_id)
+
+    def _completed(self, future: Future[object]) -> None:
+        with self._lock:
+            self._futures.discard(future)
+        # Retrieve the exception so the executor does not silently retain it.
+        # Durable intent remains retryable and is recovered by a later enqueue.
+        future.exception()
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=True)

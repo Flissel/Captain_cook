@@ -14,7 +14,13 @@ from agenten.agent_factory.forge_contracts import (
     FactoryActionResponseV1,
 )
 from blockchain.mariadb_storage import MariaDBStorage
-from gateway.factory_action_store import FactoryActionRow, FactoryActionStore
+from gateway.factory_action_store import (
+    FactoryActionRow,
+    FactoryActionStore,
+    _canonical,
+    _canonical_request_payload,
+    _db_row,
+)
 from tests.support.mariadb import assert_isolated_test_database
 
 
@@ -79,6 +85,9 @@ class TransactionalMemoryActionRepository:
             if row.tenant_id == tenant_id and row.status == status
         )
 
+    def resume_rows(self) -> tuple[FactoryActionRow, ...]:
+        return tuple(row for row in self.rows.values() if row.status == "answered")
+
     @contextmanager
     def locked(self, request_id, *, tenant_id: str):
         row = self.rows.get(str(request_id))
@@ -93,6 +102,36 @@ class TransactionalMemoryActionRepository:
                 and (request_id is None or row.request.request_id == request_id)
             ):
                 row.status = "expired"
+
+
+def canonical_db_row() -> dict[str, object]:
+    request = pending_request()
+    response = action_response(request)
+    request_payload = _canonical_request_payload(request, "tenant-a").decode()
+    response_payload = _canonical(response).decode()
+    import hashlib
+
+    return {
+        "request_id": str(request.request_id),
+        "tenant_id": "tenant-a",
+        "factory_job_id": str(request.factory_job_id),
+        "creation_job_id": str(request.creation_job_id),
+        "correlation_id": str(request.correlation_id),
+        "expected_subject_version": request.expected_subject_version,
+        "safe_checkpoint_sha256": request.safe_checkpoint_sha256,
+        "deadline_at": request.deadline_at.replace(tzinfo=None),
+        "status": "answered",
+        "request_payload": request_payload,
+        "request_sha256": hashlib.sha256(_canonical(request)).hexdigest(),
+        "response_payload": response_payload,
+        "response_sha256": hashlib.sha256(response_payload.encode()).hexdigest(),
+        "resume_phase": "answered",
+        "projection_idempotency_key": None,
+        "projection_acknowledged_at": None,
+        "continuation_idempotency_key": None,
+        "continuation_acknowledged_at": None,
+        "consumed_at": None,
+    }
 
 
 @pytest.fixture
@@ -115,7 +154,7 @@ def test_deterministic_repository_covers_replay_conflict_and_restart(
     assert restarted.list(tenant_id="tenant-b", status="pending", now=NOW) == ()
 
 
-def test_deterministic_repository_covers_answer_fences_and_consume_once(
+def test_deterministic_repository_covers_answer_fences_and_blocks_early_consume(
     memory_repository: TransactionalMemoryActionRepository,
 ) -> None:
     request = pending_request()
@@ -140,17 +179,7 @@ def test_deterministic_repository_covers_answer_fences_and_consume_once(
             safe_checkpoint_sha256=request.safe_checkpoint_sha256,
             now=NOW,
         )
-    assert store.consume(
-        request.request_id,
-        tenant_id="tenant-a",
-        factory_job_id=request.factory_job_id,
-        creation_job_id=request.creation_job_id,
-        correlation_id=request.correlation_id,
-        expected_subject_version=request.expected_subject_version,
-        safe_checkpoint_sha256=request.safe_checkpoint_sha256,
-        now=NOW,
-    ) == response
-    with pytest.raises(ValueError, match="already consumed"):
+    with pytest.raises(ValueError, match="effects are not acknowledged"):
         store.consume(
             request.request_id,
             tenant_id="tenant-a",
@@ -185,9 +214,70 @@ def test_deterministic_repository_covers_stale_scope_and_expiry(
         }
     )
     store.create(expired, tenant_id="tenant-a")
-    with pytest.raises(TimeoutError, match="expired"):
-        store.answer(action_response(expired), tenant_id="tenant-a", now=NOW)
     assert store.get(expired.request_id, tenant_id="tenant-a", now=NOW).status == "expired"
+
+
+@pytest.mark.parametrize(
+    ("column", "replacement"),
+    [
+        ("request_id", "00000000-0000-0000-0000-000000000999"),
+        ("tenant_id", "tenant-b"),
+        ("factory_job_id", "00000000-0000-0000-0000-000000000999"),
+        ("creation_job_id", "00000000-0000-0000-0000-000000000999"),
+        ("correlation_id", "00000000-0000-0000-0000-000000000999"),
+        ("expected_subject_version", 99),
+        ("safe_checkpoint_sha256", "f" * 64),
+        ("deadline_at", datetime(2027, 1, 1)),
+        ("status", "consumed"),
+        ("request_sha256", "f" * 64),
+        ("response_sha256", "f" * 64),
+        ("resume_phase", "continuation_intent"),
+    ],
+)
+def test_db_row_rejects_hash_or_denormalized_column_tampering(
+    column: str, replacement: object
+) -> None:
+    row = canonical_db_row()
+    row[column] = replacement
+    with pytest.raises(ValueError, match="factory action durable row"):
+        _db_row(row)
+
+
+def test_db_row_rejects_request_and_response_payload_tampering() -> None:
+    import json
+
+    request_row = canonical_db_row()
+    request_envelope = json.loads(str(request_row["request_payload"]))
+    request_envelope["tenant_id"] = "tenant-b"
+    request_row["request_payload"] = json.dumps(
+        request_envelope, sort_keys=True, separators=(",", ":")
+    )
+    with pytest.raises(ValueError, match="factory action durable row"):
+        _db_row(request_row)
+
+    response_row = canonical_db_row()
+    response_payload = json.loads(str(response_row["response_payload"]))
+    response_payload["idempotency_key"] = "d" * 64
+    response_row["response_payload"] = json.dumps(
+        response_payload, sort_keys=True, separators=(",", ":")
+    )
+    with pytest.raises(ValueError, match="factory action durable row"):
+        _db_row(response_row)
+
+
+def test_db_row_rejects_rehashed_response_identity_drift() -> None:
+    import hashlib
+
+    row = canonical_db_row()
+    request = pending_request()
+    drifted = action_response(request).model_copy(
+        update={"request_id": UUID("00000000-0000-0000-0000-000000000999")}
+    )
+    encoded = _canonical(drifted)
+    row["response_payload"] = encoded.decode()
+    row["response_sha256"] = hashlib.sha256(encoded).hexdigest()
+    with pytest.raises(ValueError, match="response binding"):
+        _db_row(row)
 def test_create_list_read_and_restart_are_tenant_scoped(storage: MariaDBStorage) -> None:
     request = pending_request()
     first = FactoryActionStore(storage)
@@ -242,24 +332,14 @@ def test_answer_is_version_scope_expiry_and_replay_fenced(storage: MariaDBStorag
     assert store.get(expired.request_id, tenant_id="tenant-a", now=NOW).status == "expired"
 
 
-def test_consume_once_requires_exact_job_and_checkpoint(storage: MariaDBStorage) -> None:
+def test_consume_cannot_bypass_durable_effect_acknowledgements(storage: MariaDBStorage) -> None:
     request = pending_request()
     store = FactoryActionStore(storage)
     store.create(request, tenant_id="tenant-a")
     response = store.answer(action_response(request), tenant_id="tenant-a", now=NOW)
 
-    consumed = store.consume(
-        request.request_id,
-        tenant_id="tenant-a",
-        factory_job_id=request.factory_job_id,
-        creation_job_id=request.creation_job_id,
-        correlation_id=request.correlation_id,
-        expected_subject_version=request.expected_subject_version,
-        safe_checkpoint_sha256=request.safe_checkpoint_sha256,
-        now=NOW,
-    )
-    assert consumed == response
-    with pytest.raises(ValueError, match="already consumed"):
+    assert response == action_response(request)
+    with pytest.raises(ValueError, match="effects are not acknowledged"):
         store.consume(
             request.request_id,
             tenant_id="tenant-a",

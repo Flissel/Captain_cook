@@ -225,6 +225,14 @@ class FakePortalGatewayStore:
         return "credential://org-a/n8n-crm-read"
 
 
+class RecordingResumeDispatcher:
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[UUID, str]] = []
+
+    def enqueue(self, *, request_id: UUID, tenant_id: str) -> None:
+        self.enqueued.append((request_id, tenant_id))
+
+
 def settings() -> GatewaySettings:
     return GatewaySettings(
         ledger_dsn=SecretStr("mysql://unused:unused@127.0.0.1:3306/captain_test"),
@@ -236,12 +244,18 @@ def settings() -> GatewaySettings:
     )
 
 
-def client_for(principal: PortalPrincipalV1, store: FakePortalGatewayStore) -> TestClient:
+def client_for(
+    principal: PortalPrincipalV1,
+    store: FakePortalGatewayStore,
+    *,
+    resume_dispatcher: RecordingResumeDispatcher | None = None,
+) -> TestClient:
     application = create_app(
         gateway_store=store,
         mirror=NullMirror(),
         settings=settings(),
         portal_clock=lambda: NOW,
+        factory_action_resume_dispatcher=resume_dispatcher,
     )
     application.state.portal_token_verifier = StaticVerifier(principal)
     return TestClient(application)
@@ -283,6 +297,23 @@ def test_factory_action_routes_are_authenticated_tenant_scoped_and_secret_free()
     with client_for(PortalPrincipalV1(subject_id="user-b", organization_id="org-b"), store) as client:
         assert client.get("/v1/portal/factory-actions?status=pending", headers=auth()).json() == []
         assert client.get(f"/v1/portal/factory-actions/{store.factory_action.request_id}", headers=auth()).status_code == 404
+
+
+def test_answer_dispatches_durable_resume_without_running_it_in_http_handler() -> None:
+    store = FakePortalGatewayStore()
+    dispatcher = RecordingResumeDispatcher()
+    principal = PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+    response_payload = FactoryActionResponseV1.model_validate_json(
+        (Path(__file__).parents[1] / "fixtures" / "contracts" / "factory_action_response.v1.json").read_text(encoding="utf-8")
+    ).model_dump(mode="json", by_alias=True)
+    with client_for(principal, store, resume_dispatcher=dispatcher) as client:
+        answered = client.post(
+            f"/v1/portal/factory-actions/{store.factory_action.request_id}/responses",
+            headers=auth(),
+            json=response_payload,
+        )
+    assert answered.status_code == 200
+    assert dispatcher.enqueued == [(store.factory_action.request_id, "org-a")]
 
 
 def test_org_b_cannot_read_org_a_setup_or_issue_org_a_ticket() -> None:

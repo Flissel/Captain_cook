@@ -88,6 +88,12 @@ from gateway.portal_contracts import (
     PortalTenantBindingV1,
 )
 from agenten.agent_factory.forge_contracts import FactoryActionRequestV1, FactoryActionResponseV1
+from agenten.agent_factory.action_resume import (
+    FactoryContinuationScheduler,
+    FactoryActionProjection,
+    FactoryActionResumeCoordinator,
+    FactoryActionResumeService,
+)
 from gateway.registry_feed import mirror_captain_projection
 from gateway.registry_feed import (
     MinibookProjectionFeedPage,
@@ -122,6 +128,10 @@ from gateway.portal_live_contracts import (
     PortalProviderProbeRequestV1,
     PortalRestartReceiptV1,
 )
+
+
+class FactoryActionResumeDispatcher(Protocol):
+    def enqueue(self, *, request_id: UUID, tenant_id: str) -> None: ...
 
 
 logger = logging.getLogger(__name__)
@@ -275,9 +285,15 @@ def create_app(
     portal_verification_source: PortalCredentialVerificationSource | None = None,
     portal_clock: Callable[[], datetime] | None = None,
     factory_credential_adapter: FactoryCredentialAdapter | None = None,
+    factory_action_resume_dispatcher: FactoryActionResumeDispatcher | None = None,
+    factory_action_projection: FactoryActionProjection | None = None,
+    factory_continuation_scheduler: FactoryContinuationScheduler | None = None,
 ) -> FastAPI:
+    if (factory_action_projection is None) != (factory_continuation_scheduler is None):
+        raise ValueError("factory action projection and continuation scheduler must be configured together")
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
+    resume_service_lock = Lock()
     def configured_store(
         target_storage: MariaDBStorage,
         configured: GatewaySettings | None,
@@ -316,15 +332,23 @@ def create_app(
     portal_control_boot_id = str(uuid4())
     sink_calls: list[dict[str, Any]] = []
 
+    owned_resume_service: FactoryActionResumeService | None = None
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         load_gateway_settings(app)
         start = getattr(mirror, "start", None)
         if start:
             await start()
+        resume_dispatcher = get_factory_action_resume_dispatcher()
+        recover = getattr(resume_dispatcher, "recover", None)
+        if recover is not None:
+            recover()
         try:
             yield
         finally:
+            if owned_resume_service is not None:
+                owned_resume_service.close()
             stop = getattr(mirror, "stop", None)
             if stop:
                 await stop()
@@ -378,6 +402,26 @@ def create_app(
                     dsn = configured.ledger_dsn.get_secret_value()
                     store = configured_store(MariaDBStorage(dsn), configured)
         return store
+
+    def get_factory_action_resume_dispatcher() -> FactoryActionResumeDispatcher | None:
+        nonlocal owned_resume_service
+        if factory_action_resume_dispatcher is not None:
+            return factory_action_resume_dispatcher
+        if factory_action_projection is None or factory_continuation_scheduler is None:
+            return None
+        with resume_service_lock:
+            if owned_resume_service is None:
+                consumer = get_store().factory_action_resume_consumer()
+                owned_resume_service = FactoryActionResumeService(
+                    coordinator=FactoryActionResumeCoordinator(
+                        store=consumer,
+                        projection=factory_action_projection,
+                        scheduler=factory_continuation_scheduler,
+                        clock=portal_clock,
+                    ),
+                    recovery_source=consumer.resume_candidates,
+                )
+        return owned_resume_service
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -708,12 +752,19 @@ def create_app(
         principal: PortalPrincipalV1 = Depends(require_portal_principal),
     ) -> FactoryActionResponseV1:
         try:
-            return get_store().answer_portal_factory_action(
+            answered = get_store().answer_portal_factory_action(
                 request_id=request_id,
                 principal=principal,
                 response=response,
                 now=portal_clock(),
             )
+            resume_dispatcher = get_factory_action_resume_dispatcher()
+            if resume_dispatcher is not None:
+                resume_dispatcher.enqueue(
+                    request_id=request_id,
+                    tenant_id=principal.organization_id,
+                )
+            return answered
         except LookupError:
             raise HTTPException(status_code=404, detail="factory action not found") from None
         except (ValueError, TimeoutError) as error:

@@ -292,6 +292,10 @@ class GatewayStore:
     ) -> FactoryActionRequestV1:
         return self._factory_actions.create(request, tenant_id=tenant_id)
 
+    def factory_action_resume_consumer(self) -> FactoryActionStore:
+        """Expose the durable Action Inbox state machine to the resume worker."""
+        return self._factory_actions
+
     def portal_factory_actions(
         self,
         *,

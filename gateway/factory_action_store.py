@@ -15,10 +15,22 @@ from agenten.agent_factory.forge_contracts import (
     FactoryActionResponseV1,
     validate_action_response_binding,
 )
+from agenten.agent_factory.action_resume import FactoryActionResumeRecord
 from blockchain.mariadb_storage import MariaDBStorage
 
 
 ActionStatus = Literal["pending", "answered", "expired", "consumed"]
+ResumePhase = Literal[
+    "answered",
+    "projection_intent",
+    "projection_acknowledged",
+    "continuation_intent",
+    "continuation_acknowledged",
+]
+
+
+class FactoryActionDurabilityError(ValueError):
+    """A persisted Action Inbox row no longer matches its canonical payload."""
 
 
 @dataclass
@@ -30,6 +42,11 @@ class FactoryActionRow:
     status: ActionStatus = "pending"
     response: FactoryActionResponseV1 | None = None
     response_sha256: str | None = None
+    resume_phase: ResumePhase | None = None
+    projection_idempotency_key: str | None = None
+    projection_acknowledged_at: datetime | None = None
+    continuation_idempotency_key: str | None = None
+    continuation_acknowledged_at: datetime | None = None
     consumed_at: datetime | None = None
 
 
@@ -39,6 +56,8 @@ class FactoryActionRepository(Protocol):
     def list_rows(
         self, *, tenant_id: str, status: str
     ) -> tuple[FactoryActionRow, ...]: ...
+
+    def resume_rows(self) -> tuple[FactoryActionRow, ...]: ...
 
     def locked(
         self, request_id: UUID, *, tenant_id: str
@@ -85,6 +104,12 @@ class FactoryActionStore:
         return tuple(
             row.request.model_copy(update={"status": row.status})
             for row in self._repository.list_rows(tenant_id=tenant_id, status=status)
+        )
+
+    def resume_candidates(self) -> tuple[tuple[UUID, str], ...]:
+        return tuple(
+            (row.request.request_id, row.tenant_id)
+            for row in self._repository.resume_rows()
         )
 
     def get(
@@ -135,6 +160,7 @@ class FactoryActionStore:
                     row.response = response
                     row.response_sha256 = hashlib.sha256(canonical).hexdigest()
                     row.status = "answered"
+                    row.resume_phase = "answered"
                     outcome = response
         if error is not None:
             raise error
@@ -154,47 +180,115 @@ class FactoryActionStore:
         safe_checkpoint_sha256: str,
         now: datetime,
     ) -> FactoryActionResponseV1:
-        outcome: FactoryActionResponseV1 | None = None
-        error: Exception | None = None
         with self._repository.locked(request_id, tenant_id=tenant_id) as row:
             if row is None:
-                error = LookupError("factory action not found")
-            elif row.status == "consumed":
-                error = ValueError("factory action already consumed")
-            elif row.status != "answered":
-                error = ValueError("factory action is not answered")
-            else:
-                request = row.request
-                expected = (
-                    factory_job_id,
-                    creation_job_id,
-                    correlation_id,
-                    expected_subject_version,
-                    safe_checkpoint_sha256,
+                raise LookupError("factory action not found")
+            request = row.request
+            expected = (
+                factory_job_id,
+                creation_job_id,
+                correlation_id,
+                expected_subject_version,
+                safe_checkpoint_sha256,
+            )
+            actual = (
+                request.factory_job_id,
+                request.creation_job_id,
+                request.correlation_id,
+                request.expected_subject_version,
+                request.safe_checkpoint_sha256,
+            )
+            if actual != expected:
+                raise ValueError("factory action resume fence mismatch")
+            if row.status == "consumed":
+                raise ValueError("factory action already consumed")
+            raise ValueError("factory action resume effects are not acknowledged")
+
+    def prepare_projection(
+        self, request_id: UUID, *, tenant_id: str, now: datetime
+    ) -> FactoryActionResumeRecord:
+        with self._repository.locked(request_id, tenant_id=tenant_id) as row:
+            self._validate_resumable(row, now=now)
+            assert row is not None and row.response is not None
+            if row.resume_phase == "answered":
+                row.projection_idempotency_key = _effect_key(
+                    request_id, "projection", row.response_sha256
                 )
-                actual = (
-                    request.factory_job_id,
-                    request.creation_job_id,
-                    request.correlation_id,
-                    request.expected_subject_version,
-                    request.safe_checkpoint_sha256,
+                row.resume_phase = "projection_intent"
+            return _resume_record(row)
+
+    def acknowledge_projection(
+        self,
+        request_id: UUID,
+        *,
+        tenant_id: str,
+        idempotency_key: str,
+        now: datetime,
+    ) -> FactoryActionResumeRecord:
+        with self._repository.locked(request_id, tenant_id=tenant_id) as row:
+            self._validate_resumable(row, now=now)
+            assert row is not None
+            if row.projection_idempotency_key != idempotency_key:
+                raise ValueError("factory action projection acknowledgement mismatch")
+            if row.resume_phase == "projection_intent":
+                row.projection_acknowledged_at = _aware_utc(now)
+                row.resume_phase = "projection_acknowledged"
+            elif row.resume_phase not in {
+                "projection_acknowledged",
+                "continuation_intent",
+                "continuation_acknowledged",
+            }:
+                raise ValueError("factory action projection is not pending")
+            return _resume_record(row)
+
+    def prepare_continuation(
+        self, request_id: UUID, *, tenant_id: str, now: datetime
+    ) -> FactoryActionResumeRecord:
+        with self._repository.locked(request_id, tenant_id=tenant_id) as row:
+            self._validate_resumable(row, now=now)
+            assert row is not None
+            if row.resume_phase == "projection_acknowledged":
+                row.continuation_idempotency_key = _effect_key(
+                    request_id, "continuation", row.response_sha256
                 )
-                if actual != expected:
-                    error = ValueError("factory action resume fence mismatch")
-                elif request.deadline_at <= _aware_utc(now):
-                    row.status = "expired"
-                    error = TimeoutError("factory action expired")
-                elif row.response is None:
-                    error = ValueError("factory action response missing")
-                else:
-                    row.status = "consumed"
-                    row.consumed_at = _aware_utc(now)
-                    outcome = row.response
-        if error is not None:
-            raise error
-        if outcome is None:
-            raise RuntimeError("factory action consume produced no outcome")
-        return outcome
+                row.resume_phase = "continuation_intent"
+            if row.resume_phase not in {"continuation_intent", "continuation_acknowledged"}:
+                raise ValueError("factory action projection is not acknowledged")
+            return _resume_record(row)
+
+    def acknowledge_continuation(
+        self,
+        request_id: UUID,
+        *,
+        tenant_id: str,
+        idempotency_key: str,
+        now: datetime,
+    ) -> FactoryActionResumeRecord:
+        with self._repository.locked(request_id, tenant_id=tenant_id) as row:
+            self._validate_resumable(row, now=now)
+            assert row is not None
+            if row.continuation_idempotency_key != idempotency_key:
+                raise ValueError("factory action continuation acknowledgement mismatch")
+            if row.resume_phase == "continuation_intent":
+                acknowledged_at = _aware_utc(now)
+                row.continuation_acknowledged_at = acknowledged_at
+                row.resume_phase = "continuation_acknowledged"
+                row.status = "consumed"
+                row.consumed_at = acknowledged_at
+            elif row.resume_phase != "continuation_acknowledged":
+                raise ValueError("factory action continuation is not pending")
+            return _resume_record(row)
+
+    @staticmethod
+    def _validate_resumable(row: FactoryActionRow | None, *, now: datetime) -> None:
+        if row is None:
+            raise LookupError("factory action not found")
+        if row.status not in {"answered", "consumed"} or row.response is None:
+            raise ValueError("factory action is not answered")
+        if row.request.deadline_at <= _aware_utc(now) and row.status != "consumed":
+            raise TimeoutError("factory action expired")
+        if row.resume_phase is None:
+            raise FactoryActionDurabilityError("factory action durable row has no resume phase")
 
 
 class MariaDBFactoryActionRepository:
@@ -220,8 +314,14 @@ class MariaDBFactoryActionRepository:
                         deadline_at DATETIME(6) NOT NULL,
                         status VARCHAR(16) NOT NULL,
                         request_payload JSON NOT NULL,
+                        request_sha256 CHAR(64) NULL,
                         response_payload JSON NULL,
                         response_sha256 CHAR(64) NULL,
+                        resume_phase VARCHAR(32) NULL,
+                        projection_idempotency_key CHAR(64) NULL,
+                        projection_acknowledged_at DATETIME(6) NULL,
+                        continuation_idempotency_key CHAR(64) NULL,
+                        continuation_acknowledged_at DATETIME(6) NULL,
                         consumed_at DATETIME(6) NULL,
                         created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                         updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
@@ -233,6 +333,17 @@ class MariaDBFactoryActionRepository:
                     ) ENGINE=InnoDB
                     """
                 )
+                for definition in (
+                    "request_sha256 CHAR(64) NULL",
+                    "resume_phase VARCHAR(32) NULL",
+                    "projection_idempotency_key CHAR(64) NULL",
+                    "projection_acknowledged_at DATETIME(6) NULL",
+                    "continuation_idempotency_key CHAR(64) NULL",
+                    "continuation_acknowledged_at DATETIME(6) NULL",
+                ):
+                    cursor.execute(
+                        f"ALTER TABLE factory_action_inbox ADD COLUMN IF NOT EXISTS {definition}"
+                    )
 
     def create(self, row: FactoryActionRow) -> FactoryActionRow:
         request = row.request
@@ -243,15 +354,17 @@ class MariaDBFactoryActionRepository:
                        (request_id, tenant_id, factory_job_id, creation_job_id,
                         correlation_id, expected_subject_version,
                         safe_checkpoint_sha256, deadline_at, status,
-                        request_payload, response_payload, response_sha256, consumed_at)
+                        request_payload, request_sha256, response_payload,
+                        response_sha256, resume_phase, consumed_at)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s,
-                               NULL, NULL, NULL)""",
+                               %s, NULL, NULL, NULL, NULL)""",
                     (
                         str(request.request_id), row.tenant_id,
                         str(request.factory_job_id), str(request.creation_job_id),
                         str(request.correlation_id), request.expected_subject_version,
                         request.safe_checkpoint_sha256, _naive_utc(request.deadline_at),
-                        _canonical(request).decode("utf-8"),
+                        _canonical_request_payload(request, row.tenant_id).decode("utf-8"),
+                        hashlib.sha256(_canonical(request)).hexdigest(),
                     ),
                 )
                 cursor.execute(
@@ -275,6 +388,15 @@ class MariaDBFactoryActionRepository:
                 )
                 return tuple(_db_row(row) for row in cursor.fetchall())
 
+    def resume_rows(self) -> tuple[FactoryActionRow, ...]:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT * FROM factory_action_inbox WHERE status = 'answered' "
+                    "ORDER BY updated_at, request_id"
+                )
+                return tuple(_db_row(row) for row in cursor.fetchall())
+
     @contextmanager
     def locked(self, request_id: UUID, *, tenant_id: str):
         with self.storage.transaction() as connection:
@@ -291,11 +413,20 @@ class MariaDBFactoryActionRepository:
                     cursor.execute(
                         """UPDATE factory_action_inbox SET status = %s,
                            response_payload = %s, response_sha256 = %s,
-                           consumed_at = %s WHERE request_id = %s AND tenant_id = %s""",
+                           resume_phase = %s, projection_idempotency_key = %s,
+                           projection_acknowledged_at = %s,
+                           continuation_idempotency_key = %s,
+                           continuation_acknowledged_at = %s, consumed_at = %s
+                           WHERE request_id = %s AND tenant_id = %s""",
                         (
                             row.status,
                             None if row.response is None else _canonical(row.response).decode("utf-8"),
                             row.response_sha256,
+                            row.resume_phase,
+                            row.projection_idempotency_key,
+                            None if row.projection_acknowledged_at is None else _naive_utc(row.projection_acknowledged_at),
+                            row.continuation_idempotency_key,
+                            None if row.continuation_acknowledged_at is None else _naive_utc(row.continuation_acknowledged_at),
                             None if row.consumed_at is None else _naive_utc(row.consumed_at),
                             str(request_id), tenant_id,
                         ),
@@ -330,22 +461,154 @@ def _canonical(model: FactoryActionRequestV1 | FactoryActionResponseV1) -> bytes
 
 
 def _db_row(row: dict[str, object]) -> FactoryActionRow:
-    request = FactoryActionRequestV1.model_validate_json(_json_bytes(row["request_payload"]))
+    request_bytes = _json_bytes(row["request_payload"])
+    try:
+        envelope = json.loads(request_bytes)
+        if not isinstance(envelope, dict) or set(envelope) != {"request", "tenant_id"}:
+            raise ValueError("invalid request envelope")
+        request = FactoryActionRequestV1.model_validate(envelope["request"])
+        payload_tenant = str(envelope["tenant_id"])
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise FactoryActionDurabilityError("factory action durable row request invalid") from error
+    request_canonical = _canonical(request)
     response_payload = row.get("response_payload")
-    response = (
-        None
-        if response_payload is None
-        else FactoryActionResponseV1.model_validate_json(_json_bytes(response_payload))
-    )
+    try:
+        response = (
+            None
+            if response_payload is None
+            else FactoryActionResponseV1.model_validate_json(_json_bytes(response_payload))
+        )
+    except ValueError as error:
+        raise FactoryActionDurabilityError(
+            "factory action durable row response invalid"
+        ) from error
+    response_canonical = None if response is None else _canonical(response)
     consumed = row.get("consumed_at")
-    return FactoryActionRow(
+    status = str(row["status"])
+    phase = row.get("resume_phase")
+    expected_request = (
+        str(request.request_id),
+        str(request.factory_job_id),
+        str(request.creation_job_id),
+        str(request.correlation_id),
+        request.expected_subject_version,
+        request.safe_checkpoint_sha256,
+        _naive_utc(request.deadline_at),
+    )
+    actual_request = (
+        str(row["request_id"]),
+        str(row["factory_job_id"]),
+        str(row["creation_job_id"]),
+        str(row["correlation_id"]),
+        int(row["expected_subject_version"]),
+        str(row["safe_checkpoint_sha256"]),
+        _naive_utc(row["deadline_at"]),  # type: ignore[arg-type]
+    )
+    request_digest = hashlib.sha256(request_canonical).hexdigest()
+    response_digest = None if response_canonical is None else hashlib.sha256(response_canonical).hexdigest()
+    valid_state = (
+        (status == "pending" and response is None and phase is None)
+        or (status == "answered" and response is not None and phase in {
+            "answered", "projection_intent", "projection_acknowledged", "continuation_intent"
+        })
+        or (status == "consumed" and response is not None and phase == "continuation_acknowledged")
+        or (status == "expired" and response is None and phase is None)
+    )
+    if (
+        request_bytes != _canonical_request_payload(request, payload_tenant)
+        or str(row.get("request_sha256")) != request_digest
+        or payload_tenant != str(row["tenant_id"])
+        or actual_request != expected_request
+        or (response_payload is not None and _json_bytes(response_payload) != response_canonical)
+        or (None if row.get("response_sha256") is None else str(row["response_sha256"])) != response_digest
+        or not valid_state
+    ):
+        raise FactoryActionDurabilityError("factory action durable row integrity mismatch")
+    if response is not None:
+        try:
+            validate_action_response_binding(request, response)
+        except ValueError as error:
+            raise FactoryActionDurabilityError(
+                "factory action durable row response binding mismatch"
+            ) from error
+    if response is not None and response.credential_ref is not None:
+        tenant_from_response = response.credential_ref.removeprefix("credential://").split("/", 1)[0]
+        if tenant_from_response != str(row["tenant_id"]):
+            raise FactoryActionDurabilityError("factory action durable row tenant mismatch")
+    result = FactoryActionRow(
         request=request,
         tenant_id=str(row["tenant_id"]),
-        status=str(row["status"]),  # type: ignore[arg-type]
+        status=status,  # type: ignore[arg-type]
         response=response,
         response_sha256=(None if row.get("response_sha256") is None else str(row["response_sha256"])),
+        resume_phase=(None if phase is None else str(phase)),  # type: ignore[arg-type]
+        projection_idempotency_key=(None if row.get("projection_idempotency_key") is None else str(row["projection_idempotency_key"])),
+        projection_acknowledged_at=_optional_aware(row.get("projection_acknowledged_at")),
+        continuation_idempotency_key=(None if row.get("continuation_idempotency_key") is None else str(row["continuation_idempotency_key"])),
+        continuation_acknowledged_at=_optional_aware(row.get("continuation_acknowledged_at")),
         consumed_at=(None if consumed is None else _aware_utc(consumed)),  # type: ignore[arg-type]
     )
+    if result.tenant_id == "" or not _valid_phase_columns(result):
+        raise FactoryActionDurabilityError("factory action durable row phase mismatch")
+    return result
+
+
+def _effect_key(request_id: UUID, effect: str, response_sha256: str | None) -> str:
+    if response_sha256 is None:
+        raise FactoryActionDurabilityError("factory action durable row response hash missing")
+    return hashlib.sha256(f"{request_id}:{effect}:{response_sha256}".encode()).hexdigest()
+
+
+def _canonical_request_payload(request: FactoryActionRequestV1, tenant_id: str) -> bytes:
+    return json.dumps(
+        {
+            "request": request.model_dump(mode="json", by_alias=True),
+            "tenant_id": tenant_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _resume_record(row: FactoryActionRow) -> FactoryActionResumeRecord:
+    if (
+        row.response is None
+        or row.resume_phase is None
+        or row.projection_idempotency_key is None
+    ):
+        raise FactoryActionDurabilityError("factory action durable row resume state incomplete")
+    continuation_key = row.continuation_idempotency_key or _effect_key(
+        row.request.request_id, "continuation", row.response_sha256
+    )
+    return FactoryActionResumeRecord(
+        request=row.request,
+        response=row.response,
+        phase=row.resume_phase,
+        projection_idempotency_key=row.projection_idempotency_key,
+        continuation_idempotency_key=continuation_key,
+    )
+
+
+def _optional_aware(value: object) -> datetime | None:
+    return None if value is None else _aware_utc(value)  # type: ignore[arg-type]
+
+
+def _valid_phase_columns(row: FactoryActionRow) -> bool:
+    if row.resume_phase == "answered":
+        return row.projection_idempotency_key is None
+    if row.resume_phase == "projection_intent":
+        return row.projection_idempotency_key is not None and row.projection_acknowledged_at is None
+    if row.resume_phase == "projection_acknowledged":
+        return row.projection_idempotency_key is not None and row.projection_acknowledged_at is not None
+    if row.resume_phase == "continuation_intent":
+        return (
+            row.projection_acknowledged_at is not None
+            and row.continuation_idempotency_key is not None
+            and row.continuation_acknowledged_at is None
+        )
+    if row.resume_phase == "continuation_acknowledged":
+        return row.continuation_acknowledged_at is not None and row.consumed_at is not None
+    return row.resume_phase is None
 
 
 def _json_bytes(value: object) -> bytes:
