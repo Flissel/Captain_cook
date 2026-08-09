@@ -77,6 +77,8 @@ from gateway.portal_control_auth import (
 )
 from gateway.portal_n8n_composition import build_portal_n8n_adapter_bundle
 from gateway.portal_contracts import (
+    PortalFactoryCredentialReferenceV1,
+    PortalFactoryCredentialWriteV1,
     PortalPrincipalV1,
     PortalSetupActionRequestV1,
     PortalSetupSelectionRequestV1,
@@ -85,6 +87,7 @@ from gateway.portal_contracts import (
     PortalSetupTicketV1,
     PortalTenantBindingV1,
 )
+from agenten.agent_factory.forge_contracts import FactoryActionRequestV1, FactoryActionResponseV1
 from gateway.registry_feed import mirror_captain_projection
 from gateway.registry_feed import (
     MinibookProjectionFeedPage,
@@ -98,6 +101,7 @@ from gateway.store import (
     GatewayStore,
     PortalCredentialMetadataSource,
     PortalCredentialVerificationSource,
+    FactoryCredentialAdapter,
 )
 from gateway.integration_setup_contracts import (
     IntegrationSetupMutationV1,
@@ -270,6 +274,7 @@ def create_app(
     portal_credential_source: PortalCredentialMetadataSource | None = None,
     portal_verification_source: PortalCredentialVerificationSource | None = None,
     portal_clock: Callable[[], datetime] | None = None,
+    factory_credential_adapter: FactoryCredentialAdapter | None = None,
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
@@ -286,6 +291,7 @@ def create_app(
             ),
             portal_credential_source=portal_credential_source,
             portal_verification_source=portal_verification_source,
+            factory_credential_adapter=factory_credential_adapter,
         )
         if (
             configured is not None
@@ -671,6 +677,72 @@ def create_app(
             persisted,
             n8n_ui_base_url=configured.captain_n8n_ui_url,
         )
+
+    @app.get("/v1/portal/factory-actions")
+    async def list_portal_factory_actions(
+        status_filter: Literal["pending", "answered", "expired", "consumed"] = Query(
+            default="pending", alias="status"
+        ),
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> tuple[FactoryActionRequestV1, ...]:
+        return get_store().portal_factory_actions(
+            principal=principal, status=status_filter, now=portal_clock()
+        )
+
+    @app.get("/v1/portal/factory-actions/{request_id}")
+    async def read_portal_factory_action(
+        request_id: UUID,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> FactoryActionRequestV1:
+        try:
+            return get_store().portal_factory_action(
+                request_id=request_id, principal=principal, now=portal_clock()
+            )
+        except LookupError:
+            raise HTTPException(status_code=404, detail="factory action not found") from None
+
+    @app.post("/v1/portal/factory-actions/{request_id}/responses")
+    async def answer_portal_factory_action(
+        request_id: UUID,
+        response: FactoryActionResponseV1,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> FactoryActionResponseV1:
+        try:
+            return get_store().answer_portal_factory_action(
+                request_id=request_id,
+                principal=principal,
+                response=response,
+                now=portal_clock(),
+            )
+        except LookupError:
+            raise HTTPException(status_code=404, detail="factory action not found") from None
+        except (ValueError, TimeoutError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+
+    @app.post(
+        "/v1/portal/factory-actions/{request_id}/credentials",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def store_portal_factory_credential(
+        request_id: UUID,
+        request: PortalFactoryCredentialWriteV1,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> PortalFactoryCredentialReferenceV1:
+        try:
+            reference = await run_in_threadpool(
+                get_store().store_portal_factory_credential,
+                request_id=request_id,
+                principal=principal,
+                request=request,
+                now=portal_clock(),
+            )
+            return PortalFactoryCredentialReferenceV1(credential_ref=reference)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="factory action not found") from None
+        except RuntimeError:
+            raise HTTPException(status_code=503, detail="credential store unavailable") from None
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
 
     @app.post("/v1/factory/budget/reservations", status_code=status.HTTP_201_CREATED)
     async def reserve_factory_budget(

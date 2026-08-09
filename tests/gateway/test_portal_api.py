@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from pathlib import Path
 from threading import Event
 from typing import Any
 from uuid import UUID
@@ -20,6 +21,7 @@ from gateway.portal_contracts import (
     PortalSetupTicketV1,
     PortalTenantBindingV1,
 )
+from agenten.agent_factory.forge_contracts import FactoryActionRequestV1, FactoryActionResponseV1
 from gateway.settings import GatewaySettings
 from tests.gateway.test_integration_setup_api import ready_setup_payload, setup_payload
 from tests.agent_factory.test_state_machine import job
@@ -148,6 +150,11 @@ class FakePortalGatewayStore:
         self.owner = "org-a"
         self.used: list[tuple[str, str]] = []
         self.ticket_principal: PortalPrincipalV1 | None = None
+        fixture_root = Path(__file__).parents[1] / "fixtures" / "contracts"
+        self.factory_action = FactoryActionRequestV1.model_validate_json(
+            (fixture_root / "factory_action_request.v1.json").read_text(encoding="utf-8")
+        )
+        self.factory_answer: FactoryActionResponseV1 | None = None
 
     def provision_portal_tenant(self, binding):
         if binding.job_id != JOB_ID:
@@ -197,6 +204,26 @@ class FakePortalGatewayStore:
         self.used.append((principal.organization_id, request.action))
         return self.persisted
 
+    def portal_factory_actions(self, *, principal, status, now):
+        if principal.organization_id != self.owner:
+            return ()
+        return (self.factory_action,) if status == self.factory_action.status else ()
+
+    def portal_factory_action(self, *, request_id, principal, now):
+        if principal.organization_id != self.owner or request_id != self.factory_action.request_id:
+            raise LookupError("factory action not found")
+        return self.factory_action
+
+    def answer_portal_factory_action(self, *, request_id, principal, response, now):
+        self.portal_factory_action(request_id=request_id, principal=principal, now=now)
+        self.factory_answer = response
+        return response
+
+    def store_portal_factory_credential(self, *, request_id, principal, request, now):
+        self.portal_factory_action(request_id=request_id, principal=principal, now=NOW)
+        assert request.secret_value.get_secret_value() == "secret-value"
+        return "credential://org-a/n8n-crm-read"
+
 
 def settings() -> GatewaySettings:
     return GatewaySettings(
@@ -222,6 +249,40 @@ def client_for(principal: PortalPrincipalV1, store: FakePortalGatewayStore) -> T
 
 def auth() -> dict[str, str]:
     return {"Authorization": "Bearer portal-jwt"}
+
+
+def test_factory_action_routes_are_authenticated_tenant_scoped_and_secret_free() -> None:
+    store = FakePortalGatewayStore()
+    with client_for(PortalPrincipalV1(subject_id="user-a", organization_id="org-a"), store) as client:
+        listed = client.get("/v1/portal/factory-actions?status=pending", headers=auth())
+        assert listed.status_code == 200
+        request = listed.json()[0]
+        read = client.get(f"/v1/portal/factory-actions/{request['request_id']}", headers=auth())
+        assert read.status_code == 200
+
+        credential = client.post(
+            f"/v1/portal/factory-actions/{request['request_id']}/credentials",
+            headers=auth(),
+            json={"credential_alias": "n8n-crm-read", "secret_value": "secret-value"},
+        )
+        assert credential.status_code == 201
+        assert credential.json() == {"credential_ref": "credential://org-a/n8n-crm-read"}
+        assert "secret-value" not in credential.text
+
+        response_payload = FactoryActionResponseV1.model_validate_json(
+            (Path(__file__).parents[1] / "fixtures" / "contracts" / "factory_action_response.v1.json").read_text(encoding="utf-8")
+        ).model_copy(update={"credential_ref": credential.json()["credential_ref"]}).model_dump(mode="json", by_alias=True)
+        answered = client.post(
+            f"/v1/portal/factory-actions/{request['request_id']}/responses",
+            headers=auth(),
+            json=response_payload,
+        )
+        assert answered.status_code == 200
+        assert answered.json()["credential_ref"] == "credential://org-a/n8n-crm-read"
+
+    with client_for(PortalPrincipalV1(subject_id="user-b", organization_id="org-b"), store) as client:
+        assert client.get("/v1/portal/factory-actions?status=pending", headers=auth()).json() == []
+        assert client.get(f"/v1/portal/factory-actions/{store.factory_action.request_id}", headers=auth()).status_code == 404
 
 
 def test_org_b_cannot_read_org_a_setup_or_issue_org_a_ticket() -> None:

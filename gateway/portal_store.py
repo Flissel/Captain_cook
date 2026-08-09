@@ -6,7 +6,7 @@ import hashlib
 import json
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Final
+from typing import Final, Protocol
 from uuid import UUID, uuid4
 
 from blockchain.mariadb_storage import MariaDBStorage
@@ -19,6 +19,19 @@ from gateway.portal_contracts import (
 
 
 _INVALID_TICKET: Final = "invalid portal setup ticket"
+
+
+class FactoryCredentialAdapter(Protocol):
+    """Dedicated write-only credential boundary used by Action Inbox."""
+
+    def store_credential(
+        self,
+        *,
+        tenant_id: str,
+        request_id: UUID,
+        credential_alias: str,
+        secret_value: str,
+    ) -> str: ...
 
 
 class PortalTicketStore:

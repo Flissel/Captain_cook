@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from agenten.agent_runtime.contracts import IDENTIFIER_PATTERN
 
@@ -125,6 +125,19 @@ class PortalSetupSelectionRequestV1(PortalSetupTicketUseV1):
     """Explicit secret-free selection of one discovered n8n credential ID."""
 
     credential_id: str = Field(pattern=r"^\S{1,256}$")
+
+
+class PortalFactoryCredentialWriteV1(_FrozenContract):
+    """A write-only credential submitted to the dedicated credential boundary."""
+
+    credential_alias: str = Field(pattern=IDENTIFIER_PATTERN)
+    secret_value: SecretStr = Field(min_length=1, max_length=16_384)
+
+
+class PortalFactoryCredentialReferenceV1(_FrozenContract):
+    """The only credential value allowed to leave the dedicated boundary."""
+
+    credential_ref: str = Field(pattern=r"^credential://[A-Za-z0-9._/-]+$")
 
 
 def _require_utc(value: datetime) -> datetime:

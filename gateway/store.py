@@ -146,6 +146,7 @@ from agenten.agent_factory.integration_setup import (
     N8nCredentialMetadataV1,
 )
 from gateway.portal_contracts import (
+    PortalFactoryCredentialWriteV1,
     PortalPrincipalV1,
     PortalSetupActionRequestV1,
     PortalSetupSelectionRequestV1,
@@ -155,7 +156,9 @@ from gateway.portal_contracts import (
     PortalTicketFenceV1,
     PortalTicketAction,
 )
-from gateway.portal_store import PortalTicketStore
+from gateway.portal_store import FactoryCredentialAdapter, PortalTicketStore
+from gateway.factory_action_store import ActionStatus, FactoryActionStore
+from agenten.agent_factory.forge_contracts import FactoryActionRequestV1, FactoryActionResponseV1
 from gateway.portal_live_contracts import (
     PortalLiveEvidenceQueryV1,
     PortalLiveEvidenceV1,
@@ -271,6 +274,7 @@ class GatewayStore:
         claim_ttl: timedelta = timedelta(minutes=90),
         portal_credential_source: PortalCredentialMetadataSource | None = None,
         portal_verification_source: PortalCredentialVerificationSource | None = None,
+        factory_credential_adapter: FactoryCredentialAdapter | None = None,
     ):
         if claim_ttl <= timedelta(0):
             raise ValueError("claim_ttl must be positive")
@@ -278,8 +282,78 @@ class GatewayStore:
         self._claim_ttl = claim_ttl
         self._portal_credential_source = portal_credential_source
         self._portal_verification_source = portal_verification_source
+        self._factory_credential_adapter = factory_credential_adapter
         self._ensure_schema()
         self._portal_tickets = PortalTicketStore(storage)
+        self._factory_actions = FactoryActionStore(storage)
+
+    def record_factory_action(
+        self, request: FactoryActionRequestV1, *, tenant_id: str
+    ) -> FactoryActionRequestV1:
+        return self._factory_actions.create(request, tenant_id=tenant_id)
+
+    def portal_factory_actions(
+        self,
+        *,
+        principal: PortalPrincipalV1,
+        status: ActionStatus,
+        now: datetime,
+    ) -> tuple[FactoryActionRequestV1, ...]:
+        return self._factory_actions.list(
+            tenant_id=principal.organization_id, status=status, now=now
+        )
+
+    def portal_factory_action(
+        self,
+        *,
+        request_id: UUID,
+        principal: PortalPrincipalV1,
+        now: datetime,
+    ) -> FactoryActionRequestV1:
+        return self._factory_actions.get(
+            request_id, tenant_id=principal.organization_id, now=now
+        )
+
+    def answer_portal_factory_action(
+        self,
+        *,
+        request_id: UUID,
+        principal: PortalPrincipalV1,
+        response: FactoryActionResponseV1,
+        now: datetime,
+    ) -> FactoryActionResponseV1:
+        if response.request_id != request_id:
+            raise ValueError("factory action request_id must match route")
+        return self._factory_actions.answer(
+            response, tenant_id=principal.organization_id, now=now
+        )
+
+    def store_portal_factory_credential(
+        self,
+        *,
+        request_id: UUID,
+        principal: PortalPrincipalV1,
+        request: PortalFactoryCredentialWriteV1,
+        now: datetime,
+    ) -> str:
+        action = self._factory_actions.get(
+            request_id,
+            tenant_id=principal.organization_id,
+            now=now,
+        )
+        if action.status != "pending" or action.request_type != "credential_required":
+            raise ValueError("factory action does not accept a credential")
+        if self._factory_credential_adapter is None:
+            raise RuntimeError("factory credential store unavailable")
+        reference = self._factory_credential_adapter.store_credential(
+            tenant_id=principal.organization_id,
+            request_id=request_id,
+            credential_alias=request.credential_alias,
+            secret_value=request.secret_value.get_secret_value(),
+        )
+        if not reference.startswith(f"credential://{principal.organization_id}/"):
+            raise ValueError("credential adapter returned an invalid reference")
+        return reference
 
     def configure_portal_sources(
         self,
