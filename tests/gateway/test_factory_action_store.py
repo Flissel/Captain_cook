@@ -269,11 +269,6 @@ def test_deterministic_repository_covers_stale_scope_and_expiry(
     ("answered_at", "server_now", "message"),
     [
         (NOW + timedelta(microseconds=1), NOW, "future"),
-        (
-            pending_request().deadline_at + timedelta(microseconds=1),
-            pending_request().deadline_at + timedelta(seconds=1),
-            "deadline",
-        ),
         (NOW - timedelta(hours=1, microseconds=1), NOW, "created"),
         (NOW.replace(tzinfo=None), NOW, "UTC"),
         (NOW.astimezone(timezone(timedelta(hours=2))), NOW, "UTC"),
@@ -306,7 +301,6 @@ def test_answer_rejects_invalid_timestamp_without_a_durable_write(
     ("answered_at", "server_now", "created_at"),
     [
         (NOW, NOW, NOW),
-        (pending_request().deadline_at, pending_request().deadline_at, NOW),
     ],
 )
 def test_answer_accepts_exact_timestamp_boundaries(
@@ -322,6 +316,56 @@ def test_answer_accepts_exact_timestamp_boundaries(
     response = action_response(request, answered_at=answered_at)
 
     assert store.answer(response, tenant_id="tenant-a", now=server_now) == response
+
+
+@pytest.mark.parametrize("observation", ["answer", "get", "list"])
+def test_deadline_equality_converges_to_clean_expired_state_across_race_orders(
+    memory_repository: TransactionalMemoryActionRepository,
+    observation: str,
+) -> None:
+    request = pending_request()
+    deadline = request.deadline_at
+    store = FactoryActionStore(repository=memory_repository)
+    store.create(request, tenant_id="tenant-a")
+
+    if observation == "get":
+        assert store.get(request.request_id, tenant_id="tenant-a", now=deadline).status == "expired"
+    elif observation == "list":
+        assert store.list(tenant_id="tenant-a", status="pending", now=deadline) == ()
+
+    with pytest.raises(TimeoutError, match="expired"):
+        store.answer(
+            action_response(request, answered_at=deadline),
+            tenant_id="tenant-a",
+            now=deadline,
+        )
+
+    restarted = FactoryActionStore(repository=memory_repository)
+    assert restarted.get(request.request_id, tenant_id="tenant-a", now=deadline).status == "expired"
+    durable = memory_repository.rows[str(request.request_id)]
+    assert durable.response is None
+    assert durable.response_sha256 is None
+    assert durable.resume_phase is None
+    assert durable.projection_idempotency_key is None
+    assert durable.continuation_idempotency_key is None
+
+
+def test_restart_recovery_excludes_answered_action_at_deadline(
+    memory_repository: TransactionalMemoryActionRepository,
+) -> None:
+    request = pending_request()
+    before_deadline = request.deadline_at - timedelta(microseconds=1)
+    store = FactoryActionStore(repository=memory_repository)
+    store.create(request, tenant_id="tenant-a")
+    store.answer(
+        action_response(request, answered_at=before_deadline),
+        tenant_id="tenant-a",
+        now=before_deadline,
+    )
+
+    restarted = FactoryActionStore(repository=memory_repository)
+
+    assert restarted.resume_candidates(now=request.deadline_at) == ()
 
 
 @pytest.mark.parametrize(
@@ -565,6 +609,14 @@ def test_db_row_rejects_phase_timestamp_after_action_deadline() -> None:
     row = db_row_for_phase("continuation_acknowledged")
     row["continuation_acknowledged_at"] = pending_request().deadline_at.replace(tzinfo=None) + timedelta(microseconds=1)
     row["consumed_at"] = row["continuation_acknowledged_at"]
+
+    with pytest.raises(ValueError, match="timestamp"):
+        _db_row(row)
+
+
+def test_db_row_rejects_phase_timestamp_at_action_deadline() -> None:
+    row = db_row_for_phase("projection_intent")
+    row["projection_intent_at"] = pending_request().deadline_at.replace(tzinfo=None)
 
     with pytest.raises(ValueError, match="timestamp"):
         _db_row(row)

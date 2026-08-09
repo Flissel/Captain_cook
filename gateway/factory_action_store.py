@@ -109,10 +109,12 @@ class FactoryActionStore:
             for row in self._repository.list_rows(tenant_id=tenant_id, status=status)
         )
 
-    def resume_candidates(self) -> tuple[tuple[UUID, str], ...]:
+    def resume_candidates(self, *, now: datetime) -> tuple[tuple[UUID, str], ...]:
+        now_utc = _aware_utc(now)
         return tuple(
             (row.request.request_id, row.tenant_id)
             for row in self._repository.resume_rows()
+            if row.request.deadline_at > now_utc
         )
 
     def get(
@@ -143,8 +145,14 @@ class FactoryActionStore:
         with self._repository.locked(response.request_id, tenant_id=tenant_id) as row:
             if row is None:
                 error = LookupError("factory action not found")
-            elif answered_at > row.request.deadline_at:
-                raise ValueError("factory action answered_at is after request deadline")
+            elif (
+                row.status == "expired"
+                or now_utc >= row.request.deadline_at
+                or answered_at >= row.request.deadline_at
+            ):
+                if row.status == "pending":
+                    row.status = "expired"
+                error = TimeoutError("factory action expired")
             elif row.created_at is not None and answered_at < row.created_at:
                 raise ValueError("factory action answered_at is before request created_at")
             elif row.status in {"answered", "consumed"}:
@@ -152,9 +160,6 @@ class FactoryActionStore:
                     outcome = row.response
                 else:
                     error = ValueError("conflicting action response")
-            elif row.status == "expired" or row.request.deadline_at < now_utc:
-                row.status = "expired"
-                error = TimeoutError("factory action expired")
             elif response.expected_subject_version != row.request.expected_subject_version:
                 error = ValueError("stale subject version")
             else:
@@ -884,7 +889,7 @@ def _valid_phase_timestamps(row: FactoryActionRow) -> bool:
     )
     if any(left > right for left, right in zip(timestamps, timestamps[1:])):
         return False
-    if timestamps and timestamps[-1] > row.request.deadline_at:
+    if timestamps and timestamps[-1] >= row.request.deadline_at:
         return False
     if row.resume_phase == "continuation_acknowledged":
         return row.consumed_at == row.continuation_acknowledged_at

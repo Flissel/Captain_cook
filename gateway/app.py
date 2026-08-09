@@ -438,7 +438,9 @@ def create_app(
                         scheduler=factory_continuation_scheduler,
                         clock=portal_clock,
                     ),
-                    recovery_source=consumer.resume_candidates,
+                    recovery_source=lambda: consumer.resume_candidates(
+                        now=portal_clock()
+                    ),
                 )
         return owned_resume_service
 

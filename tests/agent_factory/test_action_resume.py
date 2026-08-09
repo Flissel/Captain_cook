@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
 from time import monotonic
@@ -121,6 +121,67 @@ def test_resume_does_not_schedule_when_action_is_not_answered() -> None:
     with pytest.raises(ValueError, match="not answered"):
         coordinator.resume(request_id=request.request_id, tenant_id="tenant-a")
     assert scheduler.values == []
+
+
+def test_resume_at_deadline_writes_no_projection_or_continuation_intent() -> None:
+    request = FactoryActionRequestV1.model_validate_json(
+        (FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8")
+    )
+    before_deadline = request.deadline_at - timedelta(microseconds=1)
+    response = FactoryActionResponseV1.model_validate_json(
+        (FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8")
+    ).model_copy(update={"answered_at": before_deadline})
+    repository = TransactionalMemoryActionRepository()
+    store = FactoryActionStore(repository=repository)
+    store.create(request, tenant_id="tenant-a")
+    store.answer(response, tenant_id="tenant-a", now=before_deadline)
+    projection = RecordingProjection()
+    scheduler = RecordingScheduler()
+
+    with pytest.raises(TimeoutError, match="expired"):
+        FactoryActionResumeCoordinator(
+            store=FactoryActionStore(repository=repository),
+            projection=projection,
+            scheduler=scheduler,
+            clock=lambda: request.deadline_at,
+        ).resume(request_id=request.request_id, tenant_id="tenant-a")
+
+    durable = repository.rows[str(request.request_id)]
+    assert durable.resume_phase == "answered"
+    assert durable.projection_idempotency_key is None
+    assert durable.continuation_idempotency_key is None
+    assert projection.values == []
+    assert scheduler.values == []
+
+
+def test_answer_just_before_deadline_completes_after_restart() -> None:
+    request = FactoryActionRequestV1.model_validate_json(
+        (FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8")
+    )
+    before_deadline = request.deadline_at - timedelta(microseconds=1)
+    response = FactoryActionResponseV1.model_validate_json(
+        (FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8")
+    ).model_copy(update={"answered_at": before_deadline})
+    repository = TransactionalMemoryActionRepository()
+    store = FactoryActionStore(repository=repository)
+    store.create(request, tenant_id="tenant-a")
+    store.answer(response, tenant_id="tenant-a", now=before_deadline)
+    projection = RecordingProjection()
+    scheduler = RecordingScheduler()
+
+    restarted = FactoryActionResumeCoordinator(
+        store=FactoryActionStore(repository=repository),
+        projection=projection,
+        scheduler=scheduler,
+        clock=lambda: before_deadline,
+    )
+
+    assert restarted.resume(request_id=request.request_id, tenant_id="tenant-a") == response
+    durable = repository.rows[str(request.request_id)]
+    assert durable.status == "consumed"
+    assert durable.resume_phase == "continuation_acknowledged"
+    assert len(projection.values) == 1
+    assert len(scheduler.values) == 1
 
 
 @pytest.mark.parametrize("failure_mode", ["before", "after"])
