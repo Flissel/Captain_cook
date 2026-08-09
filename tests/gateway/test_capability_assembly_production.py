@@ -24,9 +24,13 @@ from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
 from agenten.agent_factory.input_compiler import FactoryInputCompiler
 from agenten.agent_factory.input_contracts import (
     BenchmarkExpectedPredicate,
-    PrivateBenchmarkCaseRequirement,
 )
-from agenten.agent_factory.input_document import FactoryInputError, parse_factory_input_bytes
+from agenten.agent_factory.input_document import FactoryInputError, load_factory_input, parse_factory_input_bytes
+from agenten.agent_factory.private_benchmark_catalog import (
+    InMemoryPrivateBenchmarkCatalog,
+    generate_private_benchmark_suite,
+    write_private_benchmark_catalog,
+)
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.delivery.minibook_events import (
     MinibookProjectionAcknowledgementV1,
@@ -344,12 +348,18 @@ def test_async_minibook_adapter_uses_official_projector_contract() -> None:
 
 
 def _settings_environment(root: Path) -> dict[str, str]:
+    repository = Path(__file__).resolve().parents[2]
     paths = (
-        "inputs/a/TO_BE_BUILT.md",
-        "inputs/b/TO_BE_BUILT.md",
-        "inputs/c/TO_BE_BUILT.md",
+        "demo_inputs/agent_factory/sales_pipeline_brief/TO_BE_BUILT.md",
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md",
+        "demo_inputs/agent_factory/claims_resolution/TO_BE_BUILT.md",
     )
-    digests = {path: hashlib.sha256(path.encode()).hexdigest() for path in paths}
+    documents = tuple(load_factory_input(repository / path) for path in paths)
+    digests = {path: document.input_ref.sha256 for path, document in zip(paths, documents, strict=True)}
+    private_root = root.parent / f"{root.name}-captain-private-benchmarks"
+    catalog_ref = write_private_benchmark_catalog(
+        private_root, documents, seed=b"production-settings-test-seed!" * 2,
+    )
     return {
         "CAPTAIN_CAPABILITY_ASSEMBLY_REPOSITORY_REVISION": "a" * 40,
         "CAPTAIN_CAPABILITY_ASSEMBLY_INPUTS_JSON": json.dumps(digests),
@@ -357,6 +367,9 @@ def _settings_environment(root: Path) -> dict[str, str]:
             {digest: [] for digest in digests.values()}
         ),
         "CAPTAIN_CAPABILITY_ASSEMBLY_SUBJECT_VERSION": "1",
+        "CAPTAIN_PRIVATE_BENCHMARK_ROOT": str(private_root.resolve()),
+        "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_PATH": "catalog.json",
+        "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256": catalog_ref.sha256,
         "CAPTAIN_GATEWAY_TOKEN": "gateway-secret-must-not-render",
         "MINIBOOK_PROJECTION_API_KEY": "projection-secret-must-not-render",
         "UNRELATED_ROOT": str(root),
@@ -371,9 +384,9 @@ def test_production_settings_parse_exact_three_digest_bound_inputs_and_redact_re
     )
 
     assert tuple(settings.expected_sha256_by_path) == (
-        "inputs/a/TO_BE_BUILT.md",
-        "inputs/b/TO_BE_BUILT.md",
-        "inputs/c/TO_BE_BUILT.md",
+        "demo_inputs/agent_factory/sales_pipeline_brief/TO_BE_BUILT.md",
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md",
+        "demo_inputs/agent_factory/claims_resolution/TO_BE_BUILT.md",
     )
     assert settings.subject_version == 1
     rendered = repr(settings)
@@ -697,6 +710,56 @@ def test_production_builder_preflights_all_ports_before_repository_schema_effect
                 store=store,
                 resume_gateway=_InvalidResumeGateway(),
             ),
+            holdout_store=InMemoryPrivateHoldoutStore(),
+        )
+
+    assert store.storage.statements == []
+
+
+@pytest.mark.parametrize("mutation", ("missing", "mismatch"))
+def test_production_builder_rejects_private_catalog_before_any_schema_effect(
+    tmp_path: Path, mutation: str,
+) -> None:
+    store = _GatewayStore()
+    environment = _settings_environment(tmp_path)
+    if mutation == "missing":
+        Path(environment["CAPTAIN_PRIVATE_BENCHMARK_ROOT"], "catalog.json").unlink()
+    else:
+        environment["CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256"] = "0" * 64
+
+    with pytest.raises(
+        CapabilityAssemblyProductionConfigurationError,
+        match="private catalog",
+    ):
+        build_capability_assembly_controller(
+            repository_root=tmp_path,
+            settings=CapabilityAssemblyProductionSettings.from_environment(environment),
+            authorities=_authorities(store=store),
+            holdout_store=InMemoryPrivateHoldoutStore(),
+        )
+
+    assert store.storage.statements == []
+
+
+def test_production_builder_rejects_catalog_inside_repository_before_schema(
+    tmp_path: Path,
+) -> None:
+    store = _GatewayStore()
+    environment = _settings_environment(tmp_path)
+    external_root = Path(environment["CAPTAIN_PRIVATE_BENCHMARK_ROOT"])
+    nested_root = tmp_path / ".captain-cook" / "private-benchmarks"
+    nested_root.mkdir(parents=True)
+    (nested_root / "catalog.json").write_bytes((external_root / "catalog.json").read_bytes())
+    environment["CAPTAIN_PRIVATE_BENCHMARK_ROOT"] = str(nested_root)
+
+    with pytest.raises(
+        CapabilityAssemblyProductionConfigurationError,
+        match="overlaps a repository or workspace",
+    ):
+        build_capability_assembly_controller(
+            repository_root=tmp_path,
+            settings=CapabilityAssemblyProductionSettings.from_environment(environment),
+            authorities=_authorities(store=store),
             holdout_store=InMemoryPrivateHoldoutStore(),
         )
 
@@ -1047,7 +1110,7 @@ def _admitted_demo(relative_path: str, holdouts: InMemoryPrivateHoldoutStore):
     return admitted, reservation
 
 
-def _private_benchmark_section(*, duplicate_semantic_case: bool = False) -> str:
+def _private_benchmark_section() -> str:
     expectations = {
         "normal": ("observation_equals", "status", "ok"),
         "boundary": ("observation_contains", "detail", "bounded"),
@@ -1060,21 +1123,12 @@ def _private_benchmark_section(*, duplicate_semantic_case: bool = False) -> str:
     for category, (kind, observed_key, expected) in expectations.items():
         for index, source in enumerate(sources):
             key = f"explicit_{category}_{index}"
-            semantic_index = (
-                0 if duplicate_semantic_case and category == "normal" and index == 1
-                else index
-            )
-            semantic_source = (
-                sources[0]
-                if duplicate_semantic_case and category == "normal" and index == 1
-                else source
-            )
             lines.extend((
                 f"### Benchmark case: {key}",
                 "#### Category", category,
-                "#### Setup", f"Source-grounded {category} setup {semantic_index}",
-                "#### Action", f"Exercise {category} behavior {semantic_index}",
-                "#### Source cases", f"- {semantic_source}",
+                "#### Setup", f"Source-grounded {category} setup {index}",
+                "#### Action", f"Exercise {category} behavior {index}",
+                "#### Source cases", f"- {source}",
                 "#### Expected predicates",
                 f"- {key}_primary | {kind} | {observed_key} | {json.dumps(expected)}",
                 *(() if kind.startswith("observation_") else (
@@ -1093,11 +1147,10 @@ def _admitted_explicit_benchmark(tmp_path: Path, holdouts: InMemoryPrivateHoldou
     relative_path = "inputs/incident/TO_BE_BUILT.md"
     target = root / relative_path
     target.parent.mkdir(parents=True)
-    base = (
+    source = (
         Path(__file__).resolve().parents[2]
         / "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md"
-    ).read_text(encoding="utf-8")
-    source = (base.rstrip() + _private_benchmark_section() + "\n").encode()
+    ).read_bytes()
     target.write_bytes(source)
     for command in (
         ("git", "init", "-q"),
@@ -1112,6 +1165,10 @@ def _admitted_explicit_benchmark(tmp_path: Path, holdouts: InMemoryPrivateHoldou
         capture_output=True, text=True,
     ).stdout.strip()
     digest = hashlib.sha256(source).hexdigest()
+    document = parse_factory_input_bytes(source, logical_name="TO_BE_BUILT.md")
+    catalog = InMemoryPrivateBenchmarkCatalog((
+        generate_private_benchmark_suite(document, seed=b"gateway-private-test-seed!" * 2),
+    ))
     reservation = CapabilityLiveReservation(
         reservation_id=_id("parsed-review-reservation"),
         run_id=_id("parsed-review-run"), input_id="parsed-review-input",
@@ -1123,7 +1180,8 @@ def _admitted_explicit_benchmark(tmp_path: Path, holdouts: InMemoryPrivateHoldou
         expected_sha256_by_path={relative_path: digest},
         compiled_tool_gaps_by_source_sha256={digest: ()},
         holdout_store=holdouts, subject_version=1,
-        require_private_benchmark_cases=True,
+        private_benchmark_catalog=catalog,
+        require_private_benchmark_policy=True,
     ).admit(CapabilityAssemblyInputRequest(
         input_id=reservation.input_id, repository_path=relative_path,
         correlation_id=_id("parsed-review-correlation"), reservation=reservation,
@@ -1132,29 +1190,37 @@ def _admitted_explicit_benchmark(tmp_path: Path, holdouts: InMemoryPrivateHoldou
     return admitted, reservation, source
 
 
-def test_repository_admission_parses_exact_private_benchmark_section_without_mutation(
+def test_repository_admission_compiles_private_catalog_without_mutating_public_input(
     tmp_path: Path,
 ) -> None:
     holdouts = InMemoryPrivateHoldoutStore()
     admitted, _, source = _admitted_explicit_benchmark(tmp_path, holdouts)
 
-    cases = admitted.input.document.private_benchmark_cases
-    assert len(cases) == 15
-    assert {category: sum(case.category == category for case in cases) for category in (
-        "normal", "boundary", "missing", "conflicting", "mandatory_escalation"
-    )} == {
-        "normal": 3, "boundary": 3, "missing": 3,
-        "conflicting": 3, "mandatory_escalation": 3,
-    }
+    assert admitted.input.document.benchmark_policy.cases_per_category == 3
+    assert "Private benchmark cases" not in source.decode()
+    assert "expected_predicates" not in source.decode()
     assert len(admitted.input.compiled_specification.private_holdout_refs) == 15
     assert admitted.input.source_ref.sha256 == hashlib.sha256(source).hexdigest()
 
 
-def test_production_admission_rejects_missing_private_benchmark_section() -> None:
+def test_production_admission_rejects_missing_public_benchmark_policy(tmp_path: Path) -> None:
     holdouts = InMemoryPrivateHoldoutStore()
-    root = Path(__file__).resolve().parents[2]
-    relative_path = "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md"
-    source = (root / relative_path).read_bytes()
+    repository = Path(__file__).resolve().parents[2]
+    root = tmp_path / "missing-policy-repository"
+    relative_path = "inputs/incident/TO_BE_BUILT.md"
+    original = (repository / "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md").read_text(encoding="utf-8")
+    source = original.replace("## Private holdout policy", "## Public notes").encode()
+    target = root / relative_path
+    target.parent.mkdir(parents=True)
+    target.write_bytes(source)
+    for command in (
+        ("git", "init", "-q"),
+        ("git", "config", "user.name", "Captain Test"),
+        ("git", "config", "user.email", "captain@example.invalid"),
+        ("git", "add", relative_path),
+        ("git", "commit", "-q", "-m", "test: missing public policy"),
+    ):
+        subprocess.run(command, cwd=root, check=True, capture_output=True)
     digest = hashlib.sha256(source).hexdigest()
     revision = subprocess.run(
         ("git", "rev-parse", "HEAD"), cwd=root, check=True,
@@ -1170,27 +1236,24 @@ def test_production_admission_rejects_missing_private_benchmark_section() -> Non
         expected_sha256_by_path={relative_path: digest},
         compiled_tool_gaps_by_source_sha256={digest: ()},
         holdout_store=holdouts, subject_version=1,
-        require_private_benchmark_cases=True,
+        require_private_benchmark_policy=True,
     )
 
-    with pytest.raises(CapabilityAssemblyAdmissionError, match="explicit Private benchmark"):
+    with pytest.raises(CapabilityAssemblyAdmissionError, match="public Private holdout policy"):
         admission.admit(CapabilityAssemblyInputRequest(
             input_id=reservation.input_id, repository_path=relative_path,
             correlation_id=_id("missing-private-correlation"), reservation=reservation,
         ))
 
 
-def test_private_benchmark_markdown_rejects_malformed_case_count() -> None:
+def test_private_benchmark_markdown_is_always_rejected_from_public_input() -> None:
     base = (
         Path(__file__).resolve().parents[2]
         / "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md"
     ).read_text(encoding="utf-8")
-    malformed = (base.rstrip() + _private_benchmark_section()).replace(
-        "### Benchmark case: explicit_normal_0",
-        "### Invalid private case: explicit_normal_0",
-    )
+    malformed = base.rstrip() + _private_benchmark_section()
 
-    with pytest.raises(FactoryInputError, match="three cases per category"):
+    with pytest.raises(FactoryInputError, match="must not contain private benchmark cases"):
         parse_factory_input_bytes(malformed.encode(), logical_name="TO_BE_BUILT.md")
 
 
@@ -1221,80 +1284,6 @@ def test_duplicate_semantic_private_cases_leave_no_resolvable_registration() -> 
             reference, purpose="execution",
             authority_id=_id("test-private-case-executor"),
         )
-
-
-def test_duplicate_semantic_markdown_is_rejected_before_holdout_registration() -> None:
-    holdouts = InMemoryPrivateHoldoutStore()
-    base = (
-        Path(__file__).resolve().parents[2]
-        / "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md"
-    ).read_text(encoding="utf-8")
-    source = base.rstrip() + _private_benchmark_section(duplicate_semantic_case=True)
-
-    with pytest.raises(FactoryInputError, match="semantic definitions must be unique"):
-        FactoryInputCompiler(holdout_store=holdouts).compile(
-            parse_factory_input_bytes(source.encode(), logical_name="TO_BE_BUILT.md"),
-            subject_version=1,
-        )
-    assert len(holdouts) == 0
-
-
-@pytest.mark.parametrize(
-    ("mutation", "expected"),
-    (
-        ("tool_only", "business outcome"),
-        ("missing_business", "business outcome"),
-        ("missing_rationale", "rationale"),
-        ("missing_safety", "safety"),
-        ("missing_tool", "required tool"),
-        ("escalation_missing_handoff", "handoff"),
-    ),
-)
-def test_incomplete_benchmark_dimensions_fail_before_private_mutation(
-    mutation: str, expected: str,
-) -> None:
-    base = (
-        Path(__file__).resolve().parents[2]
-        / "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md"
-    ).read_text(encoding="utf-8")
-    section = _private_benchmark_section()
-    removable = {
-        "missing_business": (
-            '- explicit_normal_0_primary | observation_equals | status | "ok"',
-        ),
-        "missing_rationale": (
-            '- explicit_normal_0_rationale | rationale_contains | rationale | "verified"',
-        ),
-        "missing_safety": (
-            "- explicit_normal_0_safety | forbidden_tool_absent | forbidden_tool | true",
-        ),
-        "missing_tool": (
-            "- explicit_normal_0_tool | tool_receipt | captain_tool | true",
-        ),
-        "escalation_missing_handoff": (
-            "- explicit_mandatory_escalation_0_primary | handoff_event | "
-            'reason_code | "mandatory_stop"',
-        ),
-        "tool_only": (
-            '- explicit_normal_0_primary | observation_equals | status | "ok"',
-            '- explicit_normal_0_rationale | rationale_contains | rationale | "verified"',
-            "- explicit_normal_0_safety | forbidden_tool_absent | forbidden_tool | true",
-        ),
-    }
-    for line in removable[mutation]:
-        assert line in section
-        section = section.replace(line + "\n", "", 1)
-    source = (base.rstrip() + section).encode()
-    holdouts = InMemoryPrivateHoldoutStore()
-    private_cases = _private_case_repository(holdouts)
-
-    with pytest.raises(FactoryInputError, match=expected):
-        FactoryInputCompiler(holdout_store=holdouts).compile(
-            parse_factory_input_bytes(source, logical_name="TO_BE_BUILT.md"),
-            subject_version=1,
-        )
-    assert len(holdouts) == 0
-    assert private_cases._definitions == {}
 
 
 def test_generic_suite_uses_compiled_private_authority_and_all_five_categories() -> None:
@@ -1367,64 +1356,17 @@ def test_raw_execution_contract_contains_no_executor_authored_verdicts() -> None
 
 def _with_grounded_benchmark_sources(canonical, holdouts):
     document = canonical.document
-    cases = []
-    expectations = {
-        "normal": ("observation_equals", "status", "ok"),
-        "boundary": ("observation_contains", "detail", "bounded"),
-        "missing": ("observation_absent", "required_value", True),
-        "conflicting": ("observation_equals", "resolution", "signed_source"),
-        "mandatory_escalation": ("handoff_event", "reason_code", "mandatory_stop"),
-    }
-    for category, (kind, observed_key, expected) in expectations.items():
-        for index in range(3):
-            predicates = [
-                BenchmarkExpectedPredicate(
-                    predicate_key=f"{category}_{index}_primary",
-                    kind=kind,
-                    observed_key=observed_key,
-                    expected_value=expected,
-                ),
-                BenchmarkExpectedPredicate(
-                    predicate_key=f"{category}_{index}_tool",
-                    kind="tool_receipt",
-                    observed_key="captain_tool",
-                    expected_value=True,
-                ),
-                BenchmarkExpectedPredicate(
-                    predicate_key=f"{category}_{index}_rationale",
-                    kind="rationale_contains",
-                    observed_key="rationale",
-                    expected_value="verified",
-                ),
-                BenchmarkExpectedPredicate(
-                    predicate_key=f"{category}_{index}_safety",
-                    kind="forbidden_tool_absent",
-                    observed_key="forbidden_tool",
-                    expected_value=True,
-                ),
-            ]
-            if not kind.startswith("observation_"):
-                predicates.append(BenchmarkExpectedPredicate(
-                    predicate_key=f"{category}_{index}_business",
-                    kind="observation_equals", observed_key="status",
-                    expected_value="ok",
-                ))
-            cases.append(PrivateBenchmarkCaseRequirement(
-                case_key=f"explicit_{category}_{index}",
-                category=category,
-                observable_setup=f"Private source scenario {category} {index}",
-                observable_action=f"Execute source-bound action {category} {index}",
-                source_case_keys=(document.real_cases[index].case_key,),
-                expected_predicates=tuple(predicates),
-            ))
-    grounded_document = document.model_copy(update={
-        "private_benchmark_cases": tuple(cases),
-    })
-    compiled = FactoryInputCompiler(holdout_store=holdouts).compile(
-        grounded_document, subject_version=canonical.compiled_specification.subject_version
+    suite = generate_private_benchmark_suite(
+        document, seed=b"gateway-grounded-private-seed" * 2,
+    )
+    compiled = FactoryInputCompiler(
+        holdout_store=holdouts,
+        private_benchmark_catalog=InMemoryPrivateBenchmarkCatalog((suite,)),
+    ).compile(
+        document, subject_version=canonical.compiled_specification.subject_version
     )
     return canonical.model_copy(update={
-        "document": grounded_document,
+        "document": document,
         "compiled_specification": compiled,
     })
 
@@ -1437,30 +1379,27 @@ def test_explicit_private_categories_fail_closed_when_incomplete_or_ambiguous(
     admitted, _ = _admitted_demo(
         "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
     )
-    grounded = _with_grounded_benchmark_sources(admitted.input, holdouts)
-    cases = list(grounded.document.private_benchmark_cases)
+    document = admitted.input.document
+    suite = generate_private_benchmark_suite(
+        document, seed=b"gateway-invalid-private-seed" * 2,
+    )
+    cases = list(suite.cases)
     if mutation == "missing_category":
         cases = [
             item.model_copy(update={"category": "normal"})
             if item.category == "mandatory_escalation" else item
             for item in cases
         ]
-        expected = "exactly three explicit cases"
     else:
         cases[-1] = cases[-1].model_copy(update={"case_key": cases[0].case_key})
-        expected = "case keys are ambiguous"
-    document = grounded.document.model_copy(update={
-        "private_benchmark_cases": tuple(cases)
-    })
-    compiled = FactoryInputCompiler(holdout_store=holdouts).compile(document, 1)
-    canonical = grounded.model_copy(update={
-        "document": document, "compiled_specification": compiled
-    })
-
-    with pytest.raises(CapabilityLiveAuthorityUnavailable, match=expected):
-        build_generic_benchmark_suite(
-            canonical, _private_case_repository(holdouts)
-        )
+    payload = suite.model_dump(mode="python")
+    payload["cases"] = tuple(cases)
+    with pytest.raises(ValueError, match=(
+        "three cases per category" if mutation == "missing_category"
+        else "case keys must be unique"
+    )):
+        type(suite).model_validate(payload)
+    assert len(holdouts) == len(admitted.input.compiled_specification.private_holdout_refs)
 
 
 def test_builder_rejects_mixed_gateway_store_before_schema_effect(tmp_path: Path) -> None:
@@ -1631,6 +1570,17 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             model_dump=lambda **kwargs: {"model": "fixed-model", "policy": "fixed"}
         ),
     )
+    public_business_text = " | ".join(
+        assertion.observable_expected
+        for assertion in grounded_input.compiled_specification.assertions
+    )
+    public_source_key_text = " | ".join(
+        grounded_input.document.benchmark_policy.source_case_keys
+    )
+    benchmark_tool_keys = tuple(dict.fromkeys((
+        "captain_decision",
+        *(item.integration_key for item in grounded_input.document.integrations),
+    )))
 
     class Bindings:
         def binding_for(self, request: object) -> object:
@@ -1712,12 +1662,13 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                     "status": "ok",
                     "detail": "bounded result",
                     "resolution": "signed_source",
+                    "business_outcome": public_business_text,
                 },
             })
             rationale_ref = evidence.put({
                 "schema": "captain.capability-benchmark-rationale.v1",
                 **common,
-                "text": "verified against private predicates",
+                "text": "verified against private predicates " + public_source_key_text,
             })
             message_ref = evidence.put({
                 "schema": "captain.capability-benchmark-message.v1",
@@ -1732,29 +1683,36 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                 "to_agent": "captain",
                 "reason_code": "mandatory_stop",
             })
-            call_ref = evidence.put({
-                "schema": "captain.capability-benchmark-tool-call.v1",
-                **common,
-                "tool_key": "captain_tool",
-                "operation": "read",
-                "call_id": f"call-{execution_request.case_ref.case_id}-{kind}",
-            })
-            lease_ref = evidence.put({
-                "schema": "captain.capability-benchmark-tool-lease.v1",
-                **common,
-                "tool_key": "captain_tool",
-                "lease_id": f"lease-{execution_request.case_ref.case_id}-{kind}",
-                "scope": ["read"],
-            })
-            receipt_ref = evidence.put({
-                "schema": "captain.capability-benchmark-tool-receipt.v1",
-                **common,
-                "tool_key": "captain_tool",
-                "call_id": f"call-{execution_request.case_ref.case_id}-{kind}",
-                "status": "succeeded",
-                "result_ref_sha256": outcome_ref.sha256,
-            })
-            tool_authority.issue(call_ref, lease_ref, receipt_ref)
+            tool_calls = []
+            for tool_key in benchmark_tool_keys:
+                call_id = f"call-{tool_key}-{execution_request.case_ref.case_id}-{kind}"
+                call_ref = evidence.put({
+                    "schema": "captain.capability-benchmark-tool-call.v1",
+                    **common,
+                    "tool_key": tool_key,
+                    "operation": "read",
+                    "call_id": call_id,
+                })
+                lease_ref = evidence.put({
+                    "schema": "captain.capability-benchmark-tool-lease.v1",
+                    **common,
+                    "tool_key": tool_key,
+                    "lease_id": f"lease-{tool_key}-{execution_request.case_ref.case_id}-{kind}",
+                    "scope": ["read"],
+                })
+                receipt_ref = evidence.put({
+                    "schema": "captain.capability-benchmark-tool-receipt.v1",
+                    **common,
+                    "tool_key": tool_key,
+                    "call_id": call_id,
+                    "status": "succeeded",
+                    "result_ref_sha256": outcome_ref.sha256,
+                })
+                tool_authority.issue(call_ref, lease_ref, receipt_ref)
+                tool_calls.append(GenericToolCallEvidence(
+                    tool_key=tool_key, call_ref=call_ref,
+                    lease_ref=lease_ref, receipt_ref=receipt_ref,
+                ))
             return GenericBenchmarkExecutionEvidence(
                 case_ref=execution_request.case_ref,
                 team_kind=kind,
@@ -1766,10 +1724,7 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                 outcome_ref=outcome_ref,
                 message_event_refs=(message_ref,),
                 handoff_event_refs=(handoff_ref,),
-                tool_calls=(GenericToolCallEvidence(
-                    tool_key="captain_tool", call_ref=call_ref,
-                    lease_ref=lease_ref, receipt_ref=receipt_ref,
-                ),),
+                tool_calls=tuple(tool_calls),
                 rationale_ref=rationale_ref,
                 cost_usd=Decimal("0.10") if kind == "team" else Decimal("0.20"),
                 latency_ms=10 if kind == "team" else 20,

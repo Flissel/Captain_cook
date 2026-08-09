@@ -29,6 +29,10 @@ from agenten.agent_factory.capability_live_runner import (
 )
 from agenten.agent_factory.holdout_store import PrivateHoldoutStore
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
+from agenten.agent_factory.private_benchmark_catalog import (
+    PrivateBenchmarkCatalogError,
+    VerifiedFilePrivateBenchmarkCatalog,
+)
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.delivery.minibook_events import (
     MinibookProjectionAcknowledgementV1,
@@ -546,6 +550,9 @@ class CapabilityAssemblyProductionSettings:
     expected_sha256_by_path: Mapping[str, str]
     compiled_tool_gaps_by_source_sha256: Mapping[str, tuple[ToolGapMarker, ...]]
     subject_version: int
+    private_benchmark_root: Path
+    private_benchmark_manifest_path: str
+    private_benchmark_manifest_sha256: str
 
     @classmethod
     def from_environment(
@@ -608,11 +615,42 @@ class CapabilityAssemblyProductionSettings:
             raise CapabilityAssemblyProductionConfigurationError(
                 "capability assembly subject version is invalid"
             )
+        private_root_value = environment.get(
+            "CAPTAIN_PRIVATE_BENCHMARK_ROOT", ""
+        ).strip()
+        manifest_path = environment.get(
+            "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_PATH", ""
+        ).strip()
+        manifest_sha256 = environment.get(
+            "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256", ""
+        ).strip()
+        if not private_root_value:
+            raise CapabilityAssemblyProductionConfigurationError(
+                "private benchmark root is unavailable"
+            )
+        private_root = Path(private_root_value)
+        if not private_root.is_absolute():
+            raise CapabilityAssemblyProductionConfigurationError(
+                "private benchmark root must be absolute"
+            )
+        relative_manifest = PurePosixPath(manifest_path.replace("\\", "/"))
+        if (relative_manifest.is_absolute() or relative_manifest.name == ""
+                or any(part in {"", ".", ".."} for part in relative_manifest.parts)):
+            raise CapabilityAssemblyProductionConfigurationError(
+                "private benchmark manifest path is invalid"
+            )
+        if _SHA256.fullmatch(manifest_sha256) is None:
+            raise CapabilityAssemblyProductionConfigurationError(
+                "private benchmark manifest digest is invalid"
+            )
         return cls(
             expected_repository_revision=revision,
             expected_sha256_by_path=digests,
             compiled_tool_gaps_by_source_sha256=gaps,
             subject_version=subject_version,
+            private_benchmark_root=private_root,
+            private_benchmark_manifest_path=relative_manifest.as_posix(),
+            private_benchmark_manifest_sha256=manifest_sha256,
         )
 
 
@@ -964,6 +1002,16 @@ def build_capability_assembly_controller(
         positional_count=0,
         label="gateway_store.storage.transaction",
     )
+    try:
+        private_catalog = VerifiedFilePrivateBenchmarkCatalog.open(
+            private_root=settings.private_benchmark_root,
+            manifest_path=settings.private_benchmark_manifest_path,
+            expected_sha256=settings.private_benchmark_manifest_sha256,
+            expected_input_sha256s=tuple(settings.expected_sha256_by_path.values()),
+            forbidden_roots=(root,),
+        )
+    except PrivateBenchmarkCatalogError as exc:
+        raise CapabilityAssemblyProductionConfigurationError(str(exc)) from None
     admission = RepositoryCapabilityAssemblyInputAdmission(
         repository_root=root,
         expected_repository_revision=settings.expected_repository_revision,
@@ -974,7 +1022,8 @@ def build_capability_assembly_controller(
         holdout_store=holdout_store,
         subject_version=settings.subject_version,
         source_artifacts=authorities.source_artifacts,
-        require_private_benchmark_cases=True,
+        private_benchmark_catalog=private_catalog,
+        require_private_benchmark_policy=True,
     )
     # Validate every external binding before Gateway repository construction,
     # whose constructor owns the only schema side effect in this builder.
