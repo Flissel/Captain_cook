@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from agenten.demo_orchestrator.processes import (
     DemoProcessError,
     ManagedProcessSupervisor,
     SpawnedProcess,
+    stop_managed_processes,
 )
 
 
@@ -242,3 +244,47 @@ def test_runtime_restart_keeps_exact_config_and_replaces_only_runtime(tmp_path: 
     assert backend.events[0] == "preflight:listener:19002"
     assert f"terminate:{original.pid}:{original.start_identity}" in backend.events
     assert "mutate:spawn:runtime" in backend.events
+
+
+def test_status_rejects_healthy_pid_when_sealed_configuration_changed(tmp_path: Path) -> None:
+    configuration = _configuration(tmp_path)
+    backend = FakeBackend()
+    ManagedProcessSupervisor(configuration, backend=backend).start_all(timeout_seconds=1)
+    changed = replace(configuration, bundle_sha256="f" * 64)
+
+    healthy = ManagedProcessSupervisor(changed, backend=backend).status(timeout_seconds=1)
+
+    assert healthy == ()
+
+
+def test_stop_uses_persisted_identity_even_when_d11_bundle_is_unavailable(tmp_path: Path) -> None:
+    configuration = _configuration(tmp_path)
+    backend = FakeBackend()
+    records = ManagedProcessSupervisor(configuration, backend=backend).start_all(timeout_seconds=1)
+    backend.events.clear()
+
+    stopped = stop_managed_processes(configuration.repository_root, backend=backend)
+
+    assert tuple(item.service for item in stopped) == tuple(
+        item.service for item in reversed(records)
+    )
+    assert not backend.processes
+
+
+def test_missing_service_executable_fails_before_compose_or_process_mutation(
+    tmp_path: Path,
+) -> None:
+    configuration = _configuration(tmp_path)
+    gateway = configuration.bundle.services[0].model_copy(
+        update={"argv": ("Z:\\captain-missing\\gateway.exe", "gateway")}
+    )
+    changed_bundle = configuration.bundle.model_copy(
+        update={"services": (gateway, *configuration.bundle.services[1:])}
+    )
+    changed = replace(configuration, bundle=changed_bundle)
+    backend = FakeBackend()
+
+    with pytest.raises(DemoProcessError, match="service executable is unavailable"):
+        ManagedProcessSupervisor(changed, backend=backend).start_all(timeout_seconds=1)
+
+    assert not any(event.startswith("mutate:") for event in backend.events)

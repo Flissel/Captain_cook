@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -190,10 +191,16 @@ class ManagedProcessSupervisor:
     def status(self, *, timeout_seconds: float = 2) -> tuple[ManagedProcessRecord, ...]:
         records = self._load_records()
         services = {service.name: service for service in self._configuration.bundle.services}
+        expected = {
+            item.service.name: item.record
+            for item in self._prepare_services(
+                {record.service: record for record in records}
+            )
+        }
         healthy: list[ManagedProcessRecord] = []
         for record in records:
             service = services.get(record.service)
-            if service is None:
+            if service is None or expected.get(record.service) != record:
                 continue
             environment = self._configuration.environment_for(service.name)
             if (
@@ -274,6 +281,18 @@ class ManagedProcessSupervisor:
         prepared: list[_PreparedService] = []
         for service in self._configuration.bundle.services:
             argv = tuple(self._expand(argument) for argument in service.argv)
+            executable = argv[0]
+            if (
+                ("\\" in executable or "/" in executable)
+                and not Path(executable).is_file()
+            ) or (
+                "\\" not in executable
+                and "/" not in executable
+                and shutil.which(executable) is None
+            ):
+                raise DemoProcessError(
+                    f"service executable is unavailable for {service.name}"
+                )
             cwd = self._resolve_working_directory(service.working_directory)
             environment = self._child_environment(
                 self._configuration.environment_for(service.name)
@@ -355,26 +374,10 @@ class ManagedProcessSupervisor:
         return environment
 
     def _load_records(self) -> tuple[ManagedProcessRecord, ...]:
-        if not self._state_path.exists():
-            return ()
-        try:
-            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
-            if payload.get("schema") != "captain.demo-managed-processes.v1":
-                raise ValueError
-            records = tuple(ManagedProcessRecord(**item) for item in payload["processes"])
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-            raise DemoProcessError("managed process state is invalid") from None
-        if len({record.service for record in records}) != len(records):
-            raise DemoProcessError("managed process state contains duplicate services")
-        return records
+        return _read_managed_records(self._state_path)
 
     def _save_records(self, records: Sequence[ManagedProcessRecord]) -> None:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "schema": "captain.demo-managed-processes.v1",
-            "processes": [asdict(record) for record in records],
-        }
-        _atomic_write_json(self._state_path, payload)
+        _write_managed_records(self._state_path, records)
 
     def _log_path(self, service: str) -> Path:
         path = self._configuration.state_root / "logs" / f"{service}.log"
@@ -499,6 +502,54 @@ def _canonical_sha256(value: object) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def stop_managed_processes(
+    repository_root: Path,
+    *,
+    backend: ProcessBackend | None = None,
+) -> tuple[ManagedProcessRecord, ...]:
+    """Stop only persisted PID/start identities without requiring D10/D11."""
+
+    repository = repository_root.resolve(strict=True)
+    state_path = repository / ".captain-cook/live-demo/managed-processes.json"
+    records = _read_managed_records(state_path)
+    selected_backend = backend or WindowsProcessBackend()
+    stopped: list[ManagedProcessRecord] = []
+    remaining: list[ManagedProcessRecord] = []
+    for record in reversed(records):
+        if selected_backend.terminate(record.pid, record.start_identity):
+            stopped.append(record)
+        else:
+            remaining.append(record)
+    _write_managed_records(state_path, tuple(reversed(remaining)))
+    return tuple(stopped)
+
+
+def _read_managed_records(path: Path) -> tuple[ManagedProcessRecord, ...]:
+    if not path.exists():
+        return ()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema") != "captain.demo-managed-processes.v1":
+            raise ValueError
+        records = tuple(ManagedProcessRecord(**item) for item in payload["processes"])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        raise DemoProcessError("managed process state is invalid") from None
+    if len({record.service for record in records}) != len(records):
+        raise DemoProcessError("managed process state contains duplicate services")
+    return records
+
+
+def _write_managed_records(
+    path: Path, records: Sequence[ManagedProcessRecord]
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": "captain.demo-managed-processes.v1",
+        "processes": [asdict(record) for record in records],
+    }
+    _atomic_write_json(path, payload)
+
+
 def _atomic_write_json(path: Path, payload: object) -> None:
     descriptor, raw_temp = tempfile.mkstemp(prefix="managed-", suffix=".tmp", dir=path.parent)
     temp = Path(raw_temp)
@@ -520,5 +571,5 @@ __all__ = [
     "ManagedProcessSupervisor",
     "SpawnedProcess",
     "WindowsProcessBackend",
+    "stop_managed_processes",
 ]
-

@@ -160,3 +160,18 @@ def test_changed_bundle_bytes_fail_before_bundle_is_used(tmp_path: Path) -> None
 
     with pytest.raises(DemoConfigurationError, match="bundle digest mismatch"):
         load_demo_configuration(repository, revision_reader=lambda _: "a" * 40)
+
+
+def test_missing_d10_catalog_reports_exact_preflight_gap(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / ".env").write_text("OPENAI_API_KEY=operator-owned\n", encoding="utf-8")
+    private_env = initialize_private_environment(repository, reporter=lambda _: None)
+    _write_bundle(repository, private_env)
+    (repository / ".captain-cook/live-demo/private/catalog.json").unlink()
+
+    with pytest.raises(
+        DemoConfigurationError,
+        match="D10 private benchmark catalog is unavailable",
+    ):
+        load_demo_configuration(repository, revision_reader=lambda _: "a" * 40)

@@ -138,6 +138,9 @@ def load_demo_configuration(
 
 
 def _verify_bundle_files(repository: Path, bundle: DemoBundleV1) -> None:
+    catalog = repository.joinpath(*PurePosixPath(bundle.benchmark_catalog_path).parts)
+    if not catalog.is_file():
+        raise DemoConfigurationError("D10 private benchmark catalog is unavailable")
     for relative, expected in {
         **bundle.canonical_inputs,
         **bundle.artifact_digests,
