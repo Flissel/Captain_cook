@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+import urllib.error
 from uuid import UUID
 
 import pytest
@@ -11,6 +12,7 @@ from agenten.demo_orchestrator.client import (
     CapabilityDemoClient,
     DemoClientError,
     DemoTimeout,
+    UrllibJsonHttp,
 )
 from tests.demo_orchestrator.test_processes import _configuration
 
@@ -222,3 +224,20 @@ def test_gateway_and_minibook_evidence_mismatch_fails_closed(tmp_path: Path) -> 
     with pytest.raises(DemoClientError, match="Minibook evidence does not equal Gateway"):
         client.run(allow_paid_run=True, maximum_cost_usd="6.00", timeout_seconds=30)
 
+
+def test_real_http_adapter_preserves_wrapped_socket_timeout_as_timeout_124(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def timeout(*_: object, **__: object) -> object:
+        raise urllib.error.URLError(TimeoutError("socket timed out"))
+
+    monkeypatch.setattr("urllib.request.urlopen", timeout)
+
+    with pytest.raises(TimeoutError):
+        UrllibJsonHttp().request_json(
+            "GET",
+            "http://127.0.0.1:19000/health",
+            token="redacted-token",
+            payload=None,
+            timeout_seconds=1,
+        )

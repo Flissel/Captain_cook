@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -46,8 +47,17 @@ class DemoServiceV1(_FrozenModel):
 
     @model_validator(mode="after")
     def validate_service_authority(self) -> "DemoServiceV1":
-        expected_url = f"http://127.0.0.1:{self.port}/health"
-        if self.health_url != expected_url:
+        parsed = urlsplit(self.health_url)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname != "127.0.0.1"
+            or parsed.port != self.port
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or not parsed.path.startswith("/")
+        ):
             raise ValueError("service health URL must be its exact loopback listener")
         if len(set(self.environment)) != len(self.environment):
             raise ValueError("service environment contains duplicate names")
@@ -76,6 +86,8 @@ class DemoBundleV1(_FrozenModel):
             raise ValueError("repository revision is invalid")
         if set(self.canonical_inputs) != set(CANONICAL_INPUT_PATHS):
             raise ValueError("bundle must bind the three canonical repository inputs")
+        if len(set(self.canonical_inputs.values())) != 3:
+            raise ValueError("bundle canonical inputs must have distinct bytes")
         if tuple(service.name for service in self.services) != SERVICE_ORDER:
             raise ValueError("bundle service dependency order is invalid")
         if len({service.port for service in self.services}) != len(self.services):

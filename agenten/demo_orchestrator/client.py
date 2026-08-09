@@ -438,6 +438,8 @@ class UrllibJsonHttp:
         except TimeoutError:
             raise
         except urllib.error.URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise TimeoutError("Captain demo HTTP request timed out") from None
             raise DemoClientError("Captain demo HTTP boundary is unavailable") from exc
         try:
             value = json.loads(raw)
@@ -495,4 +497,3 @@ __all__ = [
     "DemoTimeout",
     "UrllibJsonHttp",
 ]
-

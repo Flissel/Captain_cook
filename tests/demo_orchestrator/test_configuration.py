@@ -55,7 +55,11 @@ def _write_bundle(repository: Path, private_env: Path) -> tuple[Path, str]:
                 "argv": ["{python}", "-m", f"captain_demo_{name}"],
                 "working_directory": ".",
                 "port": 18100 + offset,
-                "health_url": f"http://127.0.0.1:{18100 + offset}/health",
+                "health_url": (
+                    "http://127.0.0.1:18100/v1/capability-assemblies/health"
+                    if name == "gateway"
+                    else f"http://127.0.0.1:{18100 + offset}/health"
+                ),
                 "health_token_env": environment[0],
                 "environment": environment,
                 "artifact_paths": ["gateway/app.py"],
@@ -174,4 +178,25 @@ def test_missing_d10_catalog_reports_exact_preflight_gap(tmp_path: Path) -> None
         DemoConfigurationError,
         match="D10 private benchmark catalog is unavailable",
     ):
+        load_demo_configuration(repository, revision_reader=lambda _: "a" * 40)
+
+
+def test_bundle_rejects_three_paths_when_two_inputs_have_same_bytes(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / ".env").write_text("OPENAI_API_KEY=operator-owned\n", encoding="utf-8")
+    private_env = initialize_private_environment(repository, reporter=lambda _: None)
+    bundle, _ = _write_bundle(repository, private_env)
+    payload = json.loads(bundle.read_text(encoding="utf-8"))
+    paths = list(payload["canonical_inputs"])
+    payload["canonical_inputs"][paths[1]] = payload["canonical_inputs"][paths[0]]
+    bundle.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    private = private_env.read_text(encoding="utf-8")
+    private = private.replace(
+        next(line for line in private.splitlines() if line.startswith("CAPTAIN_DEMO_BUNDLE_MANIFEST_SHA256=")),
+        f"CAPTAIN_DEMO_BUNDLE_MANIFEST_SHA256={_sha(bundle)}",
+    )
+    private_env.write_text(private, encoding="utf-8")
+
+    with pytest.raises(DemoConfigurationError, match="bundle is invalid"):
         load_demo_configuration(repository, revision_reader=lambda _: "a" * 40)
