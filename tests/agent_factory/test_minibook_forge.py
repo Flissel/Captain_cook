@@ -19,6 +19,7 @@ from agenten.agent_factory.minibook_forge import (
     CaptainCreationJobMapper,
     CaptainCreationJobV3Authority,
     CaptainCreationJobV3Mapper,
+    FilesystemCaptainCreationJobV3Store,
     MinibookForgeHttpClient,
     MinibookForgeHttpSettings,
     MinibookForgeSettings,
@@ -758,7 +759,7 @@ async def test_http_forge_parses_v3_terminal_result_without_legacy_fallback() ->
     assert result.cas_readback_receipt_ref is not None
 
 
-def test_v3_mapper_binds_exact_authority_and_never_maps_source_zip() -> None:
+def test_v3_mapper_binds_exact_authority_and_never_maps_source_zip(tmp_path: Path) -> None:
     factory_job = job_v3(mode="demo")
     action = FactoryAction(kind=FactoryActionKind.SUBMIT_FORGE_JOB, attempt=1)
     lease = issue_factory_lease(
@@ -812,6 +813,7 @@ def test_v3_mapper_binds_exact_authority_and_never_maps_source_zip() -> None:
     mapper = CaptainCreationJobV3Mapper(
         authority=lambda _request: authority,
         released_skill=lambda job, _step: ForgeEvidence(*_workflow_evidence()[1:]).released_for(job, FactorySkillStep.BRIEF_CODEX),
+        store=FilesystemCaptainCreationJobV3Store(tmp_path / ".captain-cook" / "v3-authority"),
     )
 
     mapped = mapper.map(FactoryDispatch(factory_job, action, None, lease))
@@ -836,4 +838,10 @@ def test_v3_mapper_binds_exact_authority_and_never_maps_source_zip() -> None:
             released_skill=lambda job, _step: ForgeEvidence(
                 *_workflow_evidence()[1:]
             ).released_for(job, FactorySkillStep.BRIEF_CODEX),
+            store=FilesystemCaptainCreationJobV3Store(tmp_path / ".captain-cook" / "wrong-authority"),
         ).map(FactoryDispatch(factory_job, action, None, lease))
+
+    restarted = FilesystemCaptainCreationJobV3Store(
+        tmp_path / ".captain-cook" / "v3-authority"
+    )
+    assert restarted.creation_job_for(factory_job, 1) == mapped

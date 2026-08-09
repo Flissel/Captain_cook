@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
+from pathlib import PurePosixPath
 from uuid import uuid4
 import zipfile
 
@@ -26,6 +28,7 @@ from agenten.agent_factory.forge_contracts import (
     CreationResultV2,
     CreationJobV3,
 )
+from agenten.agent_factory.minibook_forge import FilesystemCaptainCreationJobV3Store
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.n8n_tools import TypedN8nTool
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
@@ -60,9 +63,246 @@ class Blocks:
         return self.released_skill
 
 
+def _durable_v3_result(tmp_path: Path, *, candidate_mutation: str | None = None):
+    minibook_store, _, _, refs, gaps = v3_package_fixture(tmp_path)
+    build_bytes = minibook_store.read_bytes(refs["build_evidence_refs"][0])
+    build_ref = minibook_store.put(
+        build_bytes,
+        "application/json",
+        namespace="team-file",
+    )
+    real_payload = json.loads(
+        minibook_store.read_bytes(refs["test_evidence_refs"][0])
+    )
+    real_payload["evidence_refs"] = [build_ref.model_dump(mode="json")]
+    real_bytes = json.dumps(real_payload, sort_keys=True).encode("utf-8")
+    real_ref = minibook_store.put(
+        real_bytes,
+        "application/json",
+        namespace="team-file",
+    )
+    codex_payload = json.loads(
+        minibook_store.read_bytes(refs["codex_build_receipt_ref"])
+    )
+    codex_payload["test_evidence_refs"] = [real_ref.model_dump(mode="json")]
+    codex_bytes = json.dumps(codex_payload, sort_keys=True).encode("utf-8")
+    codex_ref = minibook_store.put(
+        codex_bytes,
+        "application/json",
+        namespace="team-file",
+    )
+    refs.update(
+        {
+            "codex_build_receipt_ref": codex_ref,
+            "build_evidence_refs": (build_ref,),
+            "test_evidence_refs": (real_ref,),
+            "authority_effect": refs["authority_effect"].model_copy(
+                update={
+                    "codex_build_receipt_ref": codex_ref,
+                    "build_evidence_refs": (build_ref,),
+                    "test_evidence_refs": (real_ref,),
+                }
+            ),
+        }
+    )
+    validated = validate_team_package(
+        artifact_store=minibook_store,
+        tool_gaps=gaps,
+        **refs,
+    )
+    authority_job = CreationJobV3.model_validate(
+        refs["authority_job"].model_dump(mode="json", by_alias=True)
+    )
+    captain_job = job_v3(mode="demo").model_copy(
+        update={
+            "compiled_spec_ref": type(job_v3(mode="demo").compiled_spec_ref).model_validate(
+                authority_job.compiled_spec_ref.model_dump(mode="json")
+            ),
+            "acceptance_assertion_ids": authority_job.public_assertion_ids,
+        }
+    )
+    team_bytes = json.dumps(
+        validated.team_manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8") + b"\n"
+    team_ref = minibook_store.put(team_bytes, "application/json", namespace="team-file")
+    candidate_source_ref = refs["source_archive_ref"]
+    candidate_team_ref = team_ref
+    if candidate_mutation == "source_ref":
+        candidate_source_ref = minibook_store.put(
+            minibook_store.read_bytes(candidate_source_ref),
+            "application/zip",
+            namespace="substituted-source",
+        )
+    elif candidate_mutation == "team_ref":
+        candidate_team_ref = refs["team_manifest_ref"]
+    candidate = FactoryCandidateManifest(
+        candidate_id="sales_pipeline_brief_v1",
+        source_archive_ref=candidate_source_ref.model_dump(mode="json"),
+        team_manifest={
+            "reference": candidate_team_ref.model_dump(mode="json"),
+            "relative_path": "team_manifest.json",
+        },
+        build_command=("python", "-m", "compileall", "-q", "."),
+        real_case_command=("python", "-m", "pytest"),
+        timeout_seconds=60,
+    )
+    candidate_bytes = json.dumps(
+        candidate.model_dump(mode="json", by_alias=True),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8") + b"\n"
+    validated = replace(
+        validated,
+        files={
+            **validated.files,
+            PurePosixPath("factory-candidate.json"): candidate_bytes,
+        },
+    )
+    sealed = seal_team_package(validated, artifact_store=minibook_store)
+    result = CreationResultV2(
+        creation_job_id=authority_job.creation_job_id,
+        factory_job_id=authority_job.factory_job_id,
+        correlation_id=authority_job.correlation_id,
+        subject_version=authority_job.subject_version,
+        attempt=authority_job.attempt,
+        status="succeeded",
+        team_manifest_ref=sealed.team_manifest_ref.model_dump(mode="json"),
+        candidate_manifest_ref=sealed.candidate_manifest_ref.model_dump(mode="json"),
+        source_archive_ref=sealed.source_archive_ref.model_dump(mode="json"),
+        package_manifest_ref=sealed.package_manifest_ref.model_dump(mode="json"),
+        hermes_usage_receipt_ref=sealed.hermes_usage_receipt_ref.model_dump(mode="json"),
+        codex_build_receipt_ref=sealed.codex_build_receipt_ref.model_dump(mode="json"),
+        build_evidence_refs=[item.model_dump(mode="json") for item in sealed.build_evidence_refs],
+        real_case_evidence_refs=[item.model_dump(mode="json") for item in sealed.real_case_evidence_refs],
+        cas_readback_receipt_ref=sealed.readback_receipt_ref.model_dump(mode="json"),
+        tool_gaps=[gap.model_dump(mode="json", by_alias=True) for gap in gaps],
+    )
+    return minibook_store, authority_job, captain_job, candidate, result
+
+
 @pytest.mark.asyncio
+async def test_v3_candidate_acceptance_survives_fresh_provider_and_store_instances(
+    tmp_path: Path,
+) -> None:
+    minibook_store, authority_job, captain_job, candidate, result = _durable_v3_result(
+        tmp_path
+    )
+    durable_root = tmp_path / ".captain-cook" / "v3-jobs"
+    first_store = FilesystemCaptainCreationJobV3Store(durable_root)
+    first_store.record_creation_job(authority_job)
+    blocks = Blocks(_released_skill(captain_job))
+
+    class GatewayCas:
+        @staticmethod
+        def _ref(ref):
+            return __import__(
+                "minibook.swarm.contracts", fromlist=["ArtifactRef"]
+            ).ArtifactRef.model_validate(ref.model_dump(mode="json"))
+
+        def read_bytes(self, ref):
+            return minibook_store.read_bytes(self._ref(ref))
+
+        def local_path(self, ref):
+            return minibook_store.local_path(self._ref(ref))
+
+    first_provider = GatewayForgeCandidateProvider(
+        repository=blocks,
+        artifacts=GatewayCas(),
+        v3_jobs=first_store,
+    )
+    validator = CandidateEvaluationFactory(
+        provider=first_provider,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "captain-evidence"),
+    )
+    request = FactoryDispatch(
+        job=captain_job,
+        action=FactoryAction(
+            kind=FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE,
+            attempt=1,
+        ),
+        role=FactoryRole.TOOL_INTEGRATOR,
+        lease=issue_factory_lease(
+            job=captain_job,
+            role=FactoryRole.TOOL_INTEGRATOR,
+            attempt=1,
+            workspace_ref="workspace://factory/v3-restart",
+            now=captain_job.occurred_at,
+        ),
+    )
+    block = await validator.record_creation_result(request, result)
+    blocks.items = (block,)
+
+    restarted = GatewayForgeCandidateProvider(
+        repository=blocks,
+        artifacts=GatewayCas(),
+        v3_jobs=FilesystemCaptainCreationJobV3Store(durable_root),
+    )
+    resolved = restarted.candidate_for(captain_job)
+
+    assert resolved.candidate == candidate
+    assert resolved.source_archive == minibook_store.local_path(
+        GatewayCas._ref(candidate.source_archive_ref)
+    )
+    assert restarted.current_candidate_ref(captain_job, 1) == candidate.source_archive_ref
+
+
+@pytest.mark.parametrize("mutation", ("source_ref", "team_ref"))
+def test_v3_candidate_manifest_never_normalizes_substituted_references(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    minibook_store, authority_job, captain_job, _, result = _durable_v3_result(
+        tmp_path,
+        candidate_mutation=mutation,
+    )
+    durable = FilesystemCaptainCreationJobV3Store(
+        tmp_path / ".captain-cook" / "v3-substitution"
+    )
+    durable.record_creation_job(authority_job)
+
+    class GatewayCas:
+        @staticmethod
+        def _ref(ref):
+            return __import__(
+                "minibook.swarm.contracts", fromlist=["ArtifactRef"]
+            ).ArtifactRef.model_validate(ref.model_dump(mode="json"))
+
+        def read_bytes(self, ref):
+            return minibook_store.read_bytes(self._ref(ref))
+
+        def local_path(self, ref):
+            return minibook_store.local_path(self._ref(ref))
+
+    provider = GatewayForgeCandidateProvider(
+        repository=Blocks(_released_skill(captain_job)),
+        artifacts=GatewayCas(),
+        v3_jobs=durable,
+    )
+
+    with pytest.raises(FactoryDispatchError, match="candidate binding is invalid"):
+        provider.accept_creation_result(captain_job, result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("cas", "Captain CAS readback digest mismatch"),
+        ("stale_build", "evidence refs differ from the canonical package"),
+        ("candidate_substitution", "result refs differ from sealed package"),
+        ("stale_receipt_evidence", "build or test evidence is stale or failed"),
+    ),
+)
 async def test_captain_rejects_minibook_v3_success_when_independent_readback_is_tampered(
     tmp_path: Path,
+    mutation: str,
+    message: str,
 ) -> None:
     minibook_store, _, _, refs, gaps = v3_package_fixture(tmp_path)
     sealed = seal_team_package(
@@ -99,7 +339,24 @@ async def test_captain_rejects_minibook_v3_success_when_independent_readback_is_
         cas_readback_receipt_ref=sealed.readback_receipt_ref.model_dump(mode="json"),
         tool_gaps=[gap.model_dump(mode="json", by_alias=True) for gap in gaps],
     )
-    minibook_store.local_path(sealed.source_archive_ref).write_bytes(b"changed-after-validation")
+    if mutation == "cas":
+        minibook_store.local_path(sealed.source_archive_ref).write_bytes(
+            b"changed-after-validation"
+        )
+    elif mutation == "stale_build":
+        stale = minibook_store.put(
+            minibook_store.read_bytes(sealed.build_evidence_refs[0]),
+            "application/json",
+            namespace="stale-build",
+        )
+        result = result.model_copy(update={"build_evidence_refs": (stale,)})
+    elif mutation == "candidate_substitution":
+        substituted = minibook_store.put(
+            minibook_store.read_bytes(sealed.candidate_manifest_ref) + b" ",
+            "application/json",
+            namespace="substituted-candidate",
+        )
+        result = result.model_copy(update={"candidate_manifest_ref": substituted})
 
     class V3Jobs:
         def creation_job_for(self, _job, _attempt):
@@ -144,7 +401,7 @@ async def test_captain_rejects_minibook_v3_success_when_independent_readback_is_
         lease=lease,
     )
 
-    with pytest.raises(FactoryDispatchError, match="Captain CAS readback digest mismatch"):
+    with pytest.raises(FactoryDispatchError, match=message):
         await validator.record_creation_result(request, result)
     assert blocks.items == ()
     assert not evidence_root.exists()

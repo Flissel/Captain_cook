@@ -7,6 +7,8 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -70,6 +72,11 @@ from agenten.agent_factory.hermes_factory_worker import (
 )
 from agenten.agent_factory.minibook_forge import (
     CaptainCreationJobMapper,
+    CaptainCreationJobV3Authority,
+    CaptainCreationJobV3Mapper,
+    FilesystemCaptainCreationJobV3Store,
+    MinibookForgeHttpClient,
+    MinibookForgeHttpSettings,
     MinibookForgeSettings,
     MinibookSwarmForge,
 )
@@ -80,6 +87,7 @@ from agenten.agent_factory.technical_revalidation import (
     TECHNICAL_REVALIDATION_RUNTIME_PATHS,
 )
 from agenten.agent_factory.state_machine import FactoryActionKind
+from agenten.agent_factory.capability_resolution import CapabilityResolution
 from agenten.agent_factory.production_dispatch_runner import (
     ProductionFactoryDispatchResult,
 )
@@ -271,6 +279,115 @@ def validate_factory_total_cost_envelope(
         raise ValueError("Factory total cost envelope is invalid")
 
 
+class _CaptainV3CreationAuthorityBuilder:
+    """Reconstruct exact V3 mapping inputs from Captain ledger and private CAS."""
+
+    def __init__(
+        self,
+        *,
+        repository: GatewayFactoryRepository,
+        artifacts: BusinessBenchmarkContentAddressedArtifactStore,
+    ) -> None:
+        self._repository = repository
+        self._artifacts = artifacts
+
+    def __call__(self, request: FactoryDispatch) -> CaptainCreationJobV3Authority:
+        if not isinstance(request.job, AgentFactoryJobV3) or request.lease is None:
+            raise FactoryDispatchError("V3 authority requires an active Captain dispatch")
+        job = request.job
+        attempt = request.action.attempt
+        blocks = tuple(
+            block
+            for block in self._repository.blocks(job.job_id)
+            if block.job_id == job.job_id
+            and block.correlation_id == job.correlation_id
+            and block.subject_version == job.subject_version
+            and block.attempt == attempt
+            and block.status.value == "succeeded"
+        )
+        if not any(block.phase.value == "forge_requested" for block in blocks):
+            raise FactoryDispatchError("V3 authority is missing the durable capability miss")
+
+        def unique_ref(phase: str) -> ArtifactRef:
+            candidates = tuple(
+                block.artifact_refs[0]
+                for block in blocks
+                if block.phase.value == phase and len(block.artifact_refs) == 1
+            )
+            if len(candidates) != 1 or candidates[0].media_type != "application/json":
+                raise FactoryDispatchError(f"V3 authority requires one durable {phase} artifact")
+            return candidates[0]
+
+        blueprint_ref = unique_ref("blueprint_created")
+        tool_plan_ref = unique_ref("tool_candidate_tested")
+        try:
+            compiled_bytes = self._artifacts.read_bytes(job.compiled_spec_ref)
+            compiled = json.loads(compiled_bytes)
+            if not isinstance(compiled, dict):
+                raise ValueError
+            required_agent_ids = tuple(compiled["required_agent_ids"])
+            ordered_handoffs = tuple(compiled["ordered_handoffs"])
+            tool_requirements = tuple(compiled["tool_requirements"])
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise FactoryDispatchError("V3 compiled topology authority is unavailable") from exc
+        lease_bytes = json.dumps(
+            request.lease.model_dump(mode="json", by_alias=True),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        lease_ref = self._artifacts.put(
+            lease_bytes, "application/json", namespace="factory-v3-lease"
+        )
+        workspace_policy_ref = self._artifacts.put(
+            json.dumps(
+                {
+                    "schema": "captain.factory-v3-workspace-policy.v1",
+                    "workspace_ref": request.lease.workspace_ref,
+                    "execution_policy": job.execution_policy.model_dump(mode="json", by_alias=True),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            "application/json",
+            namespace="factory-v3-workspace-policy",
+        )
+        creation_material = "\x1f".join(
+            (
+                job.required_capability,
+                str(job.subject_version),
+                job.input_ref.sha256,
+                job.compiled_spec_ref.sha256,
+                job.dependency_graph_ref.sha256,
+                *job.acceptance_assertion_ids,
+            )
+        )
+        return CaptainCreationJobV3Authority(
+            command_id=job.event_id,
+            capability_resolution=CapabilityResolution(
+                kind="create",
+                creation_key="factory-create-"
+                + hashlib.sha256(creation_material.encode("utf-8")).hexdigest(),
+            ),
+            compiled_spec_ref=job.compiled_spec_ref,
+            lease_ref=lease_ref,
+            blueprint_ref=blueprint_ref,
+            tool_plan_ref=tool_plan_ref,
+            required_agent_ids=required_agent_ids,
+            ordered_handoffs=ordered_handoffs,
+            tool_requirements=tool_requirements,
+            workspace_policy_ref=workspace_policy_ref,
+            clarification_policy={
+                "allowed_request_types": (
+                    "clarification",
+                    "credential_required",
+                    "external_api_approval",
+                    "n8n_approval",
+                ),
+                "max_requests": 2,
+            },
+        )
+
+
 @dataclass(frozen=True)
 class FactoryLiveOperatorSettings:
     workspace_root: Path
@@ -416,11 +533,7 @@ def compose_business_demo_factory_operator(
     """Compose every real port without dispatching Hermes, Forge, n8n, or OpenAI."""
 
     current_time = clock or (lambda: datetime.now(timezone.utc))
-    if (
-        settings.factory_v3_enabled
-        and hermes_factory_worker is None
-        and minibook_client is None
-    ) or (
+    if (settings.factory_v3_enabled and minibook_client is None) or (
         not settings.factory_v3_enabled
         and (hermes_factory_worker is not None or minibook_client is not None)
     ):
@@ -482,9 +595,17 @@ def compose_business_demo_factory_operator(
     creation_artifacts = GatewayMinibookCreationArtifactStore(
         creation_artifact_root
     )
+    v3_authority_store = (
+        FilesystemCaptainCreationJobV3Store(
+            authority_root / "runtime-state" / "factory-v3-authority"
+        )
+        if settings.factory_v3_enabled
+        else None
+    )
     candidate_bindings = GatewayForgeCandidateProvider(
         repository=repository,
         artifacts=creation_artifacts,
+        v3_jobs=v3_authority_store,
     )
     technical_revalidation_authority = (
         FilesystemFactoryTechnicalRevalidationAuthority(
@@ -514,14 +635,26 @@ def compose_business_demo_factory_operator(
     factory_evidence_root = (
         authority_root / "runtime-state" / "factory-evidence"
     ).resolve()
-    mapper = CaptainCreationJobMapper(
+    benchmark_cas = BusinessBenchmarkContentAddressedArtifactStore(
+        authority_root / "cas"
+    )
+    legacy_mapper = CaptainCreationJobMapper(
         evidence=CaptainForgeEvidenceBridge(
             repository=repository,
             evidence_store=FilesystemFactoryEvidenceStore(factory_evidence_root),
         )
     )
-    benchmark_cas = BusinessBenchmarkContentAddressedArtifactStore(
-        authority_root / "cas"
+    mapper = (
+        CaptainCreationJobV3Mapper(
+            authority=_CaptainV3CreationAuthorityBuilder(
+                repository=repository,
+                artifacts=benchmark_cas,
+            ),
+            released_skill=lambda job, step: repository.released_for(job, step),
+            store=v3_authority_store,
+        )
+        if v3_authority_store is not None
+        else legacy_mapper
     )
     codex_workspace_root = (
         workspace / ".captain-cook" / "private" / "codex-workspaces"
@@ -620,21 +753,32 @@ def compose_business_demo_factory_operator(
         )
 
     codex_sealer = codex_sealer_for(codex_cli_settings)
-    forge = MinibookSwarmForge(
-        materializer=_FactoryInputMaterializer(
-            benchmark_artifacts=benchmark_cas,
-            codex_build_artifacts=codex_build_cas,
-        ),
-        mapper=mapper,
-        skill_receipts=mapper,
-        settings=MinibookForgeSettings(
-            python_executable=str(settings.python_executable.resolve()),
-            swarm_script=workspace / "minibook" / "autogen_swarm.py",
-            working_directory=workspace,
-            max_runtime_seconds=1800,
-            artifact_root=creation_artifact_root,
-        ),
-    )
+    if settings.factory_v3_enabled:
+        assert minibook_client is not None
+        forge = MinibookForgeHttpClient(
+            mapper=mapper,
+            settings=MinibookForgeHttpSettings(
+                base_url=_required(environment, "CAPTAIN_FACTORY_V3_MINIBOOK_URL").rstrip("/"),
+                api_key=_required(environment, "CAPTAIN_FACTORY_V3_CREATION_API_KEY"),
+            ),
+            client=minibook_client,
+        )
+    else:
+        forge = MinibookSwarmForge(
+            materializer=_FactoryInputMaterializer(
+                benchmark_artifacts=benchmark_cas,
+                codex_build_artifacts=codex_build_cas,
+            ),
+            mapper=legacy_mapper,
+            skill_receipts=legacy_mapper,
+            settings=MinibookForgeSettings(
+                python_executable=str(settings.python_executable.resolve()),
+                swarm_script=workspace / "minibook" / "autogen_swarm.py",
+                working_directory=workspace,
+                max_runtime_seconds=1800,
+                artifact_root=creation_artifact_root,
+            ),
+        )
     technical_ports = GatewayTechnicalTeamExecutionPortsProvider.from_environment(
         environment=environment,
         store=store,

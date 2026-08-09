@@ -914,6 +914,10 @@ class CaptainCreationJobV3Source(Protocol):
 
     def creation_job_for(self, job: FactoryJob, attempt: int) -> CreationJobV3: ...
 
+    def record_accepted_result(self, result: CreationResultV2) -> CreationResultV2: ...
+
+    def accepted_result_for(self, job: FactoryJob, attempt: int) -> CreationResultV2: ...
+
 
 class FactoryBlockSource(Protocol):
     def blocks(self, job_id: object) -> tuple[FactoryEvidenceBlock, ...]: ...
@@ -938,7 +942,6 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
         self._repository = repository
         self._artifacts = artifacts
         self._v3_jobs = v3_jobs
-        self._accepted_v3: dict[tuple[object, int], ResolvedFactoryCandidate] = {}
 
     @property
     def v3_readback_configured(self) -> bool:
@@ -1046,19 +1049,34 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             if (
                 not isinstance(package, dict)
                 or package.get("schema") != "minibook.team-package-manifest.v1"
+                or package_bytes
+                != json.dumps(
+                    package,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+                + b"\n"
                 or files.get(PurePosixPath("package-manifest.json")) != package_bytes
             ):
                 raise ValueError
             entries = package["files"]
+            if [entry.get("path") for entry in entries if isinstance(entry, dict)] != sorted(
+                entry.get("path") for entry in entries if isinstance(entry, dict)
+            ):
+                raise ValueError
             children: dict[PurePosixPath, ArtifactRef] = {}
             for entry in entries:
                 path = PurePosixPath(entry["path"])
                 ref = ArtifactRef.model_validate(
                     {key: entry[key] for key in ("uri", "sha256", "media_type")}
                 )
-                if path in children or files.get(path) != self._read_v3_exact(ref):
+                child_content = self._read_v3_exact(ref)
+                if path in children or files.get(path) != child_content:
                     raise ValueError
                 children[path] = ref
+                contents[_artifact_identity(ref)] = child_content
             if set(files) != {*children, PurePosixPath("package-manifest.json")}:
                 raise ValueError
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1072,6 +1090,25 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
         }
         if any(children.get(path) != reference for path, reference in top_level.items()):
             raise FactoryDispatchError("Captain V3 result refs differ from sealed package")
+        packaged_build_refs = tuple(
+            reference
+            for path, reference in children.items()
+            if str(path).startswith("evidence/build")
+        )
+        packaged_case_refs = tuple(
+            reference
+            for path, reference in children.items()
+            if str(path).startswith("evidence/real-case")
+        )
+        if (
+            packaged_build_refs
+            != tuple(_runtime_ref(ref) for ref in result.build_evidence_refs)
+            or packaged_case_refs
+            != tuple(_runtime_ref(ref) for ref in result.real_case_evidence_refs)
+        ):
+            raise FactoryDispatchError(
+                "Captain V3 result evidence refs differ from the canonical package"
+            )
 
         try:
             team = json.loads(contents[_artifact_identity(top_level[PurePosixPath("team_manifest.json")])])
@@ -1096,9 +1133,33 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise FactoryDispatchError("Captain V3 team topology or required tools are invalid") from exc
 
+        codex = self._validate_v3_receipts(job, authority, result, contents)
+        candidate_source_ref = _runtime_ref(codex.source_archive_ref)
+        candidate_source_bytes = self._read_v3_exact(candidate_source_ref)
+        try:
+            candidate_source_path = self._artifacts.local_path(candidate_source_ref)
+            if (
+                candidate_source_path.read_bytes() != candidate_source_bytes
+                or hashlib.sha256(candidate_source_bytes).hexdigest()
+                != candidate_source_ref.sha256
+            ):
+                raise ValueError
+        except (OSError, ValueError) as exc:
+            raise FactoryDispatchError(
+                "Captain V3 candidate source archive binding is invalid"
+            ) from exc
+
         candidate_ref = _runtime_ref(result.candidate_manifest_ref)
         try:
             candidate_payload = json.loads(contents[_artifact_identity(candidate_ref)])
+            if contents[_artifact_identity(candidate_ref)] != json.dumps(
+                candidate_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8") + b"\n":
+                raise ValueError
             expected_authority = {
                 "compiled_spec_ref": authority.compiled_spec_ref.model_dump(mode="json"),
                 "required_agent_ids": list(authority.required_agent_ids),
@@ -1111,20 +1172,63 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
                 raise ValueError
             if candidate_payload.get("team_manifest_sha256") != top_level[PurePosixPath("team_manifest.json")].sha256:
                 raise ValueError
-            runtime_payload = {
-                key: value
-                for key, value in candidate_payload.items()
-                if key in FactoryCandidateManifest.model_fields or key == "schema"
+            declared_artifacts = candidate_payload.get("artifacts")
+            if not isinstance(declared_artifacts, list):
+                raise ValueError
+            actual_artifacts = {
+                (item.get("path"), item.get("sha256"))
+                for item in declared_artifacts
+                if isinstance(item, dict) and set(item) == {"path", "sha256"}
             }
-            runtime_payload["source_archive_ref"] = source_ref.model_dump(mode="json")
+            expected_artifacts = {
+                (str(path), reference.sha256)
+                for path, reference in children.items()
+                if path != PurePosixPath("factory-candidate.json")
+            }
+            if len(actual_artifacts) != len(declared_artifacts) or actual_artifacts != expected_artifacts:
+                raise ValueError
+            runtime_payload = dict(candidate_payload)
+            for key in (
+                "team_manifest_sha256",
+                "compiled_spec_ref",
+                "required_agent_ids",
+                "ordered_handoffs",
+                "tool_requirements",
+                "public_assertion_ids",
+                "allowed_optional_tool_gaps",
+                "artifacts",
+            ):
+                runtime_payload.pop(key)
+            if runtime_payload.get("source_archive_ref") != candidate_source_ref.model_dump(
+                mode="json"
+            ):
+                raise ValueError
             candidate = FactoryCandidateManifest.model_validate(runtime_payload)
+            declared = (
+                candidate.team_manifest,
+                *candidate.workflow_artifacts,
+                *candidate.tool_schema_artifacts,
+            )
+            for artifact in declared:
+                path = PurePosixPath(artifact.relative_path)
+                if children.get(path) != artifact.reference:
+                    raise ValueError
+                if files.get(path) != contents.get(_artifact_identity(artifact.reference)):
+                    raise ValueError
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise FactoryDispatchError("Captain V3 candidate binding is invalid") from exc
 
-        self._validate_v3_receipts(job, authority, result, contents)
         receipt_ref = _runtime_ref(result.cas_readback_receipt_ref)
         try:
             receipt = json.loads(contents[_artifact_identity(receipt_ref)])
+            if contents[_artifact_identity(receipt_ref)] != json.dumps(
+                receipt,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8") + b"\n":
+                raise ValueError
             actual = {
                 (item["uri"], item["sha256"], item["media_type"])
                 for item in receipt["artifacts"]
@@ -1138,8 +1242,11 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
                 raise ValueError
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise FactoryDispatchError("Captain V3 Minibook readback receipt is invalid") from exc
-        resolved = ResolvedFactoryCandidate(candidate=candidate, source_archive=source_path)
-        self._accepted_v3[(job.job_id, result.attempt)] = resolved
+        resolved = ResolvedFactoryCandidate(
+            candidate=candidate,
+            source_archive=candidate_source_path,
+        )
+        self._v3_jobs.record_accepted_result(result)
         return resolved
 
     def _read_v3_exact(self, reference: ArtifactRef) -> bytes:
@@ -1151,13 +1258,13 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             raise FactoryDispatchError("Captain CAS readback digest mismatch")
         return content
 
-    @staticmethod
     def _validate_v3_receipts(
+        self,
         job: AgentFactoryJobV3,
         authority: CreationJobV3,
         result: CreationResultV2,
         contents: dict[tuple[str, str, str], bytes],
-    ) -> None:
+    ) -> CodexBuildReceiptV1:
         try:
             hermes_ref = _runtime_ref(result.hermes_usage_receipt_ref)
             hermes = ForgeBuildSkillUsageReceiptV1.model_validate_json(contents[_artifact_identity(hermes_ref)])
@@ -1171,9 +1278,25 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
                 PackageRealCaseEvidenceV1.model_validate_json(contents[_artifact_identity(_runtime_ref(ref))])
                 for ref in result.real_case_evidence_refs
             )
+            preliminary_team = json.loads(
+                self._read_v3_exact(_runtime_ref(codex.candidate_manifest_ref))
+            )
+            final_team = json.loads(
+                contents[_artifact_identity(_runtime_ref(result.team_manifest_ref))]
+            )
         except (KeyError, ValueError) as exc:
             raise FactoryDispatchError("Captain V3 build or test evidence is invalid") from exc
         common = (authority.creation_job_id, job.job_id, job.correlation_id, job.subject_version, result.attempt)
+        assignment_identity = {
+            (
+                item.assignment_id,
+                item.checkpoint_version,
+                item.effect_key,
+                item.source_archive_ref,
+                item.codex_session_ref,
+            )
+            for item in (*builds, *cases)
+        }
         if (
             (hermes.creation_job_id, hermes.factory_job_id, hermes.correlation_id, hermes.subject_version, hermes.attempt) != common
             or (codex.creation_job_id, codex.factory_job_id, codex.correlation_id, codex.subject_version, codex.attempt) != common
@@ -1182,19 +1305,29 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             or any((item.creation_job_id, item.factory_job_id, item.correlation_id, item.subject_version, item.attempt) != common for item in (*builds, *cases))
             or any(item.outcome != "passed" for item in (*builds, *cases))
             or any(item.assertion_ids != job.acceptance_assertion_ids for item in cases)
+            or len(assignment_identity) != 1
+            or any(item.source_archive_ref != codex.source_archive_ref for item in (*builds, *cases))
+            or any(item.codex_session_ref != codex.codex_session_ref for item in (*builds, *cases))
+            or any(item.workspace_snapshot_ref != codex.workspace_snapshot_ref for item in builds)
+            or any(item.evidence_refs != result.build_evidence_refs for item in cases)
+            or hermes.evidence_refs
+            != (
+                authority.compiled_spec_ref,
+                authority.blueprint_ref,
+                authority.tool_plan_ref,
+            )
+            or codex.idempotency_key != next(iter(assignment_identity))[2]
+            or preliminary_team != final_team
+            or codex.test_evidence_refs != result.real_case_evidence_refs
         ):
             raise FactoryDispatchError("Captain V3 build or test evidence is stale or failed")
+        return codex
 
     def candidate_for(self, job: FactoryJob) -> ResolvedFactoryCandidate:
         if self._v3_jobs is not None and isinstance(job, AgentFactoryJobV3):
-            candidates = tuple(
-                (attempt, candidate)
-                for (job_id, attempt), candidate in self._accepted_v3.items()
-                if job_id == job.job_id
-            )
-            if not candidates:
-                raise FileNotFoundError("authoritative Gateway V3 candidate reference is unavailable")
-            return max(candidates, key=lambda item: item[0])[1]
+            block = self._authoritative_block(job)
+            result = self._v3_jobs.accepted_result_for(job, block.attempt)
+            return self._accept_v3(job, result)
         block = self._authoritative_block(job)
         resolved, _ = self._resolve_block(job, block)
         return resolved
@@ -1204,6 +1337,13 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
         job: FactoryJob,
         attempt: int,
     ) -> ArtifactRef | None:
+        if self._v3_jobs is not None and isinstance(job, AgentFactoryJobV3):
+            try:
+                self._authoritative_block(job, attempt=attempt)
+                result = self._v3_jobs.accepted_result_for(job, attempt)
+            except (FactoryDispatchError, FileNotFoundError):
+                return None
+            return self._accept_v3(job, result).candidate.source_archive_ref
         try:
             block = self._authoritative_block(job, attempt=attempt)
         except FileNotFoundError:

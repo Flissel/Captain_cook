@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 from typing import Callable, Protocol
@@ -86,6 +87,96 @@ class CaptainCreationJobV3Authority(BaseModel):
     clarification_policy: dict[str, object]
 
 
+class CaptainCreationJobV3Store(Protocol):
+    def record_creation_job(self, job: CreationJobV3) -> CreationJobV3: ...
+
+    def creation_job_for(self, job: object, attempt: int) -> CreationJobV3: ...
+
+    def record_accepted_result(self, result: CreationResultV2) -> CreationResultV2: ...
+
+    def accepted_result_for(self, job: object, attempt: int) -> CreationResultV2: ...
+
+
+class FilesystemCaptainCreationJobV3Store:
+    """Captain-owned immutable V3 mapping/readback state, durable across restart."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root.resolve()
+        if ".captain-cook" not in {part.casefold() for part in self._root.parts}:
+            raise ValueError("V3 authority store must use the .captain-cook namespace")
+        self._root.mkdir(parents=True, exist_ok=True)
+
+    def record_creation_job(self, job: CreationJobV3) -> CreationJobV3:
+        return self._record(
+            job.factory_job_id,
+            job.attempt,
+            "creation-job.json",
+            job,
+            CreationJobV3,
+        )
+
+    def creation_job_for(self, job: object, attempt: int) -> CreationJobV3:
+        return self._read(
+            getattr(job, "job_id", None), attempt, "creation-job.json", CreationJobV3
+        )
+
+    def record_accepted_result(self, result: CreationResultV2) -> CreationResultV2:
+        return self._record(
+            result.factory_job_id,
+            result.attempt,
+            "accepted-result.json",
+            result,
+            CreationResultV2,
+        )
+
+    def accepted_result_for(self, job: object, attempt: int) -> CreationResultV2:
+        return self._read(
+            getattr(job, "job_id", None), attempt, "accepted-result.json", CreationResultV2
+        )
+
+    def _record(self, job_id, attempt, name, value, model):
+        path = self._path(job_id, attempt, name)
+        content = json.dumps(
+            value.model_dump(mode="json", by_alias=True, exclude_none=True),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if path.read_bytes() != content:
+                raise FactoryDispatchError("Captain V3 durable authority replay conflicts")
+        else:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+            )
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return model.model_validate_json(content)
+
+    def _read(self, job_id, attempt, name, model):
+        path = self._path(job_id, attempt, name)
+        try:
+            value = model.model_validate_json(path.read_bytes())
+        except (OSError, ValueError) as exc:
+            raise FactoryDispatchError("Captain V3 durable authority is unavailable or invalid") from exc
+        if value.factory_job_id != job_id or value.attempt != attempt:
+            raise FactoryDispatchError("Captain V3 durable authority identity drift")
+        return value
+
+    def _path(self, job_id: object, attempt: int, name: str) -> Path:
+        if not isinstance(job_id, UUID) or not isinstance(attempt, int) or not 1 <= attempt <= 5:
+            raise FactoryDispatchError("Captain V3 durable authority identity is invalid")
+        return self._root / str(job_id) / f"attempt-{attempt}" / name
+
+
 class CaptainCreationJobV3Mapper:
     """Map only an active digest-bound Captain lease and compiled authority."""
 
@@ -94,10 +185,11 @@ class CaptainCreationJobV3Mapper:
         *,
         authority: Callable[[FactoryDispatch], CaptainCreationJobV3Authority],
         released_skill: Callable[[object, FactorySkillStep], ReleasedHermesSkill],
+        store: CaptainCreationJobV3Store,
     ) -> None:
         self._authority = authority
         self._released_skill = released_skill
-        self._mapped: dict[tuple[UUID, int], CreationJobV3] = {}
+        self._store = store
 
     def map(self, request: FactoryDispatch) -> CreationJobV3:
         if request.action.kind is not FactoryActionKind.SUBMIT_FORGE_JOB:
@@ -199,18 +291,10 @@ class CaptainCreationJobV3Mapper:
                 "required_output_contract": "minibook.creation-result.v2",
             }
         )
-        key = (request.job.job_id, request.action.attempt)
-        existing = self._mapped.setdefault(key, mapped)
-        if existing != mapped:
-            raise FactoryDispatchError("V3 creation job replay conflicts with Captain authority")
-        return existing
+        return self._store.record_creation_job(mapped)
 
     def creation_job_for(self, job: object, attempt: int) -> CreationJobV3:
-        job_id = getattr(job, "job_id", None)
-        try:
-            return self._mapped[(job_id, attempt)]
-        except KeyError as exc:
-            raise FactoryDispatchError("Captain V3 creation job was not mapped") from exc
+        return self._store.creation_job_for(job, attempt)
 
 
 class CaptainCreationJobMapper:
