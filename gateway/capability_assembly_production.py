@@ -818,7 +818,11 @@ def compose_capability_assembly_controller(
         holdout_store=holdout_store,
         clock=clock,
     )
-    private_cases = GenericPrivateBenchmarkRepository(holdouts=holdout_store)
+    private_cases = GenericPrivateBenchmarkRepository(
+        holdouts=holdout_store,
+        executor_authority_id=benchmark_executor.authority_id,
+        evaluator_authority_id=RuleBasedCapabilityBenchmarkEvaluator.AUTHORITY_ID,
+    )
     resume = GatewayCapabilityResumeExecutionAdapter(
         gateway=cast(CapabilityResumeGatewayPort, _SanitizedResumeGateway(resume_gateway))
     )

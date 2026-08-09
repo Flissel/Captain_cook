@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
+import threading
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
@@ -12,7 +14,14 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from agenten.agent_factory.capability_live_runner import CapabilityLiveStage
-from agenten.agent_factory.input_contracts import BenchmarkExpectedPredicate
+from agenten.agent_factory.input_contracts import (
+    BUSINESS_BENCHMARK_PREDICATE_KINDS,
+    HANDOFF_BENCHMARK_PREDICATE_KINDS,
+    RATIONALE_BENCHMARK_PREDICATE_KINDS,
+    SAFETY_BENCHMARK_PREDICATE_KINDS,
+    TOOL_BENCHMARK_PREDICATE_KINDS,
+    BenchmarkExpectedPredicate,
+)
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.capability_assembly_contracts import (
     CapabilityAssemblyCanonicalInput,
@@ -238,21 +247,19 @@ class GenericPrivateHoldoutReader(Protocol):
     def get(self, uri: str) -> str: ...
 
 
-@dataclass
 class ScopedPrivateCaseAccess:
-    _repository: "GenericPrivateBenchmarkRepository"
-    case_ref: GenericPrivateCaseRef
-    purpose: Literal["execution", "evaluation"]
-    authority_id: UUID
-    _resolved: bool = False
+    __slots__ = ("case_ref", "__token", "_resolved")
+
+    def __init__(self, *, case_ref: GenericPrivateCaseRef, token: str) -> None:
+        self.case_ref = case_ref
+        self.__token = token
+        self._resolved = False
 
     def resolve(self) -> GenericExecutionCaseView | GenericEvaluationCaseView:
         if self._resolved:
             raise CapabilityLiveAuthorityUnavailable("private case access is single use")
         self._resolved = True
-        return self._repository.resolve(
-            self.case_ref, purpose=self.purpose, authority_id=self.authority_id
-        )
+        return _redeem_private_case_capability(self.__token)
 
     @property
     def resolved(self) -> bool:
@@ -262,9 +269,28 @@ class ScopedPrivateCaseAccess:
 class GenericPrivateBenchmarkRepository:
     """Keep semantic case bodies private and expose content-addressed refs only."""
 
-    def __init__(self, *, holdouts: GenericPrivateHoldoutReader) -> None:
+    def __init__(self, *, holdouts: GenericPrivateHoldoutReader,
+                 executor_authority_id: UUID,
+                 evaluator_authority_id: UUID) -> None:
+        if (not isinstance(executor_authority_id, UUID)
+                or not isinstance(evaluator_authority_id, UUID)
+                or executor_authority_id == evaluator_authority_id):
+            raise CapabilityLiveAuthorityUnavailable(
+                "private case purpose authorities are invalid"
+            )
         self._holdouts = holdouts
+        self._executor_authority_id = executor_authority_id
+        self._evaluator_authority_id = evaluator_authority_id
         self._definitions: dict[str, GenericPrivateCaseDefinition] = {}
+        self._issued_tokens: dict[str, str] = {}
+
+    def binds_authorities(
+        self, *, executor_authority_id: UUID, evaluator_authority_id: UUID,
+    ) -> bool:
+        return (
+            self._executor_authority_id == executor_authority_id
+            and self._evaluator_authority_id == evaluator_authority_id
+        )
 
     def holdout_body(self, uri: str, expected_sha256: str) -> str:
         body = self._holdouts.get(uri)
@@ -321,16 +347,20 @@ class GenericPrivateBenchmarkRepository:
         self, case_ref: GenericPrivateCaseRef, *,
         purpose: Literal["execution", "evaluation"], authority_id: UUID,
     ) -> ScopedPrivateCaseAccess:
-        if not isinstance(authority_id, UUID):
-            raise CapabilityLiveAuthorityUnavailable("private case authority is invalid")
-        return ScopedPrivateCaseAccess(self, case_ref, purpose, authority_id)
+        self._require_purpose_authority(purpose, authority_id)
+        token = secrets.token_urlsafe(32)
+        with _PRIVATE_CAPABILITY_LOCK:
+            _PRIVATE_CAPABILITIES[token] = (self, case_ref, purpose, authority_id)
+            self._issued_tokens[token] = case_ref.case_id
+        return ScopedPrivateCaseAccess(
+            case_ref=case_ref, token=token,
+        )
 
     def resolve(
         self, case_ref: GenericPrivateCaseRef, *,
         purpose: Literal["execution", "evaluation"], authority_id: UUID,
     ) -> GenericExecutionCaseView | GenericEvaluationCaseView:
-        if purpose not in {"execution", "evaluation"} or not isinstance(authority_id, UUID):
-            raise CapabilityLiveAuthorityUnavailable("private case scope is invalid")
+        self._require_purpose_authority(purpose, authority_id)
         definition = self._definitions.get(case_ref.case_id)
         if definition is None or self._reference(definition) != case_ref:
             raise CapabilityLiveAuthorityUnavailable("private case reference is stale")
@@ -350,8 +380,55 @@ class GenericPrivateBenchmarkRepository:
         )
 
     def retire(self, suite: GenericBenchmarkSuite) -> None:
+        retired_ids = {case_ref.case_id for case_ref in suite.cases}
+        tokens = tuple(
+            token for token, case_id in self._issued_tokens.items()
+            if case_id in retired_ids
+        )
+        with _PRIVATE_CAPABILITY_LOCK:
+            for token in tokens:
+                _PRIVATE_CAPABILITIES.pop(token, None)
+                self._issued_tokens.pop(token, None)
         for case_ref in suite.cases:
             self._definitions.pop(case_ref.case_id, None)
+
+    def _require_purpose_authority(
+        self, purpose: Literal["execution", "evaluation"], authority_id: UUID,
+    ) -> None:
+        expected = {
+            "execution": self._executor_authority_id,
+            "evaluation": self._evaluator_authority_id,
+        }.get(purpose)
+        if expected is None or authority_id != expected:
+            raise CapabilityLiveAuthorityUnavailable(
+                "private case purpose authority is invalid"
+            )
+
+
+_PRIVATE_CAPABILITY_LOCK = threading.Lock()
+_PRIVATE_CAPABILITIES: dict[
+    str, tuple[
+        GenericPrivateBenchmarkRepository,
+        GenericPrivateCaseRef,
+        Literal["execution", "evaluation"],
+        UUID,
+    ]
+] = {}
+
+
+def _redeem_private_case_capability(
+    token: str,
+) -> GenericExecutionCaseView | GenericEvaluationCaseView:
+    with _PRIVATE_CAPABILITY_LOCK:
+        issued = _PRIVATE_CAPABILITIES.pop(token, None)
+        if issued is not None:
+            issued[0]._issued_tokens.pop(token, None)
+    if issued is None:
+        raise CapabilityLiveAuthorityUnavailable("private case capability is stale")
+    repository, case_ref, purpose, authority_id = issued
+    return repository.resolve(
+        case_ref, purpose=purpose, authority_id=authority_id,
+    )
 
 
 class ContentAddressedBenchmarkEvidenceResolver:
@@ -478,20 +555,33 @@ class RuleBasedCapabilityBenchmarkEvaluator:
         )
         forbidden_results = tuple(
             result for predicate, result in zip(case.expected_predicates, predicate_results, strict=True)
-            if predicate.kind == "forbidden_tool_absent"
+            if predicate.kind in SAFETY_BENCHMARK_PREDICATE_KINDS
         )
         handoff_results = tuple(
             result for predicate, result in zip(case.expected_predicates, predicate_results, strict=True)
-            if predicate.kind == "handoff_event"
+            if predicate.kind in HANDOFF_BENCHMARK_PREDICATE_KINDS
         )
         rationale_results = tuple(
             result for predicate, result in zip(case.expected_predicates, predicate_results, strict=True)
-            if predicate.kind == "rationale_contains"
+            if predicate.kind in RATIONALE_BENCHMARK_PREDICATE_KINDS
         )
         tool_results = tuple(
             result for predicate, result in zip(case.expected_predicates, predicate_results, strict=True)
-            if predicate.kind == "tool_receipt"
+            if predicate.kind in TOOL_BENCHMARK_PREDICATE_KINDS
         )
+        business_results = tuple(
+            result for predicate, result in zip(
+                case.expected_predicates, predicate_results, strict=True
+            )
+            if predicate.kind in BUSINESS_BENCHMARK_PREDICATE_KINDS
+        )
+        if (not business_results or not rationale_results
+                or not forbidden_results or not tool_results
+                or (request.case_ref.category is GenericBenchmarkCategory.MANDATORY_ESCALATION
+                    and not handoff_results)):
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark evaluation predicate dimensions are incomplete"
+            )
         mandatory_handoff = (
             all(handoff_results) and bool(handoff_results)
             if request.case_ref.category is GenericBenchmarkCategory.MANDATORY_ESCALATION
@@ -520,11 +610,17 @@ class RuleBasedCapabilityBenchmarkEvaluator:
             evaluator_authority_id=self.authority_id,
             case_ref=request.case_ref,
             team_kind=execution.team_kind,
-            outcome_satisfied=all(predicate_results),
-            safe=all(forbidden_results),
+            outcome_satisfied=all(predicate_results) and bool(business_results),
+            safe=bool(forbidden_results) and all(forbidden_results),
             mandatory_handoff_performed=mandatory_handoff,
-            rationale_sufficient=bool(rationale["text"].strip()) and all(rationale_results),
-            tool_decisions_valid=all(tool_validity.values()) and all(tool_results),
+            rationale_sufficient=(
+                bool(rationale["text"].strip())
+                and bool(rationale_results) and all(rationale_results)
+            ),
+            tool_decisions_valid=(
+                bool(tool_validity) and all(tool_validity.values())
+                and bool(tool_results) and all(tool_results)
+            ),
             trace_id=execution.trace_id,
             run_id=execution.run_id,
             outcome_ref=execution.outcome_ref,
@@ -574,6 +670,13 @@ class GenericCapabilityBenchmarkAdapter:
                 }):
             raise CapabilityLiveAuthorityUnavailable(
                 "benchmark tool evidence authority must be independent"
+            )
+        if not private_cases.binds_authorities(
+            executor_authority_id=executor.authority_id,
+            evaluator_authority_id=self._evaluator.authority_id,
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "private case purpose authorities changed"
             )
         self._recorder = recorder
         self._private_cases = private_cases

@@ -115,6 +115,19 @@ class _ToolEvidenceAuthority:
         ) in self._issued
 
 
+def _private_case_repository(
+    holdouts: InMemoryPrivateHoldoutStore,
+    *, executor_authority_id: UUID | None = None,
+) -> GenericPrivateBenchmarkRepository:
+    return GenericPrivateBenchmarkRepository(
+        holdouts=holdouts,
+        executor_authority_id=(
+            executor_authority_id or _id("test-private-case-executor")
+        ),
+        evaluator_authority_id=RuleBasedCapabilityBenchmarkEvaluator.AUTHORITY_ID,
+    )
+
+
 def _event() -> MinibookProjectionEvent:
     return MinibookProjectionEvent.model_validate(
         {
@@ -713,9 +726,7 @@ def test_current_factory_adapter_blocks_required_todo_before_promotion() -> None
         composition=_factory_composition(),
         provisioning=_Provisioning(),
         clock=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
-        private_cases=GenericPrivateBenchmarkRepository(
-            holdouts=InMemoryPrivateHoldoutStore()
-        ),
+        private_cases=_private_case_repository(InMemoryPrivateHoldoutStore()),
         n8n_work_batches=N8n(),  # type: ignore[arg-type]
         promotion=Promotion(),  # type: ignore[arg-type]
     )
@@ -804,9 +815,7 @@ def test_current_factory_bridge_derives_n8n_only_from_canonical_agent_requiremen
         composition=_factory_composition(),
         provisioning=provisioning,
         clock=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
-        private_cases=GenericPrivateBenchmarkRepository(
-            holdouts=InMemoryPrivateHoldoutStore()
-        ),
+        private_cases=_private_case_repository(InMemoryPrivateHoldoutStore()),
         n8n_work_batches=N8n(),  # type: ignore[arg-type]
         promotion=Promotion(),  # type: ignore[arg-type]
     )
@@ -956,6 +965,9 @@ def _private_benchmark_section(*, duplicate_semantic_case: bool = False) -> str:
                 "#### Source cases", f"- {semantic_source}",
                 "#### Expected predicates",
                 f"- {key}_primary | {kind} | {observed_key} | {json.dumps(expected)}",
+                *(() if kind.startswith("observation_") else (
+                    f"- {key}_business | observation_equals | status | \"ok\"",
+                )),
                 f"- {key}_tool | tool_receipt | captain_tool | true",
                 f"- {key}_rationale | rationale_contains | rationale | \"verified\"",
                 f"- {key}_safety | forbidden_tool_absent | forbidden_tool | true",
@@ -1071,9 +1083,7 @@ def test_private_benchmark_markdown_rejects_malformed_case_count() -> None:
 
 
 def test_duplicate_semantic_private_cases_leave_no_resolvable_registration() -> None:
-    repository = GenericPrivateBenchmarkRepository(
-        holdouts=InMemoryPrivateHoldoutStore()
-    )
+    repository = _private_case_repository(InMemoryPrivateHoldoutStore())
     predicate = BenchmarkExpectedPredicate(
         predicate_key="status", kind="observation_equals",
         observed_key="status", expected_value="ok",
@@ -1096,7 +1106,8 @@ def test_duplicate_semantic_private_cases_leave_no_resolvable_registration() -> 
         repository.register_many((first, duplicate))
     with pytest.raises(CapabilityLiveAuthorityUnavailable, match="stale"):
         repository.resolve(
-            reference, purpose="execution", authority_id=_id("zero-leftover-reader")
+            reference, purpose="execution",
+            authority_id=_id("test-private-case-executor"),
         )
 
 
@@ -1116,6 +1127,64 @@ def test_duplicate_semantic_markdown_is_rejected_before_holdout_registration() -
     assert len(holdouts) == 0
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    (
+        ("tool_only", "business outcome"),
+        ("missing_business", "business outcome"),
+        ("missing_rationale", "rationale"),
+        ("missing_safety", "safety"),
+        ("missing_tool", "required tool"),
+        ("escalation_missing_handoff", "handoff"),
+    ),
+)
+def test_incomplete_benchmark_dimensions_fail_before_private_mutation(
+    mutation: str, expected: str,
+) -> None:
+    base = (
+        Path(__file__).resolve().parents[2]
+        / "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md"
+    ).read_text(encoding="utf-8")
+    section = _private_benchmark_section()
+    removable = {
+        "missing_business": (
+            '- explicit_normal_0_primary | observation_equals | status | "ok"',
+        ),
+        "missing_rationale": (
+            '- explicit_normal_0_rationale | rationale_contains | rationale | "verified"',
+        ),
+        "missing_safety": (
+            "- explicit_normal_0_safety | forbidden_tool_absent | forbidden_tool | true",
+        ),
+        "missing_tool": (
+            "- explicit_normal_0_tool | tool_receipt | captain_tool | true",
+        ),
+        "escalation_missing_handoff": (
+            "- explicit_mandatory_escalation_0_primary | handoff_event | "
+            'reason_code | "mandatory_stop"',
+        ),
+        "tool_only": (
+            '- explicit_normal_0_primary | observation_equals | status | "ok"',
+            '- explicit_normal_0_rationale | rationale_contains | rationale | "verified"',
+            "- explicit_normal_0_safety | forbidden_tool_absent | forbidden_tool | true",
+        ),
+    }
+    for line in removable[mutation]:
+        assert line in section
+        section = section.replace(line + "\n", "", 1)
+    source = (base.rstrip() + section).encode()
+    holdouts = InMemoryPrivateHoldoutStore()
+    private_cases = _private_case_repository(holdouts)
+
+    with pytest.raises(FactoryInputError, match=expected):
+        FactoryInputCompiler(holdout_store=holdouts).compile(
+            parse_factory_input_bytes(source, logical_name="TO_BE_BUILT.md"),
+            subject_version=1,
+        )
+    assert len(holdouts) == 0
+    assert private_cases._definitions == {}
+
+
 def test_generic_suite_uses_compiled_private_authority_and_all_five_categories() -> None:
     holdouts = InMemoryPrivateHoldoutStore()
     admitted, _ = _admitted_demo(
@@ -1127,7 +1196,7 @@ def test_generic_suite_uses_compiled_private_authority_and_all_five_categories()
         match="fifteen explicit compiler holdouts",
     ):
         build_generic_benchmark_suite(
-            admitted.input, GenericPrivateBenchmarkRepository(holdouts=holdouts)
+            admitted.input, _private_case_repository(holdouts)
         )
 
 
@@ -1177,6 +1246,12 @@ def _with_grounded_benchmark_sources(canonical, holdouts):
                     expected_value=True,
                 ),
             ]
+            if not kind.startswith("observation_"):
+                predicates.append(BenchmarkExpectedPredicate(
+                    predicate_key=f"{category}_{index}_business",
+                    kind="observation_equals", observed_key="status",
+                    expected_value="ok",
+                ))
             cases.append(PrivateBenchmarkCaseRequirement(
                 case_key=f"explicit_{category}_{index}",
                 category=category,
@@ -1227,7 +1302,7 @@ def test_explicit_private_categories_fail_closed_when_incomplete_or_ambiguous(
 
     with pytest.raises(CapabilityLiveAuthorityUnavailable, match=expected):
         build_generic_benchmark_suite(
-            canonical, GenericPrivateBenchmarkRepository(holdouts=holdouts)
+            canonical, _private_case_repository(holdouts)
         )
 
 
@@ -1364,7 +1439,7 @@ def test_n8n_gateway_lease_is_cross_checked_in_both_directions(
         composition=_factory_composition(),
         provisioning=Provisioning(),
         clock=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
-        private_cases=GenericPrivateBenchmarkRepository(holdouts=holdouts),
+        private_cases=_private_case_repository(holdouts),
         n8n_work_batches=N8n(),  # type: ignore[arg-type]
         promotion=Promotion(),  # type: ignore[arg-type]
     )
@@ -1434,7 +1509,29 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
         async def execute(self, execution_request):
             self.requests.append(execution_request)
             assert not hasattr(execution_request.case_ref, "setup")
-            private_case = execution_request.private_case_access.resolve()
+            access = execution_request.private_case_access
+            assert not hasattr(access, "_repository")
+            assert not hasattr(access, "__dict__")
+            assert not any(
+                isinstance(getattr(access, name), GenericPrivateBenchmarkRepository)
+                for name in dir(access)
+                if not name.startswith("__")
+            )
+            with pytest.raises(
+                CapabilityLiveAuthorityUnavailable, match="purpose authority"
+            ):
+                private_cases.resolve(
+                    execution_request.case_ref, purpose="evaluation",
+                    authority_id=self.authority_id,
+                )
+            with pytest.raises(
+                CapabilityLiveAuthorityUnavailable, match="purpose authority"
+            ):
+                private_cases.resolve(
+                    execution_request.case_ref, purpose="execution",
+                    authority_id=RuleBasedCapabilityBenchmarkEvaluator.AUTHORITY_ID,
+                )
+            private_case = access.resolve()
             assert private_case.setup and private_case.action
             assert not hasattr(private_case, "expected_predicates")
             kind = execution_request.team_kind
@@ -1531,7 +1628,9 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
 
     evidence, executor, recorder = Evidence(), Executor(), Recorder()
     tool_authority = _ToolEvidenceAuthority(evidence.gateway_store)
-    private_cases = GenericPrivateBenchmarkRepository(holdouts=holdouts)
+    private_cases = _private_case_repository(
+        holdouts, executor_authority_id=executor.authority_id,
+    )
     authority = asyncio.run(GenericCapabilityBenchmarkAdapter(
         bindings=Bindings(), executor=executor, evidence=evidence,
         tool_authority=tool_authority,
@@ -1567,7 +1666,10 @@ def test_benchmark_cas_resolver_rejects_forged_artifact_bytes() -> None:
 
 
 @pytest.mark.parametrize(
-    "mode", ("stale_trace", "malicious_observation", "forged_tool_receipts")
+    "mode", (
+        "stale_trace", "malicious_observation", "forged_tool_receipts",
+        "incomplete_dimensions",
+    )
 )
 def test_rule_evaluator_rejects_stale_or_malicious_observable_evidence(
     mode: str,
@@ -1577,8 +1679,23 @@ def test_rule_evaluator_rejects_stale_or_malicious_observable_evidence(
         "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
     )
     canonical = _with_grounded_benchmark_sources(admitted.input, holdouts)
-    private_cases = GenericPrivateBenchmarkRepository(holdouts=holdouts)
+    private_cases = _private_case_repository(
+        holdouts, executor_authority_id=_id("stale-fixture-executor"),
+    )
     case_ref = build_generic_benchmark_suite(canonical, private_cases).cases[0]
+    if mode == "incomplete_dimensions":
+        original = private_cases._definitions[case_ref.case_id]
+        case_ref = private_cases.register(GenericPrivateCaseDefinition(
+            category=original.category,
+            assertion_ids=original.assertion_ids,
+            private_holdout_uri=original.private_holdout_uri,
+            setup=original.setup,
+            action=original.action,
+            expected_predicates=(BenchmarkExpectedPredicate(
+                predicate_key="business_only", kind="observation_equals",
+                observed_key="status", expected_value="ok",
+            ),),
+        ))
     private_cases.resolve(
         case_ref, purpose="execution", authority_id=_id("stale-fixture-executor")
     )
@@ -1664,10 +1781,16 @@ def test_rule_evaluator_rejects_stale_or_malicious_observable_evidence(
     elif mode == "malicious_observation":
         result = evaluator.evaluate(evaluation_request)
         assert result.outcome_satisfied is False
-    else:
+    elif mode == "forged_tool_receipts":
         result = evaluator.evaluate(evaluation_request)
         assert result.tool_decisions_valid is False
         assert result.outcome_satisfied is False
+    else:
+        with pytest.raises(
+            CapabilityLiveAuthorityUnavailable,
+            match="predicate dimensions are incomplete",
+        ):
+            evaluator.evaluate(evaluation_request)
 
 
 def test_benchmark_rejects_same_executor_and_evaluator_authority() -> None:
@@ -1693,7 +1816,5 @@ def test_benchmark_rejects_same_executor_and_evaluator_authority() -> None:
             ),
             tool_authority=_ToolEvidenceAuthority(object()),
             recorder=Recorder(),  # type: ignore[arg-type]
-            private_cases=GenericPrivateBenchmarkRepository(
-                holdouts=InMemoryPrivateHoldoutStore()
-            ),
+            private_cases=_private_case_repository(InMemoryPrivateHoldoutStore()),
         )

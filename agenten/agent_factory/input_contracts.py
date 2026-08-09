@@ -12,6 +12,13 @@ from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN
 
 
 ALIAS_PATTERN = r"^[A-Z][A-Z0-9_]*$"
+BUSINESS_BENCHMARK_PREDICATE_KINDS = frozenset({
+    "observation_equals", "observation_contains", "observation_absent",
+})
+RATIONALE_BENCHMARK_PREDICATE_KINDS = frozenset({"rationale_contains"})
+SAFETY_BENCHMARK_PREDICATE_KINDS = frozenset({"forbidden_tool_absent"})
+TOOL_BENCHMARK_PREDICATE_KINDS = frozenset({"tool_receipt"})
+HANDOFF_BENCHMARK_PREDICATE_KINDS = frozenset({"handoff_event"})
 
 
 class _FrozenContract(BaseModel):
@@ -49,6 +56,18 @@ class BenchmarkExpectedPredicate(_FrozenContract):
     observed_key: str = Field(pattern=IDENTIFIER_PATTERN)
     expected_value: str | bool
 
+    @model_validator(mode="after")
+    def validate_expected_value_semantics(self) -> "BenchmarkExpectedPredicate":
+        if self.kind in {
+            "observation_absent", "tool_receipt", "forbidden_tool_absent",
+        } and self.expected_value is not True:
+            raise ValueError(f"{self.kind} predicate must require true")
+        if self.kind in {
+            "observation_contains", "handoff_event", "rationale_contains",
+        } and not isinstance(self.expected_value, str):
+            raise ValueError(f"{self.kind} predicate must require a string")
+        return self
+
 
 class PrivateBenchmarkCaseRequirement(_FrozenContract):
     case_key: str = Field(pattern=IDENTIFIER_PATTERN)
@@ -65,6 +84,21 @@ class PrivateBenchmarkCaseRequirement(_FrozenContract):
         keys = tuple(item.predicate_key for item in self.expected_predicates)
         if len(keys) != len(set(keys)):
             raise ValueError("benchmark predicate keys must be unique")
+        kinds = {item.kind for item in self.expected_predicates}
+        required_dimensions = (
+            (BUSINESS_BENCHMARK_PREDICATE_KINDS, "business outcome"),
+            (RATIONALE_BENCHMARK_PREDICATE_KINDS, "rationale"),
+            (SAFETY_BENCHMARK_PREDICATE_KINDS, "safety"),
+            (TOOL_BENCHMARK_PREDICATE_KINDS, "required tool"),
+        )
+        for allowed, label in required_dimensions:
+            if kinds.isdisjoint(allowed):
+                raise ValueError(f"private benchmark case requires a {label} predicate")
+        if (self.category == "mandatory_escalation"
+                and kinds.isdisjoint(HANDOFF_BENCHMARK_PREDICATE_KINDS)):
+            raise ValueError(
+                "mandatory escalation benchmark case requires a handoff predicate"
+            )
         return self
 
 
