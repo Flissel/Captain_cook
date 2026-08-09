@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path as FilesystemPath
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Callable, Literal, Protocol
 from uuid import UUID, uuid4
+
+import httpx
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response, status
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -107,6 +110,10 @@ from gateway.integration_setup_contracts import (
     IntegrationSetupSurfaceV1,
     build_integration_setup_surface,
 )
+from agenten.agent_runtime.http_executor import AgentRuntimeHttpExecutor
+from agenten.agent_factory.capability_live_runner import (
+    FilesystemCapabilityLiveCheckpointStore,
+)
 from gateway.capability_live_pipeline import (
     CapabilityExecutionAuthority,
     CapabilityResumeAuthorization,
@@ -121,6 +128,7 @@ from gateway.capability_resume_contracts import (
 )
 from gateway.capability_resume_service import (
     CapabilityResumeConflict,
+    CapabilityResumeDispatchFailed,
     CapabilityResumeExecutor,
     CapabilityResumeNotFound,
     CapabilityResumeService,
@@ -328,6 +336,7 @@ def create_app(
         configured_store(storage, settings) if storage else None
     )
     resume_service = capability_resume_service
+    runtime_http_client: httpx.AsyncClient | None = None
     resume_service_lock = Lock()
     portal_clock = portal_clock or (lambda: datetime.now(timezone.utc))
     portal_control_boot_id = str(uuid4())
@@ -342,6 +351,8 @@ def create_app(
         try:
             yield
         finally:
+            if runtime_http_client is not None:
+                await runtime_http_client.aclose()
             stop = getattr(mirror, "stop", None)
             if stop:
                 await stop()
@@ -404,19 +415,48 @@ def create_app(
         return store
 
     def get_capability_resume_service() -> CapabilityResumeService:
-        nonlocal resume_service
+        nonlocal resume_service, runtime_http_client
         if resume_service is None:
             with resume_service_lock:
                 if resume_service is None:
                     gateway = get_store()
-                    authority = GatewayCapabilityResumeAuthoritySource(gateway)
+                    configured = load_gateway_settings(app)
+                    selected_executor = capability_resume_executor
+                    if selected_executor is None:
+                        if (
+                            configured.captain_runtime_url is None
+                            or configured.captain_runtime_token is None
+                        ):
+                            raise CapabilityResumeUnavailable(
+                                "Captain Runtime resume configuration is unavailable"
+                            )
+                        runtime_http_client = httpx.AsyncClient(
+                            verify=configured.tls_ca_bundle_path or True,
+                            timeout=30.0,
+                        )
+                        selected_executor = AgentRuntimeHttpExecutor(
+                            base_url=configured.captain_runtime_url,
+                            token=configured.captain_runtime_token.get_secret_value(),
+                            client=runtime_http_client,
+                        )
+                    authority = GatewayCapabilityResumeAuthoritySource(
+                        gateway,
+                        checkpoints=FilesystemCapabilityLiveCheckpointStore(
+                            FilesystemPath.cwd()
+                            / ".captain-cook"
+                            / "live-demo"
+                            / "checkpoints"
+                        ),
+                    )
                     resume_service = CapabilityResumeService(
                         repository=GatewayCapabilityResumeRepository(gateway),
                         authority_source=authority,
                         runtime_reader=authority,
-                        executor=capability_resume_executor,
+                        executor=selected_executor,
                     )
         return resume_service
+
+    app.state.get_capability_resume_service = get_capability_resume_service
 
     def translate_capability_resume_error(error: Exception) -> HTTPException:
         if isinstance(error, CapabilityResumeNotFound):
@@ -425,6 +465,14 @@ def create_app(
             return HTTPException(status_code=409, detail=str(error))
         if isinstance(error, CapabilityResumeUnavailable):
             return HTTPException(status_code=409, detail=str(error))
+        if isinstance(error, CapabilityResumeDispatchFailed):
+            return HTTPException(
+                status_code=502,
+                detail={
+                    "code": error.failure.failure_kind,
+                    "failure_id": str(error.failure.failure_id),
+                },
+            )
         return HTTPException(status_code=503, detail="capability resume unavailable")
 
     @app.get("/healthz")

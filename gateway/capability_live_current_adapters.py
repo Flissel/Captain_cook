@@ -199,6 +199,9 @@ class RecordedFactoryCapabilityExecutionAdapter:
         authorization_request = CapabilityResumeExecutionRequest(
             job_id=release.job_id,
             reservation_id=request.reservation.reservation_id,
+            run_id=request.run_id,
+            input_id=request.input.input_id,
+            maximum_cost_usd=request.reservation.maximum_cost_usd,
             correlation_id=release.correlation_id,
             capability_id=release.capability_id,
             capability_version=release.capability_version,

@@ -76,6 +76,8 @@ def _settings() -> GatewaySettings:
             "ledger_dsn": "mysql://ignored:ignored@127.0.0.1:3306/ignored",
             "captain_gateway_token": CAPTAIN_TOKEN,
             "worker_gateway_token": WORKER_TOKEN,
+            "captain_runtime_url": "https://runtime.test",
+            "captain_runtime_token": "runtime-resume-test-token",
         }
     )
 
@@ -84,6 +86,9 @@ def _authorization_request() -> dict[str, object]:
     return {
         "job_id": str(uuid5(NAMESPACE_URL, "resume-api-job")),
         "reservation_id": str(uuid5(NAMESPACE_URL, "resume-api-reservation")),
+        "run_id": str(uuid5(NAMESPACE_URL, "resume-api-run")),
+        "input_id": "input-one",
+        "maximum_cost_usd": "2.00",
         "correlation_id": str(uuid5(NAMESPACE_URL, "resume-api-correlation")),
         "capability_id": "claims-capability",
         "capability_version": 3,
@@ -166,7 +171,8 @@ async def test_resume_http_client_implements_authorize_dispatch_readback_port() 
             {
                 **_authorization_request(),
                 "job_id": uuid5(NAMESPACE_URL, "resume-api-job"),
-                "reservation_id": uuid5(NAMESPACE_URL, "resume-api-reservation"),
+                    "reservation_id": uuid5(NAMESPACE_URL, "resume-api-reservation"),
+                    "run_id": uuid5(NAMESPACE_URL, "resume-api-run"),
                 "correlation_id": uuid5(NAMESPACE_URL, "resume-api-correlation"),
                 "original_execution_command_id": uuid5(
                     NAMESPACE_URL, "resume-api-original-command"
@@ -203,7 +209,8 @@ async def test_resume_http_client_error_does_not_retain_token_or_response_body()
             {
                 **_authorization_request(),
                 "job_id": uuid5(NAMESPACE_URL, "resume-api-job"),
-                "reservation_id": uuid5(NAMESPACE_URL, "resume-api-reservation"),
+                    "reservation_id": uuid5(NAMESPACE_URL, "resume-api-reservation"),
+                    "run_id": uuid5(NAMESPACE_URL, "resume-api-run"),
                 "correlation_id": uuid5(NAMESPACE_URL, "resume-api-correlation"),
                 "original_execution_command_id": uuid5(
                     NAMESPACE_URL, "resume-api-original-command"
@@ -222,3 +229,23 @@ async def test_resume_http_client_error_does_not_retain_token_or_response_body()
     assert "status 401" in message
     assert "wrong-secret-token" not in message
     assert "invalid or missing bearer token" not in message
+
+
+def test_default_app_composes_authenticated_runtime_resume_executor(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class RuntimeExecutor:
+        def __init__(self, base_url: str, token: str, client: object) -> None:
+            captured.update(base_url=base_url, token=token, client=client)
+
+        async def execute(self, command):
+            raise AssertionError("preflight must not execute a runtime command")
+
+    monkeypatch.setattr("gateway.app.AgentRuntimeHttpExecutor", RuntimeExecutor)
+    app = create_app(settings=_settings(), gateway_store=object())
+
+    with TestClient(app):
+        app.state.get_capability_resume_service()
+
+    assert captured["base_url"] == "https://runtime.test"
+    assert captured["token"] == "runtime-resume-test-token"

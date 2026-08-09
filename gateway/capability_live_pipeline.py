@@ -144,11 +144,22 @@ class CapabilityResumeExecutionRequest(_FrozenAuthority):
 
     job_id: UUID
     reservation_id: UUID
+    run_id: UUID
+    input_id: str = Field(min_length=1)
+    maximum_cost_usd: Decimal
     correlation_id: UUID
     capability_id: str = Field(min_length=1)
     capability_version: int = Field(ge=1, strict=True)
     original_execution_command_id: UUID
     original_execution_result_id: UUID
+
+    @field_validator("maximum_cost_usd", mode="before")
+    @classmethod
+    def require_resume_ceiling(cls, value: object) -> Decimal:
+        amount = _nonnegative_decimal(value, "resume maximum cost")
+        if amount <= 0:
+            raise ValueError("resume maximum cost must be positive")
+        return amount
 
 
 class CapabilityFactoryPort(Protocol):

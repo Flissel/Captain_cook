@@ -44,6 +44,8 @@ class GatewaySettings(BaseModel):
     port: int = Field(default=8090, ge=1, le=65535)
     claim_ttl_seconds: int = Field(default=5_400, ge=1, le=86_400)
     captain_n8n_ui_url: str = "http://localhost:5679"
+    captain_runtime_url: str | None = None
+    captain_runtime_token: SecretStr | None = None
     portal_supabase_issuer: str | None = None
     portal_supabase_audience: str | None = None
     portal_supabase_jwks_url: str | None = None
@@ -83,6 +85,32 @@ class GatewaySettings(BaseModel):
         ):
             raise ValueError("Captain n8n URL must be a safe HTTP URL")
         return value.rstrip("/")
+
+    @field_validator("captain_runtime_url")
+    @classmethod
+    def _runtime_url_must_be_safe(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Captain Runtime URL must be a safe HTTP URL")
+        return value.rstrip("/")
+
+    @field_validator("captain_runtime_token")
+    @classmethod
+    def _runtime_token_must_not_be_blank(
+        cls, value: SecretStr | None
+    ) -> SecretStr | None:
+        if value is not None and not value.get_secret_value().strip():
+            raise ValueError("Captain Runtime token must not be blank")
+        return value
 
     @field_validator(
         "portal_supabase_issuer",
@@ -146,6 +174,8 @@ class GatewaySettings(BaseModel):
             self.worker_gateway_token.get_secret_value(),
         ):
             raise ValueError("gateway role tokens must be distinct")
+        if (self.captain_runtime_url is None) != (self.captain_runtime_token is None):
+            raise ValueError("Captain Runtime settings must be configured together")
         portal_settings = (
             self.portal_supabase_issuer,
             self.portal_supabase_audience,
@@ -246,6 +276,8 @@ class GatewaySettings(BaseModel):
             "LEDGER_DSN",
             "CAPTAIN_GATEWAY_TOKEN",
             "WORKER_GATEWAY_TOKEN",
+            "CAPTAIN_RUNTIME_URL",
+            "CAPTAIN_RUNTIME_TOKEN",
         )
         missing = [
             name
@@ -315,6 +347,8 @@ class GatewaySettings(BaseModel):
                     "CAPTAIN_N8N_URL",
                     "http://localhost:5679",
                 ),
+                captain_runtime_url=source["CAPTAIN_RUNTIME_URL"],
+                captain_runtime_token=SecretStr(source["CAPTAIN_RUNTIME_TOKEN"]),
                 portal_supabase_issuer=source.get("PORTAL_SUPABASE_ISSUER"),
                 portal_supabase_audience=source.get("PORTAL_SUPABASE_AUDIENCE"),
                 portal_supabase_jwks_url=source.get("PORTAL_SUPABASE_JWKS_URL"),

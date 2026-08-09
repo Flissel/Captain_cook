@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agenten.agent_runtime.contracts import AgentRuntimeCommand, ArtifactRef
+from agenten.agent_factory.capability_live_runner import CapabilityLiveReservation
 from gateway.capability_live_pipeline import (
     CapabilityExecutionAuthority,
     CapabilityResumeAuthorization,
@@ -30,6 +31,9 @@ class CapabilityResumeAuthorizeHttpRequest(_HttpResumeContract):
 
     job_id: UUID
     reservation_id: UUID
+    run_id: UUID
+    input_id: str = Field(min_length=1)
+    maximum_cost_usd: Decimal
     correlation_id: UUID
     capability_id: str = Field(min_length=1)
     capability_version: int = Field(ge=1, strict=True)
@@ -72,6 +76,7 @@ class CapabilityResumeSourceSnapshotV1(_FrozenResumeContract):
     capability_id: str = Field(min_length=1)
     capability_version: int = Field(ge=1, strict=True)
     booked_cost_usd: Decimal
+    reservation: CapabilityLiveReservation
     original_operation: RuntimeOperationProjection
 
     @field_validator("booked_cost_usd", mode="before")
@@ -98,6 +103,18 @@ class CapabilityResumeAuthorizationRecordV1(_FrozenResumeContract):
     authorization: CapabilityResumeAuthorization
     resume_command: AgentRuntimeCommand
     booked_cost_usd: Decimal
+    resume_budget_usd: Decimal
+
+    @field_validator("booked_cost_usd", "resume_budget_usd", mode="before")
+    @classmethod
+    def require_nonnegative_booking(cls, value: object) -> Decimal:
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            raise ValueError("resume booking must be a known decimal") from None
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("resume booking must be finite and non-negative")
+        return amount
 
 
 class CapabilityResumeDispatchStartedV1(_FrozenResumeContract):
@@ -110,6 +127,20 @@ class CapabilityResumeDispatchStartedV1(_FrozenResumeContract):
     )
     authorization_receipt_id: UUID
     execution_command_id: UUID
+
+
+class CapabilityResumeDispatchFailureV1(_FrozenResumeContract):
+    """Gateway-owned terminal receipt when no Runtime result was persisted."""
+
+    schema_name: Literal["captain.capability-resume-dispatch-failure.v1"] = Field(
+        default="captain.capability-resume-dispatch-failure.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    failure_id: UUID
+    authorization_receipt_id: UUID
+    execution_command_id: UUID
+    failure_kind: Literal["runtime_effect_failed_without_persisted_result"]
 
 
 class CapabilityResumeTerminalV1(_FrozenResumeContract):
@@ -129,6 +160,7 @@ __all__ = [
     "CapabilityResumeAuthorizationRecordV1",
     "CapabilityResumeAuthorizeHttpRequest",
     "CapabilityResumeDispatchStartedV1",
+    "CapabilityResumeDispatchFailureV1",
     "CapabilityResumeSourceSnapshotV1",
     "CapabilityResumeTerminalV1",
 ]

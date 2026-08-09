@@ -518,6 +518,9 @@ def test_gateway_resume_adapter_returns_only_gateway_observed_authorities() -> N
     request = CapabilityResumeExecutionRequest(
         job_id=job_id,
         reservation_id=reservation_id,
+        run_id=RUN_ID,
+        input_id="input-one",
+        maximum_cost_usd=Decimal("2.00"),
         correlation_id=correlation_id,
         capability_id="incident-command",
         capability_version=1,

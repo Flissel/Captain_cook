@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import json
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
+import httpx
 
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
@@ -19,17 +21,21 @@ from agenten.agent_runtime.contracts import (
     RuntimeOperation,
     RuntimeStatus,
 )
+from agenten.agent_runtime.http_executor import AgentRuntimeHttpExecutor
 from gateway.capability_live_pipeline import (
     CapabilityResumeAuthorization,
     CapabilityResumeExecutionRequest,
 )
+from agenten.agent_factory.capability_live_runner import CapabilityLiveReservation
 from gateway.capability_resume_contracts import (
     CapabilityResumeAuthorizationRecordV1,
     CapabilityResumeSourceSnapshotV1,
     CapabilityResumeTerminalV1,
+    CapabilityResumeDispatchFailureV1,
 )
 from gateway.capability_resume_service import (
     CapabilityResumeConflict,
+    CapabilityResumeDispatchFailed,
     CapabilityResumeService,
     CapabilityResumeUnavailable,
 )
@@ -97,6 +103,7 @@ def _result(
         grant_id=f"grant-{label}",
         operation=command.payload.operation,
         status=status,
+        session_id=f"session-{label}",
         evidence_refs=(_ref(f"evidence-{label}"),),
         error=error,
     )
@@ -130,6 +137,9 @@ def _request(**updates: object) -> CapabilityResumeExecutionRequest:
     values: dict[str, object] = {
         "job_id": _uuid("job"),
         "reservation_id": _uuid("reservation"),
+        "run_id": _uuid("run"),
+        "input_id": "input-one",
+        "maximum_cost_usd": Decimal("2.00"),
         "correlation_id": _uuid("correlation"),
         "capability_id": "claims-capability",
         "capability_version": 3,
@@ -146,6 +156,7 @@ class PersistentRepository:
         self.by_reservation: dict[UUID, UUID] = {}
         self.started: set[UUID] = set()
         self.terminals: dict[UUID, CapabilityResumeTerminalV1] = {}
+        self.failures: dict[UUID, CapabilityResumeDispatchFailureV1] = {}
 
     def authorization_for_reservation(
         self, reservation_id: UUID
@@ -191,17 +202,42 @@ class PersistentRepository:
         self.terminals[receipt_id] = terminal
         return existing or terminal
 
+    def dispatch_failure(
+        self, receipt_id: UUID
+    ) -> CapabilityResumeDispatchFailureV1 | None:
+        return self.failures.get(receipt_id)
+
+    def record_dispatch_failure(
+        self, failure: CapabilityResumeDispatchFailureV1
+    ) -> CapabilityResumeDispatchFailureV1:
+        existing = self.failures.get(failure.authorization_receipt_id)
+        if existing is not None and existing != failure:
+            raise CapabilityResumeConflict("dispatch failure is immutable")
+        self.failures[failure.authorization_receipt_id] = failure
+        return existing or failure
+
 
 class RuntimeTruth:
     def __init__(self) -> None:
         original = _original_command()
-        original_result = _result(original, label="original-result")
+        original_result = _result(
+            original,
+            status=RuntimeStatus.INFRASTRUCTURE_FAILED,
+            error="codex execution timed out (exit 124)",
+            label="original-result",
+        )
         self.snapshot = CapabilityResumeSourceSnapshotV1(
             job_id=_uuid("job"),
             correlation_id=_uuid("correlation"),
             capability_id="claims-capability",
             capability_version=3,
             booked_cost_usd=Decimal("1.25"),
+            reservation=CapabilityLiveReservation(
+                reservation_id=_uuid("reservation"),
+                run_id=_uuid("run"),
+                input_id="input-one",
+                maximum_cost_usd=Decimal("2.00"),
+            ),
             original_operation=_operation(original, original_result),
         )
         self.operations = {original.event_id: self.snapshot.original_operation}
@@ -268,14 +304,20 @@ def test_authorize_is_idempotent_and_binds_original_runtime_truth() -> None:
     record = repository.authorization(first.authorization_receipt_id)
     assert record is not None
     assert record.resume_command.payload.operation is RuntimeOperation.CODEX_RESUME
-    assert record.resume_command.causation_id == _uuid("original-result")
+    assert record.resume_command.causation_id == _uuid("original-command")
     assert record.resume_command.event_id != _uuid("original-command")
+    assert record.resume_budget_usd == Decimal("0.75")
+    assert record.booked_cost_usd == Decimal("2.00")
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("job_id", _uuid("wrong-job")),
+        ("reservation_id", _uuid("wrong-reservation")),
+        ("run_id", _uuid("wrong-run")),
+        ("input_id", "wrong-input"),
+        ("maximum_cost_usd", Decimal("3.00")),
         ("correlation_id", _uuid("wrong-correlation")),
         ("capability_id", "wrong-capability"),
         ("capability_version", 4),
@@ -288,6 +330,22 @@ def test_authorize_rejects_every_binding_mismatch(field: str, value: object) -> 
         _service(PersistentRepository(), RuntimeTruth(), None).authorize(
             _request(**{field: value})
         )
+
+
+def test_authorize_rejects_a_succeeded_original_as_not_resumable() -> None:
+    truth = RuntimeTruth()
+    original = _original_command()
+    truth.snapshot = truth.snapshot.model_copy(
+        update={
+            "original_operation": _operation(
+                original,
+                _result(original, label="original-result"),
+            )
+        }
+    )
+
+    with pytest.raises(CapabilityResumeUnavailable, match="not resumable"):
+        _service(PersistentRepository(), truth, None).authorize(_request())
 
 
 @pytest.mark.asyncio
@@ -307,6 +365,44 @@ async def test_dispatch_calls_effect_once_and_replays_immutable_terminal_readbac
     assert first.execution_authority_id == authorization.authorization_receipt_id
     assert first.terminal_status == "succeeded"
     assert first.replayed is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_uses_authenticated_runtime_http_boundary_then_gateway_readback() -> None:
+    repository = PersistentRepository()
+    truth = RuntimeTruth()
+    calls = 0
+
+    def runtime(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert request.url.path == "/v1/runtime/execute"
+        assert request.headers["Authorization"] == "Bearer runtime-test-token"
+        command = AgentRuntimeCommand.model_validate(json.loads(request.content))
+        result = _result(command, label="http-runtime-result")
+        truth.operations[command.event_id] = _operation(command, result)
+        return httpx.Response(
+            200,
+            json=result.model_dump(mode="json", by_alias=True),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(runtime)) as http:
+        service = CapabilityResumeService(
+            repository=repository,
+            authority_source=truth,
+            runtime_reader=truth,
+            executor=AgentRuntimeHttpExecutor(
+                "https://runtime.test",
+                "runtime-test-token",
+                http,
+            ),
+        )
+        authorization = service.authorize(_request())
+        first = await service.dispatch(authorization)
+        second = await service.dispatch(authorization)
+
+    assert calls == 1
+    assert first == second == service.readback(authorization)
 
 
 @pytest.mark.asyncio
@@ -337,6 +433,43 @@ async def test_existing_dispatch_fence_never_repeats_an_ambiguous_effect() -> No
         await service.dispatch(authorization)
 
     assert executor.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_effect_failure_without_runtime_evidence_is_terminal_across_restart() -> None:
+    repository = PersistentRepository()
+    truth = RuntimeTruth()
+
+    class BrokenExecutor:
+        calls = 0
+
+        async def execute(self, command: AgentRuntimeCommand) -> AgentRuntimeResult:
+            self.calls += 1
+            raise RuntimeError("transport contained secret-token")
+
+    executor = BrokenExecutor()
+    first = CapabilityResumeService(
+        repository=repository,
+        authority_source=truth,
+        runtime_reader=truth,
+        executor=executor,
+    )
+    authorization = first.authorize(_request())
+
+    with pytest.raises(CapabilityResumeDispatchFailed, match="dispatch failed") as initial:
+        await first.dispatch(authorization)
+    restarted = CapabilityResumeService(
+        repository=repository,
+        authority_source=truth,
+        runtime_reader=truth,
+        executor=executor,
+    )
+    with pytest.raises(CapabilityResumeDispatchFailed, match="dispatch failed") as recovered:
+        restarted.readback(authorization)
+
+    assert executor.calls == 1
+    assert getattr(initial.value, "failure") == getattr(recovered.value, "failure")
+    assert "secret-token" not in str(initial.value)
 
 
 def test_restart_recovers_terminal_runtime_truth_without_a_second_dispatch() -> None:
@@ -430,10 +563,32 @@ class GatewayStoreProjectionDouble:
         return self.artifacts
 
 
+class CheckpointProjectionDouble:
+    def load_plan(self, run_id: UUID):
+        request = _request()
+        assert run_id == request.run_id
+        return SimpleNamespace(
+            run_id=request.run_id,
+            items=(
+                SimpleNamespace(
+                    input=SimpleNamespace(input_id=request.input_id),
+                    correlation_id=request.correlation_id,
+                    reservation=CapabilityLiveReservation(
+                        reservation_id=request.reservation_id,
+                        run_id=request.run_id,
+                        input_id=request.input_id,
+                        maximum_cost_usd=request.maximum_cost_usd,
+                    ),
+                ),
+            ),
+        )
+
+
 def test_gateway_authority_source_requires_exact_factory_and_runtime_projections() -> None:
     truth = RuntimeTruth()
     source = GatewayCapabilityResumeAuthoritySource(
-        GatewayStoreProjectionDouble(truth)  # type: ignore[arg-type]
+        GatewayStoreProjectionDouble(truth),  # type: ignore[arg-type]
+        checkpoints=CheckpointProjectionDouble(),
     )
 
     snapshot = source.resolve(_request())
@@ -446,7 +601,8 @@ def test_gateway_authority_source_rejects_unbound_runtime_outcome() -> None:
     source = GatewayCapabilityResumeAuthoritySource(
         GatewayStoreProjectionDouble(  # type: ignore[arg-type]
             truth, matching_outcome=False
-        )
+        ),
+        checkpoints=CheckpointProjectionDouble(),
     )
 
     with pytest.raises(CapabilityResumeConflict, match="Factory outcome"):

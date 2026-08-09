@@ -16,6 +16,8 @@ def valid_environment(**overrides: str) -> Mapping[str, str]:
         "GATEWAY_APPROVAL_ENABLED": "true",
         "GATEWAY_PORT": "18090",
         "CAPTAIN_N8N_URL": "http://localhost:5679",
+        "CAPTAIN_RUNTIME_URL": "https://runtime.test",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-test-token",
         "UNRELATED_PROCESS_VALUE": "ignored",
     }
     values.update(overrides)
@@ -61,7 +63,13 @@ def test_settings_keep_the_gateway_bound_to_fixed_loopback(
 
 @pytest.mark.parametrize(
     "missing_name",
-    ("LEDGER_DSN", "CAPTAIN_GATEWAY_TOKEN", "WORKER_GATEWAY_TOKEN"),
+    (
+        "LEDGER_DSN",
+        "CAPTAIN_GATEWAY_TOKEN",
+        "WORKER_GATEWAY_TOKEN",
+        "CAPTAIN_RUNTIME_URL",
+        "CAPTAIN_RUNTIME_TOKEN",
+    ),
 )
 def test_settings_fail_closed_when_required_environment_is_missing(
     missing_name: str,

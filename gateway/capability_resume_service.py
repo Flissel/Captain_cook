@@ -21,6 +21,7 @@ from gateway.capability_live_pipeline import (
 from gateway.capability_resume_contracts import (
     CapabilityResumeAuthorizationRecordV1,
     CapabilityResumeDispatchStartedV1,
+    CapabilityResumeDispatchFailureV1,
     CapabilityResumeSourceSnapshotV1,
     CapabilityResumeTerminalV1,
 )
@@ -43,6 +44,14 @@ class CapabilityResumeUnavailable(CapabilityResumeError):
     """Required persistent authority or terminal runtime truth is absent."""
 
 
+class CapabilityResumeDispatchFailed(CapabilityResumeError):
+    """A single runtime effect failed without producing Runtime truth."""
+
+    def __init__(self, failure: CapabilityResumeDispatchFailureV1) -> None:
+        super().__init__("capability resume dispatch failed")
+        self.failure = failure
+
+
 class CapabilityResumeRepository(Protocol):
     def authorization_for_reservation(
         self, reservation_id: UUID
@@ -59,6 +68,14 @@ class CapabilityResumeRepository(Protocol):
     def dispatch_started(self, receipt_id: UUID) -> bool: ...
 
     def record_dispatch_started(self, receipt_id: UUID) -> bool: ...
+
+    def dispatch_failure(
+        self, receipt_id: UUID
+    ) -> CapabilityResumeDispatchFailureV1 | None: ...
+
+    def record_dispatch_failure(
+        self, failure: CapabilityResumeDispatchFailureV1
+    ) -> CapabilityResumeDispatchFailureV1: ...
 
     def terminal(self, receipt_id: UUID) -> CapabilityResumeTerminalV1 | None: ...
 
@@ -125,6 +142,10 @@ class CapabilityResumeService:
             raise CapabilityResumeUnavailable(
                 "original persisted runtime result has no evidence"
             )
+        if not _is_resumable_result(result):
+            raise CapabilityResumeUnavailable(
+                "original persisted RuntimeCodex state is not resumable"
+            )
 
         authorization_id = _authorization_id(request)
         authorization = CapabilityResumeAuthorization(
@@ -140,7 +161,7 @@ class CapabilityResumeService:
             schema_name="captain.agent-runtime-command.v1",
             event_id=uuid5(authorization_id, "captain.capability-resume-command.v1"),
             correlation_id=original.command.correlation_id,
-            causation_id=result.event_id,
+            causation_id=original.command.event_id,
             occurred_at=result.occurred_at,
             producer="captain",
             subject_id=original.command.subject_id,
@@ -153,7 +174,10 @@ class CapabilityResumeService:
             request=request,
             authorization=authorization,
             resume_command=resume_command,
-            booked_cost_usd=snapshot.booked_cost_usd,
+            booked_cost_usd=snapshot.reservation.maximum_cost_usd,
+            resume_budget_usd=(
+                snapshot.reservation.maximum_cost_usd - snapshot.booked_cost_usd
+            ),
         )
         persisted = self._repository.record_authorization(record)
         if persisted != record:
@@ -171,6 +195,11 @@ class CapabilityResumeService:
         )
         if terminal is not None:
             return terminal.execution
+        failure = self._repository.dispatch_failure(
+            authorization.authorization_receipt_id
+        )
+        if failure is not None:
+            raise CapabilityResumeDispatchFailed(failure)
         if self._repository.dispatch_started(
             authorization.authorization_receipt_id
         ):
@@ -189,8 +218,17 @@ class CapabilityResumeService:
             try:
                 return self._recover(record)
             except CapabilityResumeUnavailable:
-                raise CapabilityResumeUnavailable(
-                    "capability resume effect did not persist a runtime result"
+                failure = CapabilityResumeDispatchFailureV1(
+                    failure_id=uuid5(
+                        authorization.authorization_receipt_id,
+                        "captain.capability-resume-dispatch-failure.v1",
+                    ),
+                    authorization_receipt_id=authorization.authorization_receipt_id,
+                    execution_command_id=record.resume_command.event_id,
+                    failure_kind="runtime_effect_failed_without_persisted_result",
+                )
+                raise CapabilityResumeDispatchFailed(
+                    self._repository.record_dispatch_failure(failure)
                 ) from None
         return self._recover(record)
 
@@ -203,6 +241,11 @@ class CapabilityResumeService:
         )
         if terminal is not None:
             return terminal.execution
+        failure = self._repository.dispatch_failure(
+            authorization.authorization_receipt_id
+        )
+        if failure is not None:
+            raise CapabilityResumeDispatchFailed(failure)
         if not self._repository.dispatch_started(
             authorization.authorization_receipt_id
         ):
@@ -278,6 +321,10 @@ class CapabilityResumeService:
         result = operation.result
         if (
             request.job_id != snapshot.job_id
+            or request.reservation_id != snapshot.reservation.reservation_id
+            or request.run_id != snapshot.reservation.run_id
+            or request.input_id != snapshot.reservation.input_id
+            or request.maximum_cost_usd != snapshot.reservation.maximum_cost_usd
             or request.correlation_id != snapshot.correlation_id
             or request.capability_id != snapshot.capability_id
             or request.capability_version != snapshot.capability_version
@@ -290,6 +337,7 @@ class CapabilityResumeService:
             or operation.command.correlation_id != request.correlation_id
             or result.subject_version != request.capability_version
             or operation.command.subject_version != request.capability_version
+            or snapshot.booked_cost_usd > snapshot.reservation.maximum_cost_usd
         ):
             raise CapabilityResumeConflict(
                 "capability resume request binding does not match Gateway truth"
@@ -351,9 +399,25 @@ def _terminal_status(result: AgentRuntimeResult):
     raise CapabilityResumeUnavailable("persisted runtime result is not terminal")
 
 
+def _is_resumable_result(result: AgentRuntimeResult) -> bool:
+    return (
+        result.operation is RuntimeOperation.CODEX_RUN
+        and result.session_id is not None
+        and bool(_result_evidence(result))
+        and (
+            result.status in {RuntimeStatus.FAILED, RuntimeStatus.CANCELLED}
+            or (
+                result.status is RuntimeStatus.INFRASTRUCTURE_FAILED
+                and result.error == "codex execution timed out (exit 124)"
+            )
+        )
+    )
+
+
 __all__ = [
     "CapabilityResumeAuthoritySource",
     "CapabilityResumeConflict",
+    "CapabilityResumeDispatchFailed",
     "CapabilityResumeError",
     "CapabilityResumeExecutor",
     "CapabilityResumeNotFound",

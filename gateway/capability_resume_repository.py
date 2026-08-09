@@ -14,6 +14,7 @@ from gateway.capability_live_pipeline import CapabilityResumeExecutionRequest
 from gateway.capability_resume_contracts import (
     CapabilityResumeAuthorizationRecordV1,
     CapabilityResumeDispatchStartedV1,
+    CapabilityResumeDispatchFailureV1,
     CapabilityResumeSourceSnapshotV1,
     CapabilityResumeTerminalV1,
 )
@@ -28,6 +29,7 @@ from gateway.store import GatewayStore
 AUTHORIZATION_BLOCK = "capability_resume_authorization"
 DISPATCH_BLOCK = "capability_resume_dispatch_started"
 TERMINAL_BLOCK = "capability_resume_terminal"
+FAILURE_BLOCK = "capability_resume_dispatch_failure"
 ResumeRecord = TypeVar("ResumeRecord", bound=BaseModel)
 
 
@@ -99,6 +101,41 @@ class GatewayCapabilityResumeRepository:
         )
         return not replayed
 
+    def dispatch_failure(
+        self, receipt_id: UUID
+    ) -> CapabilityResumeDispatchFailureV1 | None:
+        row = self._find(
+            FAILURE_BLOCK,
+            "$.authorization_receipt_id",
+            str(receipt_id),
+        )
+        return self._parse(row, CapabilityResumeDispatchFailureV1)
+
+    def record_dispatch_failure(
+        self, failure: CapabilityResumeDispatchFailureV1
+    ) -> CapabilityResumeDispatchFailureV1:
+        if not self.dispatch_started(failure.authorization_receipt_id):
+            raise CapabilityResumeConflict(
+                "capability resume failure has no dispatch fence"
+            )
+        persisted, _ = self._append_unique(
+            FAILURE_BLOCK,
+            failure,
+            keys=(
+                ("$.authorization_receipt_id", str(failure.authorization_receipt_id)),
+                ("$.failure_id", str(failure.failure_id)),
+            ),
+            model=CapabilityResumeDispatchFailureV1,
+            conflicts=(
+                (
+                    TERMINAL_BLOCK,
+                    "$.authorization_receipt_id",
+                    str(failure.authorization_receipt_id),
+                ),
+            ),
+        )
+        return persisted
+
     def terminal(self, receipt_id: UUID) -> CapabilityResumeTerminalV1 | None:
         row = self._find(
             TERMINAL_BLOCK,
@@ -124,6 +161,13 @@ class GatewayCapabilityResumeRepository:
                 ),
             ),
             model=CapabilityResumeTerminalV1,
+            conflicts=(
+                (
+                    FAILURE_BLOCK,
+                    "$.authorization_receipt_id",
+                    str(terminal.authorization_receipt_id),
+                ),
+            ),
         )
         return persisted
 
@@ -150,13 +194,28 @@ class GatewayCapabilityResumeRepository:
         *,
         keys: tuple[tuple[str, str], ...],
         model: type[ResumeRecord],
+        conflicts: tuple[tuple[str, str, str], ...] = (),
     ) -> tuple[ResumeRecord, bool]:
         canonical = record.model_dump(mode="json", by_alias=True)
-        lock_seed = f"{block_type}:{keys[0][1]}".encode("utf-8")
+        lock_seed = keys[0][1].encode("utf-8")
         lock_name = f"captain:cap-resume:{hashlib.sha256(lock_seed).hexdigest()[:32]}"
         with self._record_lock(lock_name):
             with self._store.storage.transaction() as connection:
                 with connection.cursor() as cursor:
+                    if any(
+                        self._find_with_cursor(
+                            cursor,
+                            conflict_block,
+                            path,
+                            value,
+                            for_update=True,
+                        )
+                        is not None
+                        for conflict_block, path, value in conflicts
+                    ):
+                        raise CapabilityResumeConflict(
+                            "capability resume already has a different terminal record"
+                        )
                     existing_rows = tuple(
                         self._find_with_cursor(
                             cursor,
@@ -250,13 +309,15 @@ class GatewayCapabilityResumeRepository:
 class GatewayCapabilityResumeAuthoritySource:
     """Resolve resume inputs only from current Gateway projections."""
 
-    def __init__(self, store: GatewayStore) -> None:
+    def __init__(self, store: GatewayStore, *, checkpoints: Any) -> None:
         self._store = store
+        self._checkpoints = checkpoints
 
     def resolve(
         self, request: CapabilityResumeExecutionRequest
     ) -> CapabilityResumeSourceSnapshotV1:
         try:
+            plan = self._checkpoints.load_plan(request.run_id)
             job_projection = self._store.factory_job(request.job_id)
             operation = self._store.runtime_operation(
                 request.original_execution_command_id
@@ -271,6 +332,21 @@ class GatewayCapabilityResumeAuthoritySource:
             raise CapabilityResumeConflict(str(exc.detail)) from None
 
         job = job_projection.job
+        if plan is None:
+            raise CapabilityResumeUnavailable(
+                "persisted Captain live reservation is unavailable"
+            )
+        matching_items = tuple(
+            item
+            for item in plan.items
+            if item.reservation.reservation_id == request.reservation_id
+        )
+        if len(matching_items) != 1:
+            raise CapabilityResumeConflict(
+                "capability resume reservation is not unambiguous"
+            )
+        plan_item = matching_items[0]
+        reservation = plan_item.reservation
         result = operation.result
         matching_outcomes = tuple(
             outcome
@@ -287,6 +363,12 @@ class GatewayCapabilityResumeAuthoritySource:
         outcome = matching_outcomes[0]
         if (
             job.correlation_id != request.correlation_id
+            or plan.run_id != request.run_id
+            or plan_item.input.input_id != request.input_id
+            or plan_item.correlation_id != request.correlation_id
+            or reservation.run_id != request.run_id
+            or reservation.input_id != request.input_id
+            or reservation.maximum_cost_usd != request.maximum_cost_usd
             or job.required_capability != request.capability_id
             or job.subject_version != request.capability_version
             or operation.operation_id != request.original_execution_command_id
@@ -295,6 +377,7 @@ class GatewayCapabilityResumeAuthoritySource:
             or outcome.correlation_id != request.correlation_id
             or outcome.capability_id != request.capability_id
             or outcome.capability_version != request.capability_version
+            or budget.consumed_usd > reservation.maximum_cost_usd
         ):
             raise CapabilityResumeConflict(
                 "capability resume request binding does not match Gateway truth"
@@ -305,6 +388,7 @@ class GatewayCapabilityResumeAuthoritySource:
             capability_id=job.required_capability,
             capability_version=job.subject_version,
             booked_cost_usd=budget.consumed_usd,
+            reservation=reservation,
             original_operation=operation,
         )
 
