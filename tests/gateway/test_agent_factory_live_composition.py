@@ -135,6 +135,25 @@ def test_composes_real_factory_runner_without_provider_effects(tmp_path: Path) -
     )
 
 
+def test_v3_worker_requires_explicit_complete_enablement(tmp_path: Path) -> None:
+    worker = object()
+
+    disabled = _compose(tmp_path)
+    assert disabled.hermes_factory_worker is None
+
+    with pytest.raises(ValueError, match="V3.*worker.*configuration"):
+        _compose(tmp_path, factory_v3_enabled=True)
+    with pytest.raises(ValueError, match="V3.*worker.*configuration"):
+        _compose(tmp_path, hermes_factory_worker=worker)
+
+    enabled = _compose(
+        tmp_path,
+        factory_v3_enabled=True,
+        hermes_factory_worker=worker,
+    )
+    assert enabled.hermes_factory_worker is worker
+
+
 def test_gateway_technical_ports_bind_candidate_private_holdout_and_no_tools(
     tmp_path: Path,
 ) -> None:

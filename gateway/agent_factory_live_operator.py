@@ -59,6 +59,7 @@ from agenten.agent_factory.codex_build_provenance import (
 )
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.hermes_cli import HermesCliSettings
+from agenten.agent_factory.hermes_factory_worker import HermesFactoryWorker
 from agenten.agent_factory.minibook_forge import (
     CaptainCreationJobMapper,
     MinibookForgeSettings,
@@ -270,6 +271,7 @@ class FactoryLiveOperatorSettings:
     hermes_reasoning_effort: str = "high"
     maximum_dispatches: int = 12
     stop_before_quality_warden: bool = False
+    factory_v3_enabled: bool = False
 
     def __post_init__(self) -> None:
         assert_local_captain_test_dsn(self.test_mariadb_dsn)
@@ -395,10 +397,13 @@ def compose_business_demo_factory_operator(
     environment: Mapping[str, str],
     n8n_client: httpx.AsyncClient,
     clock: Callable[[], datetime] | None = None,
+    hermes_factory_worker: HermesFactoryWorker | None = None,
 ) -> AgentFactoryLiveComposition:
     """Compose every real port without dispatching Hermes, Forge, n8n, or OpenAI."""
 
     current_time = clock or (lambda: datetime.now(timezone.utc))
+    if settings.factory_v3_enabled != (hermes_factory_worker is not None):
+        raise ValueError("Factory V3 worker configuration is incomplete")
     workspace = settings.workspace_root.resolve()
     authority_root = (
         workspace / ".captain-cook" / "private" / "business-benchmarks"
@@ -676,6 +681,8 @@ def compose_business_demo_factory_operator(
         runtime_retries=runtime_retry_authority,
         hermes_retry_authority=hermes_retry_authority,
         technical_revalidation_validator=validate_technical_revalidation,
+        factory_v3_enabled=settings.factory_v3_enabled,
+        hermes_factory_worker=hermes_factory_worker,
     )
 
 

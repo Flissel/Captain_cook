@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
 from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
 )
+from agenten.agent_factory.hermes_factory_worker import HermesFactoryCodexBuild
 from agenten.agent_factory.codex_build_recovery import (
     FactoryCodexBuildCheckpointV1,
     FactoryCodexBuildPhase,
@@ -38,7 +39,11 @@ from agenten.agent_factory.codex_build_recovery import (
     canonical_factory_codex_model,
 )
 from agenten.agent_factory.contracts import AgentFactoryJobV3
-from agenten.agent_factory.forge_contracts import CodexBuildReceiptV1
+from agenten.agent_factory.forge_contracts import (
+    ArtifactRef as ForgeArtifactRef,
+    CodexBuildReceiptV1,
+    FactoryBuildAssignmentV2,
+)
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_sequence import (
     FactoryRuntimeRetryAuthorizationV1,
@@ -352,6 +357,25 @@ class CodexCliFactoryBuildSettings:
             <= MAX_FACTORY_CODEX_OUTPUT_BYTES
         ):
             raise ValueError("Factory Codex output size bound is invalid")
+
+    def narrowed_for_assignment(
+        self,
+        assignment: FactoryBuildAssignmentV2,
+    ) -> "CodexCliFactoryBuildSettings":
+        """Apply a V3 wall-clock cap without broadening any existing bound."""
+
+        if not isinstance(assignment, FactoryBuildAssignmentV2):
+            raise TypeError("Factory Codex execution requires a V2 assignment")
+        return CodexCliFactoryBuildSettings(
+            state_root=self.state_root,
+            maximum_runtime_seconds=min(
+                self.maximum_runtime_seconds,
+                assignment.limits.max_wall_clock_seconds,
+            ),
+            maximum_candidate_archive_bytes=self.maximum_candidate_archive_bytes,
+            maximum_json_artifact_bytes=self.maximum_json_artifact_bytes,
+            maximum_output_bytes=self.maximum_output_bytes,
+        )
 
 
 class CaptainCodexBuildExecutorPort(Protocol):
@@ -731,6 +755,88 @@ class CaptainCodexBuildSealer:
             status="sealed",
         )
         return self._executor.persist_sealed(invocation, completed, evidence)
+
+
+@dataclass(frozen=True)
+class MappedHermesFactoryCodexAssignment:
+    """Existing Captain dispatch inputs derived from one Minibook V2 assignment."""
+
+    request: FactoryDispatch
+    invocation: FactorySkillInvocationV1
+    brief: CodexBuildBriefV1
+    hermes_usage_receipt_ref: ArtifactRef
+
+
+class HermesFactoryCodexAssignmentMapperPort(Protocol):
+    def map_assignment(
+        self,
+        assignment: FactoryBuildAssignmentV2,
+        *,
+        settings: CodexCliFactoryBuildSettings,
+    ) -> MappedHermesFactoryCodexAssignment: ...
+
+
+class CaptainCodexAssignmentBuilder:
+    """Adapt V2 assignments to the existing detached-workspace Captain sealer."""
+
+    def __init__(
+        self,
+        *,
+        sealer: CaptainCodexBuildSealer,
+        mapper: HermesFactoryCodexAssignmentMapperPort,
+        settings: CodexCliFactoryBuildSettings,
+    ) -> None:
+        self._sealer = sealer
+        self._mapper = mapper
+        self._settings = settings
+
+    async def build(
+        self,
+        assignment: FactoryBuildAssignmentV2,
+    ) -> HermesFactoryCodexBuild:
+        narrowed = self._settings.narrowed_for_assignment(assignment)
+        mapped = self._mapper.map_assignment(assignment, settings=narrowed)
+        request = mapped.request
+        invocation = mapped.invocation
+        brief = mapped.brief
+        if (
+            not isinstance(request.job, AgentFactoryJobV3)
+            or request.job.job_id != assignment.factory_job_id
+            or request.job.correlation_id != assignment.correlation_id
+            or request.job.subject_version != assignment.subject_version
+            or invocation.job_id != assignment.factory_job_id
+            or invocation.correlation_id != assignment.correlation_id
+            or invocation.subject_version != assignment.subject_version
+            or invocation.attempt != assignment.attempt
+            or brief.build_assignment.assignment_id != assignment.assignment_id
+            or brief.build_assignment.creation_job_id != assignment.creation_job_id
+            or brief.build_assignment.workspace_ref != assignment.workspace_ref
+            or brief.build_assignment.idempotency_key != assignment.effect_key
+        ):
+            raise FactoryDispatchError(
+                "V2 assignment does not match the mapped Captain Codex authority"
+            )
+        evidence = await self._sealer.seal(request, invocation, brief)
+        receipt = evidence.build_receipt
+        receipt_ref = evidence.build_receipt_ref
+        if not isinstance(receipt, CodexBuildReceiptV1):
+            raise FactoryDispatchError("Captain Codex sealer returned no typed receipt")
+        usage_ref = ForgeArtifactRef.model_validate(
+            mapped.hermes_usage_receipt_ref.model_dump(mode="json")
+        )
+        typed_receipt_ref = ForgeArtifactRef.model_validate(
+            receipt_ref.model_dump(mode="json")
+        )
+        evidence_refs = tuple(
+            ForgeArtifactRef.model_validate(item.model_dump(mode="json"))
+            for item in evidence.evidence_refs
+        )
+        return HermesFactoryCodexBuild(
+            hermes_usage_receipt_ref=usage_ref,
+            codex_build_receipt_ref=typed_receipt_ref,
+            codex_build_receipt=receipt,
+            build_evidence_refs=evidence_refs or (typed_receipt_ref,),
+        )
 
 
 class GitDetachedFactoryWorkspacePreparer:

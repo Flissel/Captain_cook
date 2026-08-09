@@ -58,6 +58,7 @@ from agenten.agent_factory.hermes_cli import (
     HermesCliSettings,
     ReleasedFactorySkillCatalog,
 )
+from agenten.agent_factory.hermes_factory_worker import HermesFactoryWorker
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.orchestration import (
     FactoryClock,
@@ -469,6 +470,7 @@ class AgentFactoryLiveComposition:
     runner: ProductionFactoryDispatchRunner
     improvement_authority: FactoryImprovementAuthorizationPort
     runtime_retry_authority: FactoryRuntimeRetryAuthorizationPort | None
+    hermes_factory_worker: HermesFactoryWorker | None = None
 
     async def run(
         self,
@@ -504,6 +506,8 @@ def compose_agent_factory_live(
     codex_build_sealer: CaptainCodexBuildSealerPort | None = None,
     codex_prompt_artifact_store: CodexPromptArtifactStore | None = None,
     technical_revalidation_validator: Callable[[FactoryDispatch], None] | None = None,
+    factory_v3_enabled: bool = False,
+    hermes_factory_worker: HermesFactoryWorker | None = None,
 ) -> AgentFactoryLiveComposition:
     """Wire production ports without executing Hermes, providers, n8n, or Forge."""
 
@@ -517,6 +521,8 @@ def compose_agent_factory_live(
         raise ValueError("business benchmark production inputs are required")
     if not callable(clock):
         raise ValueError("Factory live clock is required")
+    if factory_v3_enabled != (hermes_factory_worker is not None):
+        raise ValueError("Factory V3 worker configuration is incomplete")
 
     repository = GatewayFactoryRepository(
         store,
@@ -602,6 +608,7 @@ def compose_agent_factory_live(
         runner=runner,
         improvement_authority=improvement_authority,
         runtime_retry_authority=runtime_retries,
+        hermes_factory_worker=hermes_factory_worker,
     )
 
 

@@ -33,6 +33,7 @@ from agenten.agent_factory.contracts import AgentFactoryJobV3
 from agenten.agent_factory.forge_contracts import (
     ArtifactRef,
     CodexBuildReceiptV1,
+    codex_build_receipt_sha256,
 )
 from agenten.agent_factory.skill_workflow_contracts import CodexBuildBriefV1
 
@@ -220,6 +221,26 @@ class CaptainCodexBuildReceiptIssuer:
             media_type="application/json",
             namespace="build-receipt",
         )
+
+    def read_receipt(self, reference: ArtifactRef) -> CodexBuildReceiptV1:
+        """Read back a genuine typed receipt through its Captain-owned CAS."""
+
+        if reference.media_type != "application/json":
+            raise CodexBuildProvenanceError(
+                "Codex build receipt reference must be application/json"
+            )
+        content = self._cas.read_bytes(reference)
+        try:
+            receipt = CodexBuildReceiptV1.model_validate_json(content)
+        except ValueError as exc:
+            raise CodexBuildProvenanceError(
+                "Codex build receipt content is invalid"
+            ) from exc
+        if codex_build_receipt_sha256(receipt) != reference.sha256:
+            raise CodexBuildProvenanceError(
+                "Codex build receipt digest does not match its reference"
+            )
+        return receipt
 
     def issue(
         self,

@@ -197,6 +197,7 @@ def test_issuer_seals_deterministic_safe_workspace_and_exact_build_bindings(
     assert replay == first
     assert receipt_ref.media_type == "application/json"
     assert receipt_ref.sha256 == codex_build_receipt_sha256(first)
+    assert issuer.read_receipt(receipt_ref) == first
     assert cas.read_bytes(receipt_ref) == json.dumps(
         first.model_dump(mode="json", by_alias=True),
         sort_keys=True,

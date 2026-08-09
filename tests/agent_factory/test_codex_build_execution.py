@@ -41,6 +41,7 @@ from agenten.agent_factory.codex_build_provenance import (
     CodexBuildArtifactCas,
 )
 from agenten.agent_factory.forge_contracts import ArtifactRef as ForgeArtifactRef
+from agenten.agent_factory.forge_contracts import FactoryBuildAssignmentV2
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_sequence import FactoryRuntimeRetryAuthorizationV1
 from agenten.agent_factory.skill_workflow_contracts import (
@@ -65,6 +66,31 @@ from tests.agent_factory.test_codex_build_provenance_contracts import (
 
 
 NOW = datetime(2026, 7, 21, 10, 5, tzinfo=timezone.utc)
+
+
+def test_codex_settings_are_only_narrowed_by_v3_assignment() -> None:
+    assignment = FactoryBuildAssignmentV2.model_validate_json(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "contracts"
+            / "hermes_factory_assignment.v2.json"
+        ).read_text()
+    )
+    defaults = CodexCliFactoryBuildSettings(
+        state_root=Path("state"),
+        maximum_runtime_seconds=900,
+    )
+
+    narrowed = defaults.narrowed_for_assignment(assignment)
+
+    assert (
+        narrowed.maximum_runtime_seconds
+        == assignment.limits.max_wall_clock_seconds
+    )
+    assert narrowed.maximum_candidate_archive_bytes == defaults.maximum_candidate_archive_bytes
+    assert narrowed.maximum_json_artifact_bytes == defaults.maximum_json_artifact_bytes
+    assert narrowed.maximum_output_bytes == defaults.maximum_output_bytes
 
 
 class FakeBuildExecutor:
