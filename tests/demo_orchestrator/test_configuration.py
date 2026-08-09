@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -39,7 +43,7 @@ def _manifest(**updates: object) -> object:
             "gateway": "/v1/capability-assemblies/health",
             "runtime": "/health",
             "minibook": "/health",
-            "provider_proxy": "/healthz",
+            "provider_proxy": "/v1/healthz",
             "benchmark": "/healthz",
         }[service]
         return SimpleNamespace(
@@ -131,6 +135,90 @@ def test_load_binds_real_d11_manifest_and_repository_inputs(tmp_path: Path) -> N
     assert set(configuration.canonical_input_digests) == set(CANONICAL_INPUT_PATHS)
     assert len(set(configuration.canonical_input_digests.values())) == 3
     assert configuration.provider_context_reference_header == "X-Captain-Provider-Context-Ref"
+    provider = configuration.production_manifest.provider_proxy
+    assert provider.base_url == "http://127.0.0.1/provider_proxy"
+    assert provider.health_url == "http://127.0.0.1/provider_proxy/v1/healthz"
+    assert provider.credential_env == "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"
+
+
+def test_real_d11_manifest_builder_is_compatible_with_d12_loader(tmp_path: Path) -> None:
+    listing = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    candidates = [
+        Path(line.removeprefix("worktree "))
+        for line in listing
+        if line.startswith("worktree ")
+        and line.endswith("capability-production-bundle-d11")
+    ]
+    if not candidates:
+        pytest.skip("D11 worktree is unavailable before integration")
+    d11_root = candidates[0]
+    environment = {
+        "CAPTAIN_GATEWAY_URL": "http://127.0.0.1:18080",
+        "CAPTAIN_GATEWAY_TOKEN": "gateway-token",
+        "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:18081/v1/execute",
+        "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-token",
+        "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:18082",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-token",
+        "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18083",
+        "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "proxy-token",
+        "CAPTAIN_PROVIDER_POLICY_SHA256": "1" * 64,
+        "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "2" * 64,
+        "MINIBOOK_BACKEND_URL": "http://127.0.0.1:18084",
+        "MINIBOOK_API_KEY": "minibook-token",
+        "MINIBOOK_PROJECTION_API_KEY": "projection-token",
+    }
+    script = (
+        "import json,sys;"
+        "from gateway.capability_assembly_bootstrap import "
+        "load_capability_production_bundle_manifest as load;"
+        "print(load(environment=json.loads(sys.stdin.read())).model_dump_json(by_alias=True))"
+    )
+    process_environment = os.environ.copy()
+    process_environment["PYTHONPATH"] = str(d11_root)
+    common_git = Path(
+        subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
+    project_python = common_git.parent / ".venv/Scripts/python.exe"
+    python = project_python if project_python.is_file() else Path(sys.executable)
+    result = subprocess.run(
+        [str(python), "-c", script],
+        input=json.dumps(environment),
+        capture_output=True,
+        text=True,
+        cwd=d11_root,
+        env=process_environment,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    manifest = SimpleNamespace(
+        schema_name=payload.pop("schema"),
+        **{
+            name: SimpleNamespace(**value) if isinstance(value, dict) else value
+            for name, value in payload.items()
+        },
+    )
+    repository = _repository(tmp_path)
+
+    configuration = load_demo_configuration(
+        repository,
+        revision_reader=lambda _: "b" * 40,
+        production_manifest_loader=lambda *, environment: manifest,
+    )
+
+    assert configuration.production_manifest.provider_proxy.health_url == (
+        "http://127.0.0.1:18083/v1/healthz"
+    )
 
 
 @pytest.mark.parametrize(
@@ -159,6 +247,7 @@ def test_load_rejects_non_dynamic_provider_contract(
         ("gateway", "health_url", "http://127.0.0.1/gateway/healthz"),
         ("runtime", "health_url", "http://127.0.0.1/runtime/healthz"),
         ("minibook", "health_url", "http://127.0.0.1/minibook/healthz"),
+        ("provider_proxy", "health_url", "http://127.0.0.1/provider_proxy/healthz"),
         ("provider_proxy", "credential_env", "CAPTAIN_GATEWAY_TOKEN"),
     ),
 )

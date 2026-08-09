@@ -300,16 +300,10 @@ class ManagedProcessSupervisor:
         return tuple(healthy)
 
     def stop(self) -> tuple[ManagedProcessRecord, ...]:
-        records = self._load_records()
-        stopped: list[ManagedProcessRecord] = []
-        remaining: list[ManagedProcessRecord] = []
-        for record in reversed(records):
-            if self._backend.terminate(record.pid, record.start_identity):
-                stopped.append(record)
-            else:
-                remaining.append(record)
-        self._save_records(tuple(reversed(remaining)))
-        return tuple(stopped)
+        return stop_managed_processes(
+            self._configuration.repository_root,
+            backend=self._backend,
+        )
 
     def _preflight(self, *, timeout_seconds: float) -> tuple[_PreparedService, ...]:
         plan = self._require_plan()
