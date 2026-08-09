@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
@@ -11,7 +12,9 @@ from pydantic import ValidationError
 
 from agenten.agent_factory.input_contracts import (
     FactoryInputDocumentV2,
+    BenchmarkExpectedPredicate,
     InputSection,
+    PrivateBenchmarkCaseRequirement,
     RealCaseRequirement,
     RequestedAgent,
     RequestedIntegration,
@@ -71,12 +74,17 @@ def parse_factory_input_bytes(source: bytes, logical_name: str) -> FactoryInputD
     title, ordered = _level_sections(text)
     required: dict[str, str] = {}
     extras: list[InputSection] = []
+    private_benchmark_body: str | None = None
     for name, body in ordered:
         if name in REQUIRED_SECTIONS:
             if name in required:
                 raise FactoryInputError(f"duplicate required section: {name}")
             required[name] = body
         else:
+            if name == "Private benchmark cases":
+                if private_benchmark_body is not None:
+                    raise FactoryInputError("duplicate Private benchmark cases section")
+                private_benchmark_body = body
             extras.append(InputSection(heading=name, heading_path=(name,), markdown=body))
     missing = [name for name in REQUIRED_SECTIONS if name not in required]
     if missing:
@@ -104,6 +112,10 @@ def parse_factory_input_bytes(source: bytes, logical_name: str) -> FactoryInputD
             real_cases=real_cases,
             helpful_resources=_items(required["Helpful resources"]),
             stop_conditions=_items(required["Stop conditions"]),
+            private_benchmark_cases=(
+                () if private_benchmark_body is None
+                else _parse_private_benchmark_cases(private_benchmark_body)
+            ),
             sections=tuple(InputSection(heading=name, heading_path=(name,), markdown=required[name]) for name in REQUIRED_SECTIONS),
             extra_sections=tuple(extras),
         )
@@ -157,6 +169,10 @@ def _nested_blocks(body: str, prefix: str) -> list[tuple[str, dict[str, str]]]:
             value = "\n".join(chunk[subindex + 1:subend]).strip()
             if not value:
                 raise FactoryInputError(f"empty nested subsection: {prefix} {key} / {name}")
+            if name in subsections:
+                raise FactoryInputError(
+                    f"duplicate nested subsection: {prefix} {key} / {name}"
+                )
             subsections[name] = value
         blocks.append((key, subsections))
     return blocks
@@ -181,6 +197,54 @@ def _parse_integrations(body: str) -> tuple[RequestedIntegration, ...]:
             raise FactoryInputError(f"integration {key} requirement must be required or optional")
         aliases = tuple(item for item in _items(values.get("Credential aliases", "- none")) if item != "none")
         result.append(RequestedIntegration(integration_key=key, purpose=_paragraph(values.get("Purpose", "")), trigger=_paragraph(values.get("Trigger", "")), operation=_paragraph(values.get("Operation", "")), required=requirement == "required", credential_aliases=aliases, success_behavior=_paragraph(values.get("Success behavior", "")), failure_behavior=_paragraph(values.get("Failure behavior", ""))))
+    return tuple(result)
+
+
+def _parse_private_benchmark_cases(
+    body: str,
+) -> tuple[PrivateBenchmarkCaseRequirement, ...]:
+    result = []
+    for key, values in _nested_blocks(body, "Benchmark case"):
+        required = {"Category", "Setup", "Action", "Source cases", "Expected predicates"}
+        if set(values) != required:
+            raise FactoryInputError(
+                f"benchmark case {key} must contain exactly Category, Setup, Action, "
+                "Source cases, and Expected predicates"
+            )
+        predicate_lines = _items(values.get("Expected predicates", ""))
+        predicates = []
+        for line in predicate_lines:
+            parts = tuple(item.strip() for item in line.split("|", 3))
+            if len(parts) != 4:
+                raise FactoryInputError(
+                    f"benchmark case {key} predicate must use key | kind | observed_key | JSON value"
+                )
+            try:
+                expected_value = json.loads(parts[3])
+            except json.JSONDecodeError:
+                raise FactoryInputError(
+                    f"benchmark case {key} predicate expected value must be JSON"
+                ) from None
+            if not isinstance(expected_value, (str, bool)):
+                raise FactoryInputError(
+                    f"benchmark case {key} predicate expected value must be string or boolean"
+                )
+            predicates.append(BenchmarkExpectedPredicate(
+                predicate_key=parts[0], kind=parts[1], observed_key=parts[2],
+                expected_value=expected_value,
+            ))
+        result.append(PrivateBenchmarkCaseRequirement(
+            case_key=key,
+            category=_paragraph(values.get("Category", "")),
+            observable_setup=_paragraph(values.get("Setup", "")),
+            observable_action=_paragraph(values.get("Action", "")),
+            source_case_keys=_items(values.get("Source cases", "")),
+            expected_predicates=tuple(predicates),
+        ))
+    if not result:
+        raise FactoryInputError(
+            "Private benchmark cases must contain Benchmark case blocks"
+        )
     return tuple(result)
 
 

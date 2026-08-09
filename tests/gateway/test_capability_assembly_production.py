@@ -22,6 +22,7 @@ from agenten.agent_factory.input_contracts import (
     BenchmarkExpectedPredicate,
     PrivateBenchmarkCaseRequirement,
 )
+from agenten.agent_factory.input_document import FactoryInputError, parse_factory_input_bytes
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.delivery.minibook_events import (
     MinibookProjectionAcknowledgementV1,
@@ -30,7 +31,10 @@ from agenten.delivery.minibook_events import (
 )
 from agenten.delivery.projector import MinibookProjector, ProjectionResult
 from gateway.agent_factory_live_composition import AgentFactoryLiveComposition
-from gateway.capability_assembly_admission import RepositoryCapabilityAssemblyInputAdmission
+from gateway.capability_assembly_admission import (
+    CapabilityAssemblyAdmissionError,
+    RepositoryCapabilityAssemblyInputAdmission,
+)
 from gateway.capability_assembly_contracts import (
     CapabilityAssemblyInputRequest,
     CapabilityAssemblyStageRequest,
@@ -49,8 +53,10 @@ from gateway.capability_assembly_production import (
     _release_projection_digest,
 )
 from gateway.capability_generic_benchmark import (
+    BenchmarkToolEvidenceVerificationRequest,
     GenericBenchmarkCategory,
     GenericBenchmarkExecutionEvidence,
+    GenericPrivateCaseDefinition,
     GenericBenchmarkReceipt,
     GenericCapabilityBenchmarkAdapter,
     ContentAddressedBenchmarkEvidenceResolver,
@@ -85,6 +91,28 @@ def _ref(label: str) -> ArtifactRef:
         sha256=digest,
         media_type="application/json",
     )
+
+
+class _ToolEvidenceAuthority:
+    authority_id = _id("captain-tool-evidence-authority")
+
+    def __init__(self, gateway_store: object) -> None:
+        self.gateway_store = gateway_store
+        self.requests: list[BenchmarkToolEvidenceVerificationRequest] = []
+        self._issued: set[tuple[str, str, str]] = set()
+
+    def issue(
+        self, call_ref: ArtifactRef, lease_ref: ArtifactRef, receipt_ref: ArtifactRef,
+    ) -> None:
+        self._issued.add((call_ref.sha256, lease_ref.sha256, receipt_ref.sha256))
+
+    def verify(self, request: BenchmarkToolEvidenceVerificationRequest) -> bool:
+        self.requests.append(request)
+        return (
+            request.call_ref.sha256,
+            request.lease_ref.sha256,
+            request.receipt_ref.sha256,
+        ) in self._issued
 
 
 def _event() -> MinibookProjectionEvent:
@@ -617,6 +645,7 @@ def _authorities(
         benchmark_evidence=ContentAddressedBenchmarkEvidenceResolver(
             gateway_store=store, artifacts=_BenchmarkArtifacts()
         ),
+        benchmark_tool_authority=_ToolEvidenceAuthority(store),
         benchmark_recorder=BenchmarkRecorder(),  # type: ignore[arg-type]
         promotion=Promotion(),  # type: ignore[arg-type]
         n8n_work_batches=N8nBatches(),  # type: ignore[arg-type]
@@ -860,6 +889,7 @@ def test_low_level_composition_rejects_missing_authority_before_using_repository
             benchmark_evidence=ContentAddressedBenchmarkEvidenceResolver(
                 gateway_store=object(), artifacts=_BenchmarkArtifacts()
             ),
+            benchmark_tool_authority=_ToolEvidenceAuthority(object()),
             benchmark_recorder=None,  # type: ignore[arg-type]
             promotion=None,  # type: ignore[arg-type]
             n8n_work_batches=None,  # type: ignore[arg-type]
@@ -894,6 +924,196 @@ def _admitted_demo(relative_path: str, holdouts: InMemoryPrivateHoldoutStore):
         correlation_id=_id("review-correlation"), reservation=reservation,
     ))
     return admitted, reservation
+
+
+def _private_benchmark_section(*, duplicate_semantic_case: bool = False) -> str:
+    expectations = {
+        "normal": ("observation_equals", "status", "ok"),
+        "boundary": ("observation_contains", "detail", "bounded"),
+        "missing": ("observation_absent", "required_value", True),
+        "conflicting": ("observation_equals", "resolution", "signed_source"),
+        "mandatory_escalation": ("handoff_event", "reason_code", "mandatory_stop"),
+    }
+    sources = ("app_regression", "database_pressure", "auth_uncertainty")
+    lines = ["", "## Private benchmark cases", ""]
+    for category, (kind, observed_key, expected) in expectations.items():
+        for index, source in enumerate(sources):
+            key = f"explicit_{category}_{index}"
+            semantic_index = (
+                0 if duplicate_semantic_case and category == "normal" and index == 1
+                else index
+            )
+            semantic_source = (
+                sources[0]
+                if duplicate_semantic_case and category == "normal" and index == 1
+                else source
+            )
+            lines.extend((
+                f"### Benchmark case: {key}",
+                "#### Category", category,
+                "#### Setup", f"Source-grounded {category} setup {semantic_index}",
+                "#### Action", f"Exercise {category} behavior {semantic_index}",
+                "#### Source cases", f"- {semantic_source}",
+                "#### Expected predicates",
+                f"- {key}_primary | {kind} | {observed_key} | {json.dumps(expected)}",
+                f"- {key}_tool | tool_receipt | captain_tool | true",
+                f"- {key}_rationale | rationale_contains | rationale | \"verified\"",
+                f"- {key}_safety | forbidden_tool_absent | forbidden_tool | true",
+                "",
+            ))
+    return "\n".join(lines)
+
+
+def _admitted_explicit_benchmark(tmp_path: Path, holdouts: InMemoryPrivateHoldoutStore):
+    root = tmp_path / "benchmark-repository"
+    relative_path = "inputs/incident/TO_BE_BUILT.md"
+    target = root / relative_path
+    target.parent.mkdir(parents=True)
+    base = (
+        Path(__file__).resolve().parents[2]
+        / "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md"
+    ).read_text(encoding="utf-8")
+    source = (base.rstrip() + _private_benchmark_section() + "\n").encode()
+    target.write_bytes(source)
+    for command in (
+        ("git", "init", "-q"),
+        ("git", "config", "user.name", "Captain Test"),
+        ("git", "config", "user.email", "captain@example.invalid"),
+        ("git", "add", relative_path),
+        ("git", "commit", "-q", "-m", "test: add canonical input"),
+    ):
+        subprocess.run(command, cwd=root, check=True, capture_output=True)
+    revision = subprocess.run(
+        ("git", "rev-parse", "HEAD"), cwd=root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    digest = hashlib.sha256(source).hexdigest()
+    reservation = CapabilityLiveReservation(
+        reservation_id=_id("parsed-review-reservation"),
+        run_id=_id("parsed-review-run"), input_id="parsed-review-input",
+        maximum_cost_usd="1.00",
+    )
+    admitted = RepositoryCapabilityAssemblyInputAdmission(
+        repository_root=root,
+        expected_repository_revision=revision,
+        expected_sha256_by_path={relative_path: digest},
+        compiled_tool_gaps_by_source_sha256={digest: ()},
+        holdout_store=holdouts, subject_version=1,
+        require_private_benchmark_cases=True,
+    ).admit(CapabilityAssemblyInputRequest(
+        input_id=reservation.input_id, repository_path=relative_path,
+        correlation_id=_id("parsed-review-correlation"), reservation=reservation,
+    ))
+    assert target.read_bytes() == source
+    return admitted, reservation, source
+
+
+def test_repository_admission_parses_exact_private_benchmark_section_without_mutation(
+    tmp_path: Path,
+) -> None:
+    holdouts = InMemoryPrivateHoldoutStore()
+    admitted, _, source = _admitted_explicit_benchmark(tmp_path, holdouts)
+
+    cases = admitted.input.document.private_benchmark_cases
+    assert len(cases) == 15
+    assert {category: sum(case.category == category for case in cases) for category in (
+        "normal", "boundary", "missing", "conflicting", "mandatory_escalation"
+    )} == {
+        "normal": 3, "boundary": 3, "missing": 3,
+        "conflicting": 3, "mandatory_escalation": 3,
+    }
+    assert len(admitted.input.compiled_specification.private_holdout_refs) == 15
+    assert admitted.input.source_ref.sha256 == hashlib.sha256(source).hexdigest()
+
+
+def test_production_admission_rejects_missing_private_benchmark_section() -> None:
+    holdouts = InMemoryPrivateHoldoutStore()
+    root = Path(__file__).resolve().parents[2]
+    relative_path = "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md"
+    source = (root / relative_path).read_bytes()
+    digest = hashlib.sha256(source).hexdigest()
+    revision = subprocess.run(
+        ("git", "rev-parse", "HEAD"), cwd=root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    reservation = CapabilityLiveReservation(
+        reservation_id=_id("missing-private-reservation"),
+        run_id=_id("missing-private-run"), input_id="missing-private-input",
+        maximum_cost_usd="1.00",
+    )
+    admission = RepositoryCapabilityAssemblyInputAdmission(
+        repository_root=root, expected_repository_revision=revision,
+        expected_sha256_by_path={relative_path: digest},
+        compiled_tool_gaps_by_source_sha256={digest: ()},
+        holdout_store=holdouts, subject_version=1,
+        require_private_benchmark_cases=True,
+    )
+
+    with pytest.raises(CapabilityAssemblyAdmissionError, match="explicit Private benchmark"):
+        admission.admit(CapabilityAssemblyInputRequest(
+            input_id=reservation.input_id, repository_path=relative_path,
+            correlation_id=_id("missing-private-correlation"), reservation=reservation,
+        ))
+
+
+def test_private_benchmark_markdown_rejects_malformed_case_count() -> None:
+    base = (
+        Path(__file__).resolve().parents[2]
+        / "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md"
+    ).read_text(encoding="utf-8")
+    malformed = (base.rstrip() + _private_benchmark_section()).replace(
+        "### Benchmark case: explicit_normal_0",
+        "### Invalid private case: explicit_normal_0",
+    )
+
+    with pytest.raises(FactoryInputError, match="three cases per category"):
+        parse_factory_input_bytes(malformed.encode(), logical_name="TO_BE_BUILT.md")
+
+
+def test_duplicate_semantic_private_cases_leave_no_resolvable_registration() -> None:
+    repository = GenericPrivateBenchmarkRepository(
+        holdouts=InMemoryPrivateHoldoutStore()
+    )
+    predicate = BenchmarkExpectedPredicate(
+        predicate_key="status", kind="observation_equals",
+        observed_key="status", expected_value="ok",
+    )
+    first = GenericPrivateCaseDefinition(
+        category=GenericBenchmarkCategory.NORMAL,
+        assertion_ids=("assertion-a",), private_holdout_uri="holdout://first",
+        setup="same setup", action="same action", expected_predicates=(predicate,),
+    )
+    duplicate = GenericPrivateCaseDefinition(
+        category=GenericBenchmarkCategory.NORMAL,
+        assertion_ids=("assertion-a",), private_holdout_uri="holdout://second",
+        setup="same setup", action="same action", expected_predicates=(
+            predicate.model_copy(update={"predicate_key": "renamed_status"}),
+        ),
+    )
+    reference = repository._reference(first)
+
+    with pytest.raises(CapabilityLiveAuthorityUnavailable, match="duplicated"):
+        repository.register_many((first, duplicate))
+    with pytest.raises(CapabilityLiveAuthorityUnavailable, match="stale"):
+        repository.resolve(
+            reference, purpose="execution", authority_id=_id("zero-leftover-reader")
+        )
+
+
+def test_duplicate_semantic_markdown_is_rejected_before_holdout_registration() -> None:
+    holdouts = InMemoryPrivateHoldoutStore()
+    base = (
+        Path(__file__).resolve().parents[2]
+        / "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md"
+    ).read_text(encoding="utf-8")
+    source = base.rstrip() + _private_benchmark_section(duplicate_semantic_case=True)
+
+    with pytest.raises(FactoryInputError, match="semantic definitions must be unique"):
+        FactoryInputCompiler(holdout_store=holdouts).compile(
+            parse_factory_input_bytes(source.encode(), logical_name="TO_BE_BUILT.md"),
+            subject_version=1,
+        )
+    assert len(holdouts) == 0
 
 
 def test_generic_suite_uses_compiled_private_authority_and_all_five_categories() -> None:
@@ -1153,12 +1373,12 @@ def test_n8n_gateway_lease_is_cross_checked_in_both_directions(
         adapter._require_n8n_authority(request)
 
 
-def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_recording() -> None:
+def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_recording(
+    tmp_path: Path,
+) -> None:
     holdouts = InMemoryPrivateHoldoutStore()
-    admitted, reservation = _admitted_demo(
-        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts
-    )
-    grounded_input = _with_grounded_benchmark_sources(admitted.input, holdouts)
+    admitted, reservation, _ = _admitted_explicit_benchmark(tmp_path, holdouts)
+    grounded_input = admitted.input
     request = CapabilityAssemblyStageRequest(
         run_id=reservation.run_id,
         input=grounded_input,
@@ -1215,6 +1435,8 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             self.requests.append(execution_request)
             assert not hasattr(execution_request.case_ref, "setup")
             private_case = execution_request.private_case_access.resolve()
+            assert private_case.setup and private_case.action
+            assert not hasattr(private_case, "expected_predicates")
             kind = execution_request.team_kind
             trace_id = _id(f"{execution_request.case_ref.case_id}-{kind}-trace")
             run_id = _id(f"{execution_request.case_ref.case_id}-{kind}-run")
@@ -1273,6 +1495,7 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                 "status": "succeeded",
                 "result_ref_sha256": outcome_ref.sha256,
             })
+            tool_authority.issue(call_ref, lease_ref, receipt_ref)
             return GenericBenchmarkExecutionEvidence(
                 case_ref=execution_request.case_ref,
                 team_kind=kind,
@@ -1307,9 +1530,11 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             )
 
     evidence, executor, recorder = Evidence(), Executor(), Recorder()
+    tool_authority = _ToolEvidenceAuthority(evidence.gateway_store)
     private_cases = GenericPrivateBenchmarkRepository(holdouts=holdouts)
     authority = asyncio.run(GenericCapabilityBenchmarkAdapter(
         bindings=Bindings(), executor=executor, evidence=evidence,
+        tool_authority=tool_authority,
         recorder=recorder,
         private_cases=private_cases,
     ).evaluate(request))
@@ -1341,7 +1566,9 @@ def test_benchmark_cas_resolver_rejects_forged_artifact_bytes() -> None:
         resolver.resolve(reference)
 
 
-@pytest.mark.parametrize("mode", ("stale_trace", "malicious_observation"))
+@pytest.mark.parametrize(
+    "mode", ("stale_trace", "malicious_observation", "forged_tool_receipts")
+)
 def test_rule_evaluator_rejects_stale_or_malicious_observable_evidence(
     mode: str,
 ) -> None:
@@ -1418,8 +1645,12 @@ def test_rule_evaluator_rejects_stale_or_malicious_observable_evidence(
         trace_id=trace_id, run_id=run_id,
     )
 
+    tool_authority = _ToolEvidenceAuthority(resolver.gateway_store)
+    if mode != "forged_tool_receipts":
+        tool_authority.issue(call, lease, receipt)
     evaluator = RuleBasedCapabilityBenchmarkEvaluator(
-        private_cases=private_cases, evidence=resolver
+        private_cases=private_cases, evidence=resolver,
+        tool_authority=tool_authority,
     )
     evaluation_request = IndependentBenchmarkEvaluationRequest(
         job_id=_id("stale-job"), case_ref=case_ref, execution=execution
@@ -1430,8 +1661,12 @@ def test_rule_evaluator_rejects_stale_or_malicious_observable_evidence(
             match="changed execution binding",
         ):
             evaluator.evaluate(evaluation_request)
+    elif mode == "malicious_observation":
+        result = evaluator.evaluate(evaluation_request)
+        assert result.outcome_satisfied is False
     else:
         result = evaluator.evaluate(evaluation_request)
+        assert result.tool_decisions_valid is False
         assert result.outcome_satisfied is False
 
 
@@ -1456,6 +1691,7 @@ def test_benchmark_rejects_same_executor_and_evaluator_authority() -> None:
             evidence=ContentAddressedBenchmarkEvidenceResolver(
                 gateway_store=object(), artifacts=_BenchmarkArtifacts()
             ),
+            tool_authority=_ToolEvidenceAuthority(object()),
             recorder=Recorder(),  # type: ignore[arg-type]
             private_cases=GenericPrivateBenchmarkRepository(
                 holdouts=InMemoryPrivateHoldoutStore()

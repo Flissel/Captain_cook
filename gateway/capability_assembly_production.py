@@ -54,6 +54,7 @@ from gateway.capability_generic_benchmark import (
     GenericBenchmarkExecutorPort,
     GenericBenchmarkRecorderPort,
     BenchmarkEvidenceResolverPort,
+    BenchmarkToolEvidenceAuthorityPort,
     ContentAddressedBenchmarkEvidenceResolver,
     GenericCapabilityBenchmarkAdapter,
     GenericPrivateHoldoutReader,
@@ -622,6 +623,7 @@ class CapabilityAssemblyProductionAuthorities:
     source_artifacts: RepositoryFactoryInputArtifactStore
     benchmark_executor: GenericBenchmarkExecutorPort
     benchmark_evidence: BenchmarkEvidenceResolverPort
+    benchmark_tool_authority: BenchmarkToolEvidenceAuthorityPort
     benchmark_recorder: GenericBenchmarkRecorderPort
     promotion: GenericCapabilityPromotionPort
     n8n_work_batches: CapabilityN8nWorkBatchAuthorityPort
@@ -790,6 +792,7 @@ def compose_capability_assembly_controller(
     minibook_effects: GatewayMinibookProjectionEffectsAdapter,
     benchmark_executor: GenericBenchmarkExecutorPort,
     benchmark_evidence: BenchmarkEvidenceResolverPort,
+    benchmark_tool_authority: BenchmarkToolEvidenceAuthorityPort,
     benchmark_recorder: GenericBenchmarkRecorderPort,
     promotion: GenericCapabilityPromotionPort,
     n8n_work_batches: CapabilityN8nWorkBatchAuthorityPort,
@@ -808,6 +811,7 @@ def compose_capability_assembly_controller(
         minibook_effects=minibook_effects,
         benchmark_executor=benchmark_executor,
         benchmark_evidence=benchmark_evidence,
+        benchmark_tool_authority=benchmark_tool_authority,
         benchmark_recorder=benchmark_recorder,
         promotion=promotion,
         n8n_work_batches=n8n_work_batches,
@@ -830,6 +834,7 @@ def compose_capability_assembly_controller(
         bindings=factory,
         executor=benchmark_executor,
         evidence=benchmark_evidence,
+        tool_authority=benchmark_tool_authority,
         recorder=benchmark_recorder,
         private_cases=private_cases,
     )
@@ -889,6 +894,7 @@ def build_capability_assembly_controller(
         holdout_store=holdout_store,
         subject_version=settings.subject_version,
         source_artifacts=authorities.source_artifacts,
+        require_private_benchmark_cases=True,
     )
     # Validate every external binding before Gateway repository construction,
     # whose constructor owns the only schema side effect in this builder.
@@ -902,6 +908,7 @@ def build_capability_assembly_controller(
         minibook_effects=authorities.minibook_effects,
         benchmark_executor=authorities.benchmark_executor,
         benchmark_evidence=authorities.benchmark_evidence,
+        benchmark_tool_authority=authorities.benchmark_tool_authority,
         benchmark_recorder=authorities.benchmark_recorder,
         promotion=authorities.promotion,
         n8n_work_batches=authorities.n8n_work_batches,
@@ -920,6 +927,7 @@ def build_capability_assembly_controller(
         minibook_effects=authorities.minibook_effects,
         benchmark_executor=authorities.benchmark_executor,
         benchmark_evidence=authorities.benchmark_evidence,
+        benchmark_tool_authority=authorities.benchmark_tool_authority,
         benchmark_recorder=authorities.benchmark_recorder,
         promotion=authorities.promotion,
         n8n_work_batches=authorities.n8n_work_batches,
@@ -943,6 +951,7 @@ def _require_same_gateway_authority(
         "reconciliation Gateway": getattr(authorities.reconciliation, "gateway_store", None),
         "benchmark executor": getattr(authorities.benchmark_executor, "gateway_store", None),
         "benchmark evidence CAS": getattr(authorities.benchmark_evidence, "gateway_store", None),
+        "benchmark tool evidence authority": getattr(authorities.benchmark_tool_authority, "gateway_store", None),
         "benchmark recorder": getattr(authorities.benchmark_recorder, "gateway_store", None),
         "promotion Gateway": getattr(authorities.promotion, "gateway_store", None),
         "n8n WorkBatch Gateway": getattr(authorities.n8n_work_batches, "gateway_store", None),
@@ -995,6 +1004,7 @@ def _preflight_composition(
     minibook_effects: object,
     benchmark_executor: object,
     benchmark_evidence: object,
+    benchmark_tool_authority: object,
     benchmark_recorder: object,
     promotion: object,
     n8n_work_batches: object,
@@ -1018,6 +1028,15 @@ def _preflight_composition(
             or benchmark_executor.authority_id == RuleBasedCapabilityBenchmarkEvaluator.AUTHORITY_ID):
         raise CapabilityAssemblyProductionConfigurationError(
             "benchmark executor and evaluator authorities are not independent"
+        )
+    tool_authority_id = getattr(benchmark_tool_authority, "authority_id", None)
+    if (not isinstance(tool_authority_id, UUID)
+            or tool_authority_id in {
+                benchmark_executor.authority_id,
+                RuleBasedCapabilityBenchmarkEvaluator.AUTHORITY_ID,
+            }):
+        raise CapabilityAssemblyProductionConfigurationError(
+            "benchmark tool evidence authority is not independent"
         )
     if source_artifacts is not None and not isinstance(
         source_artifacts, RepositoryFactoryInputArtifactStore
@@ -1087,6 +1106,7 @@ def _preflight_composition(
             (benchmark_executor, "execute", True, 1),
             (benchmark_evidence, "resolve", False, 1),
             (benchmark_evidence, "record_evaluation", False, 1),
+            (benchmark_tool_authority, "verify", False, 1),
             (benchmark_recorder, "record_generic_benchmark", False, 1),
             (promotion, "promote_generic_capability", True, 2),
             (n8n_work_batches, "active_n8n_work_batch_id", False, 1),

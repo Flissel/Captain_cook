@@ -43,6 +43,20 @@ class GenericPrivateCaseDefinition:
 
 
 @dataclass(frozen=True)
+class GenericExecutionCaseView:
+    case_ref: "GenericPrivateCaseRef"
+    setup: str
+    action: str
+    opaque_source_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GenericEvaluationCaseView:
+    case_ref: "GenericPrivateCaseRef"
+    expected_predicates: tuple[BenchmarkExpectedPredicate, ...]
+
+
+@dataclass(frozen=True)
 class GenericPrivateCaseRef:
     case_id: str
     category: GenericBenchmarkCategory
@@ -62,6 +76,18 @@ class GenericToolCallEvidence:
     call_ref: ArtifactRef
     lease_ref: ArtifactRef
     receipt_ref: ArtifactRef
+
+
+@dataclass(frozen=True)
+class BenchmarkToolEvidenceVerificationRequest:
+    case_ref: GenericPrivateCaseRef
+    tool_key: str
+    call_ref: ArtifactRef
+    lease_ref: ArtifactRef
+    receipt_ref: ArtifactRef
+    trace_id: UUID
+    run_id: UUID
+    model_policy_digest: str
 
 
 @dataclass(frozen=True)
@@ -193,6 +219,13 @@ class BenchmarkEvidenceResolverPort(Protocol):
     def record_evaluation(self, payload: bytes) -> ArtifactRef: ...
 
 
+class BenchmarkToolEvidenceAuthorityPort(Protocol):
+    gateway_store: object
+    authority_id: UUID
+
+    def verify(self, request: BenchmarkToolEvidenceVerificationRequest) -> bool: ...
+
+
 class GenericBenchmarkRecorderPort(Protocol):
     gateway_store: object
 
@@ -213,7 +246,7 @@ class ScopedPrivateCaseAccess:
     authority_id: UUID
     _resolved: bool = False
 
-    def resolve(self) -> GenericPrivateCaseDefinition:
+    def resolve(self) -> GenericExecutionCaseView | GenericEvaluationCaseView:
         if self._resolved:
             raise CapabilityLiveAuthorityUnavailable("private case access is single use")
         self._resolved = True
@@ -240,29 +273,49 @@ class GenericPrivateBenchmarkRepository:
         return body
 
     def register(self, definition: GenericPrivateCaseDefinition) -> GenericPrivateCaseRef:
+        return self.register_many((definition,))[0]
+
+    def _reference(self, definition: GenericPrivateCaseDefinition) -> GenericPrivateCaseRef:
         payload = _canonical({
             "category": definition.category.value,
             "assertion_ids": definition.assertion_ids,
-            "private_holdout_uri": definition.private_holdout_uri,
             "setup": definition.setup,
             "action": definition.action,
-            "expected_predicates": [
-                item.model_dump(mode="json")
+            "expected_predicates": sorted([
+                {
+                    "kind": item.kind,
+                    "observed_key": item.observed_key,
+                    "expected_value": item.expected_value,
+                }
                 for item in definition.expected_predicates
-            ],
+            ], key=_canonical),
         })
         digest = hashlib.sha256(payload.encode()).hexdigest()
         case_id = f"case-{digest[:16]}"
-        previous = self._definitions.get(case_id)
-        if previous is not None and previous != definition:
-            raise CapabilityLiveAuthorityUnavailable("private benchmark case conflict")
-        self._definitions[case_id] = definition
         return GenericPrivateCaseRef(
             case_id=case_id,
             category=definition.category,
             assertion_ids=definition.assertion_ids,
             case_digest=digest,
         )
+
+    def register_many(
+        self, definitions: tuple[GenericPrivateCaseDefinition, ...]
+    ) -> tuple[GenericPrivateCaseRef, ...]:
+        references = tuple(self._reference(item) for item in definitions)
+        if len({item.case_id for item in references}) != len(references):
+            raise CapabilityLiveAuthorityUnavailable(
+                "private benchmark explicit case definitions are duplicated"
+            )
+        for reference, definition in zip(references, definitions, strict=True):
+            previous = self._definitions.get(reference.case_id)
+            if previous is not None and previous != definition:
+                raise CapabilityLiveAuthorityUnavailable("private benchmark case conflict")
+        self._definitions.update({
+            reference.case_id: definition
+            for reference, definition in zip(references, definitions, strict=True)
+        })
+        return references
 
     def scoped_access(
         self, case_ref: GenericPrivateCaseRef, *,
@@ -275,13 +328,26 @@ class GenericPrivateBenchmarkRepository:
     def resolve(
         self, case_ref: GenericPrivateCaseRef, *,
         purpose: Literal["execution", "evaluation"], authority_id: UUID,
-    ) -> GenericPrivateCaseDefinition:
+    ) -> GenericExecutionCaseView | GenericEvaluationCaseView:
         if purpose not in {"execution", "evaluation"} or not isinstance(authority_id, UUID):
             raise CapabilityLiveAuthorityUnavailable("private case scope is invalid")
         definition = self._definitions.get(case_ref.case_id)
-        if definition is None or self.register(definition) != case_ref:
+        if definition is None or self._reference(definition) != case_ref:
             raise CapabilityLiveAuthorityUnavailable("private case reference is stale")
-        return definition
+        if purpose == "execution":
+            return GenericExecutionCaseView(
+                case_ref=case_ref,
+                setup=definition.setup,
+                action=definition.action,
+                opaque_source_refs=tuple(
+                    hashlib.sha256(item.encode()).hexdigest()
+                    for item in definition.assertion_ids
+                ),
+            )
+        return GenericEvaluationCaseView(
+            case_ref=case_ref,
+            expected_predicates=definition.expected_predicates,
+        )
 
     def retire(self, suite: GenericBenchmarkSuite) -> None:
         for case_ref in suite.cases:
@@ -327,10 +393,12 @@ class RuleBasedCapabilityBenchmarkEvaluator:
     AUTHORITY_ID = UUID("18e4ed5f-a65f-4ce8-94df-b0701cc56a01")
 
     def __init__(self, *, private_cases: GenericPrivateBenchmarkRepository,
-                 evidence: BenchmarkEvidenceResolverPort) -> None:
+                 evidence: BenchmarkEvidenceResolverPort,
+                 tool_authority: BenchmarkToolEvidenceAuthorityPort) -> None:
         self.authority_id = self.AUTHORITY_ID
         self._private_cases = private_cases
         self._evidence = evidence
+        self._tool_authority = tool_authority
 
     def evaluate(self, request: IndependentBenchmarkEvaluationRequest) -> IndependentBenchmarkOutcome:
         case = self._private_cases.scoped_access(
@@ -357,15 +425,12 @@ class RuleBasedCapabilityBenchmarkEvaluator:
             (
                 tool,
                 self._json_evidence(tool.call_ref, "captain.capability-benchmark-tool-call.v1"),
-                self._json_evidence(tool.lease_ref, "captain.capability-benchmark-tool-lease.v1"),
-                self._json_evidence(tool.receipt_ref, "captain.capability-benchmark-tool-receipt.v1"),
             )
             for tool in execution.tool_calls
         )
         all_payloads = (
             outcome, rationale, *messages, *handoffs,
-            *(payload for _, call, lease, receipt in tool_payloads
-              for payload in (call, lease, receipt)),
+            *(call for _, call in tool_payloads),
         )
         if any(payload.get(key) != value for key, value in common.items()
                for payload in all_payloads):
@@ -380,20 +445,27 @@ class RuleBasedCapabilityBenchmarkEvaluator:
                        for item in handoffs)):
             raise CapabilityLiveAuthorityUnavailable("benchmark evaluator evidence schema is invalid")
         tool_validity: dict[str, bool] = {}
-        for tool, call, lease, receipt in tool_payloads:
+        for tool, call in tool_payloads:
             if (set(call) != {"schema", *common, "tool_key", "operation", "call_id"}
-                    or set(lease) != {"schema", *common, "tool_key", "lease_id", "scope"}
-                    or set(receipt) != {"schema", *common, "tool_key", "call_id", "status", "result_ref_sha256"}
-                    or any(payload.get("tool_key") != tool.tool_key for payload in (call, lease, receipt))):
+                    or call.get("tool_key") != tool.tool_key):
                 raise CapabilityLiveAuthorityUnavailable("benchmark tool evidence schema is invalid")
-            tool_validity[tool.tool_key] = bool(
-                receipt["call_id"] == call["call_id"]
-                and receipt["status"] == "succeeded"
-                and isinstance(lease["scope"], list)
-                and call["operation"] in lease["scope"]
-                and isinstance(receipt["result_ref_sha256"], str)
-                and re.fullmatch(r"[0-9a-f]{64}", receipt["result_ref_sha256"])
-            )
+            try:
+                tool_validity[tool.tool_key] = self._tool_authority.verify(
+                    BenchmarkToolEvidenceVerificationRequest(
+                        case_ref=request.case_ref,
+                        tool_key=tool.tool_key,
+                        call_ref=tool.call_ref,
+                        lease_ref=tool.lease_ref,
+                        receipt_ref=tool.receipt_ref,
+                        trace_id=execution.trace_id,
+                        run_id=execution.run_id,
+                        model_policy_digest=execution.model_policy_digest,
+                    )
+                ) is True
+            except Exception:
+                raise CapabilityLiveAuthorityUnavailable(
+                    "independent tool evidence authority is unavailable"
+                ) from None
         predicate_results = tuple(
             _evaluate_predicate(
                 predicate,
@@ -482,17 +554,26 @@ class GenericCapabilityBenchmarkAdapter:
 
     def __init__(self, *, bindings: object, executor: GenericBenchmarkExecutorPort,
                  evidence: BenchmarkEvidenceResolverPort,
+                 tool_authority: BenchmarkToolEvidenceAuthorityPort,
                  recorder: GenericBenchmarkRecorderPort,
                  private_cases: GenericPrivateBenchmarkRepository) -> None:
         self._bindings = bindings
         self._executor = executor
         self._evaluator = RuleBasedCapabilityBenchmarkEvaluator(
-            private_cases=private_cases, evidence=evidence
+            private_cases=private_cases, evidence=evidence,
+            tool_authority=tool_authority,
         )
         if (not isinstance(getattr(executor, "authority_id", None), UUID)
                 or executor.authority_id == self._evaluator.authority_id):
             raise CapabilityLiveAuthorityUnavailable(
                 "benchmark executor and evaluator authorities must be independent"
+            )
+        if (not isinstance(getattr(tool_authority, "authority_id", None), UUID)
+                or tool_authority.authority_id in {
+                    executor.authority_id, self._evaluator.authority_id,
+                }):
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool evidence authority must be independent"
             )
         self._recorder = recorder
         self._private_cases = private_cases
@@ -650,11 +731,7 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
     case_keys = tuple(json.loads(private_cases.holdout_body(ref.uri, ref.sha256))["case_key"] for ref in holdouts)
     if len(case_keys) != len(set(case_keys)):
         raise CapabilityLiveAuthorityUnavailable("private benchmark case keys are ambiguous")
-    cases = [private_cases.register(item) for item in definitions]
-    if len({case.case_id for case in cases}) != 15:
-        raise CapabilityLiveAuthorityUnavailable(
-            "private benchmark explicit case definitions are duplicated"
-        )
+    cases = private_cases.register_many(tuple(definitions))
     payload = _canonical([{
         "case_id": case.case_id, "category": case.category.value,
         "assertion_ids": case.assertion_ids, "case_digest": case.case_digest,
@@ -662,7 +739,7 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
     digest = hashlib.sha256(payload.encode()).hexdigest()
     return GenericBenchmarkSuite(
         ArtifactRef(uri=f"artifact://capability-benchmark/{digest}", sha256=digest,
-                    media_type="application/json"), tuple(cases))
+                    media_type="application/json"), cases)
 
 
 def _evaluate_predicate(

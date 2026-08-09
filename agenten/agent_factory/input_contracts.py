@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -132,6 +134,35 @@ class FactoryInputDocumentV2(_FrozenContract):
         benchmark_keys = tuple(item.case_key for item in self.private_benchmark_cases)
         if len(benchmark_keys) != len(set(benchmark_keys)):
             raise ValueError("duplicate private benchmark case stable name")
+        if self.private_benchmark_cases:
+            categories = (
+                "normal", "boundary", "missing", "conflicting", "mandatory_escalation"
+            )
+            if (len(self.private_benchmark_cases) != 15
+                    or any(sum(item.category == category for item in self.private_benchmark_cases) != 3
+                           for category in categories)):
+                raise ValueError(
+                    "private benchmark cases require exactly three cases per category"
+                )
+            semantic_digests = tuple(
+                hashlib.sha256(json.dumps({
+                    "category": item.category,
+                    "setup": item.observable_setup,
+                    "action": item.observable_action,
+                    "source_case_keys": item.source_case_keys,
+                    "expected_predicates": sorted(
+                        (
+                            predicate.kind,
+                            predicate.observed_key,
+                            predicate.expected_value,
+                        )
+                        for predicate in item.expected_predicates
+                    ),
+                }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                for item in self.private_benchmark_cases
+            )
+            if len(semantic_digests) != len(set(semantic_digests)):
+                raise ValueError("private benchmark semantic definitions must be unique")
         source_case_keys = {
             *(item.case_key for item in self.real_cases),
             *(item.case_key for item in self.acceptance_outcomes),
