@@ -393,16 +393,6 @@ class ProviderBudgetProxy:
         if actual > reservation:
             raise ProviderUsageUnavailable("provider usage exceeds its reservation")
         ended_at = self.clock()
-        self.repository.record_usage(
-            call_id=call_id,
-            provider_response_id=response_id,
-            consumed_usd=actual,
-            input_units=input_units,
-            cached_input_units=cached_units,
-            output_units=output_units,
-            started_at=started_at.isoformat(),
-            ended_at=ended_at.isoformat(),
-        )
         call_receipt = {
             "schema": "captain.provider-call-usage.v1",
             "call_id": call_id,
@@ -424,6 +414,16 @@ class ProviderBudgetProxy:
         if destination.exists() and destination.read_bytes() != encoded:
             raise ProviderUsageUnavailable("provider call receipt CAS collision")
         destination.write_bytes(encoded)
+        self.repository.record_usage(
+            call_id=call_id,
+            provider_response_id=response_id,
+            consumed_usd=actual,
+            input_units=input_units,
+            cached_input_units=cached_units,
+            output_units=output_units,
+            started_at=started_at.isoformat(),
+            ended_at=ended_at.isoformat(),
+        )
 
     async def finalize(
         self, *, command_id: UUID, result_id: UUID

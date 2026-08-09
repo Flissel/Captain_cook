@@ -189,14 +189,43 @@ class SQLiteProviderBudgetRepository:
         started_at: str,
         ended_at: str,
     ) -> None:
-        self.settle(
-            call_id=call_id,
-            provider_response_id=provider_response_id,
-            consumed_usd=consumed_usd,
-            ambiguous=False,
-        )
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            reservation = connection.execute(
+                "SELECT reserved_usd,state,consumed_usd,provider_response_id FROM provider_call_reservations WHERE call_id=?",
+                (call_id,),
+            ).fetchone()
+            if reservation is None or consumed_usd > Decimal(str(reservation[0])):
+                connection.rollback()
+                raise ReservationRejected("provider usage exceeds its reservation")
+            expected_usage = (
+                provider_response_id,
+                input_units,
+                cached_input_units,
+                output_units,
+                started_at,
+                ended_at,
+            )
+            existing = connection.execute(
+                "SELECT provider_response_id,input_units,cached_input_units,output_units,started_at,ended_at FROM provider_call_usage WHERE call_id=?",
+                (call_id,),
+            ).fetchone()
+            if reservation[1] != "reserved":
+                if (
+                    reservation[1] == "settled"
+                    and Decimal(str(reservation[2])) == consumed_usd
+                    and reservation[3] == provider_response_id
+                    and existing == expected_usage
+                ):
+                    connection.commit()
+                    return
+                connection.rollback()
+                raise ReservationRejected("provider usage receipt already changed")
             try:
+                connection.execute(
+                    "UPDATE provider_call_reservations SET state='settled', consumed_usd=?, provider_response_id=? WHERE call_id=?",
+                    (format(consumed_usd, "f"), provider_response_id, call_id),
+                )
                 connection.execute(
                     "INSERT INTO provider_call_usage VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
@@ -210,20 +239,9 @@ class SQLiteProviderBudgetRepository:
                     ),
                 )
             except sqlite3.IntegrityError:
-                row = connection.execute(
-                    "SELECT provider_response_id,input_units,cached_input_units,output_units,started_at,ended_at FROM provider_call_usage WHERE call_id=?",
-                    (call_id,),
-                ).fetchone()
-                expected = (
-                    provider_response_id,
-                    input_units,
-                    cached_input_units,
-                    output_units,
-                    started_at,
-                    ended_at,
-                )
-                if row != expected:
-                    raise ReservationRejected("provider usage receipt already changed") from None
+                connection.rollback()
+                raise ReservationRejected("provider usage receipt already changed") from None
+            connection.commit()
 
     def aggregate_usage(self) -> tuple[int, int, int, str, str, tuple[str, ...]]:
         projection = self.projection()
