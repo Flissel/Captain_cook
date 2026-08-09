@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from contextlib import contextmanager
 from typing import Callable, Protocol
 from uuid import UUID, uuid5
 
@@ -191,23 +192,61 @@ class FilesystemCaptainCreationJobV3Store:
             ensure_ascii=False,
         ).encode("utf-8")
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            if path.read_bytes() != content:
-                raise FactoryDispatchError("Captain V3 durable authority replay conflicts")
-        else:
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-            )
-            temporary = Path(temporary_name)
-            try:
-                with os.fdopen(descriptor, "wb") as handle:
-                    handle.write(content)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                temporary.replace(path)
-            finally:
-                temporary.unlink(missing_ok=True)
+        with self._key_lock(path):
+            if path.exists():
+                if path.read_bytes() != content:
+                    raise FactoryDispatchError(
+                        "Captain V3 durable authority replay conflicts"
+                    )
+            else:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+                )
+                temporary = Path(temporary_name)
+                try:
+                    with os.fdopen(descriptor, "wb") as handle:
+                        handle.write(content)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, path)
+                    if os.name != "nt":
+                        directory = os.open(path.parent, os.O_RDONLY)
+                        try:
+                            os.fsync(directory)
+                        finally:
+                            os.close(directory)
+                finally:
+                    temporary.unlink(missing_ok=True)
         return model.model_validate_json(content)
+
+    @staticmethod
+    @contextmanager
+    def _key_lock(path: Path):
+        lock_path = path.with_suffix(f"{path.suffix}.lock")
+        with lock_path.open("a+b") as stream:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
+                os.fsync(stream.fileno())
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
     def _read(self, job_id, attempt, name, model):
         path = self._path(job_id, attempt, name)
@@ -607,7 +646,15 @@ class MinibookForgeHttpClient(MinibookForgePort):
         )
         if response.status_code not in {200, 202}:
             raise FactoryDispatchError(f"Minibook creation submission failed ({response.status_code})")
-        return CreationSubmissionReceipt.model_validate(response.json())
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise TypeError
+            return CreationSubmissionReceipt.model_validate(payload)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise FactoryDispatchError(
+                "Minibook creation submission response is invalid"
+            ) from exc
 
     async def status(self, creation_job_id: UUID) -> CreationProgressV1:
         response = await self._client.get(
@@ -616,7 +663,15 @@ class MinibookForgeHttpClient(MinibookForgePort):
         )
         if response.status_code != 200:
             raise FactoryDispatchError(f"Minibook creation status failed ({response.status_code})")
-        return CreationProgressV1.model_validate(response.json())
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise TypeError
+            return CreationProgressV1.model_validate(payload)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise FactoryDispatchError(
+                "Minibook creation status response is invalid"
+            ) from exc
 
     async def result(self, creation_job_id: UUID) -> CreationResultV1 | CreationResultV2:
         response = await self._client.get(
@@ -625,13 +680,20 @@ class MinibookForgeHttpClient(MinibookForgePort):
         )
         if response.status_code != 200:
             raise FactoryDispatchError(f"Minibook creation result failed ({response.status_code})")
-        payload = response.json()
-        model = (
-            CreationResultV2
-            if payload.get("schema") == "minibook.creation-result.v2"
-            else CreationResultV1
-        )
-        return model.model_validate(payload)
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise TypeError
+            model = (
+                CreationResultV2
+                if payload.get("schema") == "minibook.creation-result.v2"
+                else CreationResultV1
+            )
+            return model.model_validate(payload)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise FactoryDispatchError(
+                "Minibook creation result response is invalid"
+            ) from exc
 
     async def wait_for_result(self, creation_job_id: UUID) -> CreationResultV1 | CreationResultV2:
         for _ in range(self._settings.max_polls):

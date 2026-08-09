@@ -401,6 +401,94 @@ def test_v3_candidate_rejects_substituted_local_source_after_valid_cas_read(
         durable.accepted_result_for(captain_job, 1)
 
 
+def test_v3_package_validation_never_uses_local_source_path(tmp_path: Path) -> None:
+    (
+        minibook_store,
+        authority_job,
+        authority_assignment,
+        authority_effect,
+        captain_job,
+        candidate,
+        result,
+    ) = _durable_v3_result(tmp_path)
+    package_source_sha256 = result.source_archive_ref.sha256
+
+    class PublicReadOnlyPackageCas(_GatewayCas):
+        def local_path(self, ref):
+            if ref.sha256 == package_source_sha256:
+                raise AssertionError("package validation reopened the local path")
+            return super().local_path(ref)
+
+    durable = FilesystemCaptainCreationJobV3Store(
+        tmp_path / ".captain-cook" / "v3-public-read-package"
+    )
+    durable.record_creation_job(authority_job)
+    durable.record_assignment(authority_assignment)
+    durable.record_effect(authority_effect)
+    provider = GatewayForgeCandidateProvider(
+        repository=Blocks(_released_skill(captain_job)),
+        artifacts=PublicReadOnlyPackageCas(minibook_store),
+        v3_jobs=durable,
+    )
+
+    resolved = provider.accept_creation_result(captain_job, result)
+
+    assert resolved.candidate == candidate
+
+
+def test_v3_package_zip_bomb_is_rejected_in_memory() -> None:
+    stream = io.BytesIO()
+    with zipfile.ZipFile(
+        stream,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as archive:
+        archive.writestr("bomb.bin", b"0" * (2 * 1024 * 1024))
+
+    with pytest.raises(ValueError, match="member is unsafe"):
+        GatewayForgeCandidateProvider._safe_v3_package_zip_files(
+            stream.getvalue(),
+            maximum_files=10,
+        )
+
+
+@pytest.mark.parametrize(
+    "names",
+    (
+        ("../escape.py",),
+        ("CON.txt",),
+        ("Agent.py", "agent.py"),
+        ("café.py", "cafe\u0301.py"),
+    ),
+)
+def test_v3_package_rejects_ambiguous_or_unsafe_member_names(
+    names: tuple[str, ...],
+) -> None:
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as archive:
+        for name in names:
+            archive.writestr(name, b"safe")
+
+    with pytest.raises(ValueError, match="member is unsafe"):
+        GatewayForgeCandidateProvider._safe_v3_package_zip_files(
+            stream.getvalue(),
+            maximum_files=10,
+        )
+
+
+def test_v3_package_rejects_raw_backslash_member_name() -> None:
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as archive:
+        archive.writestr("absolute/path.py", b"safe")
+    content = stream.getvalue().replace(b"absolute/path.py", b"absolute\\path.py")
+
+    with pytest.raises(ValueError, match="member is unsafe"):
+        GatewayForgeCandidateProvider._safe_v3_package_zip_files(
+            content,
+            maximum_files=10,
+        )
+
+
 @pytest.mark.parametrize("mutation", ("source_ref", "team_ref"))
 def test_v3_candidate_manifest_never_normalizes_substituted_references(
     tmp_path: Path,

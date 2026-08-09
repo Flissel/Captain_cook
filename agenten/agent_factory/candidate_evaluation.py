@@ -13,6 +13,7 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import time
+import unicodedata
 from typing import Any, Literal, Protocol
 from uuid import NAMESPACE_URL, uuid5
 import zipfile
@@ -1068,22 +1069,10 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
         source_ref = _runtime_ref(result.source_archive_ref)
         source_bytes = contents[_artifact_identity(source_ref)]
         try:
-            source_path = self._artifacts.local_path(source_ref)
-            if hashlib.sha256(source_path.read_bytes()).hexdigest() != source_ref.sha256:
-                raise ValueError
-            with zipfile.ZipFile(source_path) as archive:
-                infos = archive.infolist()
-                if not infos or len({item.filename for item in infos}) != len(infos):
-                    raise ValueError
-                files = {
-                    PurePosixPath(item.filename): archive.read(item)
-                    for item in infos
-                    if not item.is_dir()
-                    and not PurePosixPath(item.filename).is_absolute()
-                    and ".." not in PurePosixPath(item.filename).parts
-                }
-                if len(files) != len(infos):
-                    raise ValueError
+            files = self._safe_v3_package_zip_files(
+                source_bytes,
+                maximum_files=min(4096, assignment.limits.max_files),
+            )
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
             raise FactoryDispatchError("Captain V3 sealed ZIP is unavailable or invalid") from exc
 
@@ -1357,9 +1346,86 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             content = self._artifacts.read_bytes(reference)
         except (OSError, RuntimeError, ValueError) as exc:
             raise FactoryDispatchError("Captain CAS readback digest mismatch") from exc
-        if hashlib.sha256(content).hexdigest() != reference.sha256:
+        maximum_bytes = (
+            16 * 1024 * 1024
+            if reference.media_type == "application/zip"
+            else 2 * 1024 * 1024
+        )
+        if (
+            not content
+            or len(content) > maximum_bytes
+            or hashlib.sha256(content).hexdigest() != reference.sha256
+        ):
             raise FactoryDispatchError("Captain CAS readback digest mismatch")
         return content
+
+    @staticmethod
+    def _safe_v3_package_zip_files(
+        content: bytes,
+        *,
+        maximum_files: int,
+    ) -> dict[PurePosixPath, bytes]:
+        if not content or len(content) > 16 * 1024 * 1024:
+            raise ValueError("candidate package ZIP size is invalid")
+        windows_reserved = {
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            *(f"COM{index}" for index in range(1, 10)),
+            *(f"LPT{index}" for index in range(1, 10)),
+        }
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            infos = archive.infolist()
+            if not infos or len(infos) > maximum_files:
+                raise ValueError("candidate package ZIP member count is invalid")
+            files: dict[PurePosixPath, bytes] = {}
+            normalized_names: set[str] = set()
+            total_size = 0
+            for info in infos:
+                # ZipInfo.filename normalizes the host separator on Windows;
+                # orig_filename preserves the signed archive member spelling.
+                raw = info.orig_filename
+                raw_parts = raw.split("/")
+                path = PurePosixPath(raw)
+                mode = info.external_attr >> 16
+                normalized = unicodedata.normalize("NFC", raw).casefold()
+                if (
+                    info.is_dir()
+                    or info.flag_bits & 1
+                    or info.compress_type
+                    not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+                    or "\\" in raw
+                    or "\x00" in raw
+                    or len(raw.encode("utf-8")) > 512
+                    or path.is_absolute()
+                    or any(part in {"", ".", ".."} for part in raw_parts)
+                    or ":" in raw_parts[0]
+                    or stat.S_ISLNK(mode)
+                    or path in files
+                    or normalized in normalized_names
+                    or any(
+                        part.endswith((" ", "."))
+                        or part.split(".", 1)[0].upper() in windows_reserved
+                        for part in raw_parts
+                    )
+                    or info.file_size > 2 * 1024 * 1024
+                    or (info.file_size > 0 and info.compress_size == 0)
+                    or (
+                        info.compress_size > 0
+                        and info.file_size / info.compress_size > 200
+                    )
+                ):
+                    raise ValueError("candidate package ZIP member is unsafe")
+                total_size += info.file_size
+                if total_size > 8 * 1024 * 1024:
+                    raise ValueError("candidate package ZIP expands beyond its limit")
+                member = archive.read(info)
+                if len(member) != info.file_size:
+                    raise ValueError("candidate package ZIP member size changed")
+                files[path] = member
+                normalized_names.add(normalized)
+        return files
 
     @staticmethod
     def _read_bound_v3_source_path(path: Path, *, maximum_bytes: int) -> bytes:
