@@ -14,6 +14,7 @@ from agenten.demo_orchestrator.client import (
     DemoTimeout,
     UrllibJsonHttp,
 )
+from agenten.demo_orchestrator.processes import DemoProcessTimeout
 from tests.demo_orchestrator.test_processes import _configuration
 
 
@@ -241,3 +242,28 @@ def test_real_http_adapter_preserves_wrapped_socket_timeout_as_timeout_124(
             payload=None,
             timeout_seconds=1,
         )
+
+
+def test_runtime_restart_timeout_is_persisted_as_terminal_124(tmp_path: Path) -> None:
+    configuration = _configuration(tmp_path)
+    http = FakeAssemblyHttp()
+
+    class TimeoutSupervisor(FakeSupervisor):
+        def restart_runtime(self, *, timeout_seconds: float) -> object:
+            raise DemoProcessTimeout("Runtime restart timed out")
+
+    client = CapabilityDemoClient(
+        configuration,
+        supervisor=TimeoutSupervisor(),
+        http=http,
+        reporter=lambda _: None,
+    )
+
+    with pytest.raises(DemoTimeout) as error:
+        client.run(allow_paid_run=True, maximum_cost_usd="6.00", timeout_seconds=30)
+
+    assert error.value.exit_code == 124
+    state = json.loads(
+        (configuration.state_root / "current-run.json").read_text(encoding="utf-8")
+    )
+    assert state["last_exit_code"] == 124

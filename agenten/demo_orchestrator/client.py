@@ -20,7 +20,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from .configuration import DemoConfiguration
 from .contracts import CANONICAL_INPUT_PATHS
-from .processes import ManagedProcessSupervisor
+from .processes import DemoProcessTimeout, ManagedProcessSupervisor
 
 
 class DemoClientError(RuntimeError):
@@ -262,9 +262,12 @@ class CapabilityDemoClient:
         last_slice = checkpoint.get("last_slice")
         last_kind = last_slice.get("kind") if isinstance(last_slice, Mapping) else None
         if not already and last_kind == "resume_authorize":
-            self._supervisor.restart_runtime(
-                timeout_seconds=max(0.1, self._remaining(deadline))
-            )
+            try:
+                self._supervisor.restart_runtime(
+                    timeout_seconds=max(0.1, self._remaining(deadline))
+                )
+            except DemoProcessTimeout as exc:
+                raise DemoTimeout(str(exc)) from None
             state["controlled_restart_completed"] = True
             self._save_state(state)
             self._report(
