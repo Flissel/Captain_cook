@@ -551,6 +551,46 @@ class GenericGatewayMinibookCapabilityProjectionAdapter:
         )
 
 
+class GatewayGenericCapabilityExecutionAdapter(
+    RecordedFactoryCapabilityExecutionAdapter
+):
+    """Accept execution only for the exact Gateway-issued generic promotion."""
+
+    def __init__(self, *, gateway_store: GatewayStore, **kwargs: object) -> None:
+        self.gateway_store = gateway_store
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+
+    def _require_released(self, release: CapabilityFactoryAuthority) -> None:
+        event_id = release.release_authority_id
+        summary = release.benchmark_summary_ref
+        if event_id is None or summary is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway generic release authority is unavailable"
+            )
+        try:
+            event = self.gateway_store.generic_capability_promotion(event_id)
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway generic release authority is unavailable"
+            ) from None
+        payload = None if event is None else event.get("payload")
+        if (
+            not isinstance(event, dict)
+            or event.get("event_id") != str(event_id)
+            or event.get("correlation_id") != str(release.correlation_id)
+            or event.get("subject_id") != f"subject:{release.job_id}"
+            or event.get("subject_version") != release.capability_version
+            or not isinstance(payload, dict)
+            or payload.get("benchmark_summary_digest")
+            != f"sha256:{summary.sha256}"
+            or payload.get("status_id") != "ready_to_use"
+            or payload.get("benchmark_disposition") != "passed"
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway generic release authority is unavailable"
+            )
+
+
 @dataclass(frozen=True, repr=False)
 class CapabilityAssemblyProductionSettings:
     expected_repository_revision: str
@@ -884,6 +924,7 @@ def _compose_nonproduction_capability_assembly_controller(
     n8n_work_batches: CapabilityN8nWorkBatchAuthorityPort,
     holdout_store: GenericPrivateHoldoutReader,
     clock: Callable[[], datetime],
+    gateway_store: GatewayStore | None = None,
 ) -> CapabilityAssemblyController:
     """Test-only low-level composition; it never carries production attestation."""
 
@@ -929,9 +970,17 @@ def _compose_nonproduction_capability_assembly_controller(
         recorder=benchmark_recorder,
         private_cases=private_cases,
     )
-    execution: CapabilityAssemblyExecutionPort = RecordedFactoryCapabilityExecutionAdapter(
-        composition=factory_composition,
-        resume_execution=resume,
+    execution: CapabilityAssemblyExecutionPort = (
+        GatewayGenericCapabilityExecutionAdapter(
+            gateway_store=gateway_store,
+            composition=factory_composition,
+            resume_execution=resume,
+        )
+        if gateway_store is not None
+        else RecordedFactoryCapabilityExecutionAdapter(
+            composition=factory_composition,
+            resume_execution=resume,
+        )
     )
     projection: CapabilityAssemblyProjectionPort = (
         GenericGatewayMinibookCapabilityProjectionAdapter(effects=minibook_effects)
@@ -1025,6 +1074,7 @@ def build_capability_assembly_controller(
         n8n_work_batches=authorities.n8n_work_batches,
         holdout_store=cast(GenericPrivateHoldoutReader, holdout_store),
         clock=selected_clock,
+        gateway_store=authorities.store,
     )
     executor_configuration_digest = (
         authorities.benchmark_executor.sealed_configuration_digest()
@@ -1419,6 +1469,7 @@ __all__ = [
     "CapabilityAssemblyProductionSettings",
     "CapabilityProjectionGatewayPort",
     "GatewayMinibookProjectionEffectsAdapter",
+    "GatewayGenericCapabilityExecutionAdapter",
     "GenericGatewayMinibookCapabilityProjectionAdapter",
     "ProductionCapabilityAssemblyComposition",
     "RepositoryFactoryInputArtifactStore",

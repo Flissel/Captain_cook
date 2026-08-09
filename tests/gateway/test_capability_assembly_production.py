@@ -51,6 +51,7 @@ from gateway.capability_assembly_production import (
     CapabilityAssemblyProductionConfigurationError,
     CapabilityAssemblyProductionSettings,
     GatewayMinibookProjectionEffectsAdapter,
+    GatewayGenericCapabilityExecutionAdapter,
     ProductionCapabilityAssemblyComposition,
     RepositoryFactoryInputArtifactStore,
     _compose_nonproduction_capability_assembly_controller,
@@ -922,6 +923,7 @@ def test_production_builder_uses_gateway_repository_and_current_authority_adapte
     assert isinstance(controller._repository, GatewayCapabilityAssemblyRepository)
     assert isinstance(controller._factory, CurrentCapabilityFactoryAdapter)
     assert isinstance(controller._resume, GatewayCapabilityResumeExecutionAdapter)
+    assert type(controller._execution) is GatewayGenericCapabilityExecutionAdapter
     assert len(store.storage.statements) == 4
     with pytest.raises(AttributeError, match="immutable"):
         authorities.benchmark_executor._transport = object()  # type: ignore[attr-defined]

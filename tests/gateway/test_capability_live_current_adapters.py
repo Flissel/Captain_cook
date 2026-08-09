@@ -61,6 +61,9 @@ from gateway.capability_live_current_adapters import (
     GatewayMinibookCapabilityProjectionAdapter,
     RecordedFactoryCapabilityExecutionAdapter,
 )
+from gateway.capability_assembly_production import (
+    GatewayGenericCapabilityExecutionAdapter,
+)
 from gateway.capability_live_pipeline import CapabilityFactoryAuthority
 from gateway.capability_live_pipeline import (
     CapabilityExecutionAuthority,
@@ -474,6 +477,65 @@ def test_recorded_execution_adapter_uses_existing_third_release_gate_run() -> No
     assert authority.execution_authority_id == _runs()[2].invocation_id
     assert authority.execution_command_id == _runs()[2].execution_outcome.command_id
     assert authority.execution_result_id == _runs()[2].execution_outcome.result_id
+
+
+def test_generic_execution_accepts_only_exact_gateway_promotion_event() -> None:
+    release = _release()
+    event = {
+        "event_id": str(release.release_authority_id),
+        "correlation_id": str(release.correlation_id),
+        "subject_id": f"subject:{release.job_id}",
+        "subject_version": release.capability_version,
+        "payload": {
+            "status_id": "ready_to_use",
+            "benchmark_disposition": "passed",
+            "benchmark_summary_digest": (
+                f"sha256:{release.benchmark_summary_ref.sha256}"
+            ),
+        },
+    }
+    store = SimpleNamespace(
+        generic_capability_promotion=lambda event_id: (
+            event if event_id == release.release_authority_id else None
+        )
+    )
+    adapter = GatewayGenericCapabilityExecutionAdapter(
+        gateway_store=store,
+        composition=_Composition(promoted=False),
+    )
+
+    authority = asyncio.run(
+        adapter.execute(_request(CapabilityLiveStage.EXECUTE), release)
+    )
+
+    assert authority.execution_authority_id == _runs()[2].invocation_id
+
+
+def test_generic_execution_rejects_changed_benchmark_summary_binding() -> None:
+    release = _release()
+    store = SimpleNamespace(
+        generic_capability_promotion=lambda _event_id: {
+            "event_id": str(release.release_authority_id),
+            "correlation_id": str(release.correlation_id),
+            "subject_id": f"subject:{release.job_id}",
+            "subject_version": release.capability_version,
+            "payload": {
+                "status_id": "ready_to_use",
+                "benchmark_disposition": "passed",
+                "benchmark_summary_digest": "sha256:" + "0" * 64,
+            },
+        }
+    )
+    adapter = GatewayGenericCapabilityExecutionAdapter(
+        gateway_store=store,
+        composition=_Composition(promoted=False),
+    )
+
+    with pytest.raises(
+        CapabilityLiveAuthorityUnavailable,
+        match="generic release authority",
+    ):
+        asyncio.run(adapter.execute(_request(CapabilityLiveStage.EXECUTE), release))
 
 
 def _resume_authorization(
