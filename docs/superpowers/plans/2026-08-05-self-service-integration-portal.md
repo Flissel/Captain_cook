@@ -35,7 +35,7 @@
 
 **Interfaces:** WireGuard exposes only `10.77.0.1:443` from Captain to peer `10.77.0.2`. The Mini-PC backend sends requests to `https://captain-portal-link.internal`; the Captain proxy requires a trusted Mini-PC client certificate and forwards only `/v1/portal/` to `http://127.0.0.1:8090`.
 
-- [ ] **Step 1: Write the failing proxy-boundary test**
+- [x] **Step 1: Write the failing proxy-boundary test**
 
     def test_link_requires_client_certificate_and_forwards_only_portal_routes() -> None:
         config = Path("deploy/portal-link/captain-proxy.conf").read_text(encoding="utf-8")
@@ -44,23 +44,23 @@
         assert 'proxy_pass http://127.0.0.1:8090' in config
         assert 'location / {' in config and 'return 404' in config
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `py -3.11 -m pytest -q --no-cov tests/scripts/test_portal_link_config.py`
 
 Expected: FAIL because the service-link configuration is absent.
 
-- [ ] **Step 3: Implement mTLS proxy configuration**
+- [x] **Step 3: Implement mTLS proxy configuration**
 
 Bind the Captain proxy only to `10.77.0.1:443`. Define WireGuard peers on `10.77.0.0/30`, permitting Captain UDP `51820` and allowing the Mini-PC peer only `10.77.0.1/32`. Mount WireGuard keys, Captain server certificate/key and Mini-PC client CA only from local gitignored secret paths. Set `ssl_verify_client on`, allow only the exact portal prefix, strip inbound `Authorization` headers, add a fixed internal forwarding identity header at the Captain proxy, and return 404 for every other route. The Mini-PC proxy must verify the Captain certificate hostname and never disable TLS verification.
 
-- [ ] **Step 4: Run configuration tests and compose validation**
+- [x] **Step 4: Run configuration tests and compose validation**
 
 Run: `py -3.11 -m pytest -q --no-cov tests/scripts/test_portal_link_config.py; docker compose -f deploy/portal-link/compose.portal-link.yml config`
 
 Expected: PASS without starting a container.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add deploy/portal-link tests/scripts/test_portal_link_config.py; git commit -m "feat: add private portal gateway link"`
 
@@ -70,19 +70,19 @@ Run: `git add deploy/portal-link tests/scripts/test_portal_link_config.py; git c
 
 **Interfaces:** Produce `PortalPrincipalV1`, `PortalSetupTicketRequestV1`, `PortalSetupTicketV1`, and `PortalSetupActionRequestV1`. `PortalSetupTicketRequestV1` has `job_id: UUID`, `organization_id: str`, `subject_id: str`, `credential_alias: str`, `issued_at: datetime`, and `expires_at: datetime`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
     def test_ticket_rejects_expiry_longer_than_ten_minutes() -> None:
         with pytest.raises(ValidationError, match="at most ten minutes"):
             PortalSetupTicketRequestV1(job_id=UUID("10000000-0000-0000-0000-000000000001"), organization_id="org-a", subject_id="user-a", credential_alias="CRM_PRIMARY", issued_at=NOW, expires_at=NOW + timedelta(minutes=11))
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `py -3.11 -m pytest -q tests/gateway/test_portal_contracts.py`
 
 Expected: FAIL because `gateway.portal_contracts` is absent.
 
-- [ ] **Step 3: Implement the minimal frozen contracts**
+- [x] **Step 3: Implement the minimal frozen contracts**
 
     class PortalSetupTicketRequestV1(_FrozenContract):
         job_id: UUID
@@ -98,13 +98,13 @@ Expected: FAIL because `gateway.portal_contracts` is absent.
                 raise ValueError("portal ticket expiry must be at most ten minutes")
             return self
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `py -3.11 -m pytest -q tests/gateway/test_portal_contracts.py`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add gateway/portal_contracts.py tests/gateway/test_portal_contracts.py; git commit -m "feat: define portal setup ticket contracts"`
 
@@ -114,19 +114,19 @@ Run: `git add gateway/portal_contracts.py tests/gateway/test_portal_contracts.py
 
 **Interfaces:** Produce `require_portal_principal(request: Request) -> PortalPrincipalV1`. It verifies RS256 issuer, audience and JWKS `kid`, then reads `sub` and the configured `organization_id` claim.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
     def test_portal_auth_rejects_wrong_audience_without_echoing_token() -> None:
         with pytest.raises(HTTPException, match="invalid portal identity"):
             require_portal_principal(request_with_signed_jwt(audience="wrong"), settings)
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `py -3.11 -m pytest -q tests/gateway/test_portal_auth.py`
 
 Expected: FAIL because `require_portal_principal` is absent.
 
-- [ ] **Step 3: Implement strict settings and verifier**
+- [x] **Step 3: Implement strict settings and verifier**
 
     portal_supabase_issuer: str
     portal_supabase_audience: str
@@ -135,13 +135,13 @@ Expected: FAIL because `require_portal_principal` is absent.
 
 Pin `PyJWT[crypto]` in `requirements.txt`. Cache public JWKS keys by `kid` with a bounded TTL. Return the fixed `invalid portal identity` response for missing, expired, malformed, wrong-issuer, wrong-audience or claimless tokens; never log a token.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `py -3.11 -m pytest -q tests/gateway/test_portal_auth.py tests/gateway/test_settings.py`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add requirements.txt gateway/settings.py gateway/portal_auth.py tests/gateway/test_portal_auth.py; git commit -m "feat: authenticate portal users with supabase jwt"`
 
@@ -151,20 +151,20 @@ Run: `git add requirements.txt gateway/settings.py gateway/portal_auth.py tests/
 
 **Interfaces:** Add `POST /v1/portal/integration-setups/{job_id}/tickets`, `GET /v1/portal/integration-setups/{job_id}`, `POST /v1/portal/integration-setups/{job_id}/discover`, `POST /v1/portal/integration-setups/{job_id}/select`, and `POST /v1/portal/integration-setups/{job_id}/actions`.
 
-- [ ] **Step 1: Write failing tenant and replay tests**
+- [x] **Step 1: Write failing tenant and replay tests**
 
     def test_org_b_cannot_read_org_a_setup_or_consume_org_a_ticket(client) -> None:
         ticket = issue_ticket(client, principal=ORG_A, job_id=JOB_ID)
         assert read_surface(client, principal=ORG_B, job_id=JOB_ID).status_code == 404
         assert consume_ticket(client, principal=ORG_B, ticket=ticket).status_code == 403
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `py -3.11 -m pytest -q tests/gateway/test_portal_ticket_store.py tests/gateway/test_portal_api.py`
 
 Expected: FAIL because ticket storage and portal routes are absent.
 
-- [ ] **Step 3: Implement transactional ticket storage**
+- [x] **Step 3: Implement transactional ticket storage**
 
     raw = secrets.token_urlsafe(32)
     digest = sha256(raw.encode("utf-8")).hexdigest()
@@ -174,13 +174,13 @@ Expected: FAIL because ticket storage and portal routes are absent.
 
 Store `ticket_id`, digest, job, organization, subject, alias, expiry, used timestamp and timestamps. Consumption compares SHA-256 with `compare_digest`, checks every binding and updates `used_at` in the same transaction. Portal routes delegate selection and rotation/revoke to existing `IntegrationSetupPlanner` and `IntegrationSetupMutationV1`; no route accepts secret material.
 
-- [ ] **Step 4: Run isolated MariaDB tests**
+- [x] **Step 4: Run isolated MariaDB tests**
 
 Run: `$env:TEST_MARIADB_DSN = '<isolated DSN ending in /captain_test>'; py -3.11 -m pytest -q tests/gateway/test_portal_ticket_store.py tests/gateway/test_portal_api.py tests/gateway/test_integration_setup_api.py`
 
 Expected: PASS with cross-tenant denial, expiry denial, one-time consumption and secret-free responses.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add gateway/portal_store.py gateway/store.py gateway/app.py tests/gateway/test_portal_ticket_store.py tests/gateway/test_portal_api.py; git commit -m "feat: add tenant scoped integration portal api"`
 
@@ -190,19 +190,19 @@ Run: `git add gateway/portal_store.py gateway/store.py gateway/app.py tests/gate
 
 **Interfaces:** `GiteaTemplateReleaseV1(repository, revision, path, contents_url, sha256)` and `GiteaTemplateClient.fetch_verified_template(release) -> ArtifactRef`.
 
-- [ ] **Step 1: Write failing mismatch test**
+- [x] **Step 1: Write failing mismatch test**
 
     async def test_fetch_verified_template_rejects_changed_bytes() -> None:
         with pytest.raises(GiteaTemplateError, match="template digest mismatch"):
             await client.fetch_verified_template(release(expected_sha256="0" * 64))
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `py -3.11 -m pytest -q tests/agent_factory/test_gitea_templates.py`
 
 Expected: FAIL because the Gitea client is absent.
 
-- [ ] **Step 3: Implement read-only digest verification**
+- [x] **Step 3: Implement read-only digest verification**
 
     body = response.content
     if sha256(body).hexdigest() != release.sha256:
@@ -211,13 +211,13 @@ Expected: FAIL because the Gitea client is absent.
 
 Use an injected HTTP client. The portal receives only artifact digest and release metadata; the Gitea credential never enters its bundle.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `py -3.11 -m pytest -q tests/agent_factory/test_gitea_templates.py`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add agenten/agent_factory/gitea_template_contracts.py agenten/agent_factory/gitea_templates.py tests/agent_factory/test_gitea_templates.py; git commit -m "feat: verify gitea integration templates by digest"`
 
@@ -227,7 +227,7 @@ Run: `git add agenten/agent_factory/gitea_template_contracts.py agenten/agent_fa
 
 **Interfaces:** `getSetupSurface(jobId, accessToken): Promise<PortalSetupSurface>` consumes the Task 3 API. `IntegrationCard` receives only status, credential type, label, project metadata and `n8nCredentialsUrl`.
 
-- [ ] **Step 1: Write failing UI redaction test**
+- [x] **Step 1: Write failing UI redaction test**
 
     it("links to n8n and never renders secret fields", () => {
       render(<IntegrationCard action={missingBearerAction} onCheck={vi.fn()} />)
@@ -235,13 +235,13 @@ Run: `git add agenten/agent_factory/gitea_template_contracts.py agenten/agent_fa
       expect(screen.queryByText(/token|secret|password/i)).not.toBeInTheDocument()
     })
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `npm --prefix portal test -- --run`
 
 Expected: FAIL because the portal package is absent.
 
-- [ ] **Step 3: Implement strict typed UI**
+- [x] **Step 3: Implement strict typed UI**
 
     export async function getSetupSurface(jobId: string, accessToken: string): Promise<PortalSetupSurface> {
       return request<PortalSetupSurface>(`/v1/portal/integration-setups/${jobId}`, accessToken)
@@ -249,13 +249,13 @@ Expected: FAIL because the portal package is absent.
 
 Use Supabase Auth only to obtain the browser session. Render `missing`, `selection_required`, `verification_required`, `verification_failed`, `ready`, `revoked`, and `expired` explicitly. `Connect in n8n` opens only the Gateway-issued n8n credential URL in a new tab. Action errors map to fixed public text, never response bodies.
 
-- [ ] **Step 4: Run checks**
+- [x] **Step 4: Run checks**
 
 Run: `npm --prefix portal run lint; npm --prefix portal run test -- --run; npm --prefix portal run build`
 
 Expected: PASS with TypeScript strict mode.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add portal; git commit -m "feat: add self service integration portal"`
 
@@ -265,20 +265,20 @@ Run: `git add portal; git commit -m "feat: add self service integration portal"`
 
 **Interfaces:** `portal-preflight.ps1` emits redacted URL/status/version JSON. `deploy-portal-mini-pc.ps1 -Apply` validates configuration then runs only `docker compose up -d --build portal`.
 
-- [ ] **Step 1: Write failing deployment safety test**
+- [x] **Step 1: Write failing deployment safety test**
 
     def test_portal_deploy_refuses_missing_env_and_never_removes_volumes() -> None:
         source = Path("scripts/deploy-portal-mini-pc.ps1").read_text(encoding="utf-8")
         assert "required portal environment is missing" in source
         assert "compose down -v" not in source.lower()
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `py -3.11 -m pytest -q tests/scripts/test_portal_scripts.py`
 
 Expected: FAIL because the scripts are absent.
 
-- [ ] **Step 3: Implement preflight and deployment guard**
+- [x] **Step 3: Implement preflight and deployment guard**
 
     $required = 'CAPTAIN_PORTAL_URL','CAPTAIN_PORTAL_SUPABASE_URL','CAPTAIN_PORTAL_SUPABASE_ANON_KEY','CAPTAIN_PORTAL_GATEWAY_URL','CAPTAIN_PORTAL_GITEA_URL'
     $missing = $required | Where-Object { -not $env:$_ }
@@ -286,13 +286,13 @@ Expected: FAIL because the scripts are absent.
 
 Preflight performs GET requests without authorization headers and reports only host/status/version. Deployment requires `-Apply`, runs `docker compose config` first and never changes n8n or database volumes.
 
-- [ ] **Step 4: Run checks**
+- [x] **Step 4: Run checks**
 
 Run: `py -3.11 -m pytest -q tests/scripts/test_portal_scripts.py; git diff --check`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add scripts/portal-preflight.ps1 scripts/deploy-portal-mini-pc.ps1 tests/scripts/test_portal_scripts.py .env.example README.md docs/OPERATIONS.md; git commit -m "docs: add mini pc portal operations"`
 
@@ -302,38 +302,73 @@ Run: `git add scripts/portal-preflight.ps1 scripts/deploy-portal-mini-pc.ps1 tes
 
 **Interfaces:** Live fixtures read explicit, disposable test-provider configuration only. They return status and evidence references, not provider payloads.
 
-- [ ] **Step 1: Write opt-in cross-tenant live denial**
+- [x] **Step 1: Write opt-in cross-tenant live denial**
 
     pytestmark = pytest.mark.live
 
     def test_portal_rejects_cross_tenant_ticket_before_provider_call(live_portal) -> None:
         assert live_portal.use_ticket(subject="org-b-user", ticket=live_portal.org_a_ticket()).status_code == 403
 
-- [ ] **Step 2: Run without live configuration**
+- [x] **Step 2: Run without live configuration**
 
 Run: `py -3.11 -m pytest -q -m live tests/live/test_portal_integration_live.py`
 
 Expected: SKIP with a missing-live-prerequisites reason; never PASS.
 
-- [ ] **Step 3: Implement isolated Bearer and OAuth cases**
+- [x] **Step 3: Implement isolated Bearer and OAuth cases**
 
 Use a disposable Bearer endpoint and a real sandbox OAuth client with an exact callback allowlist. Assert only redacted receipt fields, deployment/execution IDs, digest, project, status and correlation. Restart the portal and Gateway between discovery and probe; assert the ticket is unusable after restart and the setup revision is monotonic.
 
-- [ ] **Step 4: Run complete local gates**
+- [x] **Step 4: Run complete local gates**
 
 Run: `py -3.11 -m pytest -q -m "not live"; py -3.11 -m pytest -q --no-cov tests/test_architecture_fitness.py tests/test_import_boundaries.py tests/test_workstream_docs.py; py -3.11 -m compileall -q agenten blockchain chats config gateway; py -3.11 scripts/verify_submission.py`
 
 Expected: PASS. Report live evidence separately as skipped, failed or verified-live.
 
-- [ ] **Step 5: Run opted-in live gates only after Mini-PC, Supabase, Gitea and provider settings exist**
+- [x] **Step 5: Run opted-in live gates only after Mini-PC, Supabase, Gitea and provider settings exist**
 
 Run: `py -3.11 -m pytest -q -m live tests/live/test_portal_integration_live.py`
 
 Expected: PASS only with real Bearer and OAuth provider proof; absent prerequisites remain BLOCKED.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run: `git add tests/live/test_portal_integration_live.py docs/superpowers/plans/2026-08-04-integration-control-plane.md; git commit -m "test: verify portal integration evidence"`
+
+## Completion status — 2026-08-11
+
+Every task in this plan was implemented and merged to `main`; the checkboxes
+above were reconciled retroactively against the repository state, not ticked
+during execution. Per-task implementing commits:
+
+- Task 0: `e483785` feat: add private portal gateway link; `a41930e`,
+  `fbf340d`, `70b467f`, `3e4aabc` (WireGuard transport hardening).
+- Task 1: `fe3fb6d` feat: define portal setup ticket contracts.
+- Task 2: `92f352a` feat: authenticate portal users with supabase jwt;
+  `86a0c44`, `a13bfc9`, `c4f94ac` (ES256 sessions and password sign-in).
+- Task 3: `653b326` feat: add tenant scoped integration portal api;
+  `e2d295b`, `e1a609e` (tenant binding and ticket fencing).
+- Task 4: `d280bda` feat: verify digest pinned gitea templates; `f8c0d14`,
+  `a146cce`.
+- Task 5: `98cb1dc` feat: add self service integration portal; `ac7cf48`.
+- Task 6: `1437b1d` feat: add mini pc portal operations; `ed9dc3f`,
+  `fa24428`, `68ba412`.
+- Task 7: `3998184` test: add fail closed portal live gate; `c1d2eb9`,
+  `845ecd9`, `878ee52` feat: finalize portal live evidence.
+
+Reconciliation verification on 2026-08-11 (Linux container, Python 3.11.15,
+isolated MariaDB 10.11 on `127.0.0.1:33306`, `hermes-agent` submodule at the
+pinned commit):
+
+- `pytest -q tests/gateway/` with `TEST_MARIADB_DSN` set: 507 passed,
+  2 skipped (PowerShell 7 unavailable on the runner).
+- `pytest -q -m live tests/live/test_portal_integration_live.py` without
+  `CAPTAIN_PORTAL_LIVE_E2E`: 3 skipped fail-closed before network access,
+  as required by Task 7 Step 2.
+- Live Bearer/OAuth provider evidence was not re-run in this reconciliation;
+  the recorded aggregate release evidence lives in
+  `2026-08-04-integration-control-plane.md` and
+  `2026-08-05-self-service-integration-portal-live-evidence-gaps.md`.
 
 ## Plan Self-Review
 
