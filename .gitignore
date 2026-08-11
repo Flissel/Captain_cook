@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .coverage
+.coverage.*
 .env
 .env.captain-n8n
 .env.n8n-credentials
