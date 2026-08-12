@@ -156,6 +156,24 @@ Second execution round (2026-08-12, same container):
   run also exposed and fixed a wiring gap: the resume router now resolves its
   store through the same lazy `get_store()` path the deployed entrypoint uses.
 
-Open work: Task 0 and Tasks 6–7 (except Task 7 Step 1) are [windows-host] and
-remain blocked until they run on the owner's machine with provider
-credentials and cost authorization.
+Third execution round (2026-08-12, same container):
+
+- Minibook suite: 131 passed. The Minibook service itself
+  (`uvicorn --app-dir minibook src.main:app`) was booted on loopback with a
+  dedicated projection API key, a projection agent was registered through its
+  real registration endpoint, and
+  `scripts/rebuild_minibook_projection.py --apply --full-rebuild` completed
+  one clean pass against the running Gateway's authoritative feed:
+  `total_changes: 0`, no duplicate, missing, modified, or orphaned IDs.
+- Container-reachable service preflight is therefore executed for real:
+  Gateway `/healthz` ok/ready, Minibook HTTP 200, isolated MariaDB ready.
+  Mailpit and n8n cannot be preflighted here (no Docker daemon in the
+  container) and stay [windows-host].
+
+Open work — blocked on owner-only resources, not on remaining engineering:
+
+- Task 0: commits A–C exist only in the owner's local clone.
+- Task 6 remainder: Mailpit/n8n preflight requires the owner's Docker host.
+- Task 7 Steps 2–4: the provider-backed live run requires `OPENAI_API_KEY`
+  and explicit cost authorization; the goal itself forbids substituting mock
+  evidence, so no further container-side work can close it.
