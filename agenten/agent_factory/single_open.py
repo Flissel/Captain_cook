@@ -22,7 +22,7 @@ class SingleOpenError(OSError):
     """Raised when a single-open read cannot be completed fail-closed."""
 
 
-def _is_plain_regular_file(metadata: os.stat_result) -> bool:
+def is_plain_regular_file(metadata: os.stat_result) -> bool:
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     file_attributes = getattr(metadata, "st_file_attributes", 0)
     return (
@@ -32,11 +32,11 @@ def _is_plain_regular_file(metadata: os.stat_result) -> bool:
     )
 
 
-def _file_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+def file_identity(metadata: os.stat_result) -> tuple[int, int, int]:
     return (metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode))
 
 
-def _file_version(metadata: os.stat_result) -> tuple[int, int, int]:
+def file_version(metadata: os.stat_result) -> tuple[int, int, int]:
     return (metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
 
 
@@ -45,7 +45,7 @@ def read_verified_bytes(target: Path, *, maximum_size: int) -> bytes:
     descriptor: int | None = None
     try:
         before_path = os.stat(target, follow_symlinks=False)
-        if not _is_plain_regular_file(before_path):
+        if not is_plain_regular_file(before_path):
             raise SingleOpenError(f"refusing non-regular target: {target.name}")
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -53,9 +53,9 @@ def read_verified_bytes(target: Path, *, maximum_size: int) -> bytes:
         opened = os.fstat(descriptor)
         after_open_path = os.stat(target, follow_symlinks=False)
         if (
-            not _is_plain_regular_file(opened)
-            or _file_identity(before_path) != _file_identity(opened)
-            or _file_identity(after_open_path) != _file_identity(opened)
+            not is_plain_regular_file(opened)
+            or file_identity(before_path) != file_identity(opened)
+            or file_identity(after_open_path) != file_identity(opened)
         ):
             raise SingleOpenError(f"target identity changed during open: {target.name}")
         chunks: list[bytes] = []
@@ -74,9 +74,9 @@ def read_verified_bytes(target: Path, *, maximum_size: int) -> bytes:
             raise SingleOpenError(f"target is empty: {target.name}")
         after_path = os.stat(target, follow_symlinks=False)
         if (
-            _file_identity(after_read) != _file_identity(opened)
-            or _file_identity(after_path) != _file_identity(opened)
-            or _file_version(after_read) != _file_version(opened)
+            file_identity(after_read) != file_identity(opened)
+            or file_identity(after_path) != file_identity(opened)
+            or file_version(after_read) != file_version(opened)
         ):
             raise SingleOpenError(f"target changed during read: {target.name}")
         return b"".join(chunks)

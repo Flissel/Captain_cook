@@ -40,6 +40,11 @@ from agenten.agent_factory.codex_build_recovery import (
 from agenten.agent_factory.contracts import AgentFactoryJobV3
 from agenten.agent_factory.forge_contracts import CodexBuildReceiptV1
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
+from agenten.agent_factory.single_open import (
+    file_identity as single_open_file_identity,
+    file_version as single_open_file_version,
+    is_plain_regular_file as single_open_is_plain_regular_file,
+)
 from agenten.agent_factory.skill_sequence import (
     FactoryRuntimeRetryAuthorizationV1,
     validate_factory_runtime_retry_authorization,
@@ -3081,29 +3086,15 @@ class CodexCliFactoryBuildExecutor:
 
     @staticmethod
     def _is_plain_regular_file(metadata: os.stat_result) -> bool:
-        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-        file_attributes = getattr(metadata, "st_file_attributes", 0)
-        return (
-            stat.S_ISREG(metadata.st_mode)
-            and metadata.st_nlink == 1
-            and not (reparse_flag and file_attributes & reparse_flag)
-        )
+        return single_open_is_plain_regular_file(metadata)
 
     @staticmethod
     def _file_identity(metadata: os.stat_result) -> tuple[int, int, int]:
-        return (
-            metadata.st_dev,
-            metadata.st_ino,
-            stat.S_IFMT(metadata.st_mode),
-        )
+        return single_open_file_identity(metadata)
 
     @staticmethod
     def _file_version(metadata: os.stat_result) -> tuple[int, int, int]:
-        return (
-            metadata.st_size,
-            metadata.st_mtime_ns,
-            metadata.st_ctime_ns,
-        )
+        return single_open_file_version(metadata)
 
     def _require_receipt_output_binding(
         self,
