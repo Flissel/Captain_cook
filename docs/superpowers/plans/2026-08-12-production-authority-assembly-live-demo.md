@@ -78,7 +78,7 @@ environment they are unverifiable; nothing may be "recreated" in their place.
 **Interfaces:** Reuse the proven procedure from `agenten/agent_factory/codex_build_execution.py` (single `os.open` with `O_NOFOLLOW`, `os.fstat` identity capture, digest computed from the same descriptor, post-read `fstat` compare). Extract it into one shared helper rather than copying it; both call sites keep their behavior.
 
 - [x] **Step 1:** Write failing tests: a symlinked bundle path is rejected; a file replaced between open and read is rejected (identity mismatch); the happy path returns the verified bytes exactly once.
-- [ ] **Step 2:** Confirm RED, extract the shared single-open helper, wire both call sites, confirm GREEN including the existing `tests/agent_factory/test_codex_build_execution.py`.
+- [x] **Step 2:** Confirm RED, extract the shared single-open helper, wire both call sites, confirm GREEN including the existing `tests/agent_factory/test_codex_build_execution.py`.
 - [x] **Step 3:** Commit `refactor(agent-factory): share toctou-safe single-open loader`.
 
 ### Task 5: Complete offline gates **[container-ok]**
@@ -98,7 +98,7 @@ environment they are unverifiable; nothing may be "recreated" in their place.
 
 ### Task 7: Controlled real live demo **[windows-host]**
 
-- [ ] Define the three conversation patterns as fixtures before the run; record their digests.
+- [x] Define the three conversation patterns as fixtures before the run; record their digests.
 - [ ] Opt in explicitly (dedicated environment variables, never committed), set the provider budget ceiling, and start the bounded live run.
 - [ ] Require for success: real provider session IDs, Gateway-persisted dispatch and readback evidence for one correlation ID, Minibook projection rebuilt from the Gateway feed, and an immutable evidence artifact digest recorded in this file.
 - [ ] Absent prerequisites leave this task BLOCKED; it is never satisfied by mocks, and a failed run is recorded as failed.
@@ -132,5 +132,30 @@ one deliberately deferred step. Recorded deviations from the task prose:
 - Full `-m "not live"` suite: unchanged Windows-only failures remain expected
   on Linux; the exact counts for this run are recorded in the PR.
 
-Open work: Task 0 and Tasks 6–7 are [windows-host] and remain blocked until
-they run on the owner's machine; Task 4 Step 2 as noted above.
+Second execution round (2026-08-12, same container):
+
+- Task 4 Step 2 completed: `codex_build_execution.py` identity helpers now
+  delegate to `agenten/agent_factory/single_open.py` (74 existing tests stay
+  green); the adapter bundle was re-pinned after `gateway/app.py` changed —
+  the digest pin detected the drift exactly as designed.
+- Task 7 Step 1 completed: three conversation patterns are committed under
+  `tests/fixtures/live_demo/conversation_patterns/` with the pre-run gate
+  `tests/test_live_demo_conversation_patterns.py`. Recorded digests:
+  `ba48fdfc8cc40ff79e71eb4c14d70ddcc1325577d87fe03a58df806c5bbe4526`
+  (triage_handoff),
+  `f02cdac72cc16933d10b191e5a85a2552b80d75bdd285b94cf1d1ab0a3c0a2e3`
+  (integration_lease),
+  `d31a0351df344daf4ce5ed4967b610f8fffaf4fe88fce4baeb841394425841a6`
+  (resume_recovery).
+- Offline restart/recovery gate executed against the real Gateway process
+  (`python -m gateway.app` on loopback, isolated MariaDB): `/healthz` ready,
+  resume authorize 201 → dispatch (monotonic revisions across process
+  lifetimes) → double-dispatch 409 → process restart → readback returned both
+  persisted dispatches without token material → replay after restart 409 →
+  `python main.py recover-gateway` completed one bounded pass. The real-service
+  run also exposed and fixed a wiring gap: the resume router now resolves its
+  store through the same lazy `get_store()` path the deployed entrypoint uses.
+
+Open work: Task 0 and Tasks 6–7 (except Task 7 Step 1) are [windows-host] and
+remain blocked until they run on the owner's machine with provider
+credentials and cost authorization.

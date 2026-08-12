@@ -336,17 +336,18 @@ def create_app(
     app.state.gateway_settings = settings
     app.state.gateway_settings_lock = Lock()
     initialize_portal_auth(app)
-    if storage is not None:
-        authority_resume_store: list[AuthorityResumeStore] = []
+    authority_resume_store: list[AuthorityResumeStore] = []
 
-        def provide_authority_resume_store() -> AuthorityResumeStore:
-            if not authority_resume_store:
-                authority_resume_store.append(AuthorityResumeStore(storage))
-            return authority_resume_store[0]
+    def provide_authority_resume_store() -> AuthorityResumeStore:
+        if not authority_resume_store:
+            authority_resume_store.append(
+                AuthorityResumeStore(get_store().storage)
+            )
+        return authority_resume_store[0]
 
-        app.include_router(
-            build_authority_resume_router(provide_authority_resume_store)
-        )
+    app.include_router(
+        build_authority_resume_router(provide_authority_resume_store)
+    )
 
     @app.exception_handler(RequestValidationError)
     async def sanitized_review_validation_error(
