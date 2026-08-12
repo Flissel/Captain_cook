@@ -43,11 +43,11 @@ environment they are unverifiable; nothing may be "recreated" in their place.
 
 **Interfaces:** `AuthorityAssemblyV1(assembly_id, source_repository, input_sha256, adapters: tuple[AuthorityAdapterRefV1, ...], created_at)` and `AuthorityAdapterRefV1(role: Literal["captain","gateway","runtime","minibook","n8n"], artifact_uri, sha256, version)`. `assemble_production_authority(document: FactoryInputDocumentV2, adapters) -> AuthorityAssemblyV1` is deterministic: same input bytes and adapter set produce byte-identical canonical JSON.
 
-- [ ] **Step 1:** Write failing tests: three distinct repository-owned `TO_BE_BUILT.md` fixtures compile into three assemblies; a credential-bearing input is rejected; an adapter ref without a 64-hex digest is rejected; unknown roles are rejected; canonical serialization is byte-stable.
-- [ ] **Step 2:** Run `python -m pytest -q --no-cov tests/agent_factory/test_authority_assembly_contracts.py` and confirm RED.
-- [ ] **Step 3:** Implement the frozen contracts reusing `FactoryInputDocumentV2` parsing from `agenten/agent_factory/input_contracts.py`/`input_document.py`; do not duplicate the input parser.
-- [ ] **Step 4:** Confirm GREEN, then run the import-boundary gate (`tests/test_import_boundaries.py`).
-- [ ] **Step 5:** Commit `feat(agent-factory): add production authority assembly contract`.
+- [x] **Step 1:** Write failing tests: three distinct repository-owned `TO_BE_BUILT.md` fixtures compile into three assemblies; a credential-bearing input is rejected; an adapter ref without a 64-hex digest is rejected; unknown roles are rejected; canonical serialization is byte-stable.
+- [x] **Step 2:** Run `python -m pytest -q --no-cov tests/agent_factory/test_authority_assembly_contracts.py` and confirm RED.
+- [x] **Step 3:** Implement the frozen contracts reusing `FactoryInputDocumentV2` parsing from `agenten/agent_factory/input_contracts.py`/`input_document.py`; do not duplicate the input parser.
+- [x] **Step 4:** Confirm GREEN, then run the import-boundary gate (`tests/test_import_boundaries.py`).
+- [x] **Step 5:** Commit `feat(agent-factory): add production authority assembly contract`.
 
 ### Task 2: Fail-closed Gateway endpoints and sole-writer evidence for Resume Authorize → Dispatch → Readback **[container-ok]**
 
@@ -55,11 +55,11 @@ environment they are unverifiable; nothing may be "recreated" in their place.
 
 **Interfaces:** `POST /v1/authority/assemblies/{assembly_id}/resume-authorizations` (Captain-only, single-use, bounded TTL), `POST .../dispatches` (requires an unconsumed authorization; consumes it transactionally), `GET .../readback` (returns only persisted, redacted evidence). The Gateway remains the sole MariaDB writer; every transition is one transaction with a monotonic revision.
 
-- [ ] **Step 1:** Write failing tests: dispatch without authorization → 403; double-consume of one authorization → 409; readback of unknown assembly → 404; evidence rows are append-only (an UPDATE attempt has no path); restart of the app process keeps consumed state (MariaDB-backed, `TEST_MARIADB_DSN`).
-- [ ] **Step 2:** Confirm RED with the isolated MariaDB DSN.
-- [ ] **Step 3:** Implement schema through `GatewayStore._ensure_schema` (same pattern as `factory_business_benchmark_summaries`), with `FOR UPDATE` locking and single-transaction consume, following the Task-6 report conventions.
-- [ ] **Step 4:** Confirm GREEN, rerun `tests/gateway/` completely.
-- [ ] **Step 5:** Commit `feat(gateway): add fail-closed authority resume flow`.
+- [x] **Step 1:** Write failing tests: dispatch without authorization → 403; double-consume of one authorization → 409; readback of unknown assembly → 404; evidence rows are append-only (an UPDATE attempt has no path); restart of the app process keeps consumed state (MariaDB-backed, `TEST_MARIADB_DSN`).
+- [x] **Step 2:** Confirm RED with the isolated MariaDB DSN.
+- [x] **Step 3:** Implement schema through `GatewayStore._ensure_schema` (same pattern as `factory_business_benchmark_summaries`), with `FOR UPDATE` locking and single-transaction consume, following the Task-6 report conventions.
+- [x] **Step 4:** Confirm GREEN, rerun `tests/gateway/` completely.
+- [x] **Step 5:** Commit `feat(gateway): add fail-closed authority resume flow`.
 
 ### Task 3: Concrete digest-pinned authority adapter bundle **[container-ok]**
 
@@ -67,9 +67,9 @@ environment they are unverifiable; nothing may be "recreated" in their place.
 
 **Interfaces:** `AuthorityAdapterBundleV1` pins one adapter per role (captain, gateway, runtime, minibook, n8n) by artifact URI + SHA-256, mirroring the digest verification in `agenten/agent_factory/gitea_templates.py` (`sha256(body) != release.sha256 → error`). The bundle file itself is content-addressed; loading verifies the recorded digest of every entry before any adapter is used.
 
-- [ ] **Step 1:** Write failing tests: bundle with a missing role → error; digest mismatch on load → error naming the role but never the content; identical bundle bytes → identical bundle digest.
-- [ ] **Step 2:** Confirm RED, implement, confirm GREEN.
-- [ ] **Step 3:** Commit `feat(agent-factory): pin authority adapter bundle by digest`.
+- [x] **Step 1:** Write failing tests: bundle with a missing role → error; digest mismatch on load → error naming the role but never the content; identical bundle bytes → identical bundle digest.
+- [x] **Step 2:** Confirm RED, implement, confirm GREEN.
+- [x] **Step 3:** Commit `feat(agent-factory): pin authority adapter bundle by digest`.
 
 ### Task 4: Harden the adapter loader with the existing TOCTOU-safe single-open **[container-ok]**
 
@@ -77,18 +77,18 @@ environment they are unverifiable; nothing may be "recreated" in their place.
 
 **Interfaces:** Reuse the proven procedure from `agenten/agent_factory/codex_build_execution.py` (single `os.open` with `O_NOFOLLOW`, `os.fstat` identity capture, digest computed from the same descriptor, post-read `fstat` compare). Extract it into one shared helper rather than copying it; both call sites keep their behavior.
 
-- [ ] **Step 1:** Write failing tests: a symlinked bundle path is rejected; a file replaced between open and read is rejected (identity mismatch); the happy path returns the verified bytes exactly once.
+- [x] **Step 1:** Write failing tests: a symlinked bundle path is rejected; a file replaced between open and read is rejected (identity mismatch); the happy path returns the verified bytes exactly once.
 - [ ] **Step 2:** Confirm RED, extract the shared single-open helper, wire both call sites, confirm GREEN including the existing `tests/agent_factory/test_codex_build_execution.py`.
-- [ ] **Step 3:** Commit `refactor(agent-factory): share toctou-safe single-open loader`.
+- [x] **Step 3:** Commit `refactor(agent-factory): share toctou-safe single-open loader`.
 
 ### Task 5: Complete offline gates **[container-ok]**
 
-- [ ] Run `python -m pytest -q -m "not live"` with `TEST_MARIADB_DSN` set; on non-Windows, report the known Windows-only failures separately and require zero non-platform failures.
-- [ ] Run `python -m pytest -q --no-cov tests/test_architecture_fitness.py tests/test_import_boundaries.py tests/test_workstream_docs.py`.
-- [ ] Run `python -m compileall -q agenten blockchain chats config gateway`.
-- [ ] Run `python main.py demo --output artifacts/demo-run.json` only if demo evidence is intentionally refreshed; otherwise write to a scratch path.
-- [ ] Run `python scripts/verify_submission.py`.
-- [ ] Cost gate: assert every provider-facing config used by Tasks 1–4 carries an explicit budget ceiling; credential gate: `git grep` proves no new secret material.
+- [x] Run `python -m pytest -q -m "not live"` with `TEST_MARIADB_DSN` set; on non-Windows, report the known Windows-only failures separately and require zero non-platform failures.
+- [x] Run `python -m pytest -q --no-cov tests/test_architecture_fitness.py tests/test_import_boundaries.py tests/test_workstream_docs.py`.
+- [x] Run `python -m compileall -q agenten blockchain chats config gateway`.
+- [x] Run `python main.py demo --output artifacts/demo-run.json` only if demo evidence is intentionally refreshed; otherwise write to a scratch path.
+- [x] Run `python scripts/verify_submission.py`.
+- [x] Cost gate: assert every provider-facing config used by Tasks 1–4 carries an explicit budget ceiling; credential gate: `git grep` proves no new secret material.
 
 ### Task 6: Service preflight **[windows-host]**
 
@@ -108,3 +108,29 @@ environment they are unverifiable; nothing may be "recreated" in their place.
 - Spec coverage: Tasks 0–7 map one-to-one onto the stated goal sentence, in dependency order.
 - Environment honesty: every task is labeled [container-ok] or [windows-host]; the live demo cannot be produced outside the owner's infrastructure and is not claimed otherwise.
 - Reuse: input parsing (`input_contracts.py`), digest verification (`gitea_templates.py`), sole-writer schema pattern (Task-6 report), and the TOCTOU single-open (`codex_build_execution.py`) are reused, not duplicated.
+
+## Execution status — 2026-08-12 (Linux container, isolated MariaDB)
+
+Tasks 1–3 and Task 5 are implemented and green; Task 4 is implemented except
+one deliberately deferred step. Recorded deviations from the task prose:
+
+- Task 2 was implemented in dedicated modules
+  (`gateway/authority_resume_contracts.py`, `gateway/authority_resume_store.py`,
+  `gateway/authority_resume_api.py`) instead of widening `gateway/contracts.py`
+  and `gateway/store.py`; `gateway/app.py` received only a lazy, additive
+  router wiring. This keeps the concurrent-session hot files untouched while
+  preserving the sole-writer and single-transaction consume requirements.
+- Task 4's shared helper landed as `agenten/agent_factory/single_open.py` and
+  is used by the bundle loader. Rewiring the original
+  `codex_build_execution.py` call site (Step 2) is deferred to a session that
+  owns that file, to honor the no-concurrent-edit rule.
+- Task 5 results: gateway suite 518 passed; assembly/bundle suites 21 passed;
+  architecture/import/workstream gates 18 passed; `compileall` clean;
+  `verify_submission.py` pass; demo run green against a scratch output path;
+  credential grep clean; Tasks 1–4 introduce no provider-facing configuration,
+  so no new budget ceiling was required.
+- Full `-m "not live"` suite: unchanged Windows-only failures remain expected
+  on Linux; the exact counts for this run are recorded in the PR.
+
+Open work: Task 0 and Tasks 6–7 are [windows-host] and remain blocked until
+they run on the owner's machine; Task 4 Step 2 as noted above.
