@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from decimal import Decimal
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from threading import Barrier, RLock
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from fastapi import HTTPException
 
 from agenten.agent_runtime.captain_production_adapters import (
     ContentAddressedArtifactAdapter,
@@ -22,6 +27,8 @@ from gateway.capability_benchmark_execution_service import (
     GatewayBenchmarkExecutionService,
 )
 from gateway.capability_live_pipeline import CapabilityLiveAuthorityUnavailable
+from gateway.store import GatewayStore
+from agenten.provider_proxy.contracts import benchmark_provider_settlement_id
 from tests.gateway.test_capability_benchmark_process_executor import _ref, _request
 from tests.gateway.test_capability_benchmark_process_app import _payload
 
@@ -514,7 +521,9 @@ def test_prepare_broker_complete_crosses_process_contract_without_gateway_host_e
     command_id = prepared.command.event_id
     settlement = {
         "schema": "captain.capability-benchmark-provider-settlement.v1",
-        "settlement_id": str(uuid4()),
+        "settlement_id": str(benchmark_provider_settlement_id(
+            command_id, "benchmark-provider-call-1"
+        )),
         "provider_call_id": "benchmark-provider-call-1",
         "job_id": str(request.job_id),
         "correlation_id": str(store.job.correlation_id),
@@ -554,6 +563,15 @@ def test_prepare_broker_complete_crosses_process_contract_without_gateway_host_e
         ):
             service.complete_process_execution(request, result_payload)
         assert store.result is None
+    forged_identity = dict(settlement)
+    forged_identity["settlement_id"] = str(uuid4())
+    store.provider_settlements[:] = [forged_identity]
+    with pytest.raises(
+        CapabilityLiveAuthorityUnavailable,
+        match="settlement authority changed",
+    ):
+        service.complete_process_execution(request, result_payload)
+    assert store.result is None
     store.provider_settlements[:] = [settlement]
     evidence = service.complete_process_execution(request, result_payload)
 
@@ -574,6 +592,191 @@ def test_gateway_rejects_runtime_tool_set_drift_without_receipts(tmp_path, tools
 
     assert effect.calls == 1
     assert store.registry == {}
+
+
+def test_provider_settlement_and_benchmark_finalize_serialize_and_replay(
+    tmp_path,
+) -> None:
+    original = _request()
+    artifacts = ContentAddressedArtifactAdapter(tmp_path / "race-cas")
+    put = lambda value, media_type="application/json": artifacts.put(
+        value, media_type
+    )
+    plan = replace(
+        original.execution_plan,
+        candidate_ref=put(b"candidate-archive", "application/zip"),
+        candidate_manifest_ref=put(b'{"schema":"candidate"}'),
+        baseline_policy_ref=put(b'{"schema":"baseline"}'),
+        model_ref=put(b'{"schema":"model"}'),
+        execution_policy_ref=put(b'{"schema":"policy"}'),
+    )
+    from gateway.capability_generic_benchmark import generic_execution_request_digest
+    request = replace(original, execution_plan=plan)
+    request = replace(request, request_digest=generic_execution_request_digest(
+        job_id=request.job_id, capability_id=request.capability_id,
+        input_ref=request.input_ref, case_ref=request.case_ref,
+        team_kind=request.team_kind, model_id=request.model_id,
+        model_policy_digest=request.model_policy_digest,
+        execution_case=request.execution_case, execution_plan=plan,
+        request_nonce=request.request_nonce,
+    ))
+    service, memory, _effect = _service(
+        tmp_path, request, ("captain_tool",), artifacts=artifacts,
+    )
+    prepared = service.prepare(request)
+    command = prepared.command
+    reservation = memory.budget_reservation
+
+    class Cursor:
+        def __init__(self, storage):
+            self.storage = storage
+            self.rows = []
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            if "FROM capability_benchmark_work_batches" in normalized:
+                self.rows = [{
+                    "job_id": str(request.job_id),
+                    "correlation_id": str(memory.job.correlation_id),
+                    "case_digest": request.case_ref.case_digest,
+                    "trace_id": str(prepared.trace_id),
+                    "run_id": str(prepared.run_id),
+                    "command_id": str(command.event_id),
+                }]
+            elif "WHERE settlement_id = %s OR provider_call_id = %s" in normalized:
+                self.rows = [item for item in self.storage.settlements if (
+                    item["settlement_id"] == str(params[0])
+                    or item["provider_call_id"] == str(params[1])
+                )]
+            elif "WHERE command_id = %s" in normalized and (
+                "capability_benchmark_provider_settlements" in normalized
+            ):
+                self.rows = [item for item in self.storage.settlements if (
+                    item["command_id"] == str(params[0])
+                )]
+            elif normalized.startswith(
+                "INSERT INTO capability_benchmark_provider_settlements"
+            ):
+                self.storage.settlements.append(json.loads(str(params[4])))
+                self.rows = []
+            else:
+                self.rows = []
+
+        def fetchone(self):
+            return None if not self.rows else {"payload": json.dumps(self.rows[0]), **self.rows[0]}
+
+        def fetchall(self):
+            return tuple({"payload": json.dumps(item)} for item in self.rows)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Connection:
+        def __init__(self, storage):
+            self.storage = storage
+
+        def cursor(self):
+            return Cursor(self.storage)
+
+    class Storage:
+        def __init__(self):
+            self.lock = RLock()
+            self.settlements = []
+            self.closed_payload = None
+
+        @contextmanager
+        def transaction(self):
+            with self.lock:
+                yield Connection(self)
+
+    binding = (
+        "http://127.0.0.1:8091", "1" * 64, "2" * 64, "ignored-context",
+        "4" * 64, "5" * 64, "6" * 64, True,
+    )
+    storage = Storage()
+    store = object.__new__(GatewayStore)
+    store.storage = storage
+    store._runtime_provider_bundle_bindings = (binding,)
+    store._runtime_block_by_json_value = lambda _cursor, *, block_type, **_kw: (
+        {"data": command.model_dump(mode="json", by_alias=True)}
+        if block_type == "agent_runtime_command"
+        else {"data": {"execution_policy": {"allowed_models": [request.model_id]}}}
+    )
+    store._factory_reservation = lambda _cursor, _reservation_id, **_kw: reservation
+    store._reservation_is_closed = lambda _cursor, _reservation_id: storage.closed_payload is not None
+    store._factory_budget_event = lambda _cursor, _event_id, **_kw: (
+        None if storage.closed_payload is None
+        else {"payload": json.dumps(storage.closed_payload)}
+    )
+    store._factory_budget_job = lambda _cursor, _job_id: (memory.job, {"index": 1})
+
+    def insert_budget_event(_cursor, **kwargs):
+        storage.closed_payload = kwargs["payload"]
+
+    store._insert_factory_budget_event = insert_budget_event
+    store._factory_budget_projection = lambda *_args, **_kw: SimpleNamespace(
+        remaining_usd=Decimal("6.00") - Decimal(
+            "0" if storage.closed_payload is None
+            else storage.closed_payload["actual_cost_usd"]
+        )
+    )
+
+    def settlement(call_id: str, cost: str) -> dict[str, object]:
+        return {
+            "schema": "captain.capability-benchmark-provider-settlement.v1",
+            "settlement_id": str(benchmark_provider_settlement_id(
+                command.event_id, call_id
+            )),
+            "provider_call_id": call_id,
+            "job_id": str(request.job_id),
+            "correlation_id": str(memory.job.correlation_id),
+            "case_digest": request.case_ref.case_digest,
+            "trace_id": str(prepared.trace_id), "run_id": str(prepared.run_id),
+            "command_id": str(command.event_id),
+            "provider_result_id": str(command.payload.provider_result_id),
+            "provider_session_id": command.payload.provider_session_id,
+            "provider": "openai", "model": request.model_id,
+            "input_units": 1, "cached_input_units": 0, "output_units": 1,
+            "actual_cost_usd": cost,
+            "provider_proxy_url": "http://127.0.0.1:8091/v1",
+            "provider_policy_sha256": "1" * 64,
+            "provider_price_card_sha256": "2" * 64,
+            "provider_context_sha256": command.payload.provider_context_sha256,
+            "provider_proxy_executable_sha256": "4" * 64,
+            "provider_proxy_code_sha256": "5" * 64,
+            "provider_paid_command_sha256": "6" * 64,
+            "provider_hard_ceiling_enforced": True,
+        }
+
+    first, racing = settlement("call-one", "0.10"), settlement("call-two", "0.05")
+    assert reservation.requested_usd == Decimal("0.20")
+    storage.settlements.append(first)
+    barrier = Barrier(2)
+
+    def admit():
+        barrier.wait()
+        return store.record_capability_benchmark_provider_settlement(racing)
+
+    def finalize():
+        barrier.wait()
+        return store.finalize_capability_benchmark_provider_cost(command.event_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(future.result() if not future.exception() else future.exception()
+                         for future in (pool.submit(admit), pool.submit(finalize)))
+
+    assert sum(isinstance(item, HTTPException) for item in outcomes) in {0, 1}
+    assert storage.closed_payload is not None, repr(outcomes)
+    actual = Decimal(storage.closed_payload["actual_cost_usd"])
+    assert actual in {Decimal("0.10"), Decimal("0.15")}
+    assert Decimal("6.00") - actual in {Decimal("5.90"), Decimal("5.85")}
+    assert store.finalize_capability_benchmark_provider_cost(command.event_id) == actual
+    assert store.record_capability_benchmark_provider_settlement(first) is None
+    with pytest.raises(HTTPException):
+        store.record_capability_benchmark_provider_settlement(settlement("late", "0.01"))
 
 
 def test_gateway_rejects_foreign_case_before_runtime_effect(tmp_path) -> None:

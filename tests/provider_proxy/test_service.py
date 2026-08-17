@@ -236,6 +236,9 @@ async def test_benchmark_call_settles_to_gateway_before_response(tmp_path: Path)
     assert settlement["provider_result_id"] == str(context.result_id)
     assert settlement["provider_context_sha256"] == context.sha256
     assert settlement["actual_cost_usd"] == "0.004220"
+    assert settlement["settlement_id"] == str(uuid5(
+        context.command_id, settlement["provider_call_id"]
+    ))
 
 
 @pytest.mark.asyncio

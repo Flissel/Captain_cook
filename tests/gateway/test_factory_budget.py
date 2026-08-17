@@ -22,6 +22,7 @@ from agenten.agent_factory.execution_budget import (
     FactoryBudgetWriteReceipt,
     FactoryUsageReceiptV1,
 )
+from agenten.provider_proxy.contracts import benchmark_provider_settlement_id
 from agenten.agent_factory.contracts import FactoryPhase
 from agenten.agent_factory.contracts import FactoryRole
 from agenten.agent_factory.leases import issue_factory_lease
@@ -53,6 +54,69 @@ from tests.support.mariadb import assert_isolated_test_database
 
 NOW = datetime(2026, 7, 21, 12, tzinfo=timezone.utc)
 TEST_DSN = os.getenv("TEST_MARIADB_DSN")
+
+
+def test_benchmark_cost_closes_factory_reservation_for_late_settlement() -> None:
+    class Cursor:
+        sql = ""
+
+        def execute(self, sql, _params):
+            self.sql = sql
+
+        def fetchone(self):
+            return {"closed": 1}
+
+    cursor = Cursor()
+
+    assert GatewayStore._reservation_is_closed(cursor, UUID(int=1)) is True
+    assert "benchmark_cost" in cursor.sql
+
+
+def test_benchmark_provider_settlement_rejects_forged_identity_before_storage() -> None:
+    class Storage:
+        effects = 0
+
+        def transaction(self):
+            self.effects += 1
+            raise AssertionError("storage must not be opened")
+
+    command_id, settlement_id = UUID(int=7), UUID(int=8)
+    binding = (
+        "http://127.0.0.1:8091", "1" * 64, "2" * 64, "ignored-context",
+        "4" * 64, "5" * 64, "6" * 64, True,
+    )
+    payload = {
+        "schema": "captain.capability-benchmark-provider-settlement.v1",
+        "settlement_id": str(settlement_id),
+        "provider_call_id": "provider-call-one",
+        "job_id": str(UUID(int=1)), "correlation_id": str(UUID(int=2)),
+        "case_digest": "a" * 64, "trace_id": str(UUID(int=3)),
+        "run_id": str(UUID(int=4)), "command_id": str(command_id),
+        "provider_result_id": str(UUID(int=5)),
+        "provider_session_id": "provider-session-one",
+        "provider": "openai", "model": "gpt-5.6-terra",
+        "input_units": 1, "cached_input_units": 0, "output_units": 1,
+        "actual_cost_usd": "0.01",
+        "provider_proxy_url": "http://127.0.0.1:8091/v1",
+        "provider_policy_sha256": "1" * 64,
+        "provider_price_card_sha256": "2" * 64,
+        "provider_context_sha256": "3" * 64,
+        "provider_proxy_executable_sha256": "4" * 64,
+        "provider_proxy_code_sha256": "5" * 64,
+        "provider_paid_command_sha256": "6" * 64,
+        "provider_hard_ceiling_enforced": True,
+    }
+    store = object.__new__(GatewayStore)
+    store.storage = Storage()
+    store._runtime_provider_bundle_bindings = (binding,)
+
+    with pytest.raises(HTTPException, match="settlement is invalid"):
+        store.record_capability_benchmark_provider_settlement(payload)
+
+    assert store.storage.effects == 0
+    assert settlement_id != benchmark_provider_settlement_id(
+        command_id, "provider-call-one"
+    )
 
 
 class Mirror:

@@ -20,7 +20,12 @@ from agenten.agent_runtime.contracts import (
     canonical_json_bytes,
 )
 
-from .contracts import OpenAIPriceCardV1, ProviderBudgetContextV1, RuntimeProviderPolicyV1
+from .contracts import (
+    OpenAIPriceCardV1,
+    ProviderBudgetContextV1,
+    RuntimeProviderPolicyV1,
+    benchmark_provider_settlement_id,
+)
 from .repository import ReservationRejected, SQLiteProviderBudgetRepository
 
 
@@ -477,8 +482,8 @@ class ProviderBudgetProxy:
                 ) from None
             settlement = {
                 "schema": "captain.capability-benchmark-provider-settlement.v1",
-                "settlement_id": str(uuid5(
-                    self.context.command_id, f"benchmark-provider:{call_id}"
+                "settlement_id": str(benchmark_provider_settlement_id(
+                    self.context.command_id, call_id
                 )),
                 "provider_call_id": call_id,
                 "job_id": str(self.context.job_id),

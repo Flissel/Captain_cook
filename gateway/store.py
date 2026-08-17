@@ -36,7 +36,10 @@ from agenten.agent_runtime.contracts import (
     RuntimeResumeCostSettlementRequestV1,
     RuntimeResumeCostSettlementV1,
 )
-from agenten.provider_proxy.contracts import ProviderBudgetContextV1
+from agenten.provider_proxy.contracts import (
+    ProviderBudgetContextV1,
+    benchmark_provider_settlement_id,
+)
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
     FactoryBlockStatus,
@@ -5191,7 +5194,7 @@ class GatewayStore:
     @staticmethod
     def _reservation_is_closed(cursor: Any, reservation_id: UUID) -> bool:
         cursor.execute(
-            "SELECT 1 FROM factory_budget_events WHERE reservation_id = %s AND event_kind IN ('usage', 'release', 'resume_cost') LIMIT 1 FOR UPDATE",
+            "SELECT 1 FROM factory_budget_events WHERE reservation_id = %s AND event_kind IN ('usage', 'release', 'resume_cost', 'benchmark_cost') LIMIT 1 FOR UPDATE",
             (str(reservation_id),),
         )
         return cursor.fetchone() is not None
@@ -5711,6 +5714,12 @@ class GatewayStore:
     @staticmethod
     def _decode_json(value: Any) -> Any:
         return json.loads(value) if isinstance(value, (str, bytes, bytearray)) else value
+
+    @staticmethod
+    def _encode_json(value: object) -> str:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), default=str,
+        )
 
     @staticmethod
     def _stored_factory_evaluation(
@@ -7144,6 +7153,11 @@ class GatewayStore:
                 or int(canonical["cached_input_units"]) < 0
                 or int(canonical["output_units"]) < 0
                 or int(canonical["cached_input_units"]) > int(canonical["input_units"])
+                or UUID(str(canonical["settlement_id"]))
+                != benchmark_provider_settlement_id(
+                    str(canonical["command_id"]),
+                    str(canonical["provider_call_id"]),
+                )
             ):
                 raise ValueError("shape")
         except (KeyError, TypeError, ValueError):
@@ -7222,7 +7236,6 @@ class GatewayStore:
                     or reservation.job_id != UUID(str(canonical["job_id"]))
                     or reservation.requested_usd
                     != Decimal(str(command_payload.get("maximum_cost_usd")))
-                    or self._reservation_is_closed(cursor, reservation.reservation_id)
                     or canonical["model"] not in job["data"]["execution_policy"]["allowed_models"]
                 ):
                     raise HTTPException(
@@ -7240,6 +7253,11 @@ class GatewayStore:
                         return
                     raise HTTPException(
                         status_code=409, detail="benchmark provider settlement changed"
+                    )
+                if self._reservation_is_closed(cursor, reservation.reservation_id):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="benchmark provider settlement binding is invalid",
                     )
                 cursor.execute(
                     "SELECT payload FROM capability_benchmark_provider_settlements "

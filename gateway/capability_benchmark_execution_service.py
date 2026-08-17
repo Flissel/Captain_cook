@@ -13,7 +13,10 @@ from typing import Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import SecretStr
-from agenten.provider_proxy.contracts import ProviderBudgetContextV1
+from agenten.provider_proxy.contracts import (
+    ProviderBudgetContextV1,
+    benchmark_provider_settlement_id,
+)
 from agenten.agent_factory.execution_budget import FactoryBudgetReservationV1
 
 from agenten.agent_runtime.contracts import (
@@ -945,6 +948,8 @@ class GatewayBenchmarkExecutionService:
                     or value.get("schema")
                     != "captain.capability-benchmark-provider-settlement.v1"
                     or any(value.get(key) != item for key, item in expected.items())
+                    or UUID(str(value["settlement_id"]))
+                    != benchmark_provider_settlement_id(command_id, call_id)
                     or not call_id or not result_id
                     or call_id in call_ids
                     or int(value["input_units"]) < 0

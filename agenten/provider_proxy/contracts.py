@@ -38,6 +38,16 @@ def canonical_bytes(model: BaseModel) -> bytes:
     ).encode("utf-8")
 
 
+def benchmark_provider_settlement_id(
+    command_id: UUID | str, provider_call_id: str,
+) -> UUID:
+    """Canonical identity for one independently settled benchmark provider call."""
+
+    if not provider_call_id or len(provider_call_id) > 128:
+        raise ValueError("benchmark provider call identity is invalid")
+    return uuid5(UUID(str(command_id)), provider_call_id)
+
+
 class OpenAIPriceCardV1(_FrozenContract):
     schema_name: Literal["captain.openai-price-card.v1"] = Field(
         alias="schema", serialization_alias="schema"
