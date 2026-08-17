@@ -100,3 +100,32 @@ restart identity. n8n authenticated health uses `X-N8N-API-KEY` and the exact
 - The operator must supply the documented credential environment and reachable component processes; no secret values are committed.
 - n8n remains externally owned. This work neither adopts nor mutates VibeMind n8n volumes.
 - D12 may consume the immutable final-evidence readback, but D12 live orchestration is not claimed by this task.
+
+## Review Fix Round 2
+
+Commits:
+
+1. `7bdbc2c` — preserved-history merge of reviewed D12 HEAD `38f9455`.
+2. `dac6be6` — pure, digest-attested Factory runtime descriptor validates exact constructor, nested port types/signatures, roots, clock, model client, and authority identities before any materialization; the constructor receives only an allowlisted non-secret configuration object.
+3. `e31260a` — each paid resume command and Gateway authority is bound to the exact D7 tuple: proxy URL, policy, price, command context, executable, code, paid-command, and `hard_ceiling_enforced=true`, plus session/result identity. The production manifest carries the same tuple.
+4. `2133ca8` — D12 consumes typed D11 start/stop/restart and authenticated-health controls for all six services. Runtime restart is executable; process state carries typed identity kind/value; n8n uses verified Docker container ID plus start identity, authenticated `X-N8N-API-KEY` health, bounded stop, and exact-container kill fallback.
+
+Round-2 RED to GREEN evidence:
+
+- Group A: wrong constructor/model/clock/nested-port bindings previously reached materialization. GREEN focused gate: 100 passed; bootstrap gate: 32 passed.
+- Group B: the strict command contract rejected the four missing D7 fields (9 targeted RED failures). GREEN focused gate: 173 passed; every eight-field drift is rejected before the paid Codex effect.
+- Group C: D12 still returned unconditional unavailable controls and stale D10/D11 absence assertions. GREEN D11 manifest/operator plus complete D12 orchestrator gate: 65 passed. The sentinel consumer executes all six exact semantic controls and restart produces a new identity.
+
+Round-2 verification:
+
+- Offline repository gate with `tests/live` excluded explicitly: 3,613 passed, 137 skipped, 11 failed solely because the `hermes-agent` submodule is uninitialized in this worktree (missing pinned runtime surfaces/fixture copies). One pre-existing Pydantic serialization warning was emitted.
+- The ordinary `-m "not live"` command cannot collect three files under `tests/live` because the uninitialized Hermes submodule lacks `utils` and `hermes_cli`; no live test or service was run.
+- Architecture/import/workstream: 18 passed.
+- Submission verifier, `compileall`, full round diff check, and credential-pattern scan: passed; credential matches: 0.
+- MariaDB: not run because `TEST_MARIADB_DSN` was absent.
+
+Round-2 non-claims:
+
+- No live provider, network service, Docker engine, n8n deployment, volume, or production database was contacted or mutated.
+- Authenticated health and container identity behavior is covered offline by injected/sentinel boundaries; this is not a live deployment claim.
+- The uninitialized Hermes submodule prevents a repository-wide all-green claim, but does not affect the focused D11/D12 gates above.
