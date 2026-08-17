@@ -12,6 +12,10 @@ from typing import Any, Dict, List, Optional
 from .storage import LedgerStorage, JSONFileStorage
 
 
+class ChainVerificationError(ValueError):
+    """Raised when a ledger chain fails hash or linkage verification."""
+
+
 class Block:
     def __init__(
         self,
@@ -62,6 +66,31 @@ class Block:
     @property
     def assigned_agents(self) -> List[str]:
         return self.data.get("assigned_agents", []) if self.block_type == "task" else []
+
+
+def verify_chain(blocks: List[Block]) -> None:
+    """Verify linkage and per-block hash integrity of an append-only chain.
+
+    Valid only for chains whose blocks are never mutated after append — the
+    MariaDB gateway path, which issues no UPDATE or DELETE against `blocks`.
+    The in-process pipeline ledger mutates `data`, `status` and `metadata` in
+    place after append and is expected to fail this check; do not call it there.
+
+    `status`, `children` and `metadata` are outside `compute_hash`, so edits to
+    those fields are not detected. This verifies payload and linkage only.
+    """
+    previous_hash = "0"
+    for block in blocks:
+        if block.previous_hash != previous_hash:
+            raise ChainVerificationError(
+                f"broken chain link at index {block.index}"
+            )
+        recomputed = block.compute_hash()
+        if block.hash != recomputed:
+            raise ChainVerificationError(
+                f"payload hash mismatch at index {block.index}"
+            )
+        previous_hash = block.hash
 
 
 class Blockchain:

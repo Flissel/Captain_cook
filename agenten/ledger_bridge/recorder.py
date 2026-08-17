@@ -369,9 +369,18 @@ class LedgerRecorderAgent:
     def _touch(self, index: int) -> None:
         """Persist an in-place `.data`/`.metadata` mutation that did not
         change `.status`, by round-tripping through the public
-        `update_task_status` (recomputes hash + saves) with the block's
-        current status unchanged. Keeps us inside `Blockchain`'s public
-        API instead of reaching for its private `_save()`.
+        `update_task_status` with the block's current status unchanged.
+        Keeps us inside `Blockchain`'s public API instead of reaching for
+        its private `_save()`.
+
+        `update_task_status` saves but does NOT recompute the block hash.
+        Because `.data` IS inside `Block.compute_hash`, every mutation
+        persisted here leaves the stored hash stale — by design, not by
+        accident. That is why the in-process ledger is a single-writer
+        append-only log with validated stage transitions rather than a
+        hash-verifiable chain; see
+        `blockchain.Blockchain_modell.verify_chain`, which is scoped to the
+        gateway ledger and will fail against this one.
         """
         block = self._blockchain.get_block(index)
         if block is None:  # pragma: no cover - defensive
