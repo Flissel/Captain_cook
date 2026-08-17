@@ -6,6 +6,7 @@ from copy import deepcopy
 from datetime import timedelta
 import json
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
@@ -215,8 +216,19 @@ def test_shipped_gateway_promotion_is_atomic_immutable_and_replay_stable() -> No
                 self.result = self.state["summary"]
             elif normalized.startswith("SELECT suite_sha256"):
                 self.result = self.state["promotions"].get(str(job.job_id))
+            elif normalized.startswith("SELECT projection_event"):
+                expected_event_id = str(parameters[0])
+                self.result = next(
+                    (
+                        {"projection_event": item["projection_event"]}
+                        for item in self.state["promotions"].values()
+                        if item["event_id"] == expected_event_id
+                    ),
+                    None,
+                )
             elif normalized.startswith("INSERT INTO capability_generic_promotions"):
                 self.state["promotions"][str(job.job_id)] = {
+                    "event_id": parameters[0],
                     "suite_sha256": parameters[2],
                     "summary_sha256": parameters[3],
                     "projection_event": parameters[4],
@@ -280,6 +292,10 @@ def test_shipped_gateway_promotion_is_atomic_immutable_and_replay_stable() -> No
     )
 
     assert replay == first
+    readback = store.generic_capability_promotion(
+        UUID(first["event_id"])
+    )
+    assert readback == first
     assert storage.committed["projection"].status is FactoryLifecycleStatus.READY_TO_USE
     assert sum(
         block.phase is FactoryPhase.CAPABILITY_PROMOTED
