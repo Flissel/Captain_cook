@@ -366,6 +366,12 @@ def test_factory_operator_cli_threads_stop_flag_and_emits_typed_results(
     } == {"dispatch_quality_warden"}
 
 
+# The script under test unconditionally resolves a locally-installed native Codex
+# CLI binary and a locally uv-tool-installed Hermes Python interpreter before this
+# test's checkpoint logic runs -- real local/external tooling this test genuinely
+# depends on, not portable to any hosted runner or credential-free machine. See
+# https://github.com/Flissel/Captain_cook/issues/25
+@pytest.mark.live
 def test_unresolved_provisioning_returns_factory_checkpoint_without_provider(
     tmp_path: Path,
 ) -> None:
@@ -1131,6 +1137,12 @@ print(json.dumps({
     assert not (repository / "provider-called").exists()
 
 
+# The script under test unconditionally resolves a locally-installed native Codex
+# CLI binary and a locally uv-tool-installed Hermes Python interpreter before this
+# test's checkpoint logic runs -- real local/external tooling this test genuinely
+# depends on, not portable to any hosted runner or credential-free machine. See
+# https://github.com/Flissel/Captain_cook/issues/25
+@pytest.mark.live
 def test_missing_provider_key_does_not_block_infrastructure_checkpoint(
     tmp_path: Path,
 ) -> None:
