@@ -64,6 +64,27 @@ def test_shipped_registry_covers_every_declared_tool_for_three_demo_inputs() -> 
         assert set(item["required_tools"] + item["optional_tools"]) <= available
 
 
+def test_shipped_registry_head_attests_all_three_demo_tool_sets() -> None:
+    root = Path(__file__).resolve().parents[2]
+    registry = load_verified_generic_tool_registry(
+        repository_root=root,
+        relative_path="config/generic_tool_registry.json",
+        expected_sha256=(
+            "9a911de3261a96591e8eea2fabfb0aa2956c10b7b80d818982959fd7c3448ba8"
+        ),
+        environment={
+            "CAPTAIN_INCIDENT_TOOL_GATEWAY_TOKEN": "incident-tool-token-123",
+            "CAPTAIN_CLAIMS_TOOL_GATEWAY_TOKEN": "claims-tool-token-1234",
+        },
+    )
+    assert registry.tool_keys == (
+        "account_snapshot_reader", "alert_context_reader", "audit_log_query",
+        "claim_evidence_reader", "industry_signal_reader", "ocr_extractor",
+        "opportunity_scoring_rules", "policy_lookup", "service_dependency_map",
+        "status_page_draft",
+    )
+
+
 def test_remote_registry_executes_exact_authenticated_typed_readback(monkeypatch) -> None:
     endpoint = "http://127.0.0.1:8110/v1/alerts/context"
     endpoint_sha256 = hashlib.sha256(endpoint.encode()).hexdigest()
