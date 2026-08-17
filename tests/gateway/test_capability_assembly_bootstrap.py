@@ -879,6 +879,9 @@ def _factory_runtime_descriptor(*, adapter_sha256: str) -> dict[str, object]:
         "implementation_sha256": "1" * 64,
         "implementation_ast_sha256": "2" * 64,
         "implementation_head_blob": "3" * 40,
+        "closure_path": "gateway/capability_factory_runtime_closure.json",
+        "closure_sha256": "4" * 64,
+        "closure_config_sha256": "5" * 64,
         "constructor_signature": "(configuration, authorities)",
         "clock_signature": "() -> datetime",
         "model_client_signature": "(job, invocation)",
@@ -1009,6 +1012,32 @@ def test_repository_factory_adapter_matches_committed_descriptor() -> None:
     assert b"InMemoryBusinessBenchmarkRepository" not in implementation
     assert b"MinibookForgeHttpClient" in implementation
     assert b"GatewayD10BusinessBenchmarkInputs" in implementation
+    closure = json.loads(
+        (root / descriptor.closure_path).read_text(encoding="utf-8")
+    )
+    assert len(closure["entries"]) >= 100
+    assert closure["root_revision_binding"] == "runtime-expected-head"
+    assert hashlib.sha256(
+        json.dumps(closure["entries"], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest() == descriptor.closure_config_sha256
+
+
+def test_verified_closure_rejects_sys_modules_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    import gateway.capability_assembly_bootstrap as bootstrap
+
+    expected = tmp_path / "expected.py"
+    expected.write_text("VALUE = 'verified'\n", encoding="utf-8")
+    fake = SimpleNamespace(__file__=str(tmp_path / "attacker.py"), VALUE="attacker")
+    monkeypatch.setitem(sys.modules, "captain_test_closure", fake)
+    finder = bootstrap._VerifiedFactoryClosureFinder({
+        "captain_test_closure": (expected, expected.read_bytes())
+    })
+
+    with pytest.raises(ValueError, match="preloaded Factory closure module"):
+        finder.require_preloaded_origins()
 
 
 def test_factory_constructor_receives_only_allowlisted_config_and_redacts_any_error(
@@ -1048,6 +1077,8 @@ def test_factory_constructor_receives_only_allowlisted_config_and_redacts_any_er
             b"def build_capability_factory_runtime(configuration, authorities):\n"
             b"    raise RuntimeError('must-never-escape-constructor')\n"
         ),
+        repository_revision="a" * 40,
+        closure_modules={},
         descriptor_sha256="d" * 64,
         descriptor=descriptor,
         configuration=configuration,

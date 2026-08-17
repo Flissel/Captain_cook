@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.abc
+import importlib.util
 import json
 import re
 import secrets
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1407,6 +1410,9 @@ class CapabilityAssemblyFactoryRuntimeDescriptorV1(BaseModel):
     implementation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     implementation_ast_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     implementation_head_blob: str = Field(pattern=r"^[0-9a-f]{40}$")
+    closure_path: str
+    closure_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    closure_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     constructor_signature: str
     clock_signature: str
     model_client_signature: str
@@ -1452,6 +1458,26 @@ _FACTORY_RUNTIME_DESCRIPTOR_BINDINGS = {
 _FACTORY_ADAPTER_PATH = "gateway/capability_factory_runtime_adapter.py"
 _FACTORY_DESCRIPTOR_PATH = "gateway/capability_factory_runtime_descriptor.json"
 _FACTORY_IMPLEMENTATION_PATH = "gateway/capability_factory_runtime_internal.py"
+
+
+class _FactoryClosureEntryV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    module: str
+    path: str
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    ast_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    head_blob: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+class _FactoryClosureManifestV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+    schema_name: Literal["captain.capability-factory-runtime-closure.v1"] = Field(
+        alias="schema"
+    )
+    root_module: Literal["gateway.capability_factory_runtime_internal"]
+    root_revision_binding: Literal["runtime-expected-head"]
+    config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    entries: tuple[_FactoryClosureEntryV1, ...]
 
 
 def _attest_factory_adapter_ast(source: bytes) -> str:
@@ -1502,9 +1528,55 @@ class CapabilityAssemblyFactoryRuntimePlan:
     adapter_bytes: bytes
     implementation_path: Path
     implementation_bytes: bytes
+    repository_revision: str
+    closure_modules: Mapping[str, tuple[Path, bytes]]
     descriptor_sha256: str
     descriptor: CapabilityAssemblyFactoryRuntimeDescriptorV1
     configuration: CapabilityAssemblyFactoryConfiguration
+
+
+class _VerifiedFactoryClosureLoader(importlib.abc.Loader):
+    def __init__(self, fullname: str, path: Path, content: bytes) -> None:
+        self._fullname, self._path, self._content = fullname, path, content
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module: ModuleType) -> None:
+        module.__file__ = str(self._path)
+        module.__dict__["__captain_verified_source_sha256__"] = hashlib.sha256(
+            self._content
+        ).hexdigest()
+        exec(compile(self._content, str(self._path), "exec", dont_inherit=True),
+             module.__dict__)
+
+
+class _VerifiedFactoryClosureFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, modules: Mapping[str, tuple[Path, bytes]]) -> None:
+        self._modules = modules
+
+    def find_spec(self, fullname: str, path=None, target=None):
+        selected = self._modules.get(fullname)
+        if selected is None:
+            return None
+        file_path, content = selected
+        return importlib.util.spec_from_loader(
+            fullname, _VerifiedFactoryClosureLoader(fullname, file_path, content),
+            origin=str(file_path),
+        )
+
+    def require_preloaded_origins(self) -> None:
+        for name, (path, _content) in self._modules.items():
+            existing = sys.modules.get(name)
+            if existing is None:
+                continue
+            origin = getattr(existing, "__file__", None)
+            try:
+                matches = Path(str(origin)).resolve(strict=True) == path.resolve(strict=True)
+            except (OSError, ValueError):
+                matches = False
+            if not matches:
+                raise ValueError("preloaded Factory closure module is invalid")
 
 
 def plan_capability_assembly_factory_runtime_from_environment(
@@ -1600,6 +1672,48 @@ def plan_capability_assembly_factory_runtime_from_environment(
         ).hexdigest()
         if not secrets.compare_digest(descriptor.implementation_head_blob, git_blob):
             raise ValueError("implementation HEAD blob")
+        if descriptor.closure_path != "gateway/capability_factory_runtime_closure.json":
+            raise ValueError("closure path")
+        _, closure_bytes = read_verified_repository_bytes(
+            descriptor.closure_path,
+            expected_sha256=descriptor.closure_sha256,
+            expected_repository_revision=repository_revision,
+            repository_root=repository_root,
+        )
+        closure = _FactoryClosureManifestV1.model_validate_json(closure_bytes)
+        canonical_entries = json.dumps(
+            [entry.model_dump(mode="json") for entry in closure.entries],
+            sort_keys=True, separators=(",", ":"),
+        ).encode()
+        if (
+            hashlib.sha256(canonical_entries).hexdigest() != closure.config_sha256
+            or closure.config_sha256 != descriptor.closure_config_sha256
+            or tuple(entry.module for entry in closure.entries)
+            != tuple(sorted({entry.module for entry in closure.entries}))
+        ):
+            raise ValueError("closure configuration")
+        closure_modules: dict[str, tuple[Path, bytes]] = {}
+        for entry in closure.entries:
+            path, content = read_verified_repository_bytes(
+                entry.path,
+                expected_sha256=entry.source_sha256,
+                expected_repository_revision=repository_revision,
+                repository_root=repository_root,
+            )
+            tree_digest = hashlib.sha256(
+                ast.dump(ast.parse(content, filename=entry.path), annotate_fields=True,
+                         include_attributes=False).encode()
+            ).hexdigest()
+            blob = hashlib.sha1(
+                b"blob " + str(len(content)).encode("ascii") + b"\0" + content
+            ).hexdigest()
+            if tree_digest != entry.ast_sha256 or blob != entry.head_blob:
+                raise ValueError("closure entry")
+            closure_modules[entry.module] = (path, content)
+        if closure_modules.get(closure.root_module) != (
+            implementation_path, implementation_bytes
+        ):
+            raise ValueError("closure root")
         root = repository_root.resolve(strict=True)
         for relative_root in (descriptor.skill_root, descriptor.replay_root):
             candidate = Path(relative_root)
@@ -1617,6 +1731,8 @@ def plan_capability_assembly_factory_runtime_from_environment(
         adapter_bytes=adapter_bytes,
         implementation_path=implementation_path,
         implementation_bytes=implementation_bytes,
+        repository_revision=repository_revision,
+        closure_modules=closure_modules,
         descriptor_sha256=descriptor_sha256,
         descriptor=descriptor,
         configuration=CapabilityAssemblyFactoryConfiguration(
@@ -1695,6 +1811,10 @@ def materialize_capability_assembly_factory_runtime(
         minibook_api_key=minibook_api_key or SecretStr("unconfigured-minibook-token"),
     )
     try:
+        finder = _VerifiedFactoryClosureFinder(plan.closure_modules)
+        finder.require_preloaded_origins()
+        prior_modules = set(sys.modules)
+        sys.meta_path.insert(0, finder)
         implementation = ModuleType("_captain_verified_factory_implementation")
         implementation.__file__ = str(plan.implementation_path)
         exec(
@@ -1724,6 +1844,13 @@ def materialize_capability_assembly_factory_runtime(
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly Factory constructor is invalid"
         ) from None
+    finally:
+        if "finder" in locals() and finder in sys.meta_path:
+            sys.meta_path.remove(finder)
+        if "prior_modules" in locals() and "factory" not in locals():
+            for name in set(sys.modules) - prior_modules:
+                if name in plan.closure_modules:
+                    sys.modules.pop(name, None)
     if type(factory) is not AgentFactoryLiveComposition:
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly Factory constructor is invalid"

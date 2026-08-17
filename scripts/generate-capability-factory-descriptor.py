@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / "gateway/capability_factory_runtime_adapter.py"
 DESCRIPTOR = ROOT / "gateway/capability_factory_runtime_descriptor.json"
 IMPLEMENTATION = ROOT / "gateway/capability_factory_runtime_internal.py"
+CLOSURE = ROOT / "gateway/capability_factory_runtime_closure.json"
 
 
 def main() -> int:
@@ -39,6 +40,11 @@ def main() -> int:
     payload["implementation_head_blob"] = hashlib.sha1(
         b"blob " + str(len(implementation)).encode("ascii") + b"\0" + implementation
     ).hexdigest()
+    closure = CLOSURE.read_bytes()
+    closure_payload = json.loads(closure)
+    payload["closure_path"] = CLOSURE.relative_to(ROOT).as_posix()
+    payload["closure_sha256"] = hashlib.sha256(closure).hexdigest()
+    payload["closure_config_sha256"] = closure_payload["config_sha256"]
     content = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
     DESCRIPTOR.write_text(content, encoding="utf-8", newline="\n")
     print(f"CAPTAIN_CAPABILITY_FACTORY_ADAPTER_SHA256={payload['adapter_sha256']}")
