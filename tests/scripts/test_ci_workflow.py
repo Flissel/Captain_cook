@@ -55,7 +55,7 @@ def test_windows_ci_covers_the_full_deterministic_runtime() -> None:
     assert isinstance(jobs, dict)
     job = jobs["deterministic_windows"]
     assert isinstance(job, dict)
-    assert job["runs-on"] == ["self-hosted", "windows"]
+    assert job["runs-on"] == "windows-latest"
 
     steps = job["steps"]
     assert isinstance(steps, list)
