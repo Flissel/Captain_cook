@@ -21,8 +21,8 @@ from tests.agent_factory.test_generic_benchmark_quality import NOW, _quality
 from tests.agent_factory.test_state_machine import job_v3
 
 
-def _request() -> FactoryDispatch:
-    job = job_v3()
+def _request(job=None) -> FactoryDispatch:
+    job = job or job_v3()
     lease = FactoryLease.model_construct(
         lease_id="quality-lease",
         job_id=job.job_id,
@@ -152,13 +152,19 @@ def test_gateway_readback_materializes_15_job_specific_public_cases() -> None:
 
 
 def test_shipped_gateway_promotion_is_atomic_immutable_and_replay_stable() -> None:
-    job = job_v3()
+    job = job_v3().model_copy(update={
+        "job_id": UUID("00000000-0000-4000-8000-000000000301")
+    })
+    quality = _quality().model_copy(update={
+        "job_id": job.job_id, "correlation_id": job.correlation_id,
+        "acceptance_assertion_ids": job.acceptance_assertion_ids,
+    })
     quality_block = asyncio.run(AssemblyOwnedGenericBenchmark(
         gateway_store=SimpleNamespace(
-            generic_benchmark_quality_evidence=lambda *_: _quality()
+            generic_benchmark_quality_evidence=lambda *_: quality
         ),
         clock=lambda: NOW,
-    ).dispatch(_request()))
+    ).dispatch(_request(job)))
     from agenten.agent_factory.state_machine import FactoryProjection
 
     before = FactoryProjection(
@@ -184,7 +190,7 @@ def test_shipped_gateway_promotion_is_atomic_immutable_and_replay_stable() -> No
         "schema": "captain.capability-generic-benchmark-summary.v1",
         "job_id": str(job.job_id),
         "correlation_id": str(job.correlation_id),
-        "suite_digest": _quality().suite_ref.sha256,
+        "suite_digest": quality.suite_ref.sha256,
         "passed": True,
         "aggregate": aggregate,
     }
@@ -193,7 +199,7 @@ def test_shipped_gateway_promotion_is_atomic_immutable_and_replay_stable() -> No
         "blocks": [quality_block],
         "promotions": {},
         "summary": {
-            "summary_sha256": _quality().summary_ref.sha256,
+            "summary_sha256": quality.summary_ref.sha256,
             "correlation_id": str(job.correlation_id),
             "payload": json.dumps(summary),
         },
@@ -282,12 +288,12 @@ def test_shipped_gateway_promotion_is_atomic_immutable_and_replay_stable() -> No
 
     first = store.record_generic_capability_promotion(
         job_id=job.job_id,
-        suite_sha256=_quality().suite_ref.sha256,
+        suite_sha256=quality.suite_ref.sha256,
         occurred_at=NOW,
     )
     replay = store.record_generic_capability_promotion(
         job_id=job.job_id,
-        suite_sha256=_quality().suite_ref.sha256,
+        suite_sha256=quality.suite_ref.sha256,
         occurred_at=NOW,
     )
 
@@ -304,7 +310,7 @@ def test_shipped_gateway_promotion_is_atomic_immutable_and_replay_stable() -> No
     with pytest.raises(HTTPException, match="generic promotion conflicts"):
         store.record_generic_capability_promotion(
             job_id=job.job_id,
-            suite_sha256=_quality().suite_ref.sha256,
+            suite_sha256=quality.suite_ref.sha256,
             occurred_at=NOW + timedelta(seconds=1),
         )
     assert sum(
