@@ -14,11 +14,12 @@ import stat
 import subprocess
 import time
 import tokenize
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO, StringIO
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zipfile import BadZipFile, ZipFile
@@ -709,9 +710,46 @@ class _RestrictedFactoryReturn(Exception):
         self.value = value
 
 
-@dataclass(frozen=True)
+class _RestrictedFactoryNamespace(Mapping[str, object]):
+    """One seal-once module namespace for restricted generated code."""
+
+    def __init__(self) -> None:
+        self._values: Mapping[str, object] | None = None
+
+    def seal(self, values: Mapping[str, object]) -> None:
+        if self._values is not None:
+            raise _RestrictedFactoryPythonError(
+                "restricted Python namespace was already sealed"
+            )
+        self._values = MappingProxyType(dict(values))
+
+    def __getitem__(self, key: str) -> object:
+        if self._values is None:
+            raise _RestrictedFactoryPythonError(
+                "restricted Python namespace is unavailable"
+            )
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        if self._values is None:
+            raise _RestrictedFactoryPythonError(
+                "restricted Python namespace is unavailable"
+            )
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        if self._values is None:
+            raise _RestrictedFactoryPythonError(
+                "restricted Python namespace is unavailable"
+            )
+        return len(self._values)
+
+
+@dataclass(frozen=True, eq=False)
 class _RestrictedFactoryFunction:
     definition: ast.FunctionDef
+    namespace: _RestrictedFactoryNamespace
+    protected_names: frozenset[str]
 
 
 class _CaptainRestrictedStaticPythonEngine:
@@ -775,7 +813,7 @@ class _CaptainRestrictedStaticPythonEngine:
         self._trees: dict[str, ast.Module] = {}
         self._steps = 0
         self._call_depth = 0
-        self._scope: dict[str, object] = {
+        self._primitives: dict[str, object] = {
             "account_snapshot_reader": self._account_snapshot_reader,
             "blocked_external_write": self._blocked_external_write,
             "credential_ref": self._credential_ref,
@@ -834,35 +872,57 @@ class _CaptainRestrictedStaticPythonEngine:
             raise _RestrictedFactoryPythonError(
                 "restricted Python requires source and tests"
             )
+        source_namespace = _RestrictedFactoryNamespace()
+        source_scope = dict(self._primitives)
         for path in source_paths:
-            self._execute_block(self._trees[path].body, self._scope)
+            self._execute_block(
+                self._trees[path].body,
+                source_scope,
+                function_namespace=source_namespace,
+                protected_names=frozenset(),
+            )
+        source_owned_names = frozenset(source_scope) - frozenset(self._primitives)
+        source_exports = {
+            name: source_scope[name]
+            for name in source_owned_names
+            if not name.startswith("_")
+        }
+        source_namespace.seal(source_scope)
+        entrypoint = source_scope.get("run_sales_pipeline")
+        if not isinstance(entrypoint, _RestrictedFactoryFunction):
+            raise _RestrictedFactoryPythonError(
+                "restricted Python real-case entrypoint is unavailable"
+            )
         executed_tests = 0
         for path in test_paths:
-            before = set(self._scope)
-            self._execute_block(self._trees[path].body, self._scope)
+            test_namespace = _RestrictedFactoryNamespace()
+            test_scope = {"len": self._primitives["len"], **source_exports}
+            protected_names = frozenset(test_scope)
+            self._execute_block(
+                self._trees[path].body,
+                test_scope,
+                function_namespace=test_namespace,
+                protected_names=protected_names,
+            )
             test_names = tuple(
                 sorted(
                     name
-                    for name in set(self._scope) - before
+                    for name in set(test_scope) - protected_names
                     if name.startswith("test_")
-                    and isinstance(self._scope[name], _RestrictedFactoryFunction)
+                    and isinstance(test_scope[name], _RestrictedFactoryFunction)
                 )
             )
             if not test_names:
                 raise _RestrictedFactoryPythonError(
                     "restricted Python test module has no tests"
                 )
+            test_namespace.seal(test_scope)
             for name in test_names:
-                self._call_function(self._scope[name], (), {})
+                self._call_function(test_scope[name], (), {})
                 executed_tests += 1
         if executed_tests < 1:
             raise _RestrictedFactoryPythonError(
                 "restricted Python tests did not execute"
-            )
-        entrypoint = self._scope.get("run_sales_pipeline")
-        if not isinstance(entrypoint, _RestrictedFactoryFunction):
-            raise _RestrictedFactoryPythonError(
-                "restricted Python real-case entrypoint is unavailable"
             )
         self._reset_observations()
         result = self._call_function(
@@ -1050,18 +1110,32 @@ class _CaptainRestrictedStaticPythonEngine:
         self,
         statements: Iterable[ast.stmt],
         scope: dict[str, object],
+        *,
+        function_namespace: _RestrictedFactoryNamespace,
+        protected_names: frozenset[str],
     ) -> None:
         for statement in statements:
             self._tick()
             if isinstance(statement, ast.FunctionDef):
-                if statement.name in scope:
+                if statement.name in scope or any(
+                    argument.arg in protected_names
+                    for argument in statement.args.args
+                ):
                     raise _RestrictedFactoryPythonError(
                         "restricted Python name was redefined"
                     )
-                scope[statement.name] = _RestrictedFactoryFunction(statement)
+                scope[statement.name] = _RestrictedFactoryFunction(
+                    statement,
+                    function_namespace,
+                    protected_names,
+                )
             elif isinstance(statement, ast.Assign):
                 target = statement.targets[0]
                 assert isinstance(target, ast.Name)
+                if target.id in protected_names:
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python source name is read-only"
+                    )
                 scope[target.id] = self._evaluate(statement.value, scope)
             elif isinstance(statement, ast.Return):
                 raise _RestrictedFactoryReturn(
@@ -1078,6 +1152,8 @@ class _CaptainRestrictedStaticPythonEngine:
                 self._execute_block(
                     statement.body if condition else statement.orelse,
                     scope,
+                    function_namespace=function_namespace,
+                    protected_names=protected_names,
                 )
             elif isinstance(statement, ast.Assert):
                 if self._evaluate(statement.test, scope) is not True:
@@ -1196,7 +1272,9 @@ class _CaptainRestrictedStaticPythonEngine:
             }
             if isinstance(callee, _RestrictedFactoryFunction):
                 return self._call_function(callee, arguments, keywords)
-            if callee not in self._scope.values():
+            if not any(
+                callee is primitive for primitive in self._primitives.values()
+            ):
                 raise _RestrictedFactoryPythonError(
                     "restricted Python callable is forbidden"
                 )
@@ -1232,7 +1310,7 @@ class _CaptainRestrictedStaticPythonEngine:
             raise _RestrictedFactoryPythonError(
                 "restricted Python arguments are invalid"
             )
-        local = dict(self._scope)
+        local = dict(function.namespace)
         bound_names: set[str] = set()
         for name, value in zip(names, arguments):
             local[name] = value
@@ -1251,7 +1329,12 @@ class _CaptainRestrictedStaticPythonEngine:
                 "restricted Python arguments are invalid"
             )
         try:
-            self._execute_block(definition.body, local)
+            self._execute_block(
+                definition.body,
+                local,
+                function_namespace=function.namespace,
+                protected_names=function.protected_names,
+            )
         except _RestrictedFactoryReturn as returned:
             return returned.value
         finally:

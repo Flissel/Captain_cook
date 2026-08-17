@@ -211,3 +211,30 @@
 
 - The restricted static engine remains an injected hermetic Task-9 path, not default/live composition and not a Task-10 runtime.
 - No live Hermes/Codex evidence, OpenFang action, promotion, deployment, push, merge, or external-service mutation was performed.
+
+## Task 9A — isolated source and test namespaces
+
+### Critical finding closed
+
+- Restricted source now executes in one seal-once, read-only namespace. Every generated source function is bound to that original namespace instead of consulting mutable engine state at call time.
+- Captain captures the packaged `run_sales_pipeline` function after all source modules load and before any test module executes. The final Captain-owned real-case invocation always calls that captured source function.
+- Each test module executes in its own isolated namespace. Tests receive read-only public source exports plus the bounded `len` primitive; credential, tool, handoff, external-write, and environment primitives are not exported to test code.
+- Direct definitions, assignments, nested assignments, and argument bindings may not shadow a source-owned exported name. The restricted AST already excludes attribute access, subscript assignment, and callable container mutation, so aliases and container references cannot mutate the frozen source namespace.
+
+### RED → GREEN evidence
+
+- RED: a bundle whose packaged entrypoint returned `WRONG` was accepted when its generated test defined a successful helper and assigned it to `run_sales_pipeline`. The adversarial regression failed with `DID NOT RAISE`, proving Captain had invoked the test replacement.
+- GREEN: the same bundle is rejected as typed restricted Python before command-success or real-case evidence is written. The exact valid four-agent package and all five existing fail-closed variants remain green.
+
+### Verification
+
+- Task-9 authority boundaries and exact E2E: `21 passed`.
+- Focused Root contracts/compiler/orchestration/Minibook Forge/Hermes worker/Gateway API: `121 passed, 3 skipped` (MariaDB-gated skips).
+- Focused isolated Minibook contracts/state/API/package: `123 passed`.
+- Portal: `47 passed`; lint and production build passed.
+- Architecture/import/workstream: `18 passed`.
+- Root Python compileall and `git diff --check`: passed.
+
+### Non-claims
+
+- No live Hermes/Codex evidence, Task-10 execution, OpenFang action, promotion, deployment, push, merge, or external-service mutation was performed.

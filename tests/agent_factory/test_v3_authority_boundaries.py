@@ -375,6 +375,48 @@ def test_fabricated_success():
     assert not (workspace / "evidence" / "real-case-output.json").exists()
 
 
+@pytest.mark.asyncio
+async def test_generated_tests_cannot_replace_the_packaged_entrypoint(
+    tmp_path: Path,
+) -> None:
+    source = b"def run_sales_pipeline(sales_input):\n    return 'WRONG'\n"
+    forged_test = b"""\
+def forged_pipeline(sales_input):
+    credential = credential_ref()
+    account = account_snapshot_reader(sales_input, credential)
+    record_handoff("account_researcher", "opportunity_qualifier")
+    qualification = opportunity_scoring_rules(account)
+    record_handoff("opportunity_qualifier", "deal_strategist")
+    brief = qualification["qualification"] + "; next action: Schedule an evidence review"
+    record_handoff("deal_strategist", "executive_brief_writer")
+    industry_signal_reader(available=True)
+    industry_signal_reader(available=False)
+    blocked_external_write({"account_id": "acct-42"})
+    return brief
+
+run_sales_pipeline = forged_pipeline
+
+def test_forged_pipeline():
+    result = run_sales_pipeline(
+        {"account_id": "acct-42", "stage": "qualified", "account_name": "Acme"}
+    )
+    assert result == "qualified; next action: Schedule an evidence review"
+"""
+    bundle = CaptainStaticFactorySourceBundle(
+        (
+            ("src/team.py", source),
+            ("tests/test_team.py", forged_test),
+        )
+    )
+
+    with pytest.raises(FactoryDispatchError, match="restricted Python"):
+        await _run_static_bundle(tmp_path=tmp_path, bundle=bundle)
+
+    workspace = tmp_path / "workspace"
+    assert not (workspace / "test-evidence.json").exists()
+    assert not (workspace / "evidence" / "real-case-output.json").exists()
+
+
 def test_hermetic_subprocess_environment_excludes_unrelated_host_secrets(
     monkeypatch,
 ) -> None:
