@@ -2703,6 +2703,17 @@ class GatewayStore:
         """Authenticated exact readback for the proxy immediately before effect."""
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
+                if context.cost_authority_ref.startswith(
+                    "gateway://capability-benchmark-authorizations/"
+                ):
+                    benchmark = self._benchmark_provider_context_with_cursor(
+                        cursor, context.sha256, now=now,
+                    )
+                    if benchmark != context:
+                        raise HTTPException(
+                            status_code=409, detail="provider authority is unavailable"
+                        )
+                    return context
                 command_block = self._runtime_block_by_json_value(
                     cursor,
                     block_type="agent_runtime_command",
@@ -2754,6 +2765,11 @@ class GatewayStore:
             raise HTTPException(status_code=409, detail="provider authority is unavailable")
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
+                benchmark = self._benchmark_provider_context_with_cursor(
+                    cursor, digest, now=now,
+                )
+                if benchmark is not None:
+                    return benchmark
                 command_block = self._runtime_block_by_json_value(
                     cursor,
                     block_type="agent_runtime_command",
@@ -5227,6 +5243,9 @@ class GatewayStore:
                 settlement = RuntimeResumeCostSettlementV1.model_validate(payload)
                 consumed += settlement.accounted_cost_usd
                 active.pop(settlement.reservation_id, None)
+            elif row["event_kind"] == "benchmark_cost":
+                consumed += Decimal(str(payload["actual_cost_usd"]))
+                active.pop(UUID(payload["reservation_id"]), None)
             else:
                 active.pop(UUID(payload["reservation_id"]), None)
         limit = job.execution_policy.max_cost_usd
@@ -7140,7 +7159,11 @@ class GatewayStore:
             canonical["provider_proxy_code_sha256"],
             canonical["provider_paid_command_sha256"], True,
         )
-        if binding not in self._runtime_provider_bundle_bindings:
+        if not any(
+            configured[:3] == binding[:3]
+            and configured[4:] == binding[4:]
+            for configured in self._runtime_provider_bundle_bindings
+        ):
             raise HTTPException(
                 status_code=409, detail="benchmark provider authority changed"
             )
@@ -7156,6 +7179,7 @@ class GatewayStore:
                     created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
                     ) ENGINE=InnoDB"""
                 )
+
                 command = self._runtime_block_by_json_value(
                     cursor, block_type="agent_runtime_command", field="event_id",
                     value=str(canonical["command_id"]), for_update=True,
@@ -7171,6 +7195,12 @@ class GatewayStore:
                     value=str(canonical["job_id"]), for_update=True,
                 )
                 command_data = {} if command is None else command["data"]
+                command_payload = command_data.get("payload", {})
+                reservation = self._factory_reservation(
+                    cursor,
+                    UUID(str(command_payload.get("budget_reservation_id"))),
+                    for_update=True,
+                ) if command_payload.get("budget_reservation_id") else None
                 if (
                     command is None or batch is None or job is None
                     or command_data.get("payload", {}).get("operation")
@@ -7181,6 +7211,18 @@ class GatewayStore:
                     or str(batch["trace_id"]) != str(canonical["trace_id"])
                     or str(batch["run_id"]) != str(canonical["run_id"])
                     or command_data.get("correlation_id") != canonical["correlation_id"]
+                    or command_payload.get("provider_context_sha256")
+                    != canonical["provider_context_sha256"]
+                    or command_payload.get("provider_session_id")
+                    != canonical["provider_session_id"]
+                    or command_payload.get("provider_result_id")
+                    != canonical["provider_result_id"]
+                    or cost > Decimal(str(command_payload.get("maximum_cost_usd", "0")))
+                    or reservation is None
+                    or reservation.job_id != UUID(str(canonical["job_id"]))
+                    or reservation.requested_usd
+                    != Decimal(str(command_payload.get("maximum_cost_usd")))
+                    or self._reservation_is_closed(cursor, reservation.reservation_id)
                     or canonical["model"] not in job["data"]["execution_policy"]["allowed_models"]
                 ):
                     raise HTTPException(
@@ -7201,14 +7243,13 @@ class GatewayStore:
                     )
                 cursor.execute(
                     "SELECT payload FROM capability_benchmark_provider_settlements "
-                    "WHERE job_id = %s FOR UPDATE", (canonical["job_id"],),
+                    "WHERE command_id = %s FOR UPDATE", (canonical["command_id"],),
                 )
-                total = sum(
+                command_total = cost + sum(
                     (Decimal(str(self._decode_json(row["payload"])["actual_cost_usd"]))
-                     for row in cursor.fetchall()), start=cost,
+                     for row in cursor.fetchall()), start=Decimal("0"),
                 )
-                maximum = Decimal(str(job["data"]["execution_policy"]["max_cost_usd"]))
-                if total > maximum:
+                if command_total > reservation.requested_usd:
                     raise HTTPException(
                         status_code=409, detail="benchmark provider settlement exceeds Factory budget"
                     )
@@ -7219,6 +7260,195 @@ class GatewayStore:
                     (canonical["settlement_id"], canonical["provider_call_id"],
                      canonical["command_id"], canonical["job_id"], encoded),
                 )
+
+    def finalize_capability_benchmark_provider_cost(
+        self, command_id: UUID,
+    ) -> Decimal:
+        """Atomically close the command reservation from provider readbacks."""
+
+        event_id = uuid5(command_id, "benchmark-provider-cost")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                command_block = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_runtime_command", field="event_id",
+                    value=str(command_id), for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=409, detail="benchmark provider command is unavailable")
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                reservation_id = command.payload.budget_reservation_id
+                reservation = (
+                    None if reservation_id is None
+                    else self._factory_reservation(cursor, reservation_id, for_update=True)
+                )
+                cursor.execute(
+                    "SELECT payload FROM capability_benchmark_provider_settlements "
+                    "WHERE command_id = %s FOR UPDATE", (str(command_id),),
+                )
+                rows = cursor.fetchall()
+                total = sum(
+                    (Decimal(str(self._decode_json(row["payload"])["actual_cost_usd"]))
+                     for row in rows), start=Decimal("0"),
+                )
+                if (
+                    not rows or reservation is None
+                    or reservation.job_id != command.payload.cost_job_id
+                    or total > reservation.requested_usd
+                ):
+                    raise HTTPException(status_code=409, detail="benchmark provider cost is unavailable")
+                payload = {
+                    "schema": "captain.factory-benchmark-cost.v1",
+                    "reservation_id": str(reservation.reservation_id),
+                    "command_id": str(command_id),
+                    "actual_cost_usd": format(total, "f"),
+                }
+                existing = self._factory_budget_event(cursor, event_id, for_update=True)
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) != payload:
+                        raise HTTPException(status_code=409, detail="benchmark provider cost changed")
+                    return total
+                job, job_block = self._factory_budget_job(cursor, reservation.job_id)
+                self._insert_factory_budget_event(
+                    cursor, event_id=event_id,
+                    reservation_id=reservation.reservation_id,
+                    job_id=reservation.job_id, event_kind="benchmark_cost",
+                    digest=hashlib.sha256(self._encode_json(payload).encode()).hexdigest(),
+                    payload=payload, parent_index=job_block["index"],
+                    schema_name="captain.factory-benchmark-cost.v1",
+                )
+                projection = self._factory_budget_projection(
+                    cursor, job, for_update=True,
+                )
+                if projection.remaining_usd < 0:
+                    raise HTTPException(status_code=409, detail="benchmark provider cost exceeds Factory budget")
+        return total
+
+    def record_capability_benchmark_provider_authority(
+        self, *, context: ProviderBudgetContextV1,
+        provider_binding: Mapping[str, object], case_digest: str,
+        trace_id: UUID, run_id: UUID,
+    ) -> None:
+        """Persist the exact command-bound benchmark ceiling before provider use."""
+
+        payload = {
+            "context": context.model_dump(mode="json", by_alias=True),
+            "provider_binding": dict(provider_binding),
+            "case_digest": case_digest, "trace_id": str(trace_id),
+            "run_id": str(run_id),
+        }
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """CREATE TABLE IF NOT EXISTS capability_benchmark_provider_authorities (
+                    context_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                    command_id CHAR(36) NOT NULL UNIQUE,
+                    payload JSON NOT NULL,
+                    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB"""
+                )
+                command_block = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_runtime_command", field="event_id",
+                    value=str(context.command_id), for_update=True,
+                )
+                cursor.execute(
+                    "SELECT job_id, correlation_id, case_digest, trace_id, run_id "
+                    "FROM capability_benchmark_work_batches WHERE command_id = %s "
+                    "FOR UPDATE", (str(context.command_id),),
+                )
+                batch = cursor.fetchone()
+                command = (
+                    None if command_block is None
+                    else AgentRuntimeCommand.model_validate(command_block["data"])
+                )
+                if (
+                    command is None or batch is None
+                    or command.payload.operation is not RuntimeOperation.AUTOGEN_BENCHMARK
+                    or command.payload.provider_context_sha256 != context.sha256
+                    or command.payload.cost_authority_ref != context.cost_authority_ref
+                    or command.payload.maximum_cost_usd != context.ceiling_usd
+                    or command.payload.budget_reservation_id != context.reservation_id
+                    or command.payload.cost_job_id != context.job_id
+                    or command.payload.cost_run_id != context.run_id
+                    or command.payload.cost_input_id != context.input_id
+                    or command.payload.cost_capability_id != context.capability_id
+                    or command.payload.cost_capability_version != context.capability_version
+                    or command.payload.provider_session_id != context.session_id
+                    or command.payload.provider_result_id != context.result_id
+                    or str(batch["job_id"]) != str(context.job_id)
+                    or str(batch["correlation_id"]) != str(context.correlation_id)
+                    or str(batch["case_digest"]) != case_digest
+                    or str(batch["trace_id"]) != str(trace_id)
+                    or str(batch["run_id"]) != str(run_id)
+                    or context.run_id != trace_id
+                    or context.input_id != f"{case_digest}:{run_id}"
+                ):
+                    raise HTTPException(
+                        status_code=409, detail="benchmark provider authority is invalid"
+                    )
+                cursor.execute(
+                    "SELECT payload FROM capability_benchmark_provider_authorities "
+                    "WHERE context_sha256 = %s OR command_id = %s FOR UPDATE",
+                    (context.sha256, str(context.command_id)),
+                )
+                existing = cursor.fetchone()
+                if existing is None:
+                    cursor.execute(
+                        "INSERT INTO capability_benchmark_provider_authorities "
+                        "(context_sha256, command_id, payload) VALUES (%s, %s, %s)",
+                        (context.sha256, str(context.command_id), self._encode_json(payload)),
+                    )
+                elif self._decode_json(existing["payload"]) != payload:
+                    raise HTTPException(
+                        status_code=409, detail="benchmark provider authority changed"
+                    )
+
+    def _benchmark_provider_context_with_cursor(
+        self, cursor: Any, digest: str, *, now: datetime,
+    ) -> ProviderBudgetContextV1 | None:
+        cursor.execute(
+            """CREATE TABLE IF NOT EXISTS capability_benchmark_provider_authorities (
+            context_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+            command_id CHAR(36) NOT NULL UNIQUE,
+            payload JSON NOT NULL,
+            created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+            ) ENGINE=InnoDB"""
+        )
+        cursor.execute(
+            "SELECT payload FROM capability_benchmark_provider_authorities "
+            "WHERE context_sha256 = %s FOR UPDATE", (digest,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        payload = self._decode_json(row["payload"])
+        context = ProviderBudgetContextV1.model_validate(payload["context"])
+        if context.sha256 != digest:
+            raise HTTPException(status_code=409, detail="provider authority is unavailable")
+        try:
+            context.require_active(now)
+        except ValueError:
+            raise HTTPException(status_code=409, detail="provider authority is unavailable") from None
+        command_block = self._runtime_block_by_json_value(
+            cursor, block_type="agent_runtime_command", field="event_id",
+            value=str(context.command_id), for_update=True,
+        )
+        if command_block is None:
+            raise HTTPException(status_code=409, detail="provider authority is unavailable")
+        command = AgentRuntimeCommand.model_validate(command_block["data"])
+        binding = payload["provider_binding"]
+        exact = (
+            command.payload.provider_proxy_url == binding.get("provider_proxy_url")
+            and command.payload.provider_policy_sha256 == binding.get("provider_policy_sha256")
+            and command.payload.provider_price_card_sha256 == binding.get("provider_price_card_sha256")
+            and command.payload.provider_proxy_executable_sha256 == binding.get("provider_proxy_executable_sha256")
+            and command.payload.provider_proxy_code_sha256 == binding.get("provider_proxy_code_sha256")
+            and command.payload.provider_paid_command_sha256 == binding.get("provider_paid_command_sha256")
+            and command.payload.provider_hard_ceiling_enforced is True
+            and command.payload.provider_context_sha256 == digest
+        )
+        if not exact:
+            raise HTTPException(status_code=409, detail="provider authority is unavailable")
+        return context
 
     def capability_benchmark_provider_settlements(
         self, command_id: UUID,

@@ -77,6 +77,7 @@ class ProviderBudgetProxy:
         provider: ProviderClient,
         gateway: GatewaySettlementClient,
         clock: Callable[[], datetime],
+        provider_binding: Mapping[str, object] | None = None,
     ) -> None:
         if (
             context.policy_sha256 != policy.sha256
@@ -90,6 +91,9 @@ class ProviderBudgetProxy:
         self.cas_root = cas_root.resolve()
         self.provider = provider
         self.gateway = gateway
+        self.provider_binding = (
+            None if provider_binding is None else dict(provider_binding)
+        )
         self.clock = clock
         self._finalize_lock = asyncio.Lock()
 
@@ -450,6 +454,55 @@ class ProviderBudgetProxy:
             started_at=started_at.isoformat(),
             ended_at=ended_at.isoformat(),
         )
+        if self.context.cost_authority_ref.startswith(
+            "gateway://capability-benchmark-authorizations/"
+        ):
+            binding = self.provider_binding
+            required = {
+                "provider_proxy_url", "provider_policy_sha256",
+                "provider_price_card_sha256", "provider_proxy_executable_sha256",
+                "provider_proxy_code_sha256", "provider_paid_command_sha256",
+                "provider_hard_ceiling_enforced",
+            }
+            if binding is None or set(binding) != required:
+                raise ProviderUsageUnavailable(
+                    "benchmark provider binding is unavailable"
+                )
+            try:
+                case_digest, benchmark_run_id = self.context.input_id.split(":", 1)
+                UUID(benchmark_run_id)
+            except (ValueError, AttributeError):
+                raise ProviderUsageUnavailable(
+                    "benchmark provider context is invalid"
+                ) from None
+            settlement = {
+                "schema": "captain.capability-benchmark-provider-settlement.v1",
+                "settlement_id": str(uuid5(
+                    self.context.command_id, f"benchmark-provider:{call_id}"
+                )),
+                "provider_call_id": call_id,
+                "job_id": str(self.context.job_id),
+                "correlation_id": str(self.context.correlation_id),
+                "case_digest": case_digest,
+                "trace_id": str(self.context.run_id),
+                "run_id": benchmark_run_id,
+                "command_id": str(self.context.command_id),
+                "provider_result_id": str(self.context.result_id),
+                "provider_session_id": self.context.session_id,
+                "provider": "openai", "model": self.policy.model,
+                "input_units": input_units,
+                "cached_input_units": cached_units,
+                "output_units": output_units,
+                "actual_cost_usd": format(actual, "f"),
+                **binding,
+                "provider_context_sha256": self.context.sha256,
+            }
+            try:
+                await self.gateway.record_provider_settlement(settlement)
+            except Exception as exc:
+                raise ProviderUsageUnavailable(
+                    "benchmark provider settlement gateway is unavailable"
+                ) from exc
 
     async def finalize(
         self, *, command_id: UUID, result_id: UUID

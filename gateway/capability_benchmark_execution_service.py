@@ -6,13 +6,15 @@ import hashlib
 import base64
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from collections.abc import Mapping
 from typing import Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import SecretStr
+from agenten.provider_proxy.contracts import ProviderBudgetContextV1
+from agenten.agent_factory.execution_budget import FactoryBudgetReservationV1
 
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
@@ -564,6 +566,56 @@ class GatewayBenchmarkExecutionService:
         })
         command_id = uuid5(self._executor_authority_id, f"command:{request.request_nonce}")
         subtask_id = f"case-{request.case_ref.case_id[-16:]}"
+        provider_binding = self._required_provider_binding()
+        provider_result_id = uuid5(command_id, "captain.runtime-result")
+        provider_session_id = f"benchmark-{command_id}"
+        reservation_id = uuid5(command_id, "benchmark-provider-reservation")
+        budget = self._store.factory_budget(request.job_id)
+        ceiling = min(
+            job.execution_policy.max_cost_usd / Decimal("30"),
+            budget.remaining_usd,
+        ).quantize(
+            Decimal("0.01")
+        )
+        if ceiling <= 0:
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark provider budget is unavailable"
+            )
+        authority_ref = (
+            "gateway://capability-benchmark-authorizations/" + str(command_id)
+        )
+        context_seed = {
+            "schema": "captain.provider-budget-context.v1",
+            "command_id": command_id,
+            "original_command_id": request.request_nonce,
+            "result_id": provider_result_id,
+            "reservation_id": reservation_id,
+            "job_id": request.job_id, "run_id": trace_id,
+            "input_id": f"{request.case_ref.case_digest}:{run_id}",
+            "correlation_id": job.correlation_id,
+            "capability_id": request.capability_id,
+            "capability_version": job.subject_version,
+            "session_id": provider_session_id,
+            "cost_authority_ref": authority_ref,
+            "ceiling_usd": ceiling,
+            "expires_at": job.occurred_at.replace(microsecond=0)
+            + timedelta(
+                seconds=job.execution_policy.max_runtime_seconds
+            ),
+            "policy_sha256": provider_binding["provider_policy_sha256"],
+            "price_card_sha256": provider_binding["provider_price_card_sha256"],
+        }
+        provider_context = ProviderBudgetContextV1.model_validate(context_seed)
+        self._store.reserve_factory_budget(FactoryBudgetReservationV1(
+            schema="captain.factory-budget-reservation.v1",
+            reservation_id=reservation_id, job_id=request.job_id,
+            correlation_id=job.correlation_id,
+            subject_version=job.subject_version,
+            execution_policy_sha256=_factory_execution_policy_sha256(job),
+            attempt=1, requested_usd=ceiling,
+            reserved_at=job.occurred_at.replace(microsecond=0),
+            expires_at=provider_context.expires_at,
+        ))
         command = AgentRuntimeCommand(
             schema="captain.agent-runtime-command.v1", event_id=command_id,
             correlation_id=job.correlation_id, causation_id=request.request_nonce,
@@ -577,6 +629,23 @@ class GatewayBenchmarkExecutionService:
                 prompt_ref=prompt_ref, integration_intent=IntegrationIntent.NONE,
                 capability_profile=CapabilityProfile.FACTORY_REAL_CASE_TESTER,
                 limits=RuntimeLimits(wall_seconds=300, max_iterations=1),
+                maximum_cost_usd=ceiling,
+                budget_reservation_id=reservation_id,
+                cost_authority_ref=authority_ref,
+                cost_job_id=request.job_id, cost_run_id=trace_id,
+                cost_input_id=f"{request.case_ref.case_digest}:{run_id}",
+                cost_capability_id=request.capability_id,
+                cost_capability_version=job.subject_version,
+                provider_proxy_url=str(provider_binding["provider_proxy_url"]),
+                provider_policy_sha256=str(provider_binding["provider_policy_sha256"]),
+                provider_price_card_sha256=str(provider_binding["provider_price_card_sha256"]),
+                provider_context_sha256=provider_context.sha256,
+                provider_proxy_executable_sha256=str(provider_binding["provider_proxy_executable_sha256"]),
+                provider_proxy_code_sha256=str(provider_binding["provider_proxy_code_sha256"]),
+                provider_paid_command_sha256=str(provider_binding["provider_paid_command_sha256"]),
+                provider_hard_ceiling_enforced=True,
+                provider_session_id=provider_session_id,
+                provider_result_id=provider_result_id,
             ),
         )
         self._store.record_capability_benchmark_work_batch(
@@ -586,6 +655,12 @@ class GatewayBenchmarkExecutionService:
             declared_tool_keys=tools, tool_authority_sha256=tools_digest,
         )
         self._store.accept_runtime_command(command)
+        self._store.record_capability_benchmark_provider_authority(
+            context=provider_context,
+            provider_binding=provider_binding,
+            case_digest=request.case_ref.case_digest,
+            trace_id=trace_id, run_id=run_id,
+        )
         execution_ref = (
             request.execution_plan.team_manifest_ref
             if request.team_kind == "team"
@@ -619,7 +694,13 @@ class GatewayBenchmarkExecutionService:
             "baseline_policy_base64": material(request.execution_plan.baseline_policy_ref),
             "model_binding_base64": material(request.execution_plan.model_ref),
             "execution_policy_base64": material(request.execution_plan.execution_policy_ref),
-            "provider_binding": self._required_provider_binding(),
+            "provider_binding": {
+                **provider_binding,
+                "provider_context_sha256": provider_context.sha256,
+            },
+            "provider_context": provider_context.model_dump(
+                mode="json", by_alias=True
+            ),
         }
         return PreparedBenchmarkExecution(
             request=request, canonical_case_ref=canonical_case_ref, job=job,
@@ -698,8 +779,14 @@ class GatewayBenchmarkExecutionService:
 
         cost_usd = self._settled_provider_cost(
             request=request, job=job, command_id=command_id,
-            trace_id=trace_id, run_id=run_id,
+            trace_id=trace_id, run_id=run_id, command=command,
         )
+        if self._store.finalize_capability_benchmark_provider_cost(
+            command_id
+        ) != cost_usd:
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark provider cost readback changed authority"
+            )
 
         tool_calls: list[GenericToolCallEvidence] = []
         for tool_key, result_ref in tool_result_refs.items():
@@ -812,6 +899,7 @@ class GatewayBenchmarkExecutionService:
     def _settled_provider_cost(
         self, *, request: GenericBenchmarkExecutionRequest, job: object,
         command_id: UUID, trace_id: UUID, run_id: UUID,
+        command: AgentRuntimeCommand,
     ) -> Decimal:
         binding = self._required_provider_binding()
         settlements = tuple(
@@ -833,8 +921,12 @@ class GatewayBenchmarkExecutionService:
             "command_id": str(command_id), "provider": "openai",
             "model": request.model_id, **binding,
         }
+        expected["provider_context_sha256"] = (
+            command.payload.provider_context_sha256
+        )
+        expected["provider_result_id"] = str(command.payload.provider_result_id)
+        expected["provider_session_id"] = command.payload.provider_session_id
         call_ids: set[str] = set()
-        result_ids: set[str] = set()
         total = Decimal("0")
         required = {
             "schema", "settlement_id", "provider_call_id", "job_id",
@@ -854,7 +946,7 @@ class GatewayBenchmarkExecutionService:
                     != "captain.capability-benchmark-provider-settlement.v1"
                     or any(value.get(key) != item for key, item in expected.items())
                     or not call_id or not result_id
-                    or call_id in call_ids or result_id in result_ids
+                    or call_id in call_ids
                     or int(value["input_units"]) < 0
                     or int(value["cached_input_units"]) < 0
                     or int(value["output_units"]) < 0
@@ -867,7 +959,6 @@ class GatewayBenchmarkExecutionService:
                     "benchmark provider settlement authority changed"
                 ) from None
             call_ids.add(call_id)
-            result_ids.add(result_id)
             total += cost
         if total > job.execution_policy.max_cost_usd:
             raise CapabilityLiveAuthorityUnavailable(
@@ -1112,6 +1203,17 @@ class GatewayBenchmarkExecutionService:
                 "benchmark evidence CAS readback changed bytes"
             )
         return reference
+
+
+def _factory_execution_policy_sha256(job: object) -> str:
+    payload = job.execution_policy.model_dump(mode="json", by_alias=True)
+    rendered = format(job.execution_policy.max_cost_usd, "f")
+    payload["max_cost_usd"] = (
+        rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+    )
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode()).hexdigest()
 
 
 __all__ = [

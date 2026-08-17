@@ -157,7 +157,9 @@ class ProviderBudgetContextV1(_FrozenContract):
     capability_id: str = Field(min_length=1)
     capability_version: int = Field(ge=1, strict=True)
     session_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-    cost_authority_ref: str = Field(pattern=r"^gateway://capability-resume-authorizations/")
+    cost_authority_ref: str = Field(
+        pattern=r"^gateway://capability-(?:resume|benchmark)-authorizations/"
+    )
     ceiling_usd: Decimal
     expires_at: datetime
     policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")

@@ -30,6 +30,7 @@ from agenten.agent_factory.candidate_evaluation import (
 from agenten.agent_factory.contracts import AgentFactoryJobV3
 from agenten.agent_factory.team_execution import FactoryAutoGenTeamManifestV1
 from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.provider_proxy.contracts import ProviderBudgetContextV1
 
 
 def _read_prompt(workspace: Path, reference: ArtifactRef) -> str:
@@ -101,10 +102,30 @@ async def execute(payload: dict[str, object]) -> dict[str, object]:
         "model_id": request["model_id"],
     }:
         raise ValueError("isolated model binding changed")
+    provider_context = material.get("provider_context")
+    provider_binding = material.get("provider_binding")
+    if not isinstance(provider_context, dict) or not isinstance(provider_binding, dict):
+        raise ValueError("isolated provider authority is unavailable")
+    expected_provider = {
+        "provider_proxy_url": str(configuration["proxy_url"]).rstrip("/") + "/v1",
+        "provider_policy_sha256": configuration["policy_sha256"],
+        "provider_price_card_sha256": configuration["price_card_sha256"],
+        "provider_context_sha256": ProviderBudgetContextV1.model_validate(
+            provider_context
+        ).sha256,
+        "provider_proxy_executable_sha256": configuration["proxy_executable_sha256"],
+        "provider_proxy_code_sha256": configuration["proxy_code_sha256"],
+        "provider_paid_command_sha256": configuration["paid_command_sha256"],
+        "provider_hard_ceiling_enforced": True,
+    }
+    if provider_binding != expected_provider:
+        raise ValueError("isolated provider authority changed")
     client = ProxyResponsesChatCompletionClient(
         endpoint=str(configuration["proxy_url"]).rstrip("/") + "/v1/responses",
         token=str(configuration["proxy_token"]), model=str(request["model_id"]),
-        context_reference="gateway://provider-budget-contexts/" + str(configuration["context_sha256"]),
+        context_reference="gateway://provider-budget-contexts/" + str(
+            expected_provider["provider_context_sha256"]
+        ),
     )
     authorizations = {
         str(item["tool_key"]): item for item in prepared["authorized_tools"]

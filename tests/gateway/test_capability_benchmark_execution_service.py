@@ -36,8 +36,13 @@ class _Store:
             occurred_at=datetime(2026, 8, 17, tzinfo=timezone.utc),
             execution_policy=SimpleNamespace(
                 allowed_models=(request.model_id,), max_cost_usd=Decimal("6.00"),
+                max_runtime_seconds=600,
             ),
         )
+        self.job.execution_policy.model_dump = lambda **_kwargs: {
+            "schema": "captain.factory-execution-policy.v1",
+            "max_cost_usd": "6.00",
+        }
         self.job.model_dump = lambda **_kwargs: {
             "schema": "captain.agent-factory-job.v3",
             "job_id": str(request.job_id),
@@ -49,9 +54,16 @@ class _Store:
         self.authorizations = {}
         self.effects = {}
         self.provider_settlements = []
+        self.budget_reservation = None
 
     def factory_job(self, _job_id):
         return SimpleNamespace(job=self.job)
+
+    def factory_budget(self, _job_id):
+        return SimpleNamespace(remaining_usd=Decimal("6.00"))
+
+    def reserve_factory_budget(self, reservation):
+        self.budget_reservation = reservation
 
     def record_capability_benchmark_work_batch(self, **payload):
         self.batch = payload
@@ -129,6 +141,16 @@ class _Store:
         return tuple(
             item for item in self.provider_settlements
             if item["command_id"] == str(command_id)
+        )
+
+    def record_capability_benchmark_provider_authority(self, **payload):
+        self.provider_authority = payload
+
+    def finalize_capability_benchmark_provider_cost(self, command_id):
+        return sum(
+            (Decimal(item["actual_cost_usd"])
+             for item in self.capability_benchmark_provider_settlements(command_id)),
+            start=Decimal("0"),
         )
 
 
@@ -454,6 +476,12 @@ def test_prepare_broker_complete_crosses_process_contract_without_gateway_host_e
 
     prepared = service.prepare(request)
     assert gateway_effect.calls == 0
+    assert store.budget_reservation.reservation_id == (
+        prepared.command.payload.budget_reservation_id
+    )
+    assert store.provider_authority["context"].sha256 == (
+        prepared.command.payload.provider_context_sha256
+    )
     broker = GatewayDurableBenchmarkToolBroker(
         store=store, artifacts=artifacts, registry=service._tool_registry,
     )
@@ -484,7 +512,7 @@ def test_prepare_broker_complete_crosses_process_contract_without_gateway_host_e
         service.complete_process_execution(request, result_payload)
 
     command_id = prepared.command.event_id
-    store.provider_settlements.append({
+    settlement = {
         "schema": "captain.capability-benchmark-provider-settlement.v1",
         "settlement_id": str(uuid4()),
         "provider_call_id": "benchmark-provider-call-1",
@@ -494,20 +522,39 @@ def test_prepare_broker_complete_crosses_process_contract_without_gateway_host_e
         "trace_id": str(prepared.trace_id),
         "run_id": str(prepared.run_id),
         "command_id": str(command_id),
-        "provider_result_id": "response-benchmark-1",
-        "provider_session_id": "benchmark-session-1",
+        "provider_result_id": str(prepared.command.payload.provider_result_id),
+        "provider_session_id": prepared.command.payload.provider_session_id,
         "provider": "openai", "model": request.model_id,
         "input_units": 10, "cached_input_units": 0, "output_units": 5,
         "actual_cost_usd": "0.012345",
         "provider_proxy_url": "http://127.0.0.1:8091/v1",
         "provider_policy_sha256": "1" * 64,
         "provider_price_card_sha256": "2" * 64,
-        "provider_context_sha256": "3" * 64,
+        "provider_context_sha256": prepared.command.payload.provider_context_sha256,
         "provider_proxy_executable_sha256": "4" * 64,
         "provider_proxy_code_sha256": "5" * 64,
         "provider_paid_command_sha256": "6" * 64,
         "provider_hard_ceiling_enforced": True,
-    })
+    }
+    for field in (
+        "provider_proxy_url", "provider_policy_sha256",
+        "provider_price_card_sha256", "provider_context_sha256",
+        "provider_proxy_executable_sha256", "provider_proxy_code_sha256",
+        "provider_paid_command_sha256", "provider_hard_ceiling_enforced",
+    ):
+        changed = dict(settlement)
+        changed[field] = False if field == "provider_hard_ceiling_enforced" else (
+            "f" * 64 if field != "provider_proxy_url"
+            else "http://127.0.0.1:9999/v1"
+        )
+        store.provider_settlements[:] = [changed]
+        with pytest.raises(
+            CapabilityLiveAuthorityUnavailable,
+            match="settlement authority changed",
+        ):
+            service.complete_process_execution(request, result_payload)
+        assert store.result is None
+    store.provider_settlements[:] = [settlement]
     evidence = service.complete_process_execution(request, result_payload)
 
     assert gateway_effect.calls == 0

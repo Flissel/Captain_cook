@@ -184,8 +184,15 @@ class GatewayProviderSettlementHTTPClient:
         return returned
 
     async def record_provider_settlement(self, payload: dict[str, object]) -> None:
+        benchmark = payload.get("schema") == (
+            "captain.capability-benchmark-provider-settlement.v1"
+        )
+        route = (
+            "/v1/capability-benchmark/provider-settlements"
+            if benchmark else "/v1/capability-resumes/provider-settlements"
+        )
         response = await self._client.post(
-            f"{self._base_url}/v1/capability-resumes/provider-settlements",
+            self._base_url + route,
             headers={
                 "Authorization": f"Bearer {self._provider_token}",
                 "Content-Type": "application/json",
@@ -197,7 +204,10 @@ class GatewayProviderSettlementHTTPClient:
                 f"Gateway provider settlement failed with HTTP {response.status_code}"
             )
         receipt = payload.get("receipt")
-        request_id = receipt.get("request_id") if isinstance(receipt, dict) else None
+        request_id = (
+            payload.get("settlement_id") if benchmark
+            else receipt.get("request_id") if isinstance(receipt, dict) else None
+        )
         try:
             response_payload = response.json()
         except ValueError:
@@ -205,7 +215,11 @@ class GatewayProviderSettlementHTTPClient:
         if (
             not isinstance(request_id, str)
             or not isinstance(response_payload, dict)
-            or response_payload.get("operation_id") != request_id
-            or type(response_payload.get("replayed")) is not bool
+            or (
+                response_payload.get("settlement_id") != request_id
+                if benchmark
+                else response_payload.get("operation_id") != request_id
+                or type(response_payload.get("replayed")) is not bool
+            )
         ):
             raise RuntimeError("Gateway provider settlement receipt is invalid")

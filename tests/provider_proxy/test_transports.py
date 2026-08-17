@@ -57,6 +57,31 @@ async def test_upstream_and_gateway_credentials_are_confined_to_their_transports
     assert all("openai-only" not in auth for url, auth in observed if "127.0.0.1" in url)
 
 
+@pytest.mark.asyncio
+async def test_benchmark_settlement_uses_distinct_provider_receipt_route() -> None:
+    observed: list[str] = []
+    settlement_id = str(uuid5(NAMESPACE_URL, "benchmark-settlement"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(request.url.path)
+        return httpx.Response(201, json={
+            "schema": "captain.capability-benchmark-provider-settlement-write.v1",
+            "settlement_id": settlement_id,
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        gateway = GatewayProviderSettlementHTTPClient(
+            base_url="http://127.0.0.1:8090",
+            provider_token="provider-receipt-only", client=http,
+        )
+        await gateway.record_provider_settlement({
+            "schema": "captain.capability-benchmark-provider-settlement.v1",
+            "settlement_id": settlement_id,
+        })
+
+    assert observed == ["/v1/capability-benchmark/provider-settlements"]
+
+
 def test_transport_rejects_noncanonical_origins() -> None:
     with pytest.raises(ValueError, match="OpenAI"):
         OpenAIResponsesHTTPClient(

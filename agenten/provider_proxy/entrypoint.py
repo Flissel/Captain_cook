@@ -91,6 +91,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             provider=provider,
             gateway=gateway,
             clock=lambda: datetime.now(timezone.utc),
+            provider_binding={
+                "provider_proxy_url": os.environ["CAPTAIN_PROVIDER_PROXY_URL"].rstrip("/") + "/v1",
+                "provider_policy_sha256": os.environ["CAPTAIN_PROVIDER_POLICY_SHA256"],
+                "provider_price_card_sha256": os.environ["CAPTAIN_PROVIDER_PRICE_CARD_SHA256"],
+                "provider_proxy_executable_sha256": os.environ["CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256"],
+                "provider_proxy_code_sha256": os.environ["CAPTAIN_PROVIDER_PROXY_CODE_SHA256"],
+                "provider_paid_command_sha256": os.environ["CAPTAIN_PROVIDER_PAID_COMMAND_SHA256"],
+                "provider_hard_ceiling_enforced": True,
+            },
         )
 
     supervisor = DynamicProviderBudgetProxySupervisor(
