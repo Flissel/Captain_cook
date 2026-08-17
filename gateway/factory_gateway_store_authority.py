@@ -47,6 +47,7 @@ class GatewayStoreFactoryRpcAuthority:
         )
 
     def execute(self, command: FactoryGatewayRpcCommand) -> dict[str, object]:
+        self._require_current_scope(command)
         current_revision = self._revision(command.job_id)
         if (
             command.expected_revision != current_revision
@@ -72,6 +73,26 @@ class GatewayStoreFactoryRpcAuthority:
             request_sha256=request_sha256,
             response=response,
         )
+
+    def _require_current_scope(self, command: FactoryGatewayRpcCommand) -> None:
+        if command.operation == "record_factory_job":
+            job = parse_factory_job(_mapping(command.payload, "job"))
+            if (
+                job.job_id != command.job_id
+                or job.correlation_id != command.correlation_id
+                or job.required_capability != command.input_id
+                or command.attempt != 1
+            ):
+                raise ValueError("Factory Gateway authority binding changed")
+            return
+        projection = self._store.factory_job(command.job_id)
+        job = projection.job
+        if (
+            job.correlation_id != command.correlation_id
+            or job.required_capability != command.input_id
+            or projection.projection.attempt != command.attempt
+        ):
+            raise ValueError("Factory Gateway authority binding changed")
 
     def _effect_already_persisted(self, command: FactoryGatewayRpcCommand) -> bool:
         """Close effect-before-RPC-receipt crashes from authoritative readback."""
@@ -125,10 +146,12 @@ class GatewayStoreFactoryRpcAuthority:
         if operation == "record_factory_block":
             block = FactoryEvidenceBlock.model_validate(_mapping(payload, "block"))
             _require_job(command, block.job_id, block.correlation_id)
+            self._require_nested_resource(command, block)
             return self._store.record_factory_block(block)
         if operation == "record_factory_lease":
             lease = FactoryLease.model_validate(_mapping(payload, "lease"))
             _require_job(command, lease.job_id, lease.correlation_id)
+            self._require_nested_resource(command, lease)
             return self._store.record_factory_lease(lease)
         if operation == "factory_skill_assignment":
             return self._store.factory_skill_assignment(
@@ -139,6 +162,7 @@ class GatewayStoreFactoryRpcAuthority:
         if operation == "record_factory_workflow_artifact":
             artifact = parse_factory_workflow_artifact(_mapping(payload, "artifact"))
             _require_job(command, artifact.job_id, artifact.correlation_id)
+            self._require_nested_resource(command, artifact)
             return self._store.record_factory_workflow_artifact(artifact)
         if operation == "factory_budget":
             return self._store.factory_budget(command.job_id)
@@ -190,6 +214,13 @@ class GatewayStoreFactoryRpcAuthority:
                 raise ValueError("Factory Forge authority is unavailable")
             dispatch = _factory_dispatch(_mapping(payload, "dispatch"))
             _require_job(command, dispatch.job.job_id, dispatch.job.correlation_id)
+            persisted = self._store.factory_job(command.job_id).job
+            if dispatch.job != persisted or dispatch.action.attempt != command.attempt:
+                raise ValueError("Factory Gateway authority binding changed")
+            if dispatch.action.job_id not in {None, command.job_id}:
+                raise ValueError("Factory Gateway authority binding changed")
+            if dispatch.lease is not None:
+                self._require_nested_resource(command, dispatch.lease)
             return asyncio.run(self._forge.submit(dispatch))
         if operation in {"forge_status", "forge_result"}:
             if self._forge is None:
@@ -200,6 +231,34 @@ class GatewayStoreFactoryRpcAuthority:
             method = getattr(self._forge, operation.removeprefix("forge_"))
             return asyncio.run(method(creation_job_id))
         raise ValueError("Factory Gateway operation is unavailable")
+
+    def _require_nested_resource(
+        self, command: FactoryGatewayRpcCommand, resource: object,
+    ) -> None:
+        projection = self._store.factory_job(command.job_id)
+        job = projection.job
+        if (
+            getattr(resource, "job_id", None) != command.job_id
+            or getattr(resource, "correlation_id", None) != command.correlation_id
+            or getattr(resource, "subject_version", None) != job.subject_version
+            or getattr(resource, "attempt", None) != command.attempt
+        ):
+            raise ValueError("Factory Gateway authority binding changed")
+        occurred_at = getattr(resource, "occurred_at", None)
+        deadline_at = getattr(job, "deadline_at", None)
+        if occurred_at is not None and (
+            occurred_at < job.occurred_at
+            or (deadline_at is not None and occurred_at >= deadline_at)
+        ):
+            raise ValueError("Factory Gateway authority binding changed")
+        issued_at = getattr(resource, "issued_at", None)
+        expires_at = getattr(resource, "expires_at", None)
+        if issued_at is not None and (
+            issued_at < job.occurred_at
+            or expires_at is None
+            or (deadline_at is not None and expires_at > deadline_at)
+        ):
+            raise ValueError("Factory Gateway authority binding changed")
 
     def _job_artifact_refs(self, job_id: UUID) -> tuple[ArtifactRef, ...]:
         projection = self._store.factory_job(job_id)

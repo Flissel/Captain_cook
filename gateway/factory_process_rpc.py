@@ -7,7 +7,8 @@ import json
 import base64
 import hashlib
 import hmac
-from typing import Literal, Protocol
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Literal, Protocol
 from uuid import UUID
 
 from fastapi import FastAPI, Header, HTTPException
@@ -93,21 +94,22 @@ class FactoryGatewayRpcService:
 
     def __init__(
         self, *, authority: FactoryGatewayRpcAuthority, capability_key: str,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if len(capability_key) < 24:
             raise ValueError("Factory Gateway capability authority is invalid")
         self._authority = authority
         self._capability_key = capability_key
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def execute(self, command: FactoryGatewayRpcCommand) -> FactoryGatewayRpcResult:
         if command.operation not in _FACTORY_STORE_OPERATIONS:
             raise ValueError("Factory Gateway operation is unavailable")
-        _verify_factory_gateway_capability(
+        capability = _verify_factory_gateway_capability(
             command=command, capability_key=self._capability_key,
+            now=self._clock(),
         )
-        payload_job_id = command.payload.get("job_id")
-        if payload_job_id is not None and str(payload_job_id) != str(command.job_id):
-            raise ValueError("Factory Gateway job binding changed")
+        _verify_nested_factory_scope(command=command, capability=capability)
         replay = self._authority.read_receipt(command)
         if replay is not None:
             result = FactoryGatewayRpcResult.model_validate(replay)
@@ -120,6 +122,8 @@ class FactoryGatewayRpcService:
 def issue_factory_gateway_capability(
     *, capability_key: str, job_id: UUID | str, correlation_id: UUID | str,
     input_id: str, attempt: int, allowed_operations: tuple[str, ...],
+    issued_at: datetime | None = None, not_after: datetime | None = None,
+    subject_version: int | None = None, deadline_at: datetime | None = None,
 ) -> str:
     """Issue an opaque Gateway-only signed capability for one Factory scope."""
 
@@ -128,15 +132,36 @@ def issue_factory_gateway_capability(
     operations = tuple(sorted(set(allowed_operations)))
     if not operations or any(item not in _FACTORY_STORE_OPERATIONS for item in operations):
         raise ValueError("Factory Gateway capability operation is invalid")
-    payload = json.dumps(
-        {
+    issued = _utc(issued_at or datetime.now(timezone.utc))
+    expires = _utc(not_after or (issued + timedelta(minutes=5)))
+    if expires <= issued or (expires - issued) > timedelta(minutes=15):
+        raise ValueError("Factory Gateway capability window is invalid")
+    scope: dict[str, object] = {
             "schema": "captain.factory-gateway-capability.v1",
             "job_id": str(UUID(str(job_id))),
             "correlation_id": str(UUID(str(correlation_id))),
             "input_id": input_id,
             "attempt": attempt,
             "allowed_operations": operations,
-        },
+            "issued_at": issued.isoformat(),
+            "not_after": expires.isoformat(),
+    }
+    if subject_version is not None:
+        if subject_version < 1:
+            raise ValueError("Factory Gateway capability scope is invalid")
+        scope["subject_version"] = subject_version
+    if deadline_at is not None:
+        deadline = _utc(deadline_at)
+        if deadline < expires:
+            raise ValueError("Factory Gateway capability exceeds job deadline")
+        scope["deadline_at"] = deadline.isoformat()
+    scope_bytes = json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+    scope["operation_scope_sha256"] = {
+        operation: hashlib.sha256(scope_bytes + b"|" + operation.encode()).hexdigest()
+        for operation in operations
+    }
+    payload = json.dumps(
+        scope,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -156,8 +181,8 @@ def factory_gateway_request_sha256(command: FactoryGatewayRpcCommand) -> str:
 
 
 def _verify_factory_gateway_capability(
-    *, command: FactoryGatewayRpcCommand, capability_key: str,
-) -> None:
+    *, command: FactoryGatewayRpcCommand, capability_key: str, now: datetime,
+) -> dict[str, object]:
     try:
         encoded, signature = command.gateway_capability.rsplit(".", 1)
         expected = hmac.new(
@@ -169,6 +194,21 @@ def _verify_factory_gateway_capability(
         payload = json.loads(base64.urlsafe_b64decode(encoded + padding))
     except Exception:
         raise ValueError("Factory Gateway capability is invalid") from None
+    checked_at = _utc(now)
+    try:
+        issued_at = _utc(datetime.fromisoformat(str(payload["issued_at"])))
+        not_after = _utc(datetime.fromisoformat(str(payload["not_after"])))
+        operation_digests = payload["operation_scope_sha256"]
+        unsigned = dict(payload)
+        unsigned.pop("operation_scope_sha256")
+        unsigned_bytes = json.dumps(
+            unsigned, sort_keys=True, separators=(",", ":")
+        ).encode()
+        expected_operation_digest = hashlib.sha256(
+            unsigned_bytes + b"|" + command.operation.encode()
+        ).hexdigest()
+    except Exception:
+        raise ValueError("Factory Gateway capability is invalid") from None
     if (
         not isinstance(payload, dict)
         or payload.get("schema") != "captain.factory-gateway-capability.v1"
@@ -178,8 +218,58 @@ def _verify_factory_gateway_capability(
         or payload.get("attempt") != command.attempt
         or not isinstance(payload.get("allowed_operations"), list)
         or command.operation not in payload["allowed_operations"]
+        or not isinstance(operation_digests, dict)
+        or operation_digests.get(command.operation) != expected_operation_digest
+        or not issued_at <= checked_at < not_after
+        or not_after - issued_at > timedelta(minutes=15)
     ):
         raise ValueError("Factory Gateway capability binding changed")
+    return payload
+
+
+def _verify_nested_factory_scope(
+    *, command: FactoryGatewayRpcCommand, capability: dict[str, object],
+) -> None:
+    expected: dict[str, object] = {
+        "job_id": str(command.job_id),
+        "correlation_id": str(command.correlation_id),
+        "input_id": command.input_id,
+        "attempt": command.attempt,
+    }
+    for optional in ("subject_version", "deadline_at"):
+        if optional in capability:
+            expected[optional] = capability[optional]
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in expected:
+                    actual = item
+                    wanted = expected[key]
+                    if key in {"job_id", "correlation_id"}:
+                        actual, wanted = str(actual), str(wanted)
+                    elif key == "deadline_at":
+                        try:
+                            actual = _utc(datetime.fromisoformat(str(actual))).isoformat()
+                            wanted = _utc(datetime.fromisoformat(str(wanted))).isoformat()
+                        except ValueError:
+                            raise ValueError(
+                                "Factory Gateway nested scope changed"
+                            ) from None
+                    if actual != wanted:
+                        raise ValueError("Factory Gateway nested scope changed")
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(command.payload)
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError("Factory Gateway capability time must be UTC")
+    return value
 
 
 def create_factory_gateway_rpc_router(

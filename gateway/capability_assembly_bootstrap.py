@@ -2232,6 +2232,7 @@ def materialize_capability_assembly_factory_runtime(
             factory_runtime_token=token,
             capability_key=capability_key,
             candidate_resolver=candidate_provider,
+            clock=clock,
         )
         provisioning = CurrentAuthorityCapabilityFactoryProvisioner(
             repository=repository,

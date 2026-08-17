@@ -1965,6 +1965,7 @@ def create_production_app_from_environment(
                 store=gateway, forge=factory_forge, n8n=runtime.n8n,
             ),
             capability_key=bootstrap.gateway_token.get_secret_value(),
+            clock=clock,
         )
     return create_app(
         settings=configured,

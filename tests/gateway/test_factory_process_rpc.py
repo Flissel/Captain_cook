@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from types import SimpleNamespace
 
@@ -76,6 +77,139 @@ def _command(**updates: object) -> dict[str, object]:
         allowed_operations=(str(value["operation"]),),
     ))
     return value
+
+
+NOW = datetime(2026, 8, 17, 12, tzinfo=timezone.utc)
+
+
+def test_factory_gateway_rpc_rejects_expired_capability_before_authority() -> None:
+    authority = _DurableAuthority()
+    command = _command()
+    command["gateway_capability"] = issue_factory_gateway_capability(
+        capability_key=CAPABILITY_KEY,
+        job_id=command["job_id"],
+        correlation_id=command["correlation_id"],
+        input_id=str(command["input_id"]),
+        attempt=int(command["attempt"]),
+        allowed_operations=(str(command["operation"]),),
+        issued_at=NOW,
+        not_after=NOW + timedelta(minutes=5),
+    )
+    client = TestClient(create_factory_gateway_rpc_router(
+        service=FactoryGatewayRpcService(
+            authority=authority,
+            capability_key=CAPABILITY_KEY,
+            clock=lambda: NOW + timedelta(minutes=5),
+        ),
+        factory_runtime_token="factory-runtime-token-0001",
+    ))
+
+    response = client.post(
+        "/v1/factory-runtime/store", json=command,
+        headers={"Authorization": "Bearer factory-runtime-token-0001"},
+    )
+
+    assert response.status_code == 409
+    assert authority.effects == 0
+
+
+@pytest.mark.parametrize(
+    ("operation", "nested"),
+    (
+        ("record_factory_block", {"block": {"job_id": str(uuid4())}}),
+        ("record_factory_lease", {"lease": {"attempt": 2}}),
+        (
+            "record_factory_workflow_artifact",
+            {"artifact": {"attempt": 2}},
+        ),
+        ("forge_submit", {"dispatch": {"action": {"attempt": 2}}}),
+        (
+            "forge_submit",
+            {"dispatch": {"action": {"job_id": str(uuid4())}}},
+        ),
+    ),
+)
+def test_factory_gateway_rpc_rejects_nested_scope_drift_before_authority(
+    operation: str, nested: dict[str, object],
+) -> None:
+    authority = _DurableAuthority()
+    command = _command(operation=operation)
+    command["payload"] = {"job_id": command["job_id"], **nested}
+    command["gateway_capability"] = issue_factory_gateway_capability(
+        capability_key=CAPABILITY_KEY,
+        job_id=command["job_id"], correlation_id=command["correlation_id"],
+        input_id=str(command["input_id"]), attempt=1,
+        allowed_operations=(operation,), issued_at=NOW,
+        not_after=NOW + timedelta(minutes=5),
+    )
+    client = TestClient(create_factory_gateway_rpc_router(
+        service=FactoryGatewayRpcService(
+            authority=authority, capability_key=CAPABILITY_KEY, clock=lambda: NOW,
+        ),
+        factory_runtime_token="factory-runtime-token-0001",
+    ))
+
+    response = client.post(
+        "/v1/factory-runtime/store", json=command,
+        headers={"Authorization": "Bearer factory-runtime-token-0001"},
+    )
+
+    assert response.status_code == 409
+    assert authority.effects == 0
+
+
+def test_factory_gateway_rpc_stale_attempt_grant_cannot_mutate_current_attempt() -> None:
+    job_id, correlation_id = uuid4(), uuid4()
+
+    class Store:
+        effects = 0
+
+        def factory_job(self, _job_id):
+            return SimpleNamespace(
+                job=SimpleNamespace(
+                    job_id=job_id, correlation_id=correlation_id,
+                    required_capability="sales-assistant",
+                ),
+                projection=SimpleNamespace(attempt=2), blocks=(), leases=(),
+            )
+
+        def factory_workflow_artifacts(self, _job_id):
+            return ()
+
+        def factory_runtime_rpc_receipt(self, *_args, **_kwargs):
+            return None
+
+        def record_factory_runtime_rpc_receipt(self, **_kwargs):
+            self.effects += 1
+            raise AssertionError("receipt must not be written")
+
+    command = _command(
+        operation="factory_job", job_id=str(job_id),
+        correlation_id=str(correlation_id), input_id="sales-assistant",
+        attempt=1, expected_revision=1, payload={"job_id": str(job_id)},
+    )
+    command["gateway_capability"] = issue_factory_gateway_capability(
+        capability_key=CAPABILITY_KEY, job_id=job_id,
+        correlation_id=correlation_id, input_id="sales-assistant", attempt=1,
+        allowed_operations=("factory_job",), issued_at=NOW,
+        not_after=NOW + timedelta(minutes=5),
+    )
+    store = Store()
+    client = TestClient(create_factory_gateway_rpc_router(
+        service=FactoryGatewayRpcService(
+            authority=GatewayStoreFactoryRpcAuthority(store=store),
+            capability_key=CAPABILITY_KEY, clock=lambda: NOW,
+        ),
+        factory_runtime_token="factory-runtime-token-0001",
+    ))
+
+    response = client.post(
+        "/v1/factory-runtime/store", json=command,
+        headers={"Authorization": "Bearer factory-runtime-token-0001"},
+    )
+
+    assert response.status_code == 409
+    assert store.effects == 0
 
 
 def test_factory_gateway_rpc_is_role_authenticated_and_job_bound() -> None:
@@ -235,12 +369,13 @@ def test_factory_gateway_authority_rejects_foreign_resource_ids_before_effect(
         def factory_job(self, requested_job_id):
             assert requested_job_id == job_id
             return SimpleNamespace(
-                job=SimpleNamespace(
-                    job_id=job_id,
-                    correlation_id=correlation_id,
-                    required_capability="sales-assistant",
-                ),
-                blocks=(),
+                    job=SimpleNamespace(
+                        job_id=job_id,
+                        correlation_id=correlation_id,
+                        required_capability="sales-assistant",
+                    ),
+                    projection=SimpleNamespace(attempt=1),
+                    blocks=(),
                 leases=(),
             )
 

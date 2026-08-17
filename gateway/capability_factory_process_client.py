@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Literal
 from urllib import request as urllib_request
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -45,6 +46,7 @@ class GatewayFactoryProcessClient:
         factory_runtime_token: str, capability_key: str, candidate_resolver: object,
         send: Callable[[dict[str, object]], dict[str, object]] | None = None,
         timeout_seconds: float = 30.0,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if (
             not process_url.startswith("http://127.0.0.1:")
@@ -61,6 +63,7 @@ class GatewayFactoryProcessClient:
         self._candidate_resolver = candidate_resolver
         self._send_override = send
         self._timeout = timeout_seconds
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def projection(self, job_id: UUID):
         return self._coordinator.projection(job_id)
@@ -104,6 +107,12 @@ class GatewayFactoryProcessClient:
             str(revision),
         ))
         key = hashlib.sha256(identity.encode()).hexdigest()
+        issued_at = self._clock()
+        deadline_at = getattr(job, "deadline_at", None)
+        not_after = min(
+            issued_at + timedelta(minutes=5),
+            deadline_at or issued_at + timedelta(minutes=5),
+        )
         command = _FactoryProcessExecutionRequest(
             schema="captain.factory-process-execution.v1",
             job_id=job_id, correlation_id=job.correlation_id,
@@ -117,6 +126,9 @@ class GatewayFactoryProcessClient:
                 input_id=job.required_capability,
                 attempt=attempt,
                 allowed_operations=tuple(sorted(_FACTORY_STORE_OPERATIONS)),
+                issued_at=issued_at, not_after=not_after,
+                subject_version=job.subject_version,
+                deadline_at=deadline_at,
             ),
             maximum_dispatches=maximum_dispatches,
             stop_before_action=stop_before_action,
