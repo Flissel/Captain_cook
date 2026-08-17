@@ -357,7 +357,7 @@ class CapabilityProductionProcessBindingV1(BaseModel):
     base_url: str
     health_url: str
     execute_url: str | None = None
-    authentication: Literal["bearer"] = "bearer"
+    authentication: Literal["bearer", "x-n8n-api-key"] = "bearer"
     credential_env: Literal[
         "CAPTAIN_GATEWAY_TOKEN",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
@@ -375,7 +375,9 @@ class CapabilityProductionProcessBindingV1(BaseModel):
         "MINIBOOK_PROJECTION_API_KEY",
         "CAPTAIN_N8N_API_KEY",
     ]
+    authenticated_health_header: Literal["Authorization", "X-N8N-API-KEY"]
     start_argv: tuple[str, ...] = Field(min_length=1)
+    stop_argv: tuple[str, ...] = Field(min_length=1)
     restart_argv: tuple[str, ...] = Field(min_length=1)
 
 
@@ -486,37 +488,32 @@ def load_capability_production_bundle_manifest(
         "gateway": _process_binding(
             "gateway", gateway, f"{gateway}/v1/capability-assemblies/health",
             credential_env="CAPTAIN_GATEWAY_TOKEN",
-            start_action="start", restart_action="gateway-restart",
         ),
         "benchmark": _process_binding(
             "benchmark", benchmark.removesuffix("/v1/execute"),
             benchmark.removesuffix("/v1/execute") + "/healthz", benchmark,
             credential_env="CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
-            start_action="benchmark-start", restart_action="benchmark-restart",
         ),
         "runtime": _process_binding(
             "runtime", runtime, f"{runtime}/health",
             credential_env="CAPTAIN_RUNTIME_TOKEN",
-            start_action="start", restart_action="start",
         ),
         "provider_proxy": _process_binding(
             "provider_proxy", provider_root, f"{provider_root}/v1/healthz",
             credential_env="CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
-            start_action="start", restart_action="start",
         ),
         "minibook": _process_binding(
             "minibook", minibook, f"{minibook}/health",
             credential_env="MINIBOOK_API_KEY",
             authenticated_health_url=f"{minibook}/api/v1/projection-health",
             authenticated_health_credential_env="MINIBOOK_PROJECTION_API_KEY",
-            command_script="scripts/minibook-demo.ps1",
-            start_action="start", restart_action="start",
         ),
         "n8n": _process_binding(
             "n8n", n8n, f"{n8n}/healthz",
             credential_env="CAPTAIN_N8N_API_KEY",
-            command_script="scripts/captain-n8n.ps1",
-            start_action="start", restart_action="start",
+            authenticated_health_url=f"{n8n}/api/v1/workflows?limit=1",
+            authenticated_health_header="X-N8N-API-KEY",
+            authentication="x-n8n-api-key",
         ),
         "minibook_evidence_url_template": (
             f"{minibook}/api/v1/projection-assemblies/{{assembly_id}}/evidence"
@@ -532,28 +529,28 @@ def load_capability_production_bundle_manifest(
 
 def _process_binding(
     service: str, base_url: str, health_url: str, execute_url: str | None = None,
-    *, credential_env: str, start_action: str, restart_action: str,
+    *, credential_env: str,
     authenticated_health_url: str | None = None,
     authenticated_health_credential_env: str | None = None,
-    command_script: str = "scripts/live-demo-services.ps1",
+    authenticated_health_header: str = "Authorization",
+    authentication: str = "bearer",
 ) -> dict[str, object]:
+    prefix = ("python", "-m", "gateway.capability_process_operator", "--service", service)
     return {
         "service": service,
         "base_url": base_url,
         "health_url": health_url,
         "execute_url": execute_url,
-        "authentication": "bearer",
+        "authentication": authentication,
         "credential_env": credential_env,
         "authenticated_health_url": authenticated_health_url or health_url,
         "authenticated_health_credential_env": (
             authenticated_health_credential_env or credential_env
         ),
-        "start_argv": (
-            "pwsh", "-NoProfile", "-File", command_script, start_action,
-        ),
-        "restart_argv": (
-            "pwsh", "-NoProfile", "-File", command_script, restart_action,
-        ),
+        "authenticated_health_header": authenticated_health_header,
+        "start_argv": (*prefix, "start"),
+        "stop_argv": (*prefix, "stop"),
+        "restart_argv": (*prefix, "restart"),
     }
 
 

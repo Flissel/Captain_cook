@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -8,6 +9,7 @@ from gateway.capability_assembly_bootstrap import (
     CapabilityAssemblyBootstrapConfigurationError,
     load_capability_production_bundle_manifest,
 )
+from gateway.capability_process_operator import operate, service_argv
 
 
 def _environment() -> dict[str, str]:
@@ -61,18 +63,84 @@ def test_operator_manifest_is_digest_bound_and_contains_real_process_contracts()
         "/api/v1/projection-assemblies/{assembly_id}/evidence"
     )
     assert manifest.n8n.credential_env == "CAPTAIN_N8N_API_KEY"
+    assert manifest.n8n.authenticated_health_url.endswith(
+        "/api/v1/workflows?limit=1"
+    )
+    assert manifest.n8n.authenticated_health_header == "X-N8N-API-KEY"
+    assert manifest.n8n.authentication == "x-n8n-api-key"
+    assert all(
+        binding.authenticated_health_header == "Authorization"
+        for binding in (
+            manifest.gateway, manifest.runtime, manifest.provider_proxy,
+            manifest.benchmark, manifest.minibook,
+        )
+    )
     for binding in (
         manifest.gateway, manifest.provider_proxy, manifest.runtime,
         manifest.benchmark, manifest.minibook, manifest.n8n,
     ):
         assert binding.start_argv
+        assert binding.stop_argv
         assert binding.restart_argv
+        assert binding.start_argv[-1] == "start"
+        assert binding.stop_argv[-1] == "stop"
+        assert binding.restart_argv[-1] == "restart"
+        assert binding.start_argv[:-1] == binding.stop_argv[:-1]
+        assert binding.start_argv[:-1] == binding.restart_argv[:-1]
     assert len(manifest.manifest_sha256) == 64
     assert manifest.manifest_sha256 == load_capability_production_bundle_manifest(
         environment=environment
     ).manifest_sha256
     rendered = json.dumps(manifest.model_dump(mode="json"), sort_keys=True)
     assert all(value not in rendered for name, value in environment.items() if "TOKEN" in name or "KEY" in name)
+
+
+def test_operator_executes_all_six_semantic_lifecycles_with_new_restart_identity(
+    tmp_path: Path,
+) -> None:
+    environment = {
+        **_environment(),
+        "CAPTAIN_PROCESS_OPERATOR_BACKEND": "sentinel",
+        "CAPTAIN_PROCESS_STATE_ROOT": "state",
+        "CAPTAIN_PROVIDER_PRICE_CARD_PATH": "contracts/price.json",
+        "CAPTAIN_PROVIDER_POLICY_PATH": "contracts/policy.json",
+        "CAPTAIN_PROVIDER_STATE_ROOT": "state/provider",
+    }
+    expected_modules = {
+        "gateway": "gateway.app",
+        "runtime": "agenten.agent_runtime.runtime_entrypoint",
+        "provider_proxy": "agenten.provider_proxy.entrypoint",
+        "benchmark": "gateway.capability_benchmark_process_app",
+        "minibook": "minibook.src.main",
+    }
+    for service in (
+        "gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n"
+    ):
+        command = service_argv(
+            service, environment=environment, repository_root=tmp_path
+        )
+        if service == "n8n":
+            assert command[-2:] == (
+                str((tmp_path / "scripts" / "captain-n8n.ps1").resolve()), "start"
+            )
+        else:
+            assert command[1:3] == ("-m", expected_modules[service])
+        started = operate(
+            service, "start", environment=environment, repository_root=tmp_path
+        )
+        replayed = operate(
+            service, "start", environment=environment, repository_root=tmp_path
+        )
+        restarted = operate(
+            service, "restart", environment=environment, repository_root=tmp_path
+        )
+        stopped = operate(
+            service, "stop", environment=environment, repository_root=tmp_path
+        )
+        assert replayed["process_identity"] == started["process_identity"]
+        assert restarted["process_identity"] != started["process_identity"]
+        assert restarted["operation"] == "restart"
+        assert stopped["status"] == "stopped"
 
 
 def test_operator_manifest_fails_closed_before_probe_on_missing_or_reused_credentials() -> None:
