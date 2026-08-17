@@ -50,7 +50,9 @@ from gateway.capability_assembly_contracts import (
     CapabilityAssemblyFactoryPort,
     CapabilityAssemblyInputAdmissionPort,
     CapabilityAssemblyProjectionPort,
+    CapabilityAssemblyReconciliationOutcome,
     CapabilityAssemblyReconciliationPort,
+    CapabilityAssemblyReconciliationRequest,
     CapabilityAssemblyRepositoryPort,
     CapabilityAssemblyStageRequest,
 )
@@ -631,6 +633,122 @@ class GatewayGenericCapabilityExecutionAdapter(
             )
 
 
+class _EffectReceiptRecorderPort(Protocol):
+    def record_effect(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> None: ...
+
+
+def _persist_effect_receipt(
+    recorder: _EffectReceiptRecorderPort,
+    request: CapabilityAssemblyStageRequest,
+    *,
+    authority_field: str,
+    authority: object,
+) -> object:
+    scope = request.effect_receipt_scope
+    if scope is None or authority is None:
+        raise CapabilityLiveAuthorityUnavailable(
+            "effect receipt scope or authority is unavailable"
+        )
+    reconciliation = CapabilityAssemblyReconciliationRequest.model_validate(
+        scope.model_dump(mode="python")
+    )
+    outcome = CapabilityAssemblyReconciliationOutcome(
+        assembly_id=reconciliation.assembly_id,
+        operation_id=reconciliation.operation_id,
+        request_sha256=reconciliation.request_sha256,
+        started_slice=reconciliation.started_slice,
+        started_checkpoint_ref=reconciliation.started_checkpoint_ref,
+        disposition="terminal_readback",
+        **{authority_field: authority},
+    )
+    recorder.record_effect(reconciliation, outcome)
+    return authority
+
+
+class EffectReceiptBoundFactoryAdapter:
+    def __init__(self, delegate: CapabilityAssemblyFactoryPort,
+                 recorder: _EffectReceiptRecorderPort) -> None:
+        self._delegate = delegate
+        self._recorder = recorder
+
+    async def scaffold(self, request: CapabilityAssemblyStageRequest):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="factory_authority",
+            authority=await self._delegate.scaffold(request),
+        )
+
+    async def implement(self, request: CapabilityAssemblyStageRequest):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="factory_authority",
+            authority=await self._delegate.implement(request),
+        )
+
+    async def seal(self, request: CapabilityAssemblyStageRequest):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="factory_authority",
+            authority=await self._delegate.seal(request),
+        )
+
+    async def promote(self, request: CapabilityAssemblyStageRequest):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="factory_authority",
+            authority=await self._delegate.promote(request),
+        )
+
+    async def released(self, request: CapabilityAssemblyStageRequest):
+        return await self._delegate.released(request)
+
+
+class EffectReceiptBoundBenchmarkAdapter:
+    def __init__(self, delegate: CapabilityAssemblyBusinessBenchmarkPort,
+                 recorder: _EffectReceiptRecorderPort) -> None:
+        self._delegate = delegate
+        self._recorder = recorder
+
+    async def evaluate(self, request: CapabilityAssemblyStageRequest):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="benchmark_authority",
+            authority=await self._delegate.evaluate(request),
+        )
+
+
+class EffectReceiptBoundExecutionAdapter:
+    def __init__(self, delegate: CapabilityAssemblyExecutionPort,
+                 recorder: _EffectReceiptRecorderPort) -> None:
+        self._delegate = delegate
+        self._recorder = recorder
+
+    async def execute(self, request: CapabilityAssemblyStageRequest,
+                      release: CapabilityFactoryAuthority):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="execution_authority",
+            authority=await self._delegate.execute(request, release),
+        )
+
+
+class EffectReceiptBoundProjectionAdapter:
+    def __init__(self, delegate: CapabilityAssemblyProjectionPort,
+                 recorder: _EffectReceiptRecorderPort) -> None:
+        self._delegate = delegate
+        self._recorder = recorder
+
+    async def project_and_readback(
+        self, request: CapabilityAssemblyStageRequest,
+        release: CapabilityFactoryAuthority,
+        execution: CapabilityExecutionAuthority,
+    ):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="projection_authority",
+            authority=await self._delegate.project_and_readback(
+                request, release, execution
+            ),
+        )
+
+
 @dataclass(frozen=True, repr=False)
 class CapabilityAssemblyProductionSettings:
     expected_repository_revision: str
@@ -1050,7 +1168,7 @@ def _compose_nonproduction_capability_assembly_controller(
     resume = GatewayCapabilityResumeExecutionAdapter(
         gateway=cast(CapabilityResumeGatewayPort, _SanitizedResumeGateway(resume_gateway))
     )
-    factory: CapabilityAssemblyFactoryPort = CapabilityAssemblyCurrentFactoryAdapter(
+    factory_delegate: CapabilityAssemblyFactoryPort = CapabilityAssemblyCurrentFactoryAdapter(
         composition=factory_composition,
         provisioning=provisioning,
         clock=clock,
@@ -1058,15 +1176,15 @@ def _compose_nonproduction_capability_assembly_controller(
         n8n_work_batches=n8n_work_batches,
         promotion=promotion,
     )
-    benchmark: CapabilityAssemblyBusinessBenchmarkPort = GenericCapabilityBenchmarkAdapter(
-        bindings=factory,
+    benchmark_delegate: CapabilityAssemblyBusinessBenchmarkPort = GenericCapabilityBenchmarkAdapter(
+        bindings=factory_delegate,
         executor=benchmark_executor,
         evidence=benchmark_evidence,
         tool_authority=benchmark_tool_authority,
         recorder=benchmark_recorder,
         private_cases=private_cases,
     )
-    execution: CapabilityAssemblyExecutionPort = (
+    execution_delegate: CapabilityAssemblyExecutionPort = (
         GatewayGenericCapabilityExecutionAdapter(
             gateway_store=gateway_store,
             composition=factory_composition,
@@ -1078,9 +1196,28 @@ def _compose_nonproduction_capability_assembly_controller(
             resume_execution=resume,
         )
     )
-    projection: CapabilityAssemblyProjectionPort = (
+    projection_delegate: CapabilityAssemblyProjectionPort = (
         GenericGatewayMinibookCapabilityProjectionAdapter(effects=minibook_effects)
     )
+    if gateway_store is not None:
+        receipt_recorder = cast(_EffectReceiptRecorderPort, reconciliation)
+        factory: CapabilityAssemblyFactoryPort = EffectReceiptBoundFactoryAdapter(
+            factory_delegate, receipt_recorder
+        )
+        benchmark: CapabilityAssemblyBusinessBenchmarkPort = (
+            EffectReceiptBoundBenchmarkAdapter(benchmark_delegate, receipt_recorder)
+        )
+        execution: CapabilityAssemblyExecutionPort = EffectReceiptBoundExecutionAdapter(
+            execution_delegate, receipt_recorder
+        )
+        projection: CapabilityAssemblyProjectionPort = EffectReceiptBoundProjectionAdapter(
+            projection_delegate, receipt_recorder
+        )
+    else:
+        factory = factory_delegate
+        benchmark = benchmark_delegate
+        execution = execution_delegate
+        projection = projection_delegate
     return CapabilityAssemblyController(
         repository=repository,
         admission=admission,
@@ -1389,6 +1526,11 @@ def _preflight_composition(
                 "resume_gateway.readback_resume",
             ),
             (reconciliation, "reconcile", True, 1, "reconciliation.reconcile"),
+            *(
+                ((reconciliation, "record_effect", False, 2, "reconciliation.record_effect"),)
+                if require_isolated_executor
+                else ()
+            ),
             (minibook_effects, "project_and_ack", True, 1),
             (minibook_effects, "readback", True, 1),
             (

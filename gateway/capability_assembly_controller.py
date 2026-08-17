@@ -33,6 +33,7 @@ from gateway.capability_assembly_contracts import (
     CapabilityAssemblyBusinessBenchmarkPort,
     CapabilityAssemblyCheckpoint,
     CapabilityAssemblyExecutionPort,
+    CapabilityAssemblyEffectReceiptScope,
     CapabilityAssemblyFactoryPort,
     CapabilityAssemblyAdmittedInput,
     CapabilityAssemblyCanonicalInput,
@@ -684,6 +685,7 @@ class CapabilityAssemblyController:
             suite_ref=self._suite_ref(item),
             hermes_result_ref=self._hermes_ref(item),
             retry_number=0,
+            effect_receipt_scope=self._effect_receipt_scope(current),
         )
         changes: dict[str, object] = {
             "completed_stages": (*item.completed_stages, stage),
@@ -1678,8 +1680,8 @@ class CapabilityAssemblyController:
             checkpoint_refs=(),
         )
 
-    @staticmethod
     def _stage_request(
+        self,
         current: CapabilityAssemblyCheckpoint,
         item: CapabilityAssemblyItemState,
         stage: CapabilityLiveStage,
@@ -1694,6 +1696,25 @@ class CapabilityAssemblyController:
             suite_ref=CapabilityAssemblyController._suite_ref(item),
             hermes_result_ref=CapabilityAssemblyController._hermes_ref(item),
             retry_number=0,
+            effect_receipt_scope=self._effect_receipt_scope(current),
+        )
+
+    def _effect_receipt_scope(
+        self, current: CapabilityAssemblyCheckpoint
+    ) -> CapabilityAssemblyEffectReceiptScope:
+        active = current.active_advance
+        started = current.started_slice
+        if active is None or started is None:
+            raise CapabilityAssemblyConflict("effect receipt lacks a started slice")
+        record = self._history(current.assembly_id)[-1]
+        if record.checkpoint != current:
+            raise CapabilityAssemblyConflict("effect receipt checkpoint changed")
+        return CapabilityAssemblyEffectReceiptScope(
+            assembly_id=current.assembly_id,
+            operation_id=active.operation_id,
+            request_sha256=current.request_sha256,
+            started_slice=started,
+            started_checkpoint_ref=record.artifact_ref,
         )
 
 

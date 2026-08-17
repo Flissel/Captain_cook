@@ -55,6 +55,10 @@ from gateway.capability_assembly_production import (
     AsyncMinibookProjectorAdapter,
     CapabilityAssemblyProductionAuthorities,
     CapabilityAssemblyCurrentFactoryAdapter,
+    EffectReceiptBoundBenchmarkAdapter,
+    EffectReceiptBoundExecutionAdapter,
+    EffectReceiptBoundFactoryAdapter,
+    EffectReceiptBoundProjectionAdapter,
     CapabilityAssemblyProductionConfigurationError,
     CapabilityAssemblyProductionSettings,
     GatewayMinibookProjectionEffectsAdapter,
@@ -587,6 +591,9 @@ class _Reconciliation:
         del request
         return None
 
+    def record_effect(self, request: object, outcome: object) -> None:
+        del request, outcome
+
 
 class _InvalidResumeGateway(_ResumeGateway):
     def authorize_resume(self, request: object) -> object | None:
@@ -997,10 +1004,18 @@ def test_production_builder_uses_gateway_repository_and_current_authority_adapte
     controller = require_production_capability_assembly(composition)
     assert type(controller) is CapabilityAssemblyController
     assert isinstance(controller._repository, GatewayCapabilityAssemblyRepository)
-    assert isinstance(controller._factory, CurrentCapabilityFactoryAdapter)
+    assert type(controller._factory) is EffectReceiptBoundFactoryAdapter
+    assert isinstance(controller._factory._delegate, CurrentCapabilityFactoryAdapter)
+    assert type(controller._benchmark) is EffectReceiptBoundBenchmarkAdapter
     assert isinstance(controller._resume, GatewayCapabilityResumeExecutionAdapter)
-    assert type(controller._execution) is GatewayGenericCapabilityExecutionAdapter
-    assert len(store.storage.statements) == 4
+    assert type(controller._execution) is EffectReceiptBoundExecutionAdapter
+    assert type(controller._execution._delegate) is GatewayGenericCapabilityExecutionAdapter
+    assert type(controller._projection) is EffectReceiptBoundProjectionAdapter
+    assert len(store.storage.statements) == 5
+    assert any(
+        "capability_assembly_effect_receipts" in statement
+        for statement in store.storage.statements
+    )
     with pytest.raises(AttributeError, match="immutable"):
         authorities.benchmark_executor._transport = object()  # type: ignore[attr-defined]
     with pytest.raises(

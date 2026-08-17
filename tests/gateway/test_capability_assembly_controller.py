@@ -47,6 +47,12 @@ from gateway.capability_assembly_controller import (
     CapabilityAssemblyController,
     CapabilityAssemblyIncomplete,
 )
+from gateway.capability_assembly_production import (
+    EffectReceiptBoundBenchmarkAdapter,
+    EffectReceiptBoundExecutionAdapter,
+    EffectReceiptBoundFactoryAdapter,
+    EffectReceiptBoundProjectionAdapter,
+)
 from gateway.capability_assembly_admission import (
     RepositoryCapabilityAssemblyInputAdmission,
 )
@@ -494,6 +500,13 @@ class _TerminalJournalReconciliation(_Reconciliation):
         if existing is not None and existing != outcome:
             raise CapabilityAssemblyWriteConflict("terminal authority conflict")
         self.terminal[key] = outcome
+
+    def record_effect(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> None:
+        self.record_terminal(request, outcome)
 
     async def reconcile(self, request: CapabilityAssemblyReconciliationRequest):
         self.calls.append(request)
@@ -1290,6 +1303,62 @@ def test_every_effectful_input_slice_reconciles_without_duplicate_after_checkpoi
 
     assert receipt.executed_slices == 1
     assert len(original_port.calls) == original_effect_count
+    assert restarted_parts[port_index].calls == []
+    assert restarted_parts[0].projection(ASSEMBLY_ID).items[0].completed_stages[-1] is stage
+
+
+@pytest.mark.parametrize(
+    ("ordinal", "stage", "port_index"),
+    (
+        (0, CapabilityLiveStage.SCAFFOLD_AND_TEST_HARNESS, 3),
+        (1, CapabilityLiveStage.CODEX_IMPLEMENTATION, 3),
+        (2, CapabilityLiveStage.SEAL, 3),
+        (3, CapabilityLiveStage.EVALUATE, 4),
+        (4, CapabilityLiveStage.PROMOTE, 3),
+        (5, CapabilityLiveStage.EXECUTE, 5),
+        (6, CapabilityLiveStage.PROJECT, 6),
+    ),
+)
+def test_adapter_receipt_survives_crash_before_controller_append_slice(
+    ordinal: int,
+    stage: CapabilityLiveStage,
+    port_index: int,
+) -> None:
+    reconciliation = _TerminalJournalReconciliation()
+    parts = _controller(reconciliation=reconciliation)
+    controller, repo = parts[0], parts[1]
+    controller.submit(_submission())
+    if ordinal:
+        _advance(
+            controller,
+            operation=f"adapter-crash-prior-{ordinal}",
+            maximum_slices=ordinal,
+        )
+    controller._factory = EffectReceiptBoundFactoryAdapter(parts[3], reconciliation)
+    controller._benchmark = EffectReceiptBoundBenchmarkAdapter(parts[4], reconciliation)
+    controller._execution = EffectReceiptBoundExecutionAdapter(parts[5], reconciliation)
+    controller._projection = EffectReceiptBoundProjectionAdapter(parts[6], reconciliation)
+    request = CapabilityAssemblyAdvanceRequest(
+        assembly_id=ASSEMBLY_ID,
+        operation_id=_id(f"adapter-crash-{ordinal}"),
+        request_sha256=controller.projection(ASSEMBLY_ID).request_sha256,
+        maximum_slices=1,
+    )
+
+    def crash_before_append(*_args: object, **_kwargs: object):
+        raise RuntimeError("crash before controller append")
+
+    controller._append_slice = crash_before_append  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="before controller append"):
+        asyncio.run(controller.advance(request))
+    original_effect_count = len(parts[port_index].calls)
+    assert len(reconciliation.terminal) == ordinal + 1
+
+    restarted_parts = _controller(repo, reconciliation=reconciliation)
+    receipt = asyncio.run(restarted_parts[0].advance(request))
+
+    assert receipt.executed_slices == 1
+    assert len(parts[port_index].calls) == original_effect_count
     assert restarted_parts[port_index].calls == []
     assert restarted_parts[0].projection(ASSEMBLY_ID).items[0].completed_stages[-1] is stage
 

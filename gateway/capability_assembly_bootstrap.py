@@ -1170,12 +1170,23 @@ class GatewayCapabilityReconciliation:
             self.gateway_store
         ).record_terminal_readback(request, outcome)
 
+    def record_effect(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> None:
+        repository = GatewayCapabilityAssemblyRepository(self.gateway_store)
+        repository.record_effect_receipt(request, outcome)
+        if repository.effect_receipt(request) != outcome:
+            raise CapabilityLiveAuthorityUnavailable(
+                "effect receipt readback changed before adapter return"
+            )
+
     async def reconcile(
         self, request: CapabilityAssemblyReconciliationRequest
     ) -> CapabilityAssemblyReconciliationOutcome | None:
-        return GatewayCapabilityAssemblyRepository(
-            self.gateway_store
-        ).terminal_readback(request)
+        repository = GatewayCapabilityAssemblyRepository(self.gateway_store)
+        return repository.effect_receipt(request) or repository.terminal_readback(request)
 
 
 class StoreBoundGatewayCapabilityResumeClient(GatewayCapabilityResumeClient):

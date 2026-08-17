@@ -214,6 +214,16 @@ class CapabilityAssemblyAdmittedInput(_FrozenContract):
         return CapabilityAssemblyInputRequest.require_repository_relative_input(value)
 
 
+class CapabilityAssemblyEffectReceiptScope(_FrozenContract):
+    """Durably started slice identity handed to an effect adapter."""
+
+    assembly_id: UUID
+    operation_id: UUID
+    request_sha256: str = Field(pattern=SHA256_PATTERN)
+    started_slice: CapabilityAssemblySlice
+    started_checkpoint_ref: ArtifactRef
+
+
 class CapabilityAssemblyStageRequest(_FrozenContract):
     """One compiler-bound assembly stage request, separate from the legacy demo."""
 
@@ -226,6 +236,7 @@ class CapabilityAssemblyStageRequest(_FrozenContract):
     suite_ref: ArtifactRef | None = None
     hermes_result_ref: ArtifactRef | None = None
     retry_number: int = Field(default=0, ge=0, le=5, strict=True)
+    effect_receipt_scope: CapabilityAssemblyEffectReceiptScope | None = None
 
     @model_validator(mode="after")
     def require_plan_binding(self) -> "CapabilityAssemblyStageRequest":

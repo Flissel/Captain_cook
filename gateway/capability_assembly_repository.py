@@ -100,6 +100,44 @@ class GatewayCapabilityAssemblyRepository:
                     ) ENGINE=InnoDB
                     """
                 )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_assembly_effect_receipts (
+                        assembly_id CHAR(36) NOT NULL,
+                        operation_id CHAR(36) NOT NULL,
+                        request_sha256 CHAR(64) NOT NULL,
+                        slice_ordinal INT NOT NULL,
+                        started_checkpoint_sha256 CHAR(64) NOT NULL,
+                        outcome_sha256 CHAR(64) NOT NULL,
+                        outcome_payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                        PRIMARY KEY (
+                            assembly_id, operation_id, request_sha256,
+                            slice_ordinal, started_checkpoint_sha256
+                        )
+                    ) ENGINE=InnoDB
+                    """
+                )
+
+    def record_effect_receipt(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> None:
+        """Persist an adapter-owned receipt before control returns to the controller."""
+
+        self._record_readback(
+            "capability_assembly_effect_receipts", request, outcome,
+            conflict="effect receipt authority conflicts",
+        )
+
+    def effect_receipt(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+    ) -> CapabilityAssemblyReconciliationOutcome | None:
+        return self._readback(
+            "capability_assembly_effect_receipts", request
+        )
 
     def record_terminal_readback(
         self,
@@ -108,6 +146,19 @@ class GatewayCapabilityAssemblyRepository:
     ) -> None:
         """Append one exact typed result after effect validation, before checkpointing."""
 
+        self._record_readback(
+            "capability_assembly_terminal_readbacks", request, outcome,
+            conflict="terminal reconciliation authority conflicts",
+        )
+
+    def _record_readback(
+        self,
+        table: str,
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+        *,
+        conflict: str,
+    ) -> None:
         self._require_reconciliation_binding(request, outcome)
         payload = canonical_assembly_model_bytes(outcome)
         digest = hashlib.sha256(payload).hexdigest()
@@ -115,9 +166,9 @@ class GatewayCapabilityAssemblyRepository:
         with self._store.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     SELECT outcome_sha256, outcome_payload
-                    FROM capability_assembly_terminal_readbacks
+                    FROM {table}
                     WHERE assembly_id = %s AND operation_id = %s
                       AND request_sha256 = %s AND slice_ordinal = %s
                       AND started_checkpoint_sha256 = %s
@@ -130,12 +181,10 @@ class GatewayCapabilityAssemblyRepository:
                     observed = self._reconciliation_from_row(existing)
                     if observed == outcome and existing["outcome_sha256"] == digest:
                         return
-                    raise CapabilityAssemblyWriteConflict(
-                        "terminal reconciliation authority conflicts"
-                    )
+                    raise CapabilityAssemblyWriteConflict(conflict)
                 cursor.execute(
-                    """
-                    INSERT INTO capability_assembly_terminal_readbacks
+                    f"""
+                    INSERT INTO {table}
                         (assembly_id, operation_id, request_sha256, slice_ordinal,
                          started_checkpoint_sha256, outcome_sha256, outcome_payload)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -147,12 +196,19 @@ class GatewayCapabilityAssemblyRepository:
         self,
         request: CapabilityAssemblyReconciliationRequest,
     ) -> CapabilityAssemblyReconciliationOutcome | None:
+        return self._readback("capability_assembly_terminal_readbacks", request)
+
+    def _readback(
+        self,
+        table: str,
+        request: CapabilityAssemblyReconciliationRequest,
+    ) -> CapabilityAssemblyReconciliationOutcome | None:
         with self._store.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     SELECT outcome_sha256, outcome_payload
-                    FROM capability_assembly_terminal_readbacks
+                    FROM {table}
                     WHERE assembly_id = %s AND operation_id = %s
                       AND request_sha256 = %s AND slice_ordinal = %s
                       AND started_checkpoint_sha256 = %s
