@@ -127,3 +127,22 @@ MariaDB integration, Minibook sink, scheduler, provider, or deployment run.
 `TEST_MARIADB_DSN` remained unset; MariaDB-gated tests were skipped. The
 round-trip parser and SQL-shape tests are offline evidence only and do not
 claim a live MariaDB or external credential-adapter run.
+
+## Revoke recovery ordering round 3
+
+### Delivered decision
+
+- Startup reconciliation validates a typed receipt but gives an existing
+  `revoke_pending` decision precedence over every complete/link path. It
+  invokes cleanup by reservation key/reference; a revoke failure remains
+  durable and is retried on the next restart.
+
+### RED to GREEN evidence
+
+- RED: `python -m pytest --no-cov tests/gateway/test_factory_action_store.py -q -k unexpired_revoke_pending_restart`
+  -> `1 failed, 85 deselected`; the unexpired reaper linked the receipt without
+  issuing a revoke.
+- GREEN: same command -> `1 passed, 85 deselected`.
+- Focused Task 7: `python -m pytest --no-cov tests/gateway/test_factory_action_store.py tests/gateway/test_portal_api.py tests/agent_factory/test_action_resume.py -q`
+  -> `117 passed, 7 skipped`.
+- `python -m compileall -q gateway` and `git diff --check` -> passed.

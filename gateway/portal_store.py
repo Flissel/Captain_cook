@@ -253,6 +253,32 @@ class FactoryCredentialCoordinator:
                 # Preserve ambiguous reservations until the adapter can make an
                 # authoritative lookup; deleting the key could duplicate a write.
                 continue
+            if pending_revoke:
+                # Validate the typed receipt for audit/binding purposes, but a
+                # previously committed revoke decision is terminal: it can only
+                # clean up, never complete or link a credential on restart.
+                try:
+                    self._validate_receipt(
+                        receipt,
+                        reservation_key=reservation_key,
+                        tenant_id=tenant_id,
+                        request_id=request_id,
+                        expected_subject_version=version,
+                        purpose=purpose,
+                    )
+                except Exception:
+                    pass
+                try:
+                    self._revoke_pending(
+                        request_id=request_id, tenant_id=tenant_id,
+                        reservation_key=reservation_key,
+                        credential_ref=receipt.opaque_reference,
+                    )
+                except Exception:
+                    # Do not retry in the same startup pass: durable state
+                    # records the failure for the next reconciliation.
+                    continue
+                continue
             try:
                 self._validate_receipt(
                     receipt,

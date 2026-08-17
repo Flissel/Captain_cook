@@ -1241,6 +1241,60 @@ def test_credential_revoke_pending_survives_restart_until_revoke_succeeds() -> N
     assert durable.credential_revoke_phase is None
 
 
+def test_unexpired_revoke_pending_restart_never_links_typed_receipt() -> None:
+    repository = TransactionalMemoryActionRepository()
+    store = FactoryActionStore(repository=repository)
+    request = pending_request()
+    store.create(request, tenant_id="tenant-a")
+    key = store.reserve_credential(
+        request.request_id, tenant_id="tenant-a",
+        expected_subject_version=request.expected_subject_version,
+        credential_alias="n8n-crm-read", now=NOW,
+    )
+    store.mark_credential_revoke_pending(
+        request.request_id, tenant_id="tenant-a", reservation_key=key, now=NOW
+    )
+    reference = "credential://tenant-a/n8n-crm-read"
+    receipt = FactoryCredentialReceipt(
+        key, "tenant-a", request.request_id, request.expected_subject_version,
+        "n8n-crm-read", reference, hashlib.sha256(reference.encode()).hexdigest(),
+    )
+
+    class FlakyAdapter:
+        attempts = 0
+
+        def lookup_credential(self, reservation_key):
+            assert reservation_key == key
+            return receipt
+
+        def store_credential(self, **kwargs):
+            raise AssertionError(f"recovery must not write: {kwargs!r}")
+
+        def revoke_credential(self, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("temporary revoke failure")
+
+    adapter = FlakyAdapter()
+    FactoryCredentialCoordinator(
+        store=store, adapter=adapter, clock=lambda: NOW
+    ).recover()
+    durable = repository.rows[str(request.request_id)]
+    assert adapter.attempts == 1
+    assert durable.credential_ref is None
+    assert durable.credential_revoke_phase == "revoke_pending"
+
+    FactoryCredentialCoordinator(
+        store=FactoryActionStore(repository=repository), adapter=adapter,
+        clock=lambda: NOW,
+    ).recover()
+    durable = repository.rows[str(request.request_id)]
+    assert adapter.attempts == 2
+    assert durable.credential_ref is None
+    assert durable.credential_reservation_key is None
+    assert durable.credential_revoke_phase is None
+
+
 def test_blocked_credential_write_that_crosses_deadline_is_revoked_and_not_persisted() -> None:
     repository = TransactionalMemoryActionRepository()
     store = FactoryActionStore(repository=repository)
