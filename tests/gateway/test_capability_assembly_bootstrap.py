@@ -4,8 +4,11 @@ import ast
 import hashlib
 import json
 import subprocess
+import importlib.machinery
+import importlib.util
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from decimal import Decimal
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
@@ -1053,6 +1056,28 @@ def test_verified_closure_rejects_same_origin_non_module_substitution(
     monkeypatch.setitem(sys.modules, "captain_test_closure", fake)
     finder = bootstrap._VerifiedFactoryClosureFinder({
         "captain_test_closure": (expected, expected.read_bytes())
+    })
+
+    with pytest.raises(ValueError, match="preloaded Factory closure module"):
+        finder.require_preloaded_origins()
+
+
+def test_verified_closure_rejects_same_origin_code_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gateway.capability_assembly_bootstrap as bootstrap
+
+    expected = tmp_path / "expected.py"
+    expected.write_text("def authority():\n    return 'verified'\n", encoding="utf-8")
+    fake = ModuleType("captain_test_closure")
+    fake.__file__ = str(expected)
+    fake.__spec__ = importlib.util.spec_from_loader(
+        fake.__name__, importlib.machinery.SourceFileLoader(fake.__name__, str(expected)),
+    )
+    exec("def authority():\n    return 'attacker'\n", fake.__dict__)
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    finder = bootstrap._VerifiedFactoryClosureFinder({
+        fake.__name__: (expected, expected.read_bytes())
     })
 
     with pytest.raises(ValueError, match="preloaded Factory closure module"):

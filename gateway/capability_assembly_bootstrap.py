@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import importlib.abc
 import importlib.util
 import json
+import marshal
 import re
 import secrets
 import sys
@@ -20,7 +22,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from types import ModuleType
+from types import CodeType, ModuleType
 from threading import Lock
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -1566,7 +1568,7 @@ class _VerifiedFactoryClosureFinder(importlib.abc.MetaPathFinder):
         )
 
     def require_preloaded_origins(self) -> None:
-        for name, (path, _content) in self._modules.items():
+        for name, (path, content) in self._modules.items():
             existing = sys.modules.get(name)
             if existing is None:
                 continue
@@ -1579,6 +1581,59 @@ class _VerifiedFactoryClosureFinder(importlib.abc.MetaPathFinder):
                 matches = False
             if not matches:
                 raise ValueError("preloaded Factory closure module is invalid")
+            if not _preloaded_module_matches_verified_code(existing, path, content):
+                raise ValueError("preloaded Factory closure module is invalid")
+
+
+def _preloaded_module_matches_verified_code(
+    module: ModuleType, path: Path, content: bytes,
+) -> bool:
+    """Fingerprint every source-declared function retained by a loaded module."""
+
+    try:
+        syntax = ast.parse(content, filename=str(path))
+        compiled = compile(content, str(path), "exec", dont_inherit=True)
+    except (SyntaxError, ValueError, TypeError):
+        return False
+
+    expected: dict[str, CodeType] = {}
+
+    def collect_codes(code: CodeType) -> None:
+        for value in code.co_consts:
+            if isinstance(value, CodeType):
+                expected[value.co_qualname] = value
+                collect_codes(value)
+
+    collect_codes(compiled)
+    declared: list[str] = []
+
+    def collect_declarations(nodes: list[ast.stmt], prefix: str = "") -> None:
+        for node in nodes:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                declared.append(prefix + node.name)
+            elif isinstance(node, ast.ClassDef):
+                collect_declarations(node.body, prefix + node.name + ".")
+
+    collect_declarations(syntax.body)
+    for qualname in declared:
+        expected_code = expected.get(qualname)
+        if expected_code is None:
+            return False
+        value: object = module
+        try:
+            for component in qualname.split("."):
+                value = getattr(value, component)
+            value = inspect.unwrap(value)
+            if inspect.ismethod(value):
+                value = value.__func__
+            actual_code = getattr(value, "__code__", None)
+        except (AttributeError, ValueError):
+            return False
+        if not isinstance(actual_code, CodeType):
+            return False
+        if marshal.dumps(actual_code) != marshal.dumps(expected_code):
+            return False
+    return True
 
 
 def plan_capability_assembly_factory_runtime_from_environment(
