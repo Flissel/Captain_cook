@@ -72,21 +72,31 @@ def check_duplicate(
     pending_descriptions: List[Tuple[str, str]],
 ) -> Optional[ValidationFailure]:
     """Cheap duplicate check: exact match (after normalization) against other
-    subproblems currently pending under the same root problem.
+    subproblems accepted at any point under the same root problem — not just
+    ones currently pending in VALIDATING.
 
     `pending_descriptions` is a list of (root_problem_id, description) pairs
-    gathered by the caller from the ledger's VALIDATING-stage blocks plus any
-    verdicts the gate has issued that the ledger has not persisted yet — kept
-    as a plain argument here so this function stays a pure, dependency-free
-    string comparison that's trivial to unit test. Duplicate pairs are
-    harmless; the first match wins.
+    gathered by the caller from the ledger's VALIDATING-stage blocks plus the
+    gate's own in-flight memory of verdicts the ledger has not persisted yet
+    (`ConstitutionGatekeeper._accepted_in_flight`). That in-flight memory is
+    no longer pruned on ledger progress (see `IN_FLIGHT_MEMORY_LIMIT` in
+    gatekeeper.py) — it only shrinks via capacity-driven eviction, which does
+    not fire within one root problem's normal lifetime — so in practice this
+    check's scope is "accepted under this root problem, ever, within this
+    gate's memory", not merely "currently pending". Kept as a plain argument
+    here so this function stays a pure, dependency-free string comparison
+    that's trivial to unit test. Duplicate pairs are harmless; the first
+    match wins.
     """
     normalized = _normalize(description)
     for other_root_id, other_description in pending_descriptions:
         if other_root_id != root_problem_id:
             continue
         if _normalize(other_description) == normalized:
-            return ("duplicate", "an identical subproblem is already pending under this root problem")
+            return (
+                "duplicate",
+                "an identical subproblem was already accepted under this root problem",
+            )
     return None
 
 

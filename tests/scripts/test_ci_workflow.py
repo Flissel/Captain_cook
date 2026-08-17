@@ -106,6 +106,8 @@ def test_gate_e_is_manual_and_uses_the_isolated_local_live_runner() -> None:
     assert "actions/setup-python" not in uses
     commands = "\n".join(str(step.get("run", "")) for step in steps if isinstance(step, dict))
     assert "scripts/run-gate-e-ci.ps1" in commands
+    assert "requirements-dev.txt" in commands
+    assert "pytest-asyncio" not in commands
 
     runner = ROOT / "scripts" / "run-gate-e-ci.ps1"
     assert runner.is_file()

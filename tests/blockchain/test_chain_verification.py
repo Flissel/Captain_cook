@@ -56,8 +56,9 @@ def test_verify_chain_detects_a_broken_link():
 
     blocks[1].previous_hash = "0" * 64
 
-    with pytest.raises(ChainVerificationError):
+    with pytest.raises(ChainVerificationError) as error:
         verify_chain(blocks)
+    assert "index 1" in str(error.value)
 
 
 def test_status_is_outside_the_hash_by_design():
@@ -83,5 +84,6 @@ def test_status_is_outside_the_hash_by_design():
 
     blocks[1].data["batch_id"] = "b-2"
 
-    with pytest.raises(ChainVerificationError):
+    with pytest.raises(ChainVerificationError) as error:
         verify_chain(blocks)
+    assert "index 1" in str(error.value)
