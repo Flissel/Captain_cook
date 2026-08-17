@@ -380,8 +380,6 @@ _OPERATOR_REQUIRED_NAMES = (
     "MINIBOOK_BACKEND_URL",
     "MINIBOOK_API_KEY",
     "MINIBOOK_PROJECTION_API_KEY",
-    "CAPTAIN_N8N_URL",
-    "CAPTAIN_N8N_API_KEY",
 )
 
 
@@ -425,7 +423,11 @@ def load_capability_production_bundle_manifest(
     minibook = _allowed_service_url(raw["MINIBOOK_BACKEND_URL"], allowed_hosts=allowed_hosts, label="Minibook")
     provider = _allowed_service_url(raw["CAPTAIN_PROVIDER_PROXY_URL"], allowed_hosts=allowed_hosts, label="provider proxy")
     benchmark = _allowed_endpoint(raw["CAPTAIN_CAPABILITY_BENCHMARK_URL"], allowed_hosts=allowed_hosts, label="benchmark")
-    n8n = _allowed_service_url(raw["CAPTAIN_N8N_URL"], allowed_hosts=allowed_hosts, label="n8n")
+    n8n = _allowed_service_url(
+        environment.get("CAPTAIN_N8N_URL", "http://127.0.0.1:5679").strip(),
+        allowed_hosts=allowed_hosts,
+        label="n8n",
+    )
     if not benchmark.endswith("/v1/execute"):
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly operator endpoint contract is invalid"
