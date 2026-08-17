@@ -66,6 +66,7 @@ Commits, in required integration order:
 3. `bf5615f` — each of scaffold, implement, seal, evaluate, promote, execute, and project writes its durable authoritative effect receipt before returning; the fresh-controller crash matrix reconciles all seven without duplicate effects.
 4. `7bb163c` — shipped Gateway, isolated benchmark, and provider-proxy module entrypoints plus the real digest-verified `CapabilityAssemblyFactoryRuntime` constructor.
 5. `384ea25` — separate semantic start, stop, and restart operations for all six processes, with restart identity rotation and exact authenticated-health credential bindings.
+6. `f6e711c` — verify the kernel-owned executable/start identity before stopping a managed PID and preserve configured portal adapters in the shipped production app.
 
 Round-1 RED evidence:
 
@@ -81,6 +82,7 @@ Round-1 GREEN evidence:
 - P2 receipt/reconciliation gates: 60 controller plus 86 production/bootstrap passed; MariaDB 2 skipped because `TEST_MARIADB_DSN` was not configured.
 - P3 shipped-entrypoint gate: 33 passed; 16 Gateway-auth MariaDB-backed tests skipped in that focused selection.
 - P4 USD 6, final-evidence, immutable Minibook, API, and process-manifest gate: 128 passed.
+- Final managed-process identity and shipped portal-composition regression: 33 passed.
 - Fresh D1/D4-D8/D10-D12 neighboring and D11 gate: 572 passed, 2 skipped only because `TEST_MARIADB_DSN` was not configured, with one pre-existing Pydantic enum-serialization warning.
 - Fresh architecture/import/workstream gate: 19 passed. `compileall`, submission verification, full diff check, and diff-scoped credential-pattern scan (0 matches) passed.
 
