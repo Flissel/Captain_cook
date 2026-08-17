@@ -80,6 +80,11 @@ class ConstitutionGatekeeper:
     # verdict and the Recorder draining its queue — one decomposition batch.
     # A hard cap keeps a Recorder that never persists an acceptance from
     # turning a remembered verdict into a permanent ban on that description.
+    # 256 is generous headroom over what one batch can actually produce:
+    # DecompositionBudget.max_fanout_per_node defaults to 6 children per
+    # node (agenten/decomposition/budget.py), and even the root-problem
+    # lifetime total (max_total_subproblems, default 200) sits comfortably
+    # under this cap.
     IN_FLIGHT_MEMORY_LIMIT = 256
 
     def __init__(
@@ -185,7 +190,10 @@ class ConstitutionGatekeeper:
             subproblem_id=event.subproblem_id,
             block_index=None,
         )
-        if len(self._accepted_in_flight) >= self.IN_FLIGHT_MEMORY_LIMIT:
+        if (
+            event.subproblem_id not in self._accepted_in_flight
+            and len(self._accepted_in_flight) >= self.IN_FLIGHT_MEMORY_LIMIT
+        ):
             self._accepted_in_flight.pop(next(iter(self._accepted_in_flight)))
         self._accepted_in_flight[event.subproblem_id] = (
             event.meta.root_problem_id,

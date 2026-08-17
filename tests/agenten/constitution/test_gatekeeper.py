@@ -470,3 +470,36 @@ async def test_prune_does_not_query_the_ledger():
 
     # Only the single VALIDATING lookup per proposal, never a sweep of all stages.
     assert ledger.stage_queries - first == 1
+
+
+@pytest.mark.asyncio
+async def test_redelivery_of_an_already_accepted_subproblem_does_not_shrink_the_map():
+    """The event bus is at-least-once, not exactly-once: `handle_subproblem_proposed`
+    can run twice for the same `subproblem_id`. Re-accepting an id already present
+    in `_accepted_in_flight` must not count as growth — it is a same-size overwrite,
+    not an insert — so it must not trigger an eviction. Evicting anyway would drop
+    an unrelated, still-relevant entry and silently shrink the map below its limit.
+    """
+    bus, accepted, rejected = wire_bus()
+    gatekeeper = ConstitutionGatekeeper(
+        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery()
+    )
+
+    for index in range(gatekeeper.IN_FLIGHT_MEMORY_LIMIT):
+        await gatekeeper.handle_subproblem_proposed(
+            make_proposed(
+                subproblem_id=f"sp-{index}",
+                description=f"Prepare baking step number {index}.",
+            )
+        )
+    assert len(gatekeeper._accepted_in_flight) == gatekeeper.IN_FLIGHT_MEMORY_LIMIT
+    assert "sp-0" in gatekeeper._accepted_in_flight
+
+    # Redeliver an already-accepted, non-oldest subproblem — same id, same event.
+    await gatekeeper.handle_subproblem_proposed(
+        make_proposed(subproblem_id="sp-5", description="Prepare baking step number 5.")
+    )
+
+    assert len(gatekeeper._accepted_in_flight) == gatekeeper.IN_FLIGHT_MEMORY_LIMIT
+    assert "sp-0" in gatekeeper._accepted_in_flight
+    assert rejected.events == []
