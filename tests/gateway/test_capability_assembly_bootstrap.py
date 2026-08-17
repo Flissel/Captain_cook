@@ -190,6 +190,7 @@ def test_bootstrap_settings_reject_non_loopback_http_and_redact_secrets(
 
 
 def test_tool_evidence_authority_requires_three_gateway_bound_cas_documents() -> None:
+    job_id = uuid4()
     trace_id = uuid4()
     run_id = uuid4()
     policy = "a" * 64
@@ -245,6 +246,7 @@ def test_tool_evidence_authority_requires_three_gateway_bound_cas_documents() ->
     ).encode()
     refs = tuple(_ref(item) for item in (call_payload, lease_payload, receipt_payload))
     registry = {
+        "job_id": str(job_id),
         "tool_key": tool_key,
         "trace_id": str(trace_id),
         "run_id": str(run_id),
@@ -255,6 +257,9 @@ def test_tool_evidence_authority_requires_three_gateway_bound_cas_documents() ->
         "receipt_ref": refs[2].model_dump(mode="json"),
         "batch_id": "n8n-batch",
         "execution_result_id": str(uuid4()),
+        "correlation_id": str(uuid4()),
+        "operation": "read",
+        "result_ref_sha256": "c" * 64,
     }
     store = SimpleNamespace(
         capability_tool_evidence=lambda _digest: registry
@@ -269,6 +274,7 @@ def test_tool_evidence_authority_requires_three_gateway_bound_cas_documents() ->
         ),
     )
     request = BenchmarkToolEvidenceVerificationRequest(
+        job_id=job_id,
         case_ref=GenericPrivateCaseRef(
             case_id="case-a",
             category=GenericBenchmarkCategory.NORMAL,
@@ -294,6 +300,9 @@ def test_tool_evidence_authority_requires_three_gateway_bound_cas_documents() ->
 
 def test_gateway_tool_registry_persists_case_bound_entry() -> None:
     rows: dict[str, str] = {}
+    job_id, correlation_id, execution_result_id, command_id = (
+        uuid4(), uuid4(), uuid4(), uuid4(),
+    )
 
     class Cursor:
         result: dict[str, str] | None = None
@@ -311,6 +320,8 @@ def test_gateway_tool_registry_persists_case_bound_entry() -> None:
             if normalized.startswith("SELECT payload FROM capability_tool_evidence_registry"):
                 payload = rows.get(str(values[0]))
                 self.result = None if payload is None else {"payload": payload}
+            elif normalized.startswith("SELECT job_id, payload FROM capability_n8n_work_batches"):
+                self.result = {"job_id": str(job_id), "payload": "{}"}
             elif normalized.startswith("INSERT INTO capability_tool_evidence_registry"):
                 rows[str(values[0])] = str(values[1])
                 self.result = None
@@ -338,17 +349,36 @@ def test_gateway_tool_registry_persists_case_bound_entry() -> None:
 
         def _batch_row(self, cursor, batch_id, **kwargs):
             del cursor, kwargs
-            return {"data": {"batch_id": batch_id}}
+            return {"data": {
+                "batch_id": batch_id,
+                "constraints": [f"factory-job-id:{job_id}"],
+            }}
 
         def _runtime_block_by_json_value(self, cursor, **kwargs):
-            del cursor, kwargs
-            return {"data": {"status": "succeeded"}}
+            del cursor
+            if kwargs["block_type"] == "agent_factory_job":
+                return {"data": {
+                    "job_id": str(job_id), "correlation_id": str(correlation_id),
+                }}
+            if kwargs["block_type"] == "agent_runtime_command":
+                return {"data": {
+                    "event_id": str(command_id), "correlation_id": str(correlation_id),
+                    "payload": {"batch_id": "n8n-benchmark-batch", "operation": "codex.run"},
+                }}
+            return {"data": {
+                "event_id": str(execution_result_id), "command_id": str(command_id),
+                "correlation_id": str(correlation_id), "operation": "codex.run",
+                "status": "succeeded",
+                "artifact_refs": [{"sha256": refs[0].sha256}], "evidence_refs": [],
+            }}
 
     refs = tuple(_ref(label.encode()) for label in ("call", "lease", "receipt"))
     store = Store()
     store.record_capability_tool_evidence(
+        job_id=job_id,
         case_digest="d" * 64,
         tool_key="crm.lookup",
+        operation="codex.run",
         trace_id=uuid4(),
         run_id=uuid4(),
         model_policy_digest="e" * 64,
@@ -356,7 +386,8 @@ def test_gateway_tool_registry_persists_case_bound_entry() -> None:
         lease_ref=refs[1],
         receipt_ref=refs[2],
         batch_id="n8n-benchmark-batch",
-        execution_result_id=uuid4(),
+        execution_result_id=execution_result_id,
+        result_ref_sha256=refs[0].sha256,
     )
 
     assert store.capability_tool_evidence(refs[2].sha256)["case_digest"] == "d" * 64
@@ -372,6 +403,7 @@ def test_gateway_tool_authority_issues_the_exact_registered_artifact_bytes(tmp_p
         def capability_tool_evidence(self, receipt_sha256: str):
             assert receipt_sha256 == records["receipt_ref"].sha256
             return {
+                "job_id": str(records["job_id"]),
                 "case_digest": records["case_digest"],
                 "tool_key": records["tool_key"],
                 "trace_id": str(records["trace_id"]),
@@ -382,6 +414,9 @@ def test_gateway_tool_authority_issues_the_exact_registered_artifact_bytes(tmp_p
                 "receipt_ref": records["receipt_ref"].model_dump(mode="json"),
                 "batch_id": records["batch_id"],
                 "execution_result_id": str(records["execution_result_id"]),
+                "correlation_id": str(uuid4()),
+                "operation": records["operation"],
+                "result_ref_sha256": records["result_ref_sha256"],
             }
 
     artifacts = ContentAddressedArtifactAdapter(tmp_path / "artifacts")
@@ -395,6 +430,7 @@ def test_gateway_tool_authority_issues_the_exact_registered_artifact_bytes(tmp_p
     trace_id, run_id = uuid4(), uuid4()
 
     issued = authority.issue(
+        job_id=uuid4(),
         case_ref=case, tool_key="crm.lookup", operation="read",
         call_id="call-crm-lookup", lease_id="lease-crm-lookup",
         trace_id=trace_id, run_id=run_id, model_policy_digest="e" * 64,
@@ -403,6 +439,7 @@ def test_gateway_tool_authority_issues_the_exact_registered_artifact_bytes(tmp_p
     )
 
     request = BenchmarkToolEvidenceVerificationRequest(
+        job_id=records["job_id"],
         case_ref=case, tool_key=issued.tool_key, call_ref=issued.call_ref,
         lease_ref=issued.lease_ref, receipt_ref=issued.receipt_ref,
         trace_id=trace_id, run_id=run_id, model_policy_digest="e" * 64,

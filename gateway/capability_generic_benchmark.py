@@ -112,6 +112,7 @@ class GenericToolCallEvidence:
 
 @dataclass(frozen=True)
 class BenchmarkToolEvidenceVerificationRequest:
+    job_id: UUID
     case_ref: GenericPrivateCaseRef
     tool_key: str
     call_ref: ArtifactRef
@@ -538,6 +539,7 @@ class RuleBasedCapabilityBenchmarkEvaluator:
             try:
                 tool_validity[tool.tool_key] = self._tool_authority.verify(
                     BenchmarkToolEvidenceVerificationRequest(
+                        job_id=request.job_id,
                         case_ref=request.case_ref,
                         tool_key=tool.tool_key,
                         call_ref=tool.call_ref,

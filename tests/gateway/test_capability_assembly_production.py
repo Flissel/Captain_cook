@@ -1880,6 +1880,7 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             def record_capability_tool_evidence(self, **payload: object) -> None:
                 receipt_ref = payload["receipt_ref"]
                 self.issued[receipt_ref.sha256] = {
+                    "job_id": str(payload["job_id"]),
                     "case_digest": payload["case_digest"],
                     "tool_key": payload["tool_key"],
                     "trace_id": str(payload["trace_id"]),
@@ -1890,6 +1891,9 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                     "receipt_ref": receipt_ref.model_dump(mode="json"),
                     "batch_id": payload["batch_id"],
                     "execution_result_id": str(payload["execution_result_id"]),
+                    "correlation_id": str(request.correlation_id),
+                    "operation": payload["operation"],
+                    "result_ref_sha256": payload["result_ref_sha256"],
                 }
 
         gateway_store = ToolRegistry()
@@ -2001,6 +2005,7 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             for tool_key in benchmark_tool_keys:
                 call_id = f"call-{tool_key}-{execution_request.case_ref.case_id}-{kind}"
                 tool_calls.append(tool_authority.issue(
+                    job_id=execution_request.job_id,
                     case_ref=execution_request.case_ref,
                     tool_key=tool_key,
                     operation="read",

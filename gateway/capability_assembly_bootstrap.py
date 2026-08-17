@@ -615,6 +615,7 @@ class CaptainBenchmarkToolEvidenceAuthority:
     def issue(
         self,
         *,
+        job_id: UUID,
         case_ref: GenericPrivateCaseRef,
         tool_key: str,
         operation: str,
@@ -692,7 +693,9 @@ class CaptainBenchmarkToolEvidenceAuthority:
         try:
             self.gateway_store.record_capability_tool_evidence(
                 case_digest=case_ref.case_digest,
+                job_id=job_id,
                 tool_key=tool_key,
+                operation=operation,
                 trace_id=trace_id,
                 run_id=run_id,
                 model_policy_digest=model_policy_digest,
@@ -701,6 +704,7 @@ class CaptainBenchmarkToolEvidenceAuthority:
                 receipt_ref=receipt_ref,
                 batch_id=batch_id,
                 execution_result_id=execution_result_id,
+                result_ref_sha256=result_ref_sha256,
             )
         except Exception:
             raise CapabilityLiveAuthorityUnavailable(
@@ -713,6 +717,7 @@ class CaptainBenchmarkToolEvidenceAuthority:
             receipt_ref=receipt_ref,
         )
         verification = BenchmarkToolEvidenceVerificationRequest(
+            job_id=job_id,
             case_ref=case_ref,
             tool_key=tool_key,
             call_ref=call_ref,
@@ -747,6 +752,7 @@ class CaptainBenchmarkToolEvidenceAuthority:
         }
         expected_registry = {
             **common,
+            "job_id": str(request.job_id),
             "call_ref": request.call_ref.model_dump(mode="json"),
             "lease_ref": request.lease_ref.model_dump(mode="json"),
             "receipt_ref": request.receipt_ref.model_dump(mode="json"),
@@ -755,6 +761,9 @@ class CaptainBenchmarkToolEvidenceAuthority:
             isinstance(registry, dict)
             and all(registry.get(key) == value for key, value in expected_registry.items())
             and isinstance(registry.get("batch_id"), str)
+            and isinstance(registry.get("correlation_id"), str)
+            and registry.get("operation") == call.get("operation")
+            and registry.get("result_ref_sha256") == receipt.get("result_ref_sha256")
             and isinstance(registry.get("execution_result_id"), str)
             and set(call) == {
                 "schema", *common, "operation", "call_id"

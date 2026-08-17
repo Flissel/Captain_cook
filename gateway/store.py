@@ -6648,8 +6648,10 @@ class GatewayStore:
     def record_capability_tool_evidence(
         self,
         *,
+        job_id: UUID,
         case_digest: str,
         tool_key: str,
+        operation: str,
         trace_id: UUID,
         run_id: UUID,
         model_policy_digest: str,
@@ -6658,6 +6660,7 @@ class GatewayStore:
         receipt_ref: ArtifactRef,
         batch_id: str,
         execution_result_id: UUID,
+        result_ref_sha256: str,
     ) -> None:
         """Admit only a WorkBatch- and Runtime-result-bound tool receipt chain."""
 
@@ -6666,6 +6669,7 @@ class GatewayStore:
             len(case_digest) != 64
             or any(character not in "0123456789abcdef" for character in case_digest)
             or not tool_key
+            or not operation
             or len(model_policy_digest) != 64
             or any(character not in "0123456789abcdef" for character in model_policy_digest)
             or len({item.sha256 for item in refs}) != 3
@@ -6674,11 +6678,15 @@ class GatewayStore:
                 or item.uri != f"artifact://sha256/{item.sha256}"
                 for item in refs
             )
+            or len(result_ref_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in result_ref_sha256)
         ):
             raise HTTPException(status_code=409, detail="capability tool evidence is invalid")
         payload = {
+            "job_id": str(job_id),
             "case_digest": case_digest,
             "tool_key": tool_key,
+            "operation": operation,
             "trace_id": str(trace_id),
             "run_id": str(run_id),
             "model_policy_digest": model_policy_digest,
@@ -6687,6 +6695,7 @@ class GatewayStore:
             "receipt_ref": receipt_ref.model_dump(mode="json"),
             "batch_id": batch_id,
             "execution_result_id": str(execution_result_id),
+            "result_ref_sha256": result_ref_sha256,
         }
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
@@ -6699,8 +6708,24 @@ class GatewayStore:
                     ) ENGINE=InnoDB
                     """
                 )
-                if self._batch_row(cursor, batch_id, for_update=True) is None:
+                batch = self._batch_row(cursor, batch_id, for_update=True)
+                cursor.execute(
+                    "SELECT job_id, payload FROM capability_n8n_work_batches "
+                    "WHERE batch_id = %s FOR UPDATE",
+                    (batch_id,),
+                )
+                batch_binding = cursor.fetchone()
+                job = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id",
+                    value=str(job_id), for_update=True,
+                )
+                if (
+                    batch is None or batch_binding is None or job is None
+                    or str(batch_binding["job_id"]) != str(job_id)
+                    or f"factory-job-id:{job_id}" not in batch["data"].get("constraints", [])
+                ):
                     raise HTTPException(status_code=409, detail="tool WorkBatch is unavailable")
+                correlation_id = str(job["data"].get("correlation_id", ""))
                 result = self._runtime_block_by_json_value(
                     cursor,
                     block_type="agent_runtime_result",
@@ -6708,8 +6733,30 @@ class GatewayStore:
                     value=str(execution_result_id),
                     for_update=True,
                 )
-                if result is None or result["data"].get("status") != "succeeded":
+                result_data = {} if result is None else result["data"]
+                command_id = result_data.get("command_id")
+                command = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_runtime_command", field="event_id",
+                    value=str(command_id), for_update=True,
+                ) if command_id else None
+                command_data = {} if command is None else command["data"]
+                command_payload = command_data.get("payload", {})
+                result_refs = (
+                    *result_data.get("artifact_refs", []),
+                    *result_data.get("evidence_refs", []),
+                )
+                if (
+                    result is None or result_data.get("status") != "succeeded"
+                    or result_data.get("correlation_id") != correlation_id
+                    or result_data.get("operation") != operation
+                    or command is None
+                    or command_data.get("correlation_id") != correlation_id
+                    or command_payload.get("batch_id") != batch_id
+                    or command_payload.get("operation") != operation
+                    or not any(ref.get("sha256") == result_ref_sha256 for ref in result_refs)
+                ):
                     raise HTTPException(status_code=409, detail="tool execution result is unavailable")
+                payload["correlation_id"] = correlation_id
                 cursor.execute(
                     "SELECT payload FROM capability_tool_evidence_registry "
                     "WHERE receipt_sha256 = %s FOR UPDATE",
