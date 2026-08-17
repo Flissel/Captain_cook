@@ -13,6 +13,10 @@ from agenten.agent_factory.input_document import (
     FactoryInputError,
     parse_factory_input_bytes,
 )
+from agenten.agent_factory.private_benchmark_catalog import (
+    PrivateBenchmarkCatalogError,
+    PrivateBenchmarkCatalogPort,
+)
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_runtime.production_bootstrap import (
@@ -64,7 +68,8 @@ class RepositoryCapabilityAssemblyInputAdmission:
         holdout_store: PrivateHoldoutStore,
         subject_version: int,
         source_artifacts: FactoryInputArtifactAdmissionPort | None = None,
-        require_private_benchmark_cases: bool = False,
+        private_benchmark_catalog: PrivateBenchmarkCatalogPort | None = None,
+        require_private_benchmark_policy: bool = False,
     ) -> None:
         if _REVISION.fullmatch(expected_repository_revision) is None:
             raise ValueError("expected repository revision is invalid")
@@ -97,10 +102,13 @@ class RepositoryCapabilityAssemblyInputAdmission:
         self._expected_repository_revision = expected_repository_revision
         self._expected_sha256_by_path = configured
         self._compiled_tool_gaps_by_source_sha256 = compiled_tool_gaps
-        self._compiler = FactoryInputCompiler(holdout_store=holdout_store)
+        self._compiler = FactoryInputCompiler(
+            holdout_store=holdout_store,
+            private_benchmark_catalog=private_benchmark_catalog,
+        )
         self._subject_version = subject_version
         self._source_artifacts = source_artifacts
-        self._require_private_benchmark_cases = require_private_benchmark_cases
+        self._require_private_benchmark_policy = require_private_benchmark_policy
 
     def admit(
         self,
@@ -123,9 +131,10 @@ class RepositoryCapabilityAssemblyInputAdmission:
                 source,
                 logical_name="TO_BE_BUILT.md",
             )
-            if self._require_private_benchmark_cases and not document.private_benchmark_cases:
+            if (self._require_private_benchmark_policy
+                    and not document.benchmark_policy.public_policy_statement):
                 raise FactoryInputError(
-                    "canonical input requires explicit Private benchmark cases"
+                    "canonical input requires a public Private holdout policy"
                 )
             pattern = _conversation_pattern(source)
             compiled = self._compiler.compile(
@@ -145,7 +154,12 @@ class RepositoryCapabilityAssemblyInputAdmission:
                     raise ValueError(
                         "Factory input artifact store changed canonical source authority"
                     )
-        except (FactoryInputError, RuntimeAdapterManifestError, ValueError) as exc:
+        except (
+            FactoryInputError,
+            PrivateBenchmarkCatalogError,
+            RuntimeAdapterManifestError,
+            ValueError,
+        ) as exc:
             raise CapabilityAssemblyAdmissionError(str(exc)) from None
         return CapabilityAssemblyAdmittedInput(
             repository_path=repository_path,

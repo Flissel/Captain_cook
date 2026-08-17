@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
+import unicodedata
 from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 
 from pydantic import ValidationError
 
 from agenten.agent_factory.input_contracts import (
+    BenchmarkPolicyRequirement,
+    DeclaredTool,
     FactoryInputDocumentV2,
-    BenchmarkExpectedPredicate,
     InputSection,
-    PrivateBenchmarkCaseRequirement,
     RealCaseRequirement,
     RequestedAgent,
     RequestedIntegration,
@@ -37,10 +37,22 @@ REQUIRED_SECTIONS = (
     "Stop conditions",
 )
 _HEADING = re.compile(r"^(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$")
+_COMMONMARK_HEADING = re.compile(
+    r"^ {0,3}(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$"
+)
 _SECRET_ASSIGNMENT = re.compile(r"\b(?P<alias>[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))\s*[:=]\s*\S+", re.I)
 _BEARER = re.compile(r"\bBearer\s+\S+", re.I)
 _PRIVATE_KEY = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")
 _CREDENTIAL_URL = re.compile(r"https?://[^\s/:]+:[^\s/@]+@", re.I)
+_PUBLIC_PRIVATE_POLICY_HEADINGS = {
+    "private benchmark policy",
+    "private holdout policy",
+}
+_DECLARED_TOOL = re.compile(
+    r"^(?P<requirement>Required|Optional)\s+"
+    r"(?:(?P<location>local|integration)\s+)?tool\s+"
+    r"(?P<key>[a-z][a-z0-9_]*)\s+(?P<description>.+)$"
+)
 
 
 class FactoryInputError(ValueError):
@@ -71,20 +83,36 @@ def parse_factory_input_bytes(source: bytes, logical_name: str) -> FactoryInputD
     if "<!-- CAPTAIN_REVIEW_REQUIRED -->" in text:
         raise FactoryInputError("review marker must be resolved before canonical loading")
     _reject_credentials(text)
+    _prescan_headings(text)
     title, ordered = _level_sections(text)
     required: dict[str, str] = {}
     extras: list[InputSection] = []
-    private_benchmark_body: str | None = None
+    benchmark_policy_statement: str | None = None
+    tool_policy_statement: str | None = None
     for name, body in ordered:
+        normalized_name = _normalized_heading(name)
+        if (normalized_name in _PUBLIC_PRIVATE_POLICY_HEADINGS
+                and name not in {"Private benchmark policy", "Private holdout policy"}):
+            raise FactoryInputError(
+                "worker-visible input must not contain private benchmark cases"
+            )
+        if _is_reserved_private_heading(normalized_name):
+            raise FactoryInputError(
+                "worker-visible input must not contain private benchmark cases"
+            )
         if name in REQUIRED_SECTIONS:
             if name in required:
                 raise FactoryInputError(f"duplicate required section: {name}")
             required[name] = body
         else:
-            if name == "Private benchmark cases":
-                if private_benchmark_body is not None:
-                    raise FactoryInputError("duplicate Private benchmark cases section")
-                private_benchmark_body = body
+            if normalized_name in _PUBLIC_PRIVATE_POLICY_HEADINGS:
+                if benchmark_policy_statement is not None:
+                    raise FactoryInputError("duplicate Private holdout policy section")
+                benchmark_policy_statement = body
+            if name == "Tool policy":
+                if tool_policy_statement is not None:
+                    raise FactoryInputError("duplicate Tool policy section")
+                tool_policy_statement = body
             extras.append(InputSection(heading=name, heading_path=(name,), markdown=body))
     missing = [name for name in REQUIRED_SECTIONS if name not in required]
     if missing:
@@ -100,21 +128,41 @@ def parse_factory_input_bytes(source: bytes, logical_name: str) -> FactoryInputD
         real_cases = _cases(required["Real cases"])
         if not real_cases:
             raise FactoryInputError("at least one public success case is required")
+        authority_boundaries = _items(required["Authority boundaries"])
+        security_requirements = _items(required["Security requirements"])
+        acceptance_outcomes = _cases(required["Acceptance outcomes"])
+        stop_conditions = _items(required["Stop conditions"])
+        declared_tools, tool_policy_guard = _parse_tool_policy(tool_policy_statement)
+        benchmark_source_keys = tuple(dict.fromkeys((
+            *(case.case_key for case in acceptance_outcomes),
+            *(case.case_key for case in real_cases),
+            *(case.case_key for agent in agents for case in agent.real_cases),
+            *(f"{item.integration_key}_integration" for item in integrations),
+            *(f"{item.integration_key}_failure" for item in integrations),
+            *(f"{item.integration_key}_tool" for item in integrations),
+            *(f"authority_{index}" for index, _ in enumerate(authority_boundaries, 1)),
+            *(f"security_{index}" for index, _ in enumerate(security_requirements, 1)),
+            *(f"stop_{index}" for index, _ in enumerate(stop_conditions, 1)),
+            *(f"tool_{item.tool_key}" for item in declared_tools),
+            *(("tool_policy_guard",) if tool_policy_guard else ()),
+        )))
         return FactoryInputDocumentV2(
             input_ref=ArtifactRef(uri=f"artifact://factory-input/{digest}", sha256=digest, media_type="text/markdown"),
             byte_length=len(source), source_name="TO_BE_BUILT.md", title=title,
             objective=_paragraph(required["Objective"]),
-            authority_boundaries=_items(required["Authority boundaries"]),
+            authority_boundaries=authority_boundaries,
             agents=agents, integrations=integrations,
             shared_workflows=_items(required["Shared workflows"]),
-            security_requirements=_items(required["Security requirements"]),
-            acceptance_outcomes=_cases(required["Acceptance outcomes"]),
+            security_requirements=security_requirements,
+            acceptance_outcomes=acceptance_outcomes,
             real_cases=real_cases,
             helpful_resources=_items(required["Helpful resources"]),
-            stop_conditions=_items(required["Stop conditions"]),
-            private_benchmark_cases=(
-                () if private_benchmark_body is None
-                else _parse_private_benchmark_cases(private_benchmark_body)
+            stop_conditions=stop_conditions,
+            declared_tools=declared_tools,
+            tool_policy_guard=tool_policy_guard,
+            benchmark_policy=BenchmarkPolicyRequirement(
+                source_case_keys=benchmark_source_keys,
+                public_policy_statement=benchmark_policy_statement,
             ),
             sections=tuple(InputSection(heading=name, heading_path=(name,), markdown=required[name]) for name in REQUIRED_SECTIONS),
             extra_sections=tuple(extras),
@@ -135,6 +183,114 @@ def _reject_credentials(text: str) -> None:
             raise FactoryInputError(f"credential value is forbidden at line {number} for {match.group('alias')}")
         if _BEARER.search(line) or _PRIVATE_KEY.search(line) or _CREDENTIAL_URL.search(line):
             raise FactoryInputError(f"credential value is forbidden at line {number}")
+
+
+def _normalized_heading(value: str) -> str:
+    compatible = unicodedata.normalize("NFKC", value).casefold()
+    visible = "".join(
+        character if character.isalnum() else " "
+        for character in compatible
+        if unicodedata.category(character) != "Cf"
+    )
+    return " ".join(visible.split())
+
+
+def _prescan_headings(text: str) -> None:
+    for line in text.splitlines():
+        match = _COMMONMARK_HEADING.match(line)
+        if match is None:
+            continue
+        marks = match.group("marks")
+        name = match.group("title")
+        normalized = _normalized_heading(name)
+        if normalized in _PUBLIC_PRIVATE_POLICY_HEADINGS:
+            if len(marks) != 2 or name not in {
+                "Private benchmark policy", "Private holdout policy",
+            }:
+                raise FactoryInputError(
+                    "worker-visible input must not contain private benchmark cases"
+                )
+            continue
+        if _is_reserved_private_heading(normalized):
+            raise FactoryInputError(
+                "worker-visible input must not contain private benchmark cases"
+            )
+
+
+def _is_reserved_private_heading(normalized: str) -> bool:
+    if normalized in _PUBLIC_PRIVATE_POLICY_HEADINGS:
+        return False
+    ordered_tokens = normalized.split()
+    tokens = set(ordered_tokens)
+    derivative_suffixes = {
+        "", "e", "es", "s", "ly", "ely", "ive", "ively", "iveness",
+        "ness", "ity", "ities",
+    }
+    privacy_families = {
+        "privat": derivative_suffixes,
+        "privac": {"y", "ies"},
+        "hidden": derivative_suffixes,
+        "secret": derivative_suffixes,
+        "secrec": {"y", "ies"},
+        "confidential": derivative_suffixes,
+        "internal": derivative_suffixes,
+        "nonpublic": derivative_suffixes,
+    }
+    authority = any(
+        any(
+            token.startswith(stem)
+            and token.removeprefix(stem) in suffixes
+            for stem, suffixes in privacy_families.items()
+        )
+        for token in ordered_tokens
+    ) or any(
+        token == "non" and index + 1 < len(ordered_tokens)
+        and ordered_tokens[index + 1].removeprefix("public") in {"", "s", "ly"}
+        for index, token in enumerate(ordered_tokens)
+    )
+    if authority:
+        return True
+    domain = bool(tokens & {
+        "benchmark", "benchmarks", "holdout", "holdouts", "evaluation",
+        "evaluations",
+    })
+    payload = bool(tokens & {
+        "case", "cases", "fixture", "fixtures", "predicate", "predicates",
+        "answer", "answers", "result", "results", "outcome", "outcomes",
+    }) or {"expected", "outcome"}.issubset(tokens) or {
+        "expected", "outcomes",
+    }.issubset(tokens)
+    direct_answer = bool(tokens & {"answer", "answers", "predicate", "predicates"})
+    expected_outcome = "expected" in tokens and bool(tokens & {"outcome", "outcomes"})
+    return (
+        (domain and payload)
+        or direct_answer
+        or expected_outcome
+    )
+
+
+def _parse_tool_policy(
+    statement: str | None,
+) -> tuple[tuple[DeclaredTool, ...], str | None]:
+    if statement is None:
+        return (), None
+    tools: list[DeclaredTool] = []
+    guard_lines: list[str] = []
+    for item in _items(statement):
+        match = _DECLARED_TOOL.fullmatch(item)
+        if match is None:
+            guard_lines.append(item)
+            continue
+        tools.append(DeclaredTool(
+            tool_key=match.group("key"),
+            requirement=match.group("requirement").casefold(),
+            location=match.group("location") or "integration",
+            description=match.group("description"),
+        ))
+    keys = tuple(item.tool_key for item in tools)
+    if len(keys) != len(set(keys)):
+        raise FactoryInputError("duplicate declared tool stable name")
+    return tuple(tools), " ".join(guard_lines) or None
 
 
 def _level_sections(text: str) -> tuple[str, list[tuple[str, str]]]:
@@ -197,54 +353,6 @@ def _parse_integrations(body: str) -> tuple[RequestedIntegration, ...]:
             raise FactoryInputError(f"integration {key} requirement must be required or optional")
         aliases = tuple(item for item in _items(values.get("Credential aliases", "- none")) if item != "none")
         result.append(RequestedIntegration(integration_key=key, purpose=_paragraph(values.get("Purpose", "")), trigger=_paragraph(values.get("Trigger", "")), operation=_paragraph(values.get("Operation", "")), required=requirement == "required", credential_aliases=aliases, success_behavior=_paragraph(values.get("Success behavior", "")), failure_behavior=_paragraph(values.get("Failure behavior", ""))))
-    return tuple(result)
-
-
-def _parse_private_benchmark_cases(
-    body: str,
-) -> tuple[PrivateBenchmarkCaseRequirement, ...]:
-    result = []
-    for key, values in _nested_blocks(body, "Benchmark case"):
-        required = {"Category", "Setup", "Action", "Source cases", "Expected predicates"}
-        if set(values) != required:
-            raise FactoryInputError(
-                f"benchmark case {key} must contain exactly Category, Setup, Action, "
-                "Source cases, and Expected predicates"
-            )
-        predicate_lines = _items(values.get("Expected predicates", ""))
-        predicates = []
-        for line in predicate_lines:
-            parts = tuple(item.strip() for item in line.split("|", 3))
-            if len(parts) != 4:
-                raise FactoryInputError(
-                    f"benchmark case {key} predicate must use key | kind | observed_key | JSON value"
-                )
-            try:
-                expected_value = json.loads(parts[3])
-            except json.JSONDecodeError:
-                raise FactoryInputError(
-                    f"benchmark case {key} predicate expected value must be JSON"
-                ) from None
-            if not isinstance(expected_value, (str, bool)):
-                raise FactoryInputError(
-                    f"benchmark case {key} predicate expected value must be string or boolean"
-                )
-            predicates.append(BenchmarkExpectedPredicate(
-                predicate_key=parts[0], kind=parts[1], observed_key=parts[2],
-                expected_value=expected_value,
-            ))
-        result.append(PrivateBenchmarkCaseRequirement(
-            case_key=key,
-            category=_paragraph(values.get("Category", "")),
-            observable_setup=_paragraph(values.get("Setup", "")),
-            observable_action=_paragraph(values.get("Action", "")),
-            source_case_keys=_items(values.get("Source cases", "")),
-            expected_predicates=tuple(predicates),
-        ))
-    if not result:
-        raise FactoryInputError(
-            "Private benchmark cases must contain Benchmark case blocks"
-        )
     return tuple(result)
 
 
