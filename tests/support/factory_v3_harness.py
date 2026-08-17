@@ -13,16 +13,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
-import io
 import json
 import os
 from pathlib import Path, PurePosixPath
-import subprocess
-import sys
 from threading import RLock
 from typing import Iterator, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
-import zipfile
 
 from fastapi import FastAPI
 import httpx
@@ -35,6 +31,8 @@ from agenten.agent_factory.candidate_evaluation import (
     CandidateEvaluationFactory,
     GatewayForgeCandidateProvider,
 )
+from agenten.agent_factory.codex_build_provenance import CodexBuildArtifactCas
+from agenten.agent_factory.codex_build_recovery import canonical_factory_codex_model
 from agenten.agent_factory.capability_resolution import CapabilityResolver
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
@@ -50,21 +48,17 @@ from agenten.agent_factory.execution_policy import (
 )
 from agenten.agent_factory.forge_contracts import (
     ArtifactRef,
-    CodexBuildReceiptV1,
     CreationJobV3,
     CreationResultV2,
     FactoryActionRequestV1,
     FactoryActionResponseV1,
     FactoryBuildAssignmentV2,
     FactoryBuildEffectV2,
-    ToolGapMarkerV1,
-    codex_build_receipt_sha256,
 )
 from agenten.agent_factory.hermes_factory_worker import (
     AuthenticatedMinibookV3WorkerClient,
     FilesystemHermesFactoryWorkerCheckpointStore,
     HermesFactoryAssignmentScope,
-    HermesFactoryCodexBuild,
     HermesFactoryWorker,
 )
 from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
@@ -79,7 +73,11 @@ from agenten.agent_factory.minibook_forge import (
     MinibookForgeHttpClient,
     MinibookForgeHttpSettings,
 )
-from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatcher
+from agenten.agent_factory.orchestration import (
+    FactoryDispatch,
+    FactoryDispatchError,
+    FactoryDispatcher,
+)
 from agenten.agent_factory.service import FactoryCoordinator, InMemoryFactoryRepository
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
@@ -88,12 +86,10 @@ from gateway.factory_action_store import (
     FactoryActionRow,
     FactoryActionStore,
 )
-from gateway.minibook_creation_artifacts import GatewayMinibookCreationArtifactStore
 from minibook.swarm.api import create_creation_router
 from minibook.swarm.artifact_store import FilesystemCreationArtifactStore
 from minibook.swarm.contracts import (
     ArtifactRef as MinibookArtifactRef,
-    CreationFailure as MinibookCreationFailure,
     CreationResultV2 as MinibookCreationResultV2,
     FactoryActionRequestV1 as MinibookActionRequestV1,
     FactoryActionResponseV1 as MinibookActionResponseV1,
@@ -103,6 +99,9 @@ from minibook.swarm.runner import CreationRunner
 from minibook.swarm.scheduler import CreationScheduler
 from minibook.swarm.team_package import verify_sealed_team_package
 from minibook.swarm.v3_pipeline import TeamPackageV3Validator, V3CreationPipeline
+from tests.support.factory_v3_authorized_build import (
+    CaptainAuthorizedHermeticCodexPort,
+)
 
 
 _FIXTURE = (
@@ -142,42 +141,23 @@ def _minibook_ref(reference: object) -> MinibookArtifactRef:
     return MinibookArtifactRef.model_validate(reference.model_dump(mode="json"))
 
 
-def _zip_bytes(files: dict[str, bytes]) -> bytes:
-    stream = io.BytesIO()
-    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for name, content in sorted(files.items()):
-            info = zipfile.ZipInfo(name, date_time=(2026, 8, 8, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o100644 << 16
-            archive.writestr(info, content)
-    return stream.getvalue()
-
-
 class _HermeticCreationArtifactStore(FilesystemCreationArtifactStore):
-    """One real filesystem object store with a read-only Captain receipt alias."""
+    """Minibook CAS with read-only routing to the separate Captain build CAS."""
 
-    _CAPTAIN_RECEIPT_PREFIX = "artifact://captain-codex-build/build-receipt/"
+    _CAPTAIN_PREFIX = "artifact://captain-codex-build/"
 
-    def put_captain_receipt(self, content: bytes) -> ArtifactRef:
-        stored = super().put(
-            content,
-            "application/json",
-            namespace="captain-receipt",
-        )
-        return ArtifactRef(
-            uri=f"{self._CAPTAIN_RECEIPT_PREFIX}{stored.sha256}",
-            sha256=stored.sha256,
-            media_type=stored.media_type,
-        )
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self._captain_cas: CodexBuildArtifactCas | None = None
+
+    def bind_captain_cas(self, cas: CodexBuildArtifactCas) -> None:
+        self._captain_cas = cas
 
     def local_path(self, reference: MinibookArtifactRef) -> Path:
-        if reference.uri.startswith(self._CAPTAIN_RECEIPT_PREFIX):
-            if reference.uri.removeprefix(self._CAPTAIN_RECEIPT_PREFIX) != reference.sha256:
-                raise ValueError("Captain receipt reference digest changed")
-            target = self.root / "objects" / reference.sha256[:2] / reference.sha256
-            if not target.is_file():
-                raise FileNotFoundError("Captain receipt object is unavailable")
-            return target
+        if reference.uri.startswith(self._CAPTAIN_PREFIX):
+            if self._captain_cas is None:
+                raise ValueError("Captain build CAS is unavailable")
+            return self._captain_cas.local_path(_agent_runtime_ref(reference))
         return super().local_path(reference)
 
 
@@ -472,6 +452,7 @@ class _FixedClock:
 class _LeaseAuthority:
     def __init__(self, *, now: datetime) -> None:
         self._now = now
+        self._leases: dict[str, object] = {}
 
     def active(
         self,
@@ -482,13 +463,22 @@ class _LeaseAuthority:
     ):
         if now != self._now:
             raise ValueError("Hermetic Captain clock drifted")
-        return issue_factory_lease(
+        lease = issue_factory_lease(
             job=job,
             role=role,
             attempt=attempt,
             workspace_ref=f"workspace://captain/factory-v3/{job.job_id}",
             now=now,
         )
+        digest = hashlib.sha256(canonical_factory_codex_model(lease)).hexdigest()
+        self._leases[digest] = lease
+        return lease
+
+    def for_reference(self, reference: ArtifactRef):
+        try:
+            return self._leases[reference.sha256]
+        except KeyError as exc:
+            raise ValueError("Captain lease evidence is unavailable") from exc
 
 
 class _NoCapabilities:
@@ -574,329 +564,6 @@ class _SkillVerifier:
             raise ValueError("Hermetic Hermes skill release changed")
 
 
-class _ReceiptReader:
-    def __init__(self, store: _HermeticCreationArtifactStore) -> None:
-        self._store = store
-
-    def read_receipt(self, reference: ArtifactRef) -> CodexBuildReceiptV1:
-        return CodexBuildReceiptV1.model_validate_json(
-            self._store.read_bytes(_minibook_ref(reference))
-        )
-
-
-class _DeterministicCodexAdapter:
-    """Test-only external-process replacement implementing the authorized port."""
-
-    def __init__(
-        self,
-        *,
-        variant: str,
-        store: _HermeticCreationArtifactStore,
-        jobs: CreationJobStore,
-        workspace_root: Path,
-    ) -> None:
-        if variant not in _VARIANTS:
-            raise ValueError("unsupported hermetic Codex variant")
-        self.variant = variant
-        self._store = store
-        self._jobs = jobs
-        self._workspace_root = workspace_root
-        self.sessions = 0
-        self.tested_tools: set[str] = set()
-
-    async def build(
-        self, assignment: FactoryBuildAssignmentV2
-    ) -> HermesFactoryCodexBuild:
-        self.sessions += 1
-        if self.variant == "null_output":
-            return cast(HermesFactoryCodexBuild, None)
-        if self.variant == "timeout":
-            raise TimeoutError("deterministic external model timeout")
-
-        job = CreationJobV3.model_validate(
-            self._jobs.job(assignment.creation_job_id).model_dump(
-                mode="json", by_alias=True
-            )
-        )
-        workspace = self._workspace_root / assignment.assignment_id.hex
-        (workspace / "src" / "tools").mkdir(parents=True)
-        (workspace / "tests").mkdir(parents=True)
-        files = self._workspace_files(assignment)
-        for relative, content in files.items():
-            target = workspace / PurePosixPath(relative)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-
-        subprocess.run(
-            [sys.executable, "-m", "compileall", "-q", "src"],
-            cwd=workspace,
-            check=True,
-            capture_output=True,
-            timeout=30,
-        )
-        subprocess.run(
-            [sys.executable, "-m", "pytest", "-q"],
-            cwd=workspace,
-            check=True,
-            capture_output=True,
-            timeout=30,
-        )
-        self.tested_tools = {
-            "account_snapshot_reader",
-            "opportunity_scoring_rules",
-        }
-
-        manifest = self._team_manifest(assignment)
-        manifest_bytes = _canonical(manifest, newline=True)
-        preliminary_team_ref = _runtime_ref(
-            self._store.put(
-                manifest_bytes,
-                "application/json",
-                namespace="team-manifest",
-            )
-        )
-        final_team_ref = ArtifactRef(
-            uri=(
-                "artifact://minibook-creation/team-file/"
-                f"{preliminary_team_ref.sha256}"
-            ),
-            sha256=preliminary_team_ref.sha256,
-            media_type="application/json",
-        )
-        candidate = {
-            "schema": "captain.factory-candidate.v1",
-            "candidate_id": "sales_pipeline_team",
-            "team_manifest": {
-                "reference": final_team_ref.model_dump(mode="json"),
-                "relative_path": "team_manifest.json",
-            },
-            "workflow_artifacts": [],
-            "tool_schema_artifacts": [],
-            "n8n_tools": [],
-            "n8n_tool_references": [],
-            "host_tools": [],
-            "build_command": ["python", "-m", "compileall", "src"],
-            "real_case_command": ["python", "-m", "pytest"],
-            "timeout_seconds": 30,
-        }
-        archive_files = dict(files)
-        archive_files["factory-candidate.json"] = _canonical(candidate, newline=True)
-        source_ref = _runtime_ref(
-            self._store.put(
-                _zip_bytes(archive_files),
-                "application/zip",
-                namespace="source",
-            )
-        )
-        session_ref = _runtime_ref(
-            self._store.put(
-                _canonical({"schema": "codex.session.v1", "status": "completed"}),
-                "application/json",
-                namespace="session",
-            )
-        )
-        snapshot_ref = _runtime_ref(
-            self._store.put(
-                _zip_bytes(files),
-                "application/zip",
-                namespace="snapshot",
-            )
-        )
-        completed_at = datetime.now(timezone.utc)
-        common = {
-            "assignment_id": str(assignment.assignment_id),
-            "creation_job_id": str(assignment.creation_job_id),
-            "factory_job_id": str(assignment.factory_job_id),
-            "correlation_id": str(assignment.correlation_id),
-            "subject_version": assignment.subject_version,
-            "checkpoint_version": assignment.checkpoint_version,
-            "attempt": assignment.attempt,
-            "effect_key": assignment.effect_key,
-            "source_archive_ref": source_ref.model_dump(mode="json"),
-            "codex_session_ref": session_ref.model_dump(mode="json"),
-            "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
-        }
-        build_ref = _runtime_ref(
-            self._store.put(
-                _canonical(
-                    {
-                        "schema": "captain.package-build-evidence.v1",
-                        "producer": "captain",
-                        "outcome": "passed",
-                        **common,
-                        "workspace_snapshot_ref": snapshot_ref.model_dump(mode="json"),
-                    }
-                ),
-                "application/json",
-                namespace="evidence",
-            )
-        )
-        real_case_ref = _runtime_ref(
-            self._store.put(
-                _canonical(
-                    {
-                        "schema": "captain.package-real-case-evidence.v1",
-                        "producer": "captain",
-                        "outcome": "passed",
-                        **common,
-                        "assertion_ids": list(job.public_assertion_ids),
-                        "declared_test_paths": list(manifest["test_files"]),
-                        "evidence_refs": [build_ref.model_dump(mode="json")],
-                    }
-                ),
-                "application/json",
-                namespace="evidence",
-            )
-        )
-        hermes_ref = _runtime_ref(
-            self._store.put(
-                _canonical(
-                    {
-                        "schema": "hermes.forge-build-skill-usage-receipt.v1",
-                        "producer": "hermes",
-                        "outcome": "fulfilled",
-                        "creation_job_id": str(job.creation_job_id),
-                        "factory_job_id": str(job.factory_job_id),
-                        "correlation_id": str(job.correlation_id),
-                        "subject_version": job.subject_version,
-                        "attempt": job.attempt,
-                        "idempotency_key": job.idempotency_key,
-                        "released_skill": job.released_skill.model_dump(mode="json"),
-                        "public_assertion_ids": list(job.public_assertion_ids),
-                        "evidence_refs": [
-                            job.compiled_spec_ref.model_dump(mode="json"),
-                            job.blueprint_ref.model_dump(mode="json"),
-                            job.tool_plan_ref.model_dump(mode="json"),
-                        ],
-                    }
-                ),
-                "application/json",
-                namespace="receipt",
-            )
-        )
-        receipt = CodexBuildReceiptV1(
-            receipt_id=uuid5(assignment.assignment_id, "codex-build-receipt"),
-            producer="captain",
-            outcome="sealed",
-            factory_job_id=assignment.factory_job_id,
-            creation_job_id=assignment.creation_job_id,
-            correlation_id=assignment.correlation_id,
-            subject_version=assignment.subject_version,
-            attempt=assignment.attempt,
-            assignment_id=assignment.assignment_id,
-            idempotency_key=assignment.effect_key,
-            seal_idempotency_key=assignment.effect_key,
-            build_brief_ref=job.blueprint_ref,
-            workspace_ref=assignment.workspace_ref,
-            codex_session_ref=session_ref,
-            workspace_snapshot_ref=snapshot_ref,
-            candidate_manifest_ref=preliminary_team_ref,
-            source_archive_ref=source_ref,
-            test_evidence_refs=(real_case_ref,),
-            acceptance_assertion_ids=job.public_assertion_ids,
-            completed_at=completed_at,
-        )
-        receipt_bytes = _canonical(
-            receipt.model_dump(mode="json", by_alias=True)
-        )
-        receipt_ref = self._store.put_captain_receipt(receipt_bytes)
-        if receipt_ref.sha256 != codex_build_receipt_sha256(receipt):
-            raise AssertionError("Captain receipt canonical digest drifted")
-        gap_ref = _runtime_ref(
-            self._store.put(
-                _canonical({"status": "unresolved", "kind": "optional"}),
-                "application/json",
-                namespace="tool-gap",
-            )
-        )
-        tool_gap = ToolGapMarkerV1(
-            schema_name="TODO_TOOL.v1",
-            gap_id="industry_signal_reader",
-            severity="optional",
-            evidence_ref=gap_ref,
-            status="unresolved",
-        )
-        build = HermesFactoryCodexBuild(
-            hermes_usage_receipt_ref=hermes_ref,
-            codex_build_receipt_ref=receipt_ref,
-            codex_build_receipt=receipt,
-            build_evidence_refs=(build_ref,),
-            tool_gaps=(tool_gap,),
-        )
-        if self.variant == "receipt_only":
-            self._store.local_path(_minibook_ref(source_ref)).unlink()
-        return build
-
-    def _workspace_files(
-        self, assignment: FactoryBuildAssignmentV2
-    ) -> dict[str, bytes]:
-        agents = assignment.required_agent_ids
-        if self.variant == "one_agent":
-            agents = agents[:1]
-        return {
-            "src/__init__.py": b"\"\"\"Generated sales pipeline package.\"\"\"\n",
-            "src/team.py": (
-                "AGENTS = " + repr(tuple(agents)) + "\n"
-            ).encode("utf-8"),
-            "src/tools/__init__.py": b"\"\"\"Generated typed sales tools.\"\"\"\n",
-            "src/tools/account_snapshot_reader.py": (
-                b"def read_account_snapshot(value: dict[str, object]) -> dict[str, object]:\n"
-                b"    return {key: value[key] for key in sorted(value)}\n"
-            ),
-            "src/tools/opportunity_scoring_rules.py": (
-                b"def qualify_opportunity(value: dict[str, object]) -> dict[str, object]:\n"
-                b"    return {'qualified': value.get('stage') == 'qualified'}\n"
-            ),
-            "tests/test_team.py": (
-                b"from src.team import AGENTS\n"
-                b"from src.tools.account_snapshot_reader import read_account_snapshot\n"
-                b"from src.tools.opportunity_scoring_rules import qualify_opportunity\n\n"
-                b"def test_generated_team_and_required_tools():\n"
-                b"    assert AGENTS\n"
-                b"    assert read_account_snapshot({'b': 2, 'a': 1}) == {'a': 1, 'b': 2}\n"
-                b"    assert qualify_opportunity({'stage': 'qualified'}) == {'qualified': True}\n"
-            ),
-        }
-
-    def _team_manifest(
-        self, assignment: FactoryBuildAssignmentV2
-    ) -> dict[str, object]:
-        agents = assignment.required_agent_ids
-        handoffs = assignment.ordered_handoffs
-        if self.variant == "one_agent":
-            agents = agents[:1]
-            handoffs = ()
-        return {
-            "schema": "minibook.team-manifest.v2",
-            "agents": [{"agent_id": value} for value in agents],
-            "handoffs": [item.model_dump(mode="json") for item in handoffs],
-            "tools": [
-                {
-                    "tool_id": "account_snapshot_reader",
-                    "input_schema": {"type": "object"},
-                    "output_schema": {"type": "object"},
-                    "implementation_path": "src/tools/account_snapshot_reader.py",
-                    "test_path": "tests/test_team.py",
-                },
-                {
-                    "tool_id": "opportunity_scoring_rules",
-                    "input_schema": {"type": "object"},
-                    "output_schema": {"type": "object"},
-                    "implementation_path": "src/tools/opportunity_scoring_rules.py",
-                    "test_path": "tests/test_team.py",
-                },
-            ],
-            "source_files": [
-                "src/__init__.py",
-                "src/team.py",
-                "src/tools/__init__.py",
-                "src/tools/account_snapshot_reader.py",
-                "src/tools/opportunity_scoring_rules.py",
-            ],
-            "test_files": ["tests/test_team.py"],
-        }
-
-
 class _CountingForge:
     def __init__(self, delegate: MinibookForgeHttpClient) -> None:
         self._delegate = delegate
@@ -918,7 +585,7 @@ class _CountingForge:
 
 
 class _TamperingCaptainArtifactReader:
-    def __init__(self, delegate: GatewayMinibookCreationArtifactStore) -> None:
+    def __init__(self, delegate) -> None:  # type: ignore[no-untyped-def]
         self._delegate = delegate
         self._tampered = False
 
@@ -936,10 +603,40 @@ class _TamperingCaptainArtifactReader:
     def local_path(self, reference: RuntimeArtifactRef) -> Path:
         return self._delegate.local_path(reference)
 
+    @property
+    def tampered(self) -> bool:
+        return self._tampered
+
+
+class _CaptainArtifactReader:
+    """Captain readback over the exact CAS router used by Minibook."""
+
+    def __init__(self, store: _HermeticCreationArtifactStore) -> None:
+        self._store = store
+
+    def read_bytes(self, reference: RuntimeArtifactRef) -> bytes:
+        return self._store.read_bytes(_minibook_ref(reference))
+
+    def read_bytes_bounded(
+        self, reference: RuntimeArtifactRef, *, max_bytes: int
+    ) -> bytes:
+        path = self.local_path(reference)
+        if path.stat().st_size > max_bytes:
+            raise ValueError("Captain artifact exceeds read bound")
+        return self.read_bytes(reference)
+
+    def local_path(self, reference: RuntimeArtifactRef) -> Path:
+        return self._store.local_path(_minibook_ref(reference))
+
 
 @dataclass(frozen=True)
 class FactoryV3FailedOutcome:
     status: Literal["failed", "blocked"]
+    minibook_status: str
+    captain_status: Literal["failed"]
+    failure_code: str
+    failure_summary: str
+    tamper_performed: bool
 
 
 class FactoryV3Run:
@@ -995,6 +692,30 @@ class FactoryV3Run:
     @property
     def serialized_action_payloads(self) -> str:
         return self._harness._action_repository_path.read_text(encoding="utf-8")
+
+    @property
+    def minibook_status(self) -> str:
+        return self._harness.minibook_status
+
+    @property
+    def executed_commands(self) -> tuple[tuple[str, ...], ...]:
+        return self._harness.executed_commands
+
+    @property
+    def real_case_handoff_trace(self) -> tuple[str, ...]:
+        return self._harness.real_case_handoff_trace
+
+    @property
+    def verified_public_assertion_ids(self) -> tuple[str, ...]:
+        return self._harness.verified_public_assertion_ids
+
+    @property
+    def captain_sealed_receipt_verified(self) -> bool:
+        return self._harness.captain_sealed_receipt_verified
+
+    @property
+    def build_credential_refs(self) -> tuple[str, ...]:
+        return self._harness.build_credential_refs
 
 
 class FactoryV3Harness:
@@ -1056,10 +777,13 @@ class FactoryV3Harness:
         self._effect: FactoryBuildEffectV2 | None = None
         self._result: CreationResultV2 | None = None
         self._forge: _CountingForge | None = None
-        self._codex: _DeterministicCodexAdapter | None = None
+        self._codex: CaptainAuthorizedHermeticCodexPort | None = None
         self._worker: HermesFactoryWorker | None = None
         self._coordinator: FactoryCoordinator | None = None
         self._authority_store: FilesystemCaptainCreationJobV3Store | None = None
+        self._worker_checkpoints: FilesystemHermesFactoryWorkerCheckpointStore | None = None
+        self._tampering_reader: _TamperingCaptainArtifactReader | None = None
+        self._build_lease = None
         self._minibook_readback = False
         self._captain_readback = False
 
@@ -1080,7 +804,7 @@ class FactoryV3Harness:
         await self._begin("happy", tamper_captain=False, with_action=True)
         return FactoryV3Run(self)
 
-    async def run_variant(self, variant: str) -> CreationResultV2 | FactoryV3FailedOutcome:
+    async def run_variant(self, variant: str) -> FactoryV3FailedOutcome:
         if variant not in {"one_agent", "null_output", "timeout", "receipt_only", "tampered_cas"}:
             raise ValueError("unknown Factory V3 variant")
         codex_variant = "happy" if variant == "tampered_cas" else variant
@@ -1089,24 +813,76 @@ class FactoryV3Harness:
             tamper_captain=variant == "tampered_cas",
             with_action=False,
         )
-        try:
-            await self._run_worker()
-        except (TimeoutError, TypeError, ValueError):
-            self._finish_codex_failure()
+        if variant == "one_agent":
+            try:
+                await self._run_worker()
+            except FactoryDispatchError as exc:
+                if str(exc) != "real-case execution evidence changed":
+                    raise
+                return self._block_worker_failure(
+                    expected_kind="runtime_error",
+                    failure_code="topology_drift",
+                    failure_summary=str(exc),
+                )
+            raise AssertionError("one-agent topology was accepted")
+        if variant == "null_output":
+            try:
+                await self._run_worker()
+            except ValueError as exc:
+                if str(exc) != "Hermes Factory requires a typed Codex build result":
+                    raise
+                return self._block_worker_failure(
+                    expected_kind="validation_error",
+                    failure_code="codex_null_output",
+                    failure_summary=str(exc),
+                )
+            raise AssertionError("null Codex output was accepted")
+        if variant == "timeout":
+            try:
+                await self._run_worker()
+            except TimeoutError as exc:
+                return self._block_worker_failure(
+                    expected_kind="timeout",
+                    failure_code="codex_timeout",
+                    failure_summary=str(exc),
+                )
+            raise AssertionError("timed-out Codex output was accepted")
+
+        await self._run_worker()
         await self._scheduler.join()
+        if variant == "receipt_only":
+            try:
+                await self._await_dispatch_task()
+            except FactoryDispatchError as exc:
+                if (
+                    str(exc)
+                    != "Minibook CreationResultV1 did not produce successful agent code"
+                ):
+                    raise
+            else:
+                raise AssertionError("invalid Minibook build reached Captain success")
+            return self._persisted_minibook_failure()
+
+        assert variant == "tampered_cas"
         try:
             await self._await_dispatch_task()
-        except Exception:
-            pass
-        assert self._creation_job is not None
-        stored = self._minibook_store.result(self._creation_job.creation_job_id)
-        if variant == "tampered_cas":
-            return FactoryV3FailedOutcome(status="failed")
-        if stored is None:
-            return FactoryV3FailedOutcome(status="blocked")
-        return CreationResultV2.model_validate(
-            stored.model_dump(mode="json", by_alias=True)
-        )
+        except FactoryDispatchError as exc:
+            if str(exc) != "Captain CAS readback digest mismatch":
+                raise
+            self._record_captain_failure(
+                failure_code="captain_cas_readback_rejected",
+                failure_summary=str(exc),
+            )
+            assert self._tampering_reader is not None
+            return FactoryV3FailedOutcome(
+                status="blocked",
+                minibook_status=self.minibook_status,
+                captain_status="failed",
+                failure_code="captain_cas_readback_rejected",
+                failure_summary=str(exc),
+                tamper_performed=self._tampering_reader.tampered,
+            )
+        raise AssertionError("tampered CAS reached Captain success")
 
     async def _begin(
         self,
@@ -1267,13 +1043,16 @@ class FactoryV3Harness:
         self._forge = _CountingForge(real_forge)
         repository = InMemoryFactoryRepository()
         self._coordinator = FactoryCoordinator(repository)
-        gateway_reader = GatewayMinibookCreationArtifactStore(
-            self._root / "minibook-cas"
-        )
+        gateway_reader = _CaptainArtifactReader(self._artifacts)
         candidate_reader = (
             _TamperingCaptainArtifactReader(gateway_reader)
             if tamper_captain
             else gateway_reader
+        )
+        self._tampering_reader = (
+            candidate_reader
+            if isinstance(candidate_reader, _TamperingCaptainArtifactReader)
+            else None
         )
         provider = GatewayForgeCandidateProvider(
             repository=self._coordinator,
@@ -1338,17 +1117,28 @@ class FactoryV3Harness:
         checkpoint_store = FilesystemHermesFactoryWorkerCheckpointStore(
             self._root / ".captain-cook" / "hermes-worker-checkpoints"
         )
+        self._worker_checkpoints = checkpoint_store
         worker_client = AuthenticatedMinibookV3WorkerClient(
             client=self._client,
             worker_token=_WORKER_TOKEN,
             worker_id=_WORKER_ID,
             checkpoint_store=checkpoint_store,
         )
-        self._codex = _DeterministicCodexAdapter(
+        captain_cas = CodexBuildArtifactCas(
+            self._root / ".captain-cook" / "hermetic-build-cas"
+        )
+        self._artifacts.bind_captain_cas(captain_cas)
+        self._build_lease = leases.for_reference(self._assignment.lease_ref)
+        self._codex = CaptainAuthorizedHermeticCodexPort(
             variant=variant,
-            store=self._artifacts,
-            jobs=self._minibook_store,
-            workspace_root=self._root / "codex-workspaces",
+            root=self._root,
+            artifact_cas=captain_cas,
+            assignment=self._assignment,
+            creation_job=self._creation_job,
+            factory_job=self._job,
+            lease=self._build_lease,
+            released_skill=released,
+            clock=lambda: self._base_time,
         )
         self._worker = HermesFactoryWorker(
             minibook=worker_client,
@@ -1358,10 +1148,29 @@ class FactoryV3Harness:
             released_skill_name=_SKILL_NAME,
             released_skill_sha256=released.content_sha256,
             checkpoint_store=checkpoint_store,
-            codex_receipts=_ReceiptReader(self._artifacts),
+            codex_receipts=self._codex,
             clock=lambda: self._base_time,
         )
         if with_action:
+            self._ensure_build_prerequisites(document)
+        else:
+            self._codex.release_credential(
+                "credential://tenant-a/preapproved-crm-readonly"
+            )
+
+    def _ensure_build_prerequisites(self, document: FactoryInputDocumentV2) -> None:
+        assert self._assignment is not None and self._codex is not None
+        credential_tools = {
+            integration.integration_key
+            for integration in document.integrations
+            if integration.required and integration.credential_aliases
+        }
+        required_tools = {
+            requirement.tool_id
+            for requirement in self._assignment.tool_requirements
+            if requirement.required
+        }
+        if credential_tools & required_tools:
             self._create_credential_action()
 
     def _create_credential_action(self) -> None:
@@ -1470,6 +1279,8 @@ class FactoryV3Harness:
         self._continuation.response = response
         self._resume.resume(request_id=action.request_id, tenant_id=_TENANT)
         await self._scheduler.join()
+        assert self._codex is not None
+        self._codex.release_credential(credential_ref)
         await self._run_worker()
 
     async def _run_worker(self) -> None:
@@ -1499,24 +1310,110 @@ class FactoryV3Harness:
         self._authority_store.record_effect(effect)
         await self._scheduler.join()
 
-    def _finish_codex_failure(self) -> None:
-        assert self._creation_job is not None
-        if self._minibook_store.result(self._creation_job.creation_job_id) is not None:
-            return
-        progress = self._minibook_store.progress(self._creation_job.creation_job_id)
-        result = MinibookCreationResultV2(
-            creation_job_id=self._creation_job.creation_job_id,
-            factory_job_id=self._creation_job.factory_job_id,
-            correlation_id=self._creation_job.correlation_id,
-            subject_version=self._creation_job.subject_version,
-            attempt=self._creation_job.attempt,
-            status="failed",
-            failure=MinibookCreationFailure(
-                code="codex_failed",
-                summary="authorized Codex build did not produce typed artifacts",
-            ),
+    def _block_worker_failure(
+        self,
+        *,
+        expected_kind: str,
+        failure_code: str,
+        failure_summary: str,
+    ) -> FactoryV3FailedOutcome:
+        assert (
+            self._assignment is not None
+            and self._creation_job is not None
+            and self._worker_checkpoints is not None
         )
-        self._minibook_store.finish(result, expected_version=progress.version)
+        checkpoint = self._worker_checkpoints.load(self._assignment)
+        if (
+            checkpoint is None
+            or checkpoint.state != "failed"
+            or checkpoint.failure_kind != expected_kind
+        ):
+            raise AssertionError("durable Hermes worker failure evidence changed")
+        progress = self._minibook_store.progress(
+            self._creation_job.creation_job_id
+        )
+        self._minibook_store.transition(
+            self._creation_job.creation_job_id,
+            "blocked",
+            expected_version=progress.version,
+            checkpoint="build_handoff",
+        )
+        self._record_captain_failure(
+            failure_code=failure_code,
+            failure_summary=failure_summary,
+        )
+        return FactoryV3FailedOutcome(
+            status="blocked",
+            minibook_status=self.minibook_status,
+            captain_status="failed",
+            failure_code=failure_code,
+            failure_summary=failure_summary,
+            tamper_performed=False,
+        )
+
+    def _persisted_minibook_failure(self) -> FactoryV3FailedOutcome:
+        assert self._creation_job is not None
+        stored = self._minibook_store.result(self._creation_job.creation_job_id)
+        if stored is None or stored.status != "failed" or stored.failure is None:
+            raise AssertionError("Minibook did not persist its terminal failure")
+        exception_type = stored.failure.exception_type or "unknown"
+        failure_summary = f"{stored.failure.summary} ({exception_type})"
+        self._record_captain_failure(
+            failure_code=stored.failure.code,
+            failure_summary=failure_summary,
+        )
+        return FactoryV3FailedOutcome(
+            status="failed",
+            minibook_status=self.minibook_status,
+            captain_status="failed",
+            failure_code=stored.failure.code,
+            failure_summary=failure_summary,
+            tamper_performed=False,
+        )
+
+    def _record_captain_failure(
+        self, *, failure_code: str, failure_summary: str
+    ) -> None:
+        assert (
+            self._job is not None
+            and self._coordinator is not None
+            and self._build_lease is not None
+        )
+        evidence_ref = _agent_runtime_ref(
+            self._artifacts.put(
+                _canonical(
+                    {
+                        "schema": "hermes.factory-build-failure.v1",
+                        "status": "failed",
+                        "factory_job_id": str(self._job.job_id),
+                        "failure_code": failure_code,
+                        "failure_summary": failure_summary,
+                    },
+                    newline=True,
+                ),
+                "application/json",
+                namespace="build-failure",
+            )
+        )
+        self._coordinator.record(
+            FactoryEvidenceBlock(
+                schema_name="captain.agent-factory-block.v1",
+                event_id=uuid5(self._job.job_id, "task-9-hermetic-build-failed"),
+                job_id=self._job.job_id,
+                correlation_id=self._job.correlation_id,
+                causation_id=self._job.event_id,
+                occurred_at=self._base_time,
+                producer="hermes",
+                subject_version=self._job.subject_version,
+                attempt=1,
+                phase=FactoryPhase.AGENT_CODE_CREATED,
+                role=FactoryRole.TOOL_INTEGRATOR,
+                status=FactoryBlockStatus.FAILED,
+                artifact_refs=(evidence_ref,),
+                evidence_refs=(evidence_ref,),
+                lease_id=self._build_lease.lease_id,
+            )
+        )
 
     async def _wait_for_result(self) -> CreationResultV2:
         await self._await_dispatch_task()
@@ -1590,6 +1487,45 @@ class FactoryV3Harness:
         return set() if self._codex is None else set(self._codex.tested_tools)
 
     @property
+    def minibook_status(self) -> str:
+        if self._creation_job is None:
+            return "unsubmitted"
+        return self._minibook_store.progress(
+            self._creation_job.creation_job_id
+        ).status
+
+    @property
+    def executed_commands(self) -> tuple[tuple[str, ...], ...]:
+        return () if self._codex is None else self._codex.executed_commands
+
+    @property
+    def real_case_handoff_trace(self) -> tuple[str, ...]:
+        return () if self._codex is None else self._codex.real_case_handoff_trace
+
+    @property
+    def verified_public_assertion_ids(self) -> tuple[str, ...]:
+        return (
+            ()
+            if self._codex is None
+            else self._codex.verified_public_assertion_ids
+        )
+
+    @property
+    def build_credential_refs(self) -> tuple[str, ...]:
+        return () if self._codex is None else self._codex.build_credential_refs
+
+    @property
+    def captain_sealed_receipt_verified(self) -> bool:
+        if self._codex is None or self._effect is None:
+            return False
+        receipt = self._codex.read_receipt(self._effect.codex_build_receipt_ref)
+        return (
+            receipt.assignment_id == self._effect.assignment_id
+            and receipt.source_archive_ref == self._effect.source_archive_ref
+            and receipt.test_evidence_refs == self._effect.test_evidence_refs
+        )
+
+    @property
     def minibook_readback_verified(self) -> bool:
         return self._minibook_readback
 
@@ -1606,6 +1542,17 @@ class FactoryV3Harness:
             for block in self._coordinator.blocks(self._job.job_id)
             if block.phase is FactoryPhase.AGENT_CODE_CREATED
             and block.status is FactoryBlockStatus.SUCCEEDED
+        )
+
+    @property
+    def captain_failure_events(self) -> tuple[FactoryEvidenceBlock, ...]:
+        if self._coordinator is None or self._job is None:
+            return ()
+        return tuple(
+            block
+            for block in self._coordinator.blocks(self._job.job_id)
+            if block.phase is FactoryPhase.AGENT_CODE_CREATED
+            and block.status is FactoryBlockStatus.FAILED
         )
 
 
