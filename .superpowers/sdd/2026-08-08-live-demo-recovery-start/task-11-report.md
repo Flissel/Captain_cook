@@ -156,3 +156,33 @@ Round-3 non-claims:
 - No live network service, provider, Docker engine/container, n8n deployment/volume, or production database was contacted or mutated.
 - Process identity, authenticated health, and cleanup behavior are proven through offline injected/sentinel boundaries; this is not a live deployment claim.
 - The canonical deferred Factory ports are production graph authorities, but external Forge and benchmark-input provisioning remains an operator prerequisite before real paid dispatch.
+
+## Review Fix Round 4
+
+Commits:
+
+1. `1e8dcbe` — replaces generic environment stripping with explicit real-entrypoint contracts. Only Provider Proxy receives `OPENAI_API_KEY` and the provider-receipt/runtime secrets; Runtime receives its Gateway, adapter, and proxy-client bindings; Gateway receives the exact capability/catalog/provider/Minibook configuration without the OpenAI/provider-receipt secrets.
+2. `c81904f` — extends the Factory descriptor across the real internal implementation path, source digest, AST digest, and HEAD blob. Adapter and implementation bytes are single-open/HEAD-attested before effects and executed from those byte snapshots in isolated module namespaces; the wrapper no longer imports the internal implementation.
+3. `8aff972` — replaces the direct OpenAI Factory model path with an AutoGen `ChatCompletionClient` over the proxy's exact `/v1/responses` surface. The builder binds loopback URL, proxy credential, Gateway context reference/header, all six D7 digests, and `hard_ceiling_enforced=true`; it maps Responses text/function calls and usage without exposing an OpenAI key to Gateway.
+4. `46f40f7` — installs the concrete Minibook Forge HTTP/mapper/Gateway-evidence graph and a Gateway/D10-backed benchmark-input readiness gate. The deferred Forge/input classes and in-memory benchmark repository are absent from the production implementation.
+5. `8428946` — persists `starting` before every OS/container spawn, persists the PID before its identity probe, retains ambiguous start state on timeout or missing identity, snapshots exact parent/descendant kernel identities before TERM, and performs bounded per-identity tree cleanup with confirmed exit.
+
+Round-4 RED to GREEN evidence:
+
+- Group A: filtered real settings previously failed because Runtime/Gateway/Benchmark authorities were missing and the provider receipt name was wrong. GREEN service-manifest gate: 9 passed.
+- Group B: the descriptor previously trusted only a wrapper that imported an unverified cached module. GREEN bootstrap/production graph gate: 71 passed; dirty/same-size and AST/signature/top-level drift remain fail-closed before construction.
+- Group C: the production graph previously constructed `OpenAIChatCompletionClient` with a direct provider key. GREEN proxy/Factory gate: 83 passed; endpoint, bearer, exact context reference, usage mapping, and zero direct OpenAI authority are asserted.
+- Group D: production contained `_DeferredForge`, `_DeferredBenchmarkInputs`, and `InMemoryBusinessBenchmarkRepository`. GREEN graph/orchestration gate: 70 passed with concrete Minibook and Gateway/D10 types.
+- Group E: no durable state existed before spawn and Windows cleanup knew only the parent PID. GREEN lifecycle/D12 gate: 81 passed, including pre-spawn crash, missing identity, n8n timeout, and orphan-child cases.
+
+Round-4 verification:
+
+- D1/D4-D12, prior critical capability, Factory, provider-proxy, and demo regressions: 1,946 passed, 2 skipped, with one pre-existing Pydantic serialization warning.
+- Architecture/import/workstream: 18 passed. `compileall`, submission verifier, round diff check, and credential-pattern scan passed; credential matches: 0.
+- MariaDB authority gate: 14 skipped because `TEST_MARIADB_DSN` was absent. No production database was contacted.
+
+Round-4 non-claims:
+
+- No live service, network request, provider, Docker engine/container, n8n deployment/volume, or database was contacted or mutated.
+- The Gateway/D10 benchmark input port deliberately returns `incomplete` until exact job-specific dispatch inputs exist; this is not a paid benchmark-ready claim.
+- The full repository gate was not repeated in Round 4; Round 3's Hermes/worktree-environment failures remain the repository-wide non-claim. The changed D1/D4-D12 neighborhood is green as recorded above.
