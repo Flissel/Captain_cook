@@ -93,7 +93,7 @@ jobs:
           submodules: recursive
       - name: Install Captain dependencies
         shell: pwsh
-        run: python --version; python -m pip install --upgrade pip; python -m pip install -r requirements.txt pytest pytest-cov
+        run: python --version; python -m pip install --upgrade pip; python -m pip install -r requirements-dev.txt
       - name: Run three provider traces and fail-closed release decision
         shell: pwsh
         run: pwsh -NoProfile -File scripts/run-gate-e-ci.ps1
