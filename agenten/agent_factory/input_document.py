@@ -220,16 +220,22 @@ def _prescan_headings(text: str) -> None:
 def _is_reserved_private_heading(normalized: str) -> bool:
     if normalized in _PUBLIC_PRIVATE_POLICY_HEADINGS:
         return False
-    tokens = set(normalized.split())
-    authority = bool(tokens & {
+    ordered_tokens = normalized.split()
+    tokens = set(ordered_tokens)
+    privacy_markers = {
         "private", "hidden", "secret", "confidential", "internal", "nonpublic",
-    }) or {"non", "public"}.issubset(tokens)
-    semantic = bool(tokens & {
-        "expected", "result", "results", "outcome", "outcomes", "answer",
-        "answers", "predicate", "predicates", "benchmark", "benchmarks",
-        "holdout", "holdouts", "evaluation", "evaluations", "case", "cases",
-        "fixture", "fixtures",
-    })
+    }
+    authority = any(
+        token in privacy_markers
+        or (token.endswith("s") and token[:-1] in privacy_markers)
+        for token in ordered_tokens
+    ) or any(
+        token == "non" and index + 1 < len(ordered_tokens)
+        and ordered_tokens[index + 1].removesuffix("s") == "public"
+        for index, token in enumerate(ordered_tokens)
+    )
+    if authority:
+        return True
     domain = bool(tokens & {
         "benchmark", "benchmarks", "holdout", "holdouts", "evaluation",
         "evaluations",
@@ -243,8 +249,7 @@ def _is_reserved_private_heading(normalized: str) -> bool:
     direct_answer = bool(tokens & {"answer", "answers", "predicate", "predicates"})
     expected_outcome = "expected" in tokens and bool(tokens & {"outcome", "outcomes"})
     return (
-        (authority and semantic)
-        or (domain and payload)
+        (domain and payload)
         or direct_answer
         or expected_outcome
     )

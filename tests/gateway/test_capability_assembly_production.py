@@ -1460,6 +1460,85 @@ def test_generic_suite_rejects_private_contract_drift_from_public_authority(
         build_generic_benchmark_suite(drifted, _private_case_repository(holdouts))
 
 
+@pytest.mark.parametrize(
+    "dimension",
+    ("business", "rationale", "safety", "tool", "handoff"),
+)
+@pytest.mark.parametrize("rewrite_bindings", (False, True))
+def test_generic_suite_rejects_per_predicate_source_cross_swaps(
+    dimension: str,
+    rewrite_bindings: bool,
+) -> None:
+    holdouts = InMemoryPrivateHoldoutStore()
+    admitted, _ = _admitted_demo(
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts,
+    )
+    canonical = _with_grounded_benchmark_sources(admitted.input, holdouts)
+    refs = canonical.compiled_specification.private_holdout_refs
+    indexed_payloads = [
+        (index, ref, json.loads(holdouts.get(ref.uri)))
+        for index, ref in enumerate(refs)
+    ]
+    case_index, case_ref, payload = next(
+        item for item in indexed_payloads
+        if (item[2]["category"] == "mandatory_escalation")
+        == (dimension == "handoff")
+    )
+    kinds = {
+        "business": "observation_contains",
+        "rationale": "rationale_contains",
+        "safety": "forbidden_tool_absent",
+        "tool": "tool_receipt",
+        "handoff": "handoff_event",
+    }
+    target = next(
+        item for item in payload["expected_predicates"]
+        if item["kind"] == kinds[dimension]
+    )
+    counterpart_kind = (
+        "rationale_contains" if dimension == "safety"
+        else "forbidden_tool_absent"
+    )
+    counterpart = next(
+        item for item in payload["expected_predicates"]
+        if item["kind"] == counterpart_kind
+    )
+    target_sources = target["source_case_keys"]
+    counterpart_sources = counterpart["source_case_keys"]
+    target["source_case_keys"] = counterpart_sources
+    counterpart["source_case_keys"] = target_sources
+    if rewrite_bindings:
+        bindings = {
+            item["predicate_key"]: item
+            for item in payload["predicate_source_bindings"]
+        }
+        target_binding = bindings[target["predicate_key"]]
+        counterpart_binding = bindings[counterpart["predicate_key"]]
+        target_binding_sources = target_binding["sources"]
+        counterpart_binding_sources = counterpart_binding["sources"]
+        target_binding["sources"] = counterpart_binding_sources
+        counterpart_binding["sources"] = target_binding_sources
+    changed_body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    changed_digest = hashlib.sha256(changed_body.encode()).hexdigest()
+    holdouts._bodies[case_ref.uri] = changed_body
+    changed_refs = list(refs)
+    changed_refs[case_index] = case_ref.model_copy(update={
+        "sha256": changed_digest,
+    })
+    drifted = canonical.model_copy(update={
+        "compiled_specification": canonical.compiled_specification.model_copy(update={
+            "private_holdout_refs": tuple(changed_refs),
+        }),
+    })
+
+    repository = _private_case_repository(holdouts)
+    with pytest.raises(
+        CapabilityLiveAuthorityUnavailable, match="predicate source binding",
+    ):
+        build_generic_benchmark_suite(drifted, repository)
+    assert repository._definitions == {}
+
+
 @pytest.mark.parametrize("mutation", ("missing_category", "duplicate_case"))
 def test_explicit_private_categories_fail_closed_when_incomplete_or_ambiguous(
     mutation: str,
@@ -2028,16 +2107,23 @@ def test_rule_evaluator_rejects_stale_or_malicious_observable_evidence(
     case_ref = build_generic_benchmark_suite(canonical, private_cases).cases[0]
     if mode == "incomplete_dimensions":
         original = private_cases._definitions[case_ref.case_id]
+        business = next(
+            item for item in original.expected_predicates
+            if item.kind in {"observation_equals", "observation_contains"}
+        )
+        business_binding = next(
+            item for item in original.predicate_source_bindings
+            if item.predicate_key == business.predicate_key
+        )
         case_ref = private_cases.register(GenericPrivateCaseDefinition(
             category=original.category,
             assertion_ids=original.assertion_ids,
             private_holdout_uri=original.private_holdout_uri,
             setup=original.setup,
             action=original.action,
-            expected_predicates=(BenchmarkExpectedPredicate(
-                predicate_key="business_only", kind="observation_equals",
-                observed_key="status", expected_value="ok",
-            ),),
+            expected_predicates=(business,),
+            declared_tool_keys=original.declared_tool_keys,
+            predicate_source_bindings=(business_binding,),
         ))
     private_cases.resolve(
         case_ref, purpose="execution", authority_id=_id("stale-fixture-executor")

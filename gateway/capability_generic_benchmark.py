@@ -41,6 +41,22 @@ class GenericBenchmarkCategory(str, Enum):
 
 
 @dataclass(frozen=True)
+class GenericBoundPredicateSource:
+    source_case_key: str
+    assertion_id: str
+    assertion_sha256: str
+    assertion_kind: str
+    source_path: tuple[str, ...]
+    observable_expected: str
+
+
+@dataclass(frozen=True)
+class GenericPredicateSourceBinding:
+    predicate_key: str
+    sources: tuple[GenericBoundPredicateSource, ...]
+
+
+@dataclass(frozen=True)
 class GenericPrivateCaseDefinition:
     category: GenericBenchmarkCategory
     assertion_ids: tuple[str, ...]
@@ -49,6 +65,7 @@ class GenericPrivateCaseDefinition:
     action: str
     expected_predicates: tuple[BenchmarkExpectedPredicate, ...]
     declared_tool_keys: tuple[str, ...] = ()
+    predicate_source_bindings: tuple[GenericPredicateSourceBinding, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -64,6 +81,7 @@ class GenericEvaluationCaseView:
     case_ref: "GenericPrivateCaseRef"
     expected_predicates: tuple[BenchmarkExpectedPredicate, ...]
     declared_tool_keys: tuple[str, ...]
+    predicate_source_bindings: tuple[GenericPredicateSourceBinding, ...]
 
 
 @dataclass(frozen=True)
@@ -296,6 +314,13 @@ class GenericPrivateBenchmarkRepository:
             "setup": definition.setup,
             "action": definition.action,
             "declared_tool_keys": definition.declared_tool_keys,
+            "predicate_source_bindings": [
+                {
+                    "predicate_key": binding.predicate_key,
+                    "sources": [source.__dict__ for source in binding.sources],
+                }
+                for binding in definition.predicate_source_bindings
+            ],
             "expected_predicates": sorted([
                 {
                     "kind": item.kind,
@@ -382,6 +407,7 @@ class GenericPrivateBenchmarkRepository:
             case_ref=case_ref,
             expected_predicates=definition.expected_predicates,
             declared_tool_keys=definition.declared_tool_keys,
+            predicate_source_bindings=definition.predicate_source_bindings,
         )
 
     def retire(self, suite: GenericBenchmarkSuite) -> None:
@@ -456,6 +482,9 @@ class RuleBasedCapabilityBenchmarkEvaluator:
             request.case_ref, purpose="evaluation", authority_id=self.authority_id
         )
         assert isinstance(case, GenericEvaluationCaseView)
+        _validate_predicate_source_authority(
+            case.expected_predicates, case.predicate_source_bindings,
+        )
         outcome = self._json_evidence(request.execution.outcome_ref, "captain.capability-benchmark-outcome.v1")
         rationale = self._json_evidence(request.execution.rationale_ref, "captain.capability-benchmark-rationale.v1")
         execution = request.execution
@@ -816,7 +845,8 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
             raise CapabilityLiveAuthorityUnavailable("structured private holdout is invalid") from None
         required = {
             "case_key", "category", "observable_setup", "observable_action",
-            "source_assertion_ids", "declared_tool_keys", "expected_predicates",
+            "source_assertion_ids", "predicate_source_bindings",
+            "declared_tool_keys", "expected_predicates",
         }
         if not isinstance(payload, dict) or set(payload) != required:
             raise CapabilityLiveAuthorityUnavailable("structured private holdout is invalid")
@@ -832,18 +862,6 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
             raise CapabilityLiveAuthorityUnavailable(
                 "explicit private benchmark category or predicate is invalid"
             ) from None
-        bound_expected = {
-            assertions_by_id[item].observable_expected
-            for item in assertion_ids if item in assertions_by_id
-        }
-        rationale_predicates = tuple(
-            item for item in predicates
-            if item.kind in RATIONALE_BENCHMARK_PREDICATE_KINDS
-        )
-        safety_predicates = tuple(
-            item for item in predicates
-            if item.kind in SAFETY_BENCHMARK_PREDICATE_KINDS
-        )
         if (not isinstance(payload["case_key"], str)
                 or not isinstance(payload["observable_setup"], str)
                 or not isinstance(payload["observable_action"], str)
@@ -858,21 +876,19 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
                     or re.fullmatch(r"[a-z][a-z0-9_]*", item) is None
                     for item in declared_tool_keys
                 )
-                or not rationale_predicates
-                or any(
-                    item.observed_key != "business_outcome"
-                    or item.expected_value not in bound_expected
-                    for item in rationale_predicates
-                )
-                or not safety_predicates
-                or any(
-                    item.observed_key != "declared_tools"
-                    for item in safety_predicates
-                )
                 or not predicates):
             raise CapabilityLiveAuthorityUnavailable(
                 "explicit private benchmark binding is invalid"
             )
+        predicate_source_bindings = _parse_predicate_source_bindings(
+            payload["predicate_source_bindings"],
+            predicates=predicates,
+            assertions_by_id=assertions_by_id,
+            aggregate_assertion_ids=assertion_ids,
+        )
+        _validate_predicate_source_authority(
+            predicates, predicate_source_bindings,
+        )
         definitions.append(GenericPrivateCaseDefinition(
             category=category,
             assertion_ids=assertion_ids,
@@ -881,6 +897,7 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
             action=payload["observable_action"],
             expected_predicates=predicates,
             declared_tool_keys=declared_tool_keys,
+            predicate_source_bindings=predicate_source_bindings,
         ))
     counts = {category: sum(item.category is category for item in definitions)
               for category in GenericBenchmarkCategory}
@@ -900,6 +917,167 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
     return GenericBenchmarkSuite(
         ArtifactRef(uri=f"artifact://capability-benchmark/{digest}", sha256=digest,
                     media_type="application/json"), cases)
+
+
+def _parse_predicate_source_bindings(
+    value: object,
+    *,
+    predicates: tuple[BenchmarkExpectedPredicate, ...],
+    assertions_by_id: dict[str, object],
+    aggregate_assertion_ids: tuple[str, ...],
+) -> tuple[GenericPredicateSourceBinding, ...]:
+    if not isinstance(value, list):
+        raise CapabilityLiveAuthorityUnavailable(
+            "private benchmark predicate source binding is invalid"
+        )
+    bindings: list[GenericPredicateSourceBinding] = []
+    for raw_binding in value:
+        if (
+            not isinstance(raw_binding, dict)
+            or set(raw_binding) != {"predicate_key", "sources"}
+            or not isinstance(raw_binding.get("predicate_key"), str)
+            or not isinstance(raw_binding.get("sources"), list)
+            or not raw_binding["sources"]
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "private benchmark predicate source binding is invalid"
+            )
+        sources: list[GenericBoundPredicateSource] = []
+        for raw_source in raw_binding["sources"]:
+            if (
+                not isinstance(raw_source, dict)
+                or set(raw_source) != {
+                    "source_case_key", "assertion_id", "assertion_sha256",
+                }
+                or not all(
+                    isinstance(raw_source.get(key), str)
+                    for key in (
+                        "source_case_key", "assertion_id", "assertion_sha256",
+                    )
+                )
+                or re.fullmatch(r"[0-9a-f]{64}", raw_source["assertion_sha256"])
+                is None
+            ):
+                raise CapabilityLiveAuthorityUnavailable(
+                    "private benchmark predicate source binding is invalid"
+                )
+            assertion = assertions_by_id.get(raw_source["assertion_id"])
+            if (
+                assertion is None
+                or not hasattr(assertion, "source_path")
+                or not hasattr(assertion, "kind")
+                or not hasattr(assertion, "observable_expected")
+                or assertion.source_path[-1] != raw_source["source_case_key"]
+                or _generic_assertion_sha256(assertion)
+                != raw_source["assertion_sha256"]
+            ):
+                raise CapabilityLiveAuthorityUnavailable(
+                    "private benchmark predicate source binding is invalid"
+                )
+            sources.append(GenericBoundPredicateSource(
+                source_case_key=raw_source["source_case_key"],
+                assertion_id=raw_source["assertion_id"],
+                assertion_sha256=raw_source["assertion_sha256"],
+                assertion_kind=assertion.kind,
+                source_path=assertion.source_path,
+                observable_expected=assertion.observable_expected,
+            ))
+        bindings.append(GenericPredicateSourceBinding(
+            predicate_key=raw_binding["predicate_key"],
+            sources=tuple(sources),
+        ))
+    predicate_keys = tuple(item.predicate_key for item in predicates)
+    binding_keys = tuple(item.predicate_key for item in bindings)
+    bound_assertion_ids = tuple(dict.fromkeys(
+        source.assertion_id for binding in bindings for source in binding.sources
+    ))
+    if (
+        binding_keys != predicate_keys
+        or len(binding_keys) != len(set(binding_keys))
+        or bound_assertion_ids != aggregate_assertion_ids
+    ):
+        raise CapabilityLiveAuthorityUnavailable(
+            "private benchmark predicate source binding is invalid"
+        )
+    return tuple(bindings)
+
+
+def _generic_assertion_sha256(assertion: object) -> str:
+    return hashlib.sha256(
+        _canonical(assertion.model_dump(mode="json")).encode()
+    ).hexdigest()
+
+
+def _validate_predicate_source_authority(
+    predicates: tuple[BenchmarkExpectedPredicate, ...],
+    bindings: tuple[GenericPredicateSourceBinding, ...],
+) -> None:
+    if tuple(item.predicate_key for item in predicates) != tuple(
+        item.predicate_key for item in bindings
+    ):
+        raise CapabilityLiveAuthorityUnavailable(
+            "private benchmark predicate source binding is invalid"
+        )
+    for predicate, binding in zip(predicates, bindings, strict=True):
+        sources = binding.sources
+        if (
+            not sources
+            or tuple(item.source_case_key for item in sources)
+            != predicate.source_case_keys
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "private benchmark predicate source binding is invalid"
+            )
+        expected = predicate.expected_value
+        source_expected = tuple(item.observable_expected for item in sources)
+        valid = False
+        if predicate.kind in {"observation_equals", "observation_contains"}:
+            valid = (
+                predicate.observed_key == "business_outcome"
+                and isinstance(expected, str)
+                and expected in source_expected
+            )
+        elif predicate.kind == "rationale_contains":
+            valid = (
+                predicate.observed_key == "business_outcome"
+                and isinstance(expected, str)
+                and expected in source_expected
+            )
+        elif predicate.kind == "forbidden_tool_absent":
+            valid = (
+                predicate.observed_key == "declared_tools"
+                and expected is True
+                and all(item.assertion_kind == "security" for item in sources)
+                and any(
+                    marker in item.observable_expected.casefold()
+                    for item in sources
+                    for marker in (
+                        "tool lease", "integration lease",
+                        "released team manifest",
+                    )
+                )
+            )
+        elif predicate.kind == "tool_receipt":
+            valid = (
+                len(sources) == 1
+                and predicate.observed_key
+                == sources[0].source_case_key.removeprefix("tool_")
+                and sources[0].source_path[0] == "Tool policy"
+                and expected is True
+            )
+        elif predicate.kind == "handoff_event":
+            valid = (
+                predicate.observed_key == "to_agent"
+                and isinstance(expected, str)
+                and any(
+                    expected.casefold() in item.observable_expected.casefold()
+                    for item in sources
+                )
+            )
+        if not valid:
+            raise CapabilityLiveAuthorityUnavailable(
+                "private benchmark predicate source binding is invalid"
+            )
 
 
 def _evaluate_predicate(

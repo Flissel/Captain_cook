@@ -197,6 +197,59 @@ def test_private_heading_alias_matrix_is_rejected_before_parser_effects(
     assert parser_calls == 0
 
 
+def test_every_normalized_privacy_marker_heading_fails_before_parser_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    parser_calls = 0
+    original = input_document_module._level_sections
+
+    def counted_parser(text: str):
+        nonlocal parser_calls
+        parser_calls += 1
+        return original(text)
+
+    monkeypatch.setattr(input_document_module, "_level_sections", counted_parser)
+    markers = (
+        "Private", "Privates", "Hidden", "Hiddens", "Secret", "Secrets",
+        "Confidential", "Confidentials", "Internal", "Internals",
+        "Nonpublic", "Nonpublics", "Non-public", "Ｎｏｎｐｕｂｌｉｃ",
+    )
+    suffixes = ("verdicts", "notes", "appendix", "decisions")
+    for level in range(1, 7):
+        for marker in markers:
+            for suffix in suffixes:
+                malformed = source.replace(
+                    "## Helpful resources",
+                    (
+                        "## Helpful resources\n- Public resource\n"
+                        f"{'#' * level} {marker} {suffix}\nSENTINEL"
+                    ),
+                )
+                with pytest.raises(FactoryInputError, match="private benchmark cases"):
+                    parse_factory_input_bytes(
+                        malformed.encode(), logical_name="TO_BE_BUILT.md",
+                    )
+
+    assert parser_calls == 0
+
+
+@pytest.mark.parametrize(
+    "heading",
+    ("Public verdicts", "Customer results", "Release appendix", "Team decisions"),
+)
+def test_unrelated_public_nested_headings_remain_valid(heading: str) -> None:
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    source = source.replace(
+        "## Helpful resources",
+        f"## Helpful resources\n### {heading}\nPublic content only.",
+    )
+
+    document = parse_factory_input_bytes(source.encode(), logical_name="TO_BE_BUILT.md")
+
+    assert document.title == "Customer Support Triage"
+
+
 @pytest.mark.parametrize(
     "heading", ("Private benchmark policy", "Private holdout policy"),
 )

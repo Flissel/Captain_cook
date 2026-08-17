@@ -12,7 +12,11 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validat
 
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.holdout_store import PrivateHoldoutStore
-from agenten.agent_factory.input_contracts import FactoryInputDocumentV2, RealCaseRequirement
+from agenten.agent_factory.input_contracts import (
+    BenchmarkExpectedPredicate,
+    FactoryInputDocumentV2,
+    RealCaseRequirement,
+)
 from agenten.agent_factory.private_benchmark_catalog import (
     PrivateBenchmarkCatalogError,
     PrivateBenchmarkCatalogPort,
@@ -164,24 +168,71 @@ class FactoryInputCompiler:
                     "private benchmark suite changed admitted input or policy authority"
                 )
             assertions_by_source = {
-                item.source_path[-1]: item.assertion_id for item in assertions
+                item.source_path[-1]: item for item in assertions
             }
             entries: list[tuple[str, str]] = []
             for case in suite.cases:
                 try:
-                    assertion_ids = tuple(
+                    case_assertions = tuple(
                         assertions_by_source[key] for key in case.source_case_keys
                     )
                 except KeyError:
                     raise PrivateBenchmarkCatalogError(
                         "private benchmark case references an unknown admitted source"
                     ) from None
+                assertion_ids = tuple(item.assertion_id for item in case_assertions)
+                predicate_bindings = []
+                for predicate in case.expected_predicates:
+                    try:
+                        source_assertions = tuple(
+                            assertions_by_source[key]
+                            for key in predicate.source_case_keys
+                        )
+                    except KeyError:
+                        raise PrivateBenchmarkCatalogError(
+                            "private benchmark predicate source binding is invalid"
+                        ) from None
+                    _validate_predicate_source_binding(
+                        predicate, source_assertions,
+                    )
+                    predicate_bindings.append({
+                        "predicate_key": predicate.predicate_key,
+                        "sources": [
+                            {
+                                "source_case_key": source_case_key,
+                                "assertion_id": assertion.assertion_id,
+                                "assertion_sha256": _assertion_sha256(assertion),
+                            }
+                            for source_case_key, assertion in zip(
+                                predicate.source_case_keys,
+                                source_assertions,
+                                strict=True,
+                            )
+                        ],
+                    })
+                bound_assertion_ids = tuple(dict.fromkeys(
+                    source["assertion_id"]
+                    for binding in predicate_bindings
+                    for source in binding["sources"]
+                ))
+                if (
+                    set(bound_assertion_ids) != set(assertion_ids)
+                    or set(case.source_case_keys) != {
+                        source
+                        for predicate in case.expected_predicates
+                        for source in predicate.source_case_keys
+                    }
+                ):
+                    raise PrivateBenchmarkCatalogError(
+                        "private benchmark predicate source binding is invalid"
+                    )
                 body = _canonical_json({
                     "case_key": case.case_key,
                     "category": case.category,
                     "observable_setup": case.observable_setup,
                     "observable_action": case.observable_action,
                     "source_assertion_ids": assertion_ids,
+                    "predicate_source_bindings": predicate_bindings,
                     "declared_tool_keys": list(case.declared_tool_keys),
                     "expected_predicates": [
                         item.model_dump(mode="json")
@@ -256,3 +307,72 @@ def _capability_key(title: str) -> str:
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _assertion_sha256(assertion: AcceptanceAssertion) -> str:
+    return hashlib.sha256(
+        _canonical_json(assertion.model_dump(mode="json")).encode()
+    ).hexdigest()
+
+
+def _validate_predicate_source_binding(
+    predicate: BenchmarkExpectedPredicate,
+    sources: tuple[AcceptanceAssertion, ...],
+) -> None:
+    if (
+        not sources
+        or tuple(item.source_path[-1] for item in sources)
+        != predicate.source_case_keys
+    ):
+        raise PrivateBenchmarkCatalogError(
+            "private benchmark predicate source binding is invalid"
+        )
+    expected = predicate.expected_value
+    source_expected = tuple(item.observable_expected for item in sources)
+    valid = False
+    if predicate.kind in {"observation_equals", "observation_contains"}:
+        valid = (
+            predicate.observed_key == "business_outcome"
+            and isinstance(expected, str)
+            and expected in source_expected
+        )
+    elif predicate.kind == "rationale_contains":
+        valid = (
+            predicate.observed_key == "business_outcome"
+            and isinstance(expected, str)
+            and expected in source_expected
+        )
+    elif predicate.kind == "forbidden_tool_absent":
+        valid = (
+            predicate.observed_key == "declared_tools"
+            and expected is True
+            and all(item.kind == "security" for item in sources)
+            and any(
+                marker in item.observable_expected.casefold()
+                for item in sources
+                for marker in (
+                    "tool lease", "integration lease", "released team manifest",
+                )
+            )
+        )
+    elif predicate.kind == "tool_receipt":
+        valid = (
+            len(sources) == 1
+            and predicate.observed_key
+            == sources[0].source_path[-1].removeprefix("tool_")
+            and sources[0].source_path[0] == "Tool policy"
+            and expected is True
+        )
+    elif predicate.kind == "handoff_event":
+        valid = (
+            predicate.observed_key == "to_agent"
+            and isinstance(expected, str)
+            and any(
+                expected.casefold() in item.observable_expected.casefold()
+                for item in sources
+            )
+        )
+    if not valid:
+        raise PrivateBenchmarkCatalogError(
+            "private benchmark predicate source binding is invalid"
+        )

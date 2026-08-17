@@ -374,11 +374,11 @@ def test_private_catalog_compiles_only_opaque_refs_and_never_enters_worker_bytes
     tmp_path: Path,
 ) -> None:
     document = _documents()[1]
-    sentinel = "CAPTAIN-PRIVATE-EXPECTED-SENTINEL"
+    sentinel = "captain_private_predicate_sentinel"
     suite = generate_private_benchmark_suite(document, seed=b"c" * 32)
     first = suite.cases[0]
     predicates = list(first.expected_predicates)
-    predicates[0] = predicates[0].model_copy(update={"expected_value": sentinel})
+    predicates[0] = predicates[0].model_copy(update={"predicate_key": sentinel})
     suite = suite.model_copy(update={
         "cases": (first.model_copy(update={"expected_predicates": tuple(predicates)}), *suite.cases[1:])
     })
@@ -518,6 +518,67 @@ def test_unknown_source_in_final_case_leaves_holdout_store_empty() -> None:
     holdouts = InMemoryPrivateHoldoutStore()
 
     with pytest.raises(PrivateBenchmarkCatalogError, match="unknown admitted source"):
+        FactoryInputCompiler(
+            holdout_store=holdouts, private_benchmark_catalog=catalog,
+        ).compile(document, subject_version=1)
+
+    assert len(holdouts) == 0
+
+
+@pytest.mark.parametrize(
+    "dimension",
+    ("business", "rationale", "safety", "tool", "handoff"),
+)
+def test_compiler_rejects_per_predicate_source_cross_swaps_before_holdout_effect(
+    dimension: str,
+) -> None:
+    document = _documents()[1]
+    suite = generate_private_benchmark_suite(
+        document, seed=b"predicate-source-cross-swap-seed" * 2,
+    )
+    case_index = next(
+        index for index, item in enumerate(suite.cases)
+        if (item.category == "mandatory_escalation") == (dimension == "handoff")
+    )
+    case = suite.cases[case_index]
+    predicates = list(case.expected_predicates)
+    kinds = {
+        "business": "observation_contains",
+        "rationale": "rationale_contains",
+        "safety": "forbidden_tool_absent",
+        "tool": "tool_receipt",
+        "handoff": "handoff_event",
+    }
+    target_index = next(
+        index for index, item in enumerate(predicates)
+        if item.kind == kinds[dimension]
+    )
+    counterpart_kind = (
+        "rationale_contains" if dimension == "safety"
+        else "forbidden_tool_absent"
+    )
+    counterpart_index = next(
+        index for index, item in enumerate(predicates)
+        if item.kind == counterpart_kind
+    )
+    target_sources = predicates[target_index].source_case_keys
+    counterpart_sources = predicates[counterpart_index].source_case_keys
+    predicates[target_index] = predicates[target_index].model_copy(update={
+        "source_case_keys": counterpart_sources,
+    })
+    predicates[counterpart_index] = predicates[counterpart_index].model_copy(update={
+        "source_case_keys": target_sources,
+    })
+    cases = list(suite.cases)
+    cases[case_index] = case.model_copy(update={
+        "expected_predicates": tuple(predicates),
+    })
+    catalog = InMemoryPrivateBenchmarkCatalog((
+        suite.model_copy(update={"cases": tuple(cases)}),
+    ))
+    holdouts = InMemoryPrivateHoldoutStore()
+
+    with pytest.raises(PrivateBenchmarkCatalogError, match="predicate source binding"):
         FactoryInputCompiler(
             holdout_store=holdouts, private_benchmark_catalog=catalog,
         ).compile(document, subject_version=1)
