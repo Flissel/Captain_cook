@@ -26,7 +26,7 @@ _SERVICE_SECRET_ENV = {
         "CAPTAIN_GATEWAY_TOKEN", "WORKER_GATEWAY_TOKEN",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN", "CAPTAIN_RUNTIME_TOKEN",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN", "MINIBOOK_API_KEY",
-        "MINIBOOK_PROJECTION_API_KEY",
+        "MINIBOOK_PROJECTION_API_KEY", "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN",
     ),
     "runtime": (
         "CAPTAIN_RUNTIME_TOKEN", "CAPTAIN_GATEWAY_TOKEN",
@@ -87,6 +87,18 @@ def _service_environment(service: str, environment: Mapping[str, str]) -> dict[s
     for name in _SERVICE_SECRET_ENV[service]:
         if name not in child:
             raise ValueError(f"required process setting is missing: {name}")
+    child["PYTHONUTF8"] = "1"
+    return child
+
+
+def _process_introspection_environment(
+    environment: Mapping[str, str],
+) -> dict[str, str]:
+    child = {
+        name: environment[name]
+        for name in _INHERITED_ENV
+        if environment.get(name, "").strip()
+    }
     child["PYTHONUTF8"] = "1"
     return child
 
@@ -208,7 +220,10 @@ def _require_same_process(state: Mapping[str, object]) -> int:
     return pid
 
 
-def _observed_n8n_container_identity() -> tuple[str, str] | None:
+def _observed_n8n_container_identity(
+    environment: Mapping[str, str],
+) -> tuple[str, str] | None:
+    docker_environment = _service_environment("n8n", environment)
     inventory = subprocess.run(
         (
             "docker", "ps", "-q",
@@ -216,6 +231,7 @@ def _observed_n8n_container_identity() -> tuple[str, str] | None:
             "--filter", "label=com.docker.compose.service=n8n",
             "--filter", "status=running",
         ), capture_output=True, text=True, check=False, timeout=10,
+        env=docker_environment,
     )
     ids = tuple(line.strip() for line in inventory.stdout.splitlines() if line.strip())
     if inventory.returncode != 0 or len(ids) != 1:
@@ -223,6 +239,7 @@ def _observed_n8n_container_identity() -> tuple[str, str] | None:
     inspected = subprocess.run(
         ("docker", "inspect", "--format", "{{.Id}}|{{.State.StartedAt}}", ids[0]),
         capture_output=True, text=True, check=False, timeout=10,
+        env=docker_environment,
     )
     values = inspected.stdout.strip().split("|", 1)
     if inspected.returncode != 0 or len(values) != 2 or not all(values):
@@ -256,6 +273,7 @@ def _collect_exact_process_tree(
         result = subprocess.run(
             ("pwsh", "-NoProfile", "-Command", command),
             capture_output=True, text=True, check=False, timeout=10,
+            env=_process_introspection_environment(os.environ),
         )
         values = json.loads(result.stdout) if result.returncode == 0 else []
         pids = values if isinstance(values, list) else [values]
@@ -308,8 +326,10 @@ def _terminate_exact_process_tree(state: Mapping[str, object]) -> bool:
     return _wait_tracked_tree_gone(tree, timeout_seconds=2.0)
 
 
-def _require_same_n8n_container(state: Mapping[str, object]) -> str:
-    observed = _observed_n8n_container_identity()
+def _require_same_n8n_container(
+    state: Mapping[str, object], environment: Mapping[str, str],
+) -> str:
+    observed = _observed_n8n_container_identity(environment)
     expected = str(state.get("identity_value", ""))
     if observed is None or f"{observed[0]}:{observed[1]}" != expected:
         raise RuntimeError("managed n8n container identity changed; refusing to stop")
@@ -337,7 +357,17 @@ def _wait_authenticated_health(
     url_name, suffix, token_name, header = definitions[service]
     base = _required(environment, url_name)
     if service == "benchmark":
+        if not base.endswith("/v1/execute"):
+            raise ValueError("authenticated health endpoint is invalid")
         base = base.removesuffix("/v1/execute")
+    parsed = urlsplit(base)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username is not None or parsed.password is not None
+        or parsed.query or parsed.fragment or parsed.path.rstrip("/")
+    ):
+        raise ValueError("authenticated health endpoint is invalid")
     token = _required(environment, token_name)
     value = token if header == "X-N8N-API-KEY" else f"Bearer {token}"
     deadline = time.monotonic() + timeout_seconds
@@ -407,7 +437,7 @@ def operate(
 
     if action in {"stop", "restart"}:
         if not sentinel and service == "n8n" and prior is not None:
-            container_id = _require_same_n8n_container(prior)
+            container_id = _require_same_n8n_container(prior, environment)
             completed = subprocess.run(
                 service_argv(
                     service,
@@ -418,17 +448,21 @@ def operate(
                 cwd=repository_root,
                 check=False,
                 timeout=30,
+                env=_service_environment("n8n", environment),
             )
             if completed.returncode != 0:
                 raise RuntimeError("n8n process stop failed")
             deadline = time.monotonic() + 5.0
             while container_id is not None and time.monotonic() < deadline:
-                if _observed_n8n_container_identity() is None:
+                if _observed_n8n_container_identity(environment) is None:
                     break
                 time.sleep(0.1)
-            if container_id is not None and _observed_n8n_container_identity() is not None:
-                subprocess.run(("docker", "kill", container_id), check=False, timeout=10)
-                if _observed_n8n_container_identity() is not None:
+            if container_id is not None and _observed_n8n_container_identity(environment) is not None:
+                subprocess.run(
+                    ("docker", "kill", container_id), check=False, timeout=10,
+                    env=_service_environment("n8n", environment),
+                )
+                if _observed_n8n_container_identity(environment) is not None:
                     raise RuntimeError("n8n container exit could not be confirmed")
         if prior is not None:
             raw_pid = prior.get("process_id")
@@ -462,7 +496,7 @@ def operate(
         if sentinel:
             return current
         if service == "n8n":
-            _require_same_n8n_container(current)
+            _require_same_n8n_container(current, environment)
         else:
             _require_same_process(current)
         _wait_authenticated_health(service, environment=environment, timeout_seconds=5.0)
@@ -485,10 +519,13 @@ def operate(
     if sentinel:
         process_id = int(identity.replace("-", "")[:8], 16) or 1
     elif service == "n8n":
-        completed = subprocess.run(argv, cwd=repository_root, check=False, timeout=30)
+        completed = subprocess.run(
+            argv, cwd=repository_root, check=False, timeout=30,
+            env=_service_environment("n8n", environment),
+        )
         if completed.returncode != 0:
             raise RuntimeError("n8n process start failed")
-        observed_container = _observed_n8n_container_identity()
+        observed_container = _observed_n8n_container_identity(environment)
         if observed_container is None:
             raise RuntimeError("started n8n container identity is unavailable")
         process_id = None
@@ -538,18 +575,19 @@ def operate(
         try:
             _wait_authenticated_health(service, environment=environment)
             if service == "n8n":
-                _require_same_n8n_container(state)
+                _require_same_n8n_container(state, environment)
             else:
                 _require_same_process(state)
         except Exception:
             gone = False
             try:
                 if service == "n8n":
-                    container_id = _require_same_n8n_container(state)
+                    container_id = _require_same_n8n_container(state, environment)
                     subprocess.run(
-                        ("docker", "kill", container_id), check=False, timeout=10
+                        ("docker", "kill", container_id), check=False, timeout=10,
+                        env=_service_environment("n8n", environment),
                     )
-                    gone = _observed_n8n_container_identity() is None
+                    gone = _observed_n8n_container_identity(environment) is None
                 else:
                     gone = _terminate_exact_process_tree(state)
             except Exception:

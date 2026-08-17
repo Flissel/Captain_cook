@@ -28,6 +28,7 @@ def _environment() -> dict[str, str]:
         "CAPTAIN_RUNTIME_TOKEN": "runtime-token-value",
         "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "provider-token-value",
+        "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN": "receipt-token-value",
         "CAPTAIN_PROVIDER_POLICY_SHA256": "a" * 64,
         "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "b" * 64,
         "CAPTAIN_PROVIDER_CONTEXT_SHA256": "c" * 64,
@@ -198,8 +199,30 @@ def test_each_process_receives_only_its_allowlisted_environment() -> None:
         assert "UNRELATED_SECRET" not in child
         assert ("OPENAI_API_KEY" in child) is (service == "provider_proxy")
         assert ("CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN" in child) is (
-            service == "provider_proxy"
+            service in {"gateway", "provider_proxy"}
         )
+
+
+def test_health_rejects_attacker_url_before_reading_token_or_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested: list[object] = []
+    monkeypatch.setattr(
+        process_operator.urllib.request, "urlopen",
+        lambda *_args, **_kwargs: requested.append(object()),
+    )
+
+    with pytest.raises(ValueError, match="health endpoint is invalid"):
+        process_operator._wait_authenticated_health(
+            "gateway",
+            environment={
+                "CAPTAIN_GATEWAY_URL": "https://attacker.invalid",
+                "CAPTAIN_GATEWAY_TOKEN": "must-not-be-attached",
+            },
+            timeout_seconds=0.1,
+        )
+
+    assert requested == []
 
 
 def test_filtered_environments_satisfy_real_entrypoint_preflights(tmp_path: Path) -> None:
@@ -276,7 +299,7 @@ def test_n8n_reuse_uses_container_identity_without_pid_sentinel(
         "identity_value": "container-id:started-at", "argv": ["pwsh"],
     }
     (state_root / "n8n.json").write_text(json.dumps(state), encoding="utf-8")
-    monkeypatch.setattr(process_operator, "_observed_n8n_container_identity", lambda: ("container-id", "started-at"))
+    monkeypatch.setattr(process_operator, "_observed_n8n_container_identity", lambda _environment: ("container-id", "started-at"))
     monkeypatch.setattr(process_operator, "_wait_authenticated_health", lambda *_args, **_kwargs: None)
 
     reused = operate("n8n", "start", environment={

@@ -408,8 +408,8 @@ class GatewaySettings(BaseModel):
                 captain_gateway_token=SecretStr(captain_token),
                 worker_gateway_token=SecretStr(worker_token),
                 provider_receipt_gateway_token=(
-                    SecretStr(source["PROVIDER_RECEIPT_GATEWAY_TOKEN"])
-                    if source.get("PROVIDER_RECEIPT_GATEWAY_TOKEN") is not None
+                    SecretStr(source["CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN"])
+                    if source.get("CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN") is not None
                     else None
                 ),
                 provider_proxy_url=(
