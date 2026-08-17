@@ -435,3 +435,64 @@ The implementation commit changed exactly those seven product/test files.
 - After the implementation commit, `git status --short --branch` showed only
   `## codex/private-demo-benchmarks-d10`. The final handoff records the same
   clean status after the separate report commit.
+
+## Review Fix Round 4 — privacy and secrecy noun morphology
+
+### Base and implementation commit
+
+- Review-fix starting commit: `3030d8ca21237c132e187201c49e30ade883990d`.
+- Review-fix implementation commit: `322ac6a7bd7bd9a57f07bfa95048f9ca4395c7bc`
+  (`fix(factory): reject privacy noun headings`).
+- Branch: `codex/private-demo-benchmarks-d10`.
+- The report append is the only file in the separate documentation commit; its
+  hash is recorded in the final handoff because a commit cannot self-reference
+  its own hash.
+
+### RED evidence
+
+The Privacy/Secrecy noun-family group produced `36 failed, 8 passed,
+94 deselected`. `Privacy`, `Privacies`, `Secrecy`, and `Secrecies` variants,
+including mixed case and punctuation, reached parser behavior at every heading
+level 1–6. Exact level-2 public-policy headings and unrelated public controls
+passed. Every failure carried the sentinel input and the parser-call counter.
+
+### Implemented scope
+
+- `agenten/agent_factory/input_document.py`: the normalized token classifier now
+  models `privat`/`privac` and `secret`/`secrec` as related morphological
+  families. The noun and plural-noun suffixes are handled at token level rather
+  than as exact heading phrases.
+- `tests/agent_factory/test_input_document.py`: 36 behavioral cases cover noun,
+  plural, punctuation, mixed-case, levels 1–6, zero parser calls, and sentinel
+  persistence.
+
+The implementation commit changed exactly those two files. No compiler,
+source-authority, Gateway, evaluator, or execution-wire file changed.
+
+### GREEN and verification evidence
+
+- Morphology/allowlist/public-control target: `80 passed, 58 deselected in
+  0.57s`.
+- Complete D10 input/catalog/Gateway focus: `254 passed in 15.71s`.
+- Architecture/import/workstream gate: `18 passed in 2.05s`.
+- `python -m compileall -q agenten blockchain chats config gateway`: exit 0.
+- `scripts/verify_submission.py`: `Submission evidence check passed.`, exit 0.
+- `git diff --check`: exit 0 before the implementation commit.
+- Added-line credential-assignment plus bearer/private-key/credential-URL scan:
+  zero hits.
+- No `.coverage` or `.coverage.*` data artifact remained before the report
+  commit.
+
+### Nonclaims
+
+- No live service, database, provider, Docker, n8n, Minibook, browser, or
+  network operation was run.
+- The broader Agent Factory/runtime regression, six-minute full non-live suite,
+  and MariaDB integration were not requested or run in this morphology-only
+  round. Only the gates listed above are claimed.
+- No source-authority contract, private predicate binding, expected answer,
+  public projection, worker input, deployment, push, merge, rebase, credential,
+  or unrelated behavior changed.
+- After the implementation commit, `git status --short --branch` showed only
+  `## codex/private-demo-benchmarks-d10`. The final handoff records the same
+  clean status after the separate report commit.
