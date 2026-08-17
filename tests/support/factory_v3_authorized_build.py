@@ -173,46 +173,39 @@ class _DeterministicExternalModel:
 AGENTS = {list(agents)!r}
 
 def evaluate_industry_signal(available):
-    if available:
-        return "bounded_public_signal"
-    return "typed_optional_gap"
+    return industry_signal_reader(available=available)
 
-def run_sales_pipeline(sales_input, credential):
-    trace = ["account_researcher"]
+def run_sales_pipeline(sales_input):
+    credential = credential_ref()
     account = read_account_snapshot(sales_input, credential)
     if len(AGENTS) == 1:
-        return {{"executive_brief": "incomplete", "handoff_trace": trace, "handoffs": [], "credential_ref_used": credential, "pipeline_status": "incomplete", "qualification_preserved": False, "next_action_preserved": False}}
+        blocked_external_write({{"account_id": "acct-42"}})
+        return "incomplete"
+    record_handoff("account_researcher", "opportunity_qualifier")
     qualification = qualify_opportunity(account)
+    record_handoff("opportunity_qualifier", "deal_strategist")
     brief = qualification["qualification"] + "; next action: Schedule an evidence review"
-    return {{"executive_brief": brief, "handoff_trace": ["account_researcher", "opportunity_qualifier", "deal_strategist", "executive_brief_writer"], "handoffs": [{{"from": "account_researcher", "to": "opportunity_qualifier"}}, {{"from": "opportunity_qualifier", "to": "deal_strategist"}}, {{"from": "deal_strategist", "to": "executive_brief_writer"}}], "credential_ref_used": credential, "pipeline_status": "passed", "qualification_preserved": True, "next_action_preserved": True}}
+    record_handoff("deal_strategist", "executive_brief_writer")
+    evaluate_industry_signal(available=True)
+    evaluate_industry_signal(available=False)
+    blocked_external_write({{"account_id": "acct-42"}})
+    return brief
 """
         test = """\
 def test_generated_sales_pipeline_real_case():
-    credential = credential_ref()
     sales_input = {"account_id": "acct-42", "stage": "qualified", "account_name": "Acme"}
-    result = run_sales_pipeline(sales_input, credential)
-    assert result["handoff_trace"] == AGENTS
-    assert result["credential_ref_used"] == credential
+    result = run_sales_pipeline(sales_input)
     if len(AGENTS) == 1:
-        assert result["executive_brief"] == "incomplete"
+        assert result == "incomplete"
     else:
-        assert result["executive_brief"] == "qualified; next action: Schedule an evidence review"
-    assert read_account_snapshot(sales_input, credential)["account_id"] == "acct-42"
-    assert qualify_opportunity({"stage": "qualified"})["applied_rule"] == "published-stage-rule"
-    available_signal = evaluate_industry_signal(available=True)
-    unavailable_signal = evaluate_industry_signal(available=False)
-    assert available_signal == "bounded_public_signal"
-    assert unavailable_signal == "typed_optional_gap"
-    blocked = blocked_external_write({"account_id": "acct-42"})
-    assert blocked == "blocked"
-    emit_evidence({"executive_brief": result["executive_brief"], "handoff_trace": result["handoff_trace"], "handoffs": result["handoffs"], "credential_ref_used": result["credential_ref_used"], "pipeline_status": result["pipeline_status"], "qualification_preserved": result["qualification_preserved"], "next_action_preserved": result["next_action_preserved"], "tool_evidence": {"account_snapshot_reader": {"status": "passed", "typed_schema": True, "test_passed": True, "result": "approved_account_snapshot"}, "opportunity_scoring_rules": {"status": "passed", "typed_schema": True, "test_passed": True, "result": "versioned_published_rule"}}, "optional_tool_policy": {"available_result": available_signal, "unavailable_result": unavailable_signal}, "sentinel_secret_seen": sentinel_secret_seen()})
+        assert result == "qualified; next action: Schedule an evidence review"
 """
         return {
             "src/__init__.py": b'"""Generated sales pipeline package."""\n',
             "src/team.py": team.encode(),
             "src/tools/__init__.py": b'"""Generated typed sales tools."""\n',
-            "src/tools/account_snapshot_reader.py": b"def read_account_snapshot(value, credential):\n    return {'account_id': value['account_id'], 'account_name': value['account_name'], 'stage': value['stage']}\n",
-            "src/tools/opportunity_scoring_rules.py": b"def qualify_opportunity(value):\n    if value['stage'] == 'qualified':\n        return {'qualification': 'qualified', 'applied_rule': 'published-stage-rule'}\n    return {'qualification': 'not-qualified', 'applied_rule': 'published-stage-rule'}\n",
+            "src/tools/account_snapshot_reader.py": b"def read_account_snapshot(value, credential):\n    return account_snapshot_reader(value, credential)\n",
+            "src/tools/opportunity_scoring_rules.py": b"def qualify_opportunity(value):\n    return opportunity_scoring_rules(value)\n",
             "tests/test_team.py": test.encode(),
         }
 
@@ -288,6 +281,7 @@ class CaptainAuthorizedHermeticCodexPort:
             allowed_commands=assignment.allowed_commands,
             network_allowed=False,
             maximum_provider_cost_usd=assignment.limits.max_provider_cost_usd,
+            maximum_files=assignment.limits.max_files,
         )
         executor = CodexCliFactoryBuildExecutor(
             settings=settings,

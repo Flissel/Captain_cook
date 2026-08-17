@@ -6,17 +6,18 @@ import ast
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import stat
 import subprocess
 import time
-import math
+import tokenize
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Literal, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -601,9 +602,102 @@ class FactoryCodexRuntimeAuthority:
     allowed_commands: tuple[tuple[str, ...], ...]
     network_allowed: bool
     maximum_provider_cost_usd: float
+    maximum_files: int
 
 
 _CAPTAIN_FACTORY_RUNTIME_SEAL = object()
+
+_MAX_STATIC_FACTORY_FILES = 4_096
+_MAX_STATIC_FACTORY_SOURCE_FILES = 256
+_MAX_STATIC_FACTORY_TEST_FILES = 256
+_MAX_STATIC_FACTORY_PATH_CHARS = 240
+_MAX_STATIC_FACTORY_SOURCE_BYTES = MAX_FACTORY_CODEX_JSON_ARTIFACT_BYTES
+_MAX_STATIC_FACTORY_FILE_BYTES = MAX_FACTORY_CODEX_CANDIDATE_ARCHIVE_BYTES
+_MAX_STATIC_FACTORY_TOTAL_BYTES = MAX_FACTORY_CODEX_OUTPUT_BYTES
+_MAX_STATIC_FACTORY_TOKENS = 20_000
+_MAX_STATIC_FACTORY_SYNTAX_DEPTH = 64
+_MAX_STATIC_FACTORY_AST_NODES = 20_000
+_MAX_STATIC_FACTORY_AST_DEPTH = 64
+_MAX_STATIC_FACTORY_LITERAL_BYTES = 64 * 1024
+_MAX_STATIC_FACTORY_CONTAINER_ITEMS = 256
+_MAX_STATIC_FACTORY_RUNTIME_STRING_BYTES = 256 * 1024
+_STATIC_FACTORY_PATH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _validate_static_factory_path(path: object) -> str:
+    if (
+        not isinstance(path, str)
+        or not path
+        or len(path) > _MAX_STATIC_FACTORY_PATH_CHARS
+        or not path.isascii()
+        or _STATIC_FACTORY_PATH_PATTERN.fullmatch(path) is None
+        or path.startswith(("/", "."))
+        or path.endswith("/")
+        or "//" in path
+        or "\\" in path
+        or ":" in path
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+    ):
+        raise ValueError("static Factory source path is unsafe")
+    return path
+
+
+def _preflight_static_factory_bundle(
+    *,
+    authority: FactoryCodexRuntimeAuthority,
+    bundle: "CaptainStaticFactorySourceBundle",
+    deadline_check: Callable[[], None],
+) -> None:
+    """Apply assignment and hard resource bounds before decoding or writing."""
+
+    maximum_files = authority.maximum_files
+    if (
+        not isinstance(maximum_files, int)
+        or isinstance(maximum_files, bool)
+        or maximum_files < 1
+        or maximum_files > _MAX_STATIC_FACTORY_FILES
+        or len(bundle.files) > maximum_files
+        or len(bundle.files) > _MAX_STATIC_FACTORY_FILES
+    ):
+        raise FactoryDispatchError("static Factory source bundle exceeds file bound")
+    source_files = 0
+    test_files = 0
+    total_bytes = 0
+    for raw_path, content in bundle.files:
+        deadline_check()
+        try:
+            path = _validate_static_factory_path(raw_path)
+        except ValueError as exc:
+            raise FactoryDispatchError("static Factory source bundle path is unsafe") from exc
+        if not isinstance(content, bytes) or not content:
+            raise FactoryDispatchError("static Factory source bundle content is invalid")
+        maximum_file_bytes = (
+            _MAX_STATIC_FACTORY_SOURCE_BYTES
+            if path.endswith(".py")
+            else _MAX_STATIC_FACTORY_FILE_BYTES
+        )
+        if len(content) > maximum_file_bytes:
+            raise FactoryDispatchError("static Factory source bundle exceeds file size")
+        if len(content) > _MAX_STATIC_FACTORY_TOTAL_BYTES - total_bytes:
+            raise FactoryDispatchError("static Factory source bundle exceeds total size")
+        total_bytes += len(content)
+        if path.endswith(".py"):
+            if path.startswith("tests/"):
+                test_files += 1
+            else:
+                source_files += 1
+    if (
+        source_files < 1
+        or test_files < 1
+        or source_files > min(maximum_files, _MAX_STATIC_FACTORY_SOURCE_FILES)
+        or test_files > min(maximum_files, _MAX_STATIC_FACTORY_TEST_FILES)
+        or source_files + test_files > maximum_files
+    ):
+        raise FactoryDispatchError("static Factory source bundle count is invalid")
 
 
 class _RestrictedFactoryPythonError(ValueError):
@@ -653,10 +747,13 @@ class _CaptainRestrictedStaticPythonEngine:
     )
     _PRIMITIVE_NAMES = frozenset(
         {
+            "account_snapshot_reader",
             "blocked_external_write",
             "credential_ref",
-            "emit_evidence",
+            "industry_signal_reader",
             "len",
+            "opportunity_scoring_rules",
+            "record_handoff",
             "sentinel_secret_seen",
         }
     )
@@ -668,24 +765,26 @@ class _CaptainRestrictedStaticPythonEngine:
         writable_roots: tuple[Path, ...],
         bundle: "CaptainStaticFactorySourceBundle",
         environment: Mapping[str, str],
+        deadline_check: Callable[[], None],
     ) -> None:
         self._workspace_root = workspace_root.resolve()
         self._writable_roots = writable_roots
         self._bundle = bundle
         self._environment = dict(environment)
+        self._deadline_check = deadline_check
         self._trees: dict[str, ast.Module] = {}
         self._steps = 0
         self._call_depth = 0
-        self._external_write_attempts = 0
-        self._external_write_blocks = 0
-        self._evidence_emitted = False
         self._scope: dict[str, object] = {
+            "account_snapshot_reader": self._account_snapshot_reader,
             "blocked_external_write": self._blocked_external_write,
             "credential_ref": self._credential_ref,
-            "emit_evidence": self._emit_evidence,
+            "industry_signal_reader": self._industry_signal_reader,
             "len": self._safe_len,
-            "sentinel_secret_seen": self._sentinel_secret_seen,
+            "opportunity_scoring_rules": self._opportunity_scoring_rules,
+            "record_handoff": self._record_handoff,
         }
+        self._reset_observations()
 
     def validate(self) -> None:
         python_paths = tuple(
@@ -698,11 +797,22 @@ class _CaptainRestrictedStaticPythonEngine:
                 "restricted Python requires source and tests"
             )
         for relative in python_paths:
-            path = (self._workspace_root / relative).resolve()
+            self._deadline_check()
             try:
-                content = path.read_text(encoding="utf-8")
+                raw = dict(self._bundle.files)[relative]
+                content = raw.decode("utf-8", errors="strict")
+                self._validate_source_tokens(content)
+                self._deadline_check()
                 tree = ast.parse(content, filename=relative, mode="exec")
-            except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+            except (
+                LookupError,
+                UnicodeDecodeError,
+                SyntaxError,
+                ValueError,
+                tokenize.TokenError,
+                RecursionError,
+                MemoryError,
+            ) as exc:
                 raise _RestrictedFactoryPythonError(
                     "restricted Python source is invalid"
                 ) from exc
@@ -745,13 +855,92 @@ class _CaptainRestrictedStaticPythonEngine:
             for name in test_names:
                 self._call_function(self._scope[name], (), {})
                 executed_tests += 1
-        if executed_tests < 1 or not self._evidence_emitted:
+        if executed_tests < 1:
             raise _RestrictedFactoryPythonError(
-                "restricted Python tests produced no evidence"
+                "restricted Python tests did not execute"
+            )
+        entrypoint = self._scope.get("run_sales_pipeline")
+        if not isinstance(entrypoint, _RestrictedFactoryFunction):
+            raise _RestrictedFactoryPythonError(
+                "restricted Python real-case entrypoint is unavailable"
+            )
+        self._reset_observations()
+        result = self._call_function(
+            entrypoint,
+            (
+                {
+                    "account_id": "acct-42",
+                    "stage": "qualified",
+                    "account_name": "Acme",
+                },
+            ),
+            {},
+        )
+        self._write_captain_evidence(result)
+
+    def _validate_source_tokens(self, content: str) -> None:
+        if "\x00" in content:
+            raise _RestrictedFactoryPythonError(
+                "restricted Python source contains a null byte"
+            )
+        token_count = 0
+        syntax_depth = 0
+        indentation_depth = 0
+        for token in tokenize.generate_tokens(StringIO(content).readline):
+            self._deadline_check()
+            token_count += 1
+            if token_count > _MAX_STATIC_FACTORY_TOKENS:
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python token bound exceeded"
+                )
+            if token.type == tokenize.OP and token.string in "([{":
+                syntax_depth += 1
+                if syntax_depth > _MAX_STATIC_FACTORY_SYNTAX_DEPTH:
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python syntax depth exceeded"
+                    )
+            elif token.type == tokenize.OP and token.string in ")]}":
+                syntax_depth -= 1
+                if syntax_depth < 0:
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python syntax nesting is invalid"
+                    )
+            elif token.type == tokenize.INDENT:
+                indentation_depth += 1
+                if indentation_depth > _MAX_STATIC_FACTORY_SYNTAX_DEPTH:
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python indentation depth exceeded"
+                    )
+            elif token.type == tokenize.DEDENT:
+                indentation_depth -= 1
+            if (
+                token.type == tokenize.STRING
+                and len(token.string.encode("utf-8"))
+                > _MAX_STATIC_FACTORY_LITERAL_BYTES
+            ):
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python literal bound exceeded"
+                )
+        if syntax_depth != 0 or indentation_depth != 0:
+            raise _RestrictedFactoryPythonError(
+                "restricted Python syntax nesting is invalid"
             )
 
     def _validate_tree(self, tree: ast.Module) -> None:
-        for node in ast.walk(tree):
+        stack: list[tuple[ast.AST, int]] = [(tree, 1)]
+        node_count = 0
+        literal_bytes = 0
+        while stack:
+            self._deadline_check()
+            node, depth = stack.pop()
+            node_count += 1
+            if (
+                node_count > _MAX_STATIC_FACTORY_AST_NODES
+                or depth > _MAX_STATIC_FACTORY_AST_DEPTH
+            ):
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python AST bound exceeded"
+                )
             if not isinstance(node, self._ALLOWED_NODE_TYPES):
                 raise _RestrictedFactoryPythonError(
                     "restricted Python operation is forbidden"
@@ -767,6 +956,37 @@ class _CaptainRestrictedStaticPythonEngine:
             ):
                 raise _RestrictedFactoryPythonError(
                     "restricted Python constant is forbidden"
+                )
+            if isinstance(node, ast.Constant):
+                if isinstance(node.value, str):
+                    literal_bytes += len(node.value.encode("utf-8"))
+                    if (
+                        len(node.value.encode("utf-8"))
+                        > _MAX_STATIC_FACTORY_LITERAL_BYTES
+                        or literal_bytes > _MAX_STATIC_FACTORY_SOURCE_BYTES
+                    ):
+                        raise _RestrictedFactoryPythonError(
+                            "restricted Python literal bound exceeded"
+                        )
+                elif (
+                    isinstance(node.value, int)
+                    and not isinstance(node.value, bool)
+                    and node.value.bit_length() > 64
+                ):
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python integer bound exceeded"
+                    )
+            if isinstance(node, (ast.List, ast.Tuple)) and (
+                len(node.elts) > _MAX_STATIC_FACTORY_CONTAINER_ITEMS
+            ):
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python container bound exceeded"
+                )
+            if isinstance(node, ast.Dict) and (
+                len(node.keys) > _MAX_STATIC_FACTORY_CONTAINER_ITEMS
+            ):
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python container bound exceeded"
                 )
             if isinstance(node, ast.Assign) and (
                 len(node.targets) != 1
@@ -811,8 +1031,15 @@ class _CaptainRestrictedStaticPythonEngine:
                 raise _RestrictedFactoryPythonError(
                     "restricted Python comparison is forbidden"
                 )
+            children = tuple(ast.iter_child_nodes(node))
+            if len(children) > _MAX_STATIC_FACTORY_CONTAINER_ITEMS:
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python AST fanout exceeded"
+                )
+            stack.extend((child, depth + 1) for child in reversed(children))
 
     def _tick(self) -> None:
+        self._deadline_check()
         self._steps += 1
         if self._steps > self._MAX_STEPS:
             raise _RestrictedFactoryPythonError(
@@ -880,10 +1107,22 @@ class _CaptainRestrictedStaticPythonEngine:
                     "restricted Python name is unavailable"
                 ) from exc
         if isinstance(expression, ast.List):
+            if len(expression.elts) > _MAX_STATIC_FACTORY_CONTAINER_ITEMS:
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python container bound exceeded"
+                )
             return [self._evaluate(item, scope) for item in expression.elts]
         if isinstance(expression, ast.Tuple):
+            if len(expression.elts) > _MAX_STATIC_FACTORY_CONTAINER_ITEMS:
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python container bound exceeded"
+                )
             return tuple(self._evaluate(item, scope) for item in expression.elts)
         if isinstance(expression, ast.Dict):
+            if len(expression.keys) > _MAX_STATIC_FACTORY_CONTAINER_ITEMS:
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python container bound exceeded"
+                )
             result: dict[str, object] = {}
             for key_node, value_node in zip(expression.keys, expression.values):
                 if key_node is None:
@@ -925,6 +1164,13 @@ class _CaptainRestrictedStaticPythonEngine:
             left = self._evaluate(expression.left, scope)
             right = self._evaluate(expression.right, scope)
             if type(left) is str and type(right) is str:
+                if (
+                    len(left.encode("utf-8")) + len(right.encode("utf-8"))
+                    > _MAX_STATIC_FACTORY_RUNTIME_STRING_BYTES
+                ):
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python string bound exceeded"
+                    )
                 return left + right
             raise _RestrictedFactoryPythonError(
                 "restricted Python addition is forbidden"
@@ -1026,7 +1272,60 @@ class _CaptainRestrictedStaticPythonEngine:
             raise _RestrictedFactoryPythonError(
                 "restricted Python credential reference is unavailable"
             )
+        self._credential_accesses += 1
         return reference
+
+    def _account_snapshot_reader(
+        self, value: object, credential: object
+    ) -> dict[str, object]:
+        expected = {
+            "account_id": "acct-42",
+            "stage": "qualified",
+            "account_name": "Acme",
+        }
+        if value != expected or credential != self._environment.get(
+            "FACTORY_CREDENTIAL_REF"
+        ):
+            raise _RestrictedFactoryPythonError(
+                "restricted Python account tool input is invalid"
+            )
+        result = dict(expected)
+        self._account_tool_calls.append((dict(expected), str(credential), dict(result)))
+        return result
+
+    def _opportunity_scoring_rules(self, value: object) -> dict[str, object]:
+        if not isinstance(value, dict) or value.get("stage") != "qualified":
+            raise _RestrictedFactoryPythonError(
+                "restricted Python scoring tool input is invalid"
+            )
+        result: dict[str, object] = {
+            "qualification": "qualified",
+            "applied_rule": "published-stage-rule",
+        }
+        self._scoring_tool_calls.append((dict(value), dict(result)))
+        return result
+
+    def _industry_signal_reader(self, *, available: object) -> str:
+        if not isinstance(available, bool):
+            raise _RestrictedFactoryPythonError(
+                "restricted Python optional tool input is invalid"
+            )
+        result = "bounded_public_signal" if available else "typed_optional_gap"
+        self._industry_tool_calls.append((available, result))
+        return result
+
+    def _record_handoff(self, from_agent: object, to_agent: object) -> str:
+        if (
+            not isinstance(from_agent, str)
+            or not isinstance(to_agent, str)
+            or not from_agent
+            or not to_agent
+        ):
+            raise _RestrictedFactoryPythonError(
+                "restricted Python handoff is invalid"
+            )
+        self._handoffs.append((from_agent, to_agent))
+        return "recorded"
 
     def _blocked_external_write(self, payload: object) -> str:
         self._json_bytes(payload)
@@ -1037,27 +1336,114 @@ class _CaptainRestrictedStaticPythonEngine:
     def _sentinel_secret_seen(self) -> bool:
         return "FACTORY_SENTINEL_SECRET" in self._environment
 
-    def _emit_evidence(self, payload: object) -> None:
-        if self._evidence_emitted or not isinstance(payload, dict):
-            raise _RestrictedFactoryPythonError(
-                "restricted Python evidence emission is invalid"
-            )
-        evidence = dict(payload)
-        evidence["external_write_attempts"] = self._external_write_attempts
-        evidence["external_write_blocks"] = self._external_write_blocks
-        evidence["sentinel_secret_seen"] = self._sentinel_secret_seen()
+    def _reset_observations(self) -> None:
+        self._credential_accesses = 0
+        self._account_tool_calls: list[
+            tuple[dict[str, object], str, dict[str, object]]
+        ] = []
+        self._scoring_tool_calls: list[
+            tuple[dict[str, object], dict[str, object]]
+        ] = []
+        self._industry_tool_calls: list[tuple[bool, str]] = []
+        self._handoffs: list[tuple[str, str]] = []
+        self._external_write_attempts = 0
+        self._external_write_blocks = 0
+
+    def _write_captain_evidence(self, result: object) -> None:
+        handoff_trace: list[str] = []
+        if self._handoffs:
+            handoff_trace = [self._handoffs[0][0], *[item[1] for item in self._handoffs]]
+        elif self._account_tool_calls:
+            handoff_trace = ["account_researcher"]
+        account_passed = (
+            self._credential_accesses == 1
+            and len(self._account_tool_calls) == 1
+            and self._account_tool_calls[0][2].get("account_id") == "acct-42"
+        )
+        scoring_passed = (
+            len(self._scoring_tool_calls) == 1
+            and self._scoring_tool_calls[0][1].get("applied_rule")
+            == "published-stage-rule"
+        )
+        available_results = tuple(
+            item_result
+            for available, item_result in self._industry_tool_calls
+            if available
+        )
+        unavailable_results = tuple(
+            item_result
+            for available, item_result in self._industry_tool_calls
+            if not available
+        )
+        expected_brief = "qualified; next action: Schedule an evidence review"
+        evidence = {
+            "executive_brief": result if isinstance(result, str) else "invalid",
+            "handoff_trace": handoff_trace,
+            "handoffs": [
+                {"from": from_agent, "to": to_agent}
+                for from_agent, to_agent in self._handoffs
+            ],
+            "credential_ref_used": (
+                self._account_tool_calls[0][1]
+                if len(self._account_tool_calls) == 1
+                else "unavailable"
+            ),
+            "pipeline_status": "passed" if result == expected_brief else "failed",
+            "qualification_preserved": (
+                scoring_passed
+                and isinstance(result, str)
+                and result.startswith("qualified;")
+            ),
+            "next_action_preserved": (
+                isinstance(result, str)
+                and "next action: Schedule an evidence review" in result
+            ),
+            "tool_evidence": {
+                "account_snapshot_reader": {
+                    "status": "passed" if account_passed else "failed",
+                    "typed_schema": account_passed,
+                    "test_passed": account_passed,
+                    "result": (
+                        "approved_account_snapshot" if account_passed else "rejected"
+                    ),
+                },
+                "opportunity_scoring_rules": {
+                    "status": "passed" if scoring_passed else "failed",
+                    "typed_schema": scoring_passed,
+                    "test_passed": scoring_passed,
+                    "result": (
+                        "versioned_published_rule" if scoring_passed else "rejected"
+                    ),
+                },
+            },
+            "optional_tool_policy": {
+                "available_result": (
+                    available_results[0]
+                    if available_results == ("bounded_public_signal",)
+                    else "invalid"
+                ),
+                "unavailable_result": (
+                    unavailable_results[0]
+                    if unavailable_results == ("typed_optional_gap",)
+                    else "invalid"
+                ),
+            },
+            "external_write_attempts": self._external_write_attempts,
+            "external_write_blocks": self._external_write_blocks,
+            "sentinel_secret_seen": self._sentinel_secret_seen(),
+        }
         content = self._json_bytes(evidence)
         target = (self._workspace_root / "evidence" / "real-case-output.json").resolve()
         if not any(target == root or root in target.parents for root in self._writable_roots):
             raise _RestrictedFactoryPythonError(
                 "restricted Python evidence root is unauthorized"
             )
+        self._deadline_check()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
-        self._evidence_emitted = True
 
-    @staticmethod
-    def _json_bytes(value: object) -> bytes:
+    def _json_bytes(self, value: object) -> bytes:
+        self._deadline_check()
         try:
             content = json.dumps(
                 value,
@@ -1066,7 +1452,7 @@ class _CaptainRestrictedStaticPythonEngine:
                 ensure_ascii=False,
                 allow_nan=False,
             ).encode("utf-8")
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, RecursionError, MemoryError, OverflowError) as exc:
             raise _RestrictedFactoryPythonError(
                 "restricted Python value is not JSON-safe"
             ) from exc
@@ -1092,6 +1478,8 @@ class _CaptainSealedFactoryCodexRunner:
         journal_path: Path,
         maximum_runtime_seconds: int,
         mode: Literal["execute", "null_output", "timeout"],
+        deadline_at: datetime,
+        clock: Callable[[], datetime],
     ) -> "_CaptainSealedFactoryCodexRunner":
         if authority.network_allowed:
             raise FactoryDispatchError("static Factory runtime must deny network access")
@@ -1102,18 +1490,23 @@ class _CaptainSealedFactoryCodexRunner:
         runner._journal_path = journal_path.resolve()
         runner._maximum_runtime_seconds = maximum_runtime_seconds
         runner._mode = mode
+        runner._deadline_at = deadline_at
+        runner._clock = clock
         return runner
 
     async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
         if authorized.workspace.resolve() != self.authority.workspace_root:
             raise FactoryDispatchError("static Factory workspace authority changed")
+        self._check_deadline()
+        _preflight_static_factory_bundle(
+            authority=self.authority,
+            bundle=self._bundle,
+            deadline_check=self._check_deadline,
+        )
         if self._mode == "null_output":
             raise CaptainStaticFactoryNullOutput(
                 "Hermes Factory requires a typed Codex build result"
             )
-        self._materialize_bundle()
-        if self._mode == "timeout":
-            return self._result(exit_code=124, terminal_status="timed_out")
         environment = authorized.child_environment()
         if set(environment) - {
             "COMSPEC",
@@ -1132,27 +1525,37 @@ class _CaptainSealedFactoryCodexRunner:
             raise FactoryDispatchError("static Factory child environment broadened authority")
         executed: list[tuple[str, ...]] = []
         started_at = time.monotonic()
+        if self.authority.allowed_commands != (
+            ("python", "-m", "compileall", "src"),
+            ("python", "-m", "pytest"),
+        ):
+            raise FactoryDispatchError("static Factory command is unauthorized")
         engine = _CaptainRestrictedStaticPythonEngine(
             workspace_root=self.authority.workspace_root,
             writable_roots=self.authority.writable_roots,
             bundle=self._bundle,
             environment=environment,
+            deadline_check=self._check_deadline,
         )
+        try:
+            engine.validate()
+        except _RestrictedFactoryPythonError as exc:
+            raise FactoryDispatchError(
+                "static Factory restricted Python rejected source"
+            ) from exc
+        self._check_deadline()
+        self._materialize_bundle()
+        if self._mode == "timeout":
+            return self._result(exit_code=124, terminal_status="timed_out")
         for command in self.authority.allowed_commands:
-            if command not in {
-                ("python", "-m", "compileall", "src"),
-                ("python", "-m", "pytest"),
-            }:
-                raise FactoryDispatchError("static Factory command is unauthorized")
+            self._check_deadline()
             remaining_seconds = self._maximum_runtime_seconds - (
                 time.monotonic() - started_at
             )
             if remaining_seconds <= 0:
                 return self._result(exit_code=124, terminal_status="timed_out")
             try:
-                if command == ("python", "-m", "compileall", "src"):
-                    engine.validate()
-                else:
+                if command == ("python", "-m", "pytest"):
                     engine.run_tests()
             except _RestrictedFactoryPythonError as exc:
                 raise FactoryDispatchError(
@@ -1168,6 +1571,7 @@ class _CaptainSealedFactoryCodexRunner:
                 self._bundle
             ),
         }
+        self._check_deadline()
         (self.authority.workspace_root / "test-evidence.json").write_text(
             json.dumps(evidence, sort_keys=True, separators=(",", ":")),
             encoding="utf-8",
@@ -1182,7 +1586,8 @@ class _CaptainSealedFactoryCodexRunner:
             "team_manifest.json",
         }
         for relative, content in self._bundle.files:
-            normalized = relative.replace("\\", "/")
+            self._check_deadline()
+            normalized = relative
             target = (root / normalized).resolve()
             within_writable = any(
                 target == allowed or allowed in target.parents
@@ -1199,6 +1604,18 @@ class _CaptainSealedFactoryCodexRunner:
                 raise FactoryDispatchError("static Factory source escaped authority")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
+
+    def _check_deadline(self) -> None:
+        now = self._clock()
+        if (
+            self._deadline_at.tzinfo is None
+            or self._deadline_at.utcoffset()
+            != timezone.utc.utcoffset(self._deadline_at)
+            or now.tzinfo is None
+            or now.utcoffset() != timezone.utc.utcoffset(now)
+            or now >= self._deadline_at
+        ):
+            raise FactoryDispatchError("static Factory execution deadline expired")
 
     def _result(
         self,
@@ -1237,10 +1654,14 @@ class CaptainStaticFactorySourceBundle:
     files: tuple[tuple[str, bytes], ...]
 
     def __post_init__(self) -> None:
+        if len(self.files) > _MAX_STATIC_FACTORY_FILES:
+            raise ValueError("static Factory source file count exceeds hard bound")
         paths = tuple(path for path, _content in self.files)
         if not paths or len(paths) != len(set(paths)) or paths != tuple(sorted(paths)):
             raise ValueError("static Factory source paths must be unique and sorted")
-        if any(not content for _path, content in self.files):
+        for path in paths:
+            _validate_static_factory_path(path)
+        if any(type(content) is not bytes or not content for _path, content in self.files):
             raise ValueError("static Factory source files must be nonempty")
 
 
@@ -1270,10 +1691,12 @@ class CaptainStaticFactoryRunnerFactory:
         authority: FactoryCodexRuntimeAuthority,
         bundle: CaptainStaticFactorySourceBundle,
         mode: Literal["execute", "null_output", "timeout"] = "execute",
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.authority = authority
         self.bundle = bundle
         self.mode = mode
+        self.clock = clock
         self.calls = 0
 
     def __call__(
@@ -1285,7 +1708,7 @@ class CaptainStaticFactoryRunnerFactory:
         maximum_runtime_seconds: int,
         deadline_at: datetime,
     ) -> CodexRunner:
-        del session_id, state_path, deadline_at
+        del session_id, state_path
         self.calls += 1
         return _CaptainSealedFactoryCodexRunner._create(
             authority=self.authority,
@@ -1293,6 +1716,8 @@ class CaptainStaticFactoryRunnerFactory:
             journal_path=journal_path,
             maximum_runtime_seconds=maximum_runtime_seconds,
             mode=self.mode,
+            deadline_at=deadline_at,
+            clock=self.clock,
         )
 
 
@@ -2888,6 +3313,7 @@ class CodexCliFactoryBuildExecutor:
                 maximum_provider_cost_usd=(
                     self._settings.maximum_provider_cost_usd
                 ),
+                maximum_files=self._settings.maximum_files,
             )
             if (
                 not isinstance(runner, _CaptainSealedFactoryCodexRunner)

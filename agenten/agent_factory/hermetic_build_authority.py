@@ -286,7 +286,7 @@ class CaptainStaticFactoryExecutionAuthorizer:
 
 
 class CaptainStaticFactoryBuildObserver:
-    """Independently verify semantics emitted by the executed real case."""
+    """Verify evidence derived by Captain from the executed real case."""
 
     def __init__(
         self,

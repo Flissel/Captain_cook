@@ -179,3 +179,35 @@
 
 - The restricted static engine remains an injected hermetic Task-9 adapter path, not default/live composition and not a Task-10 runtime.
 - No host firewall mutation, Docker/live service, live Hermes/Codex claim, OpenFang action, promotion, deployment, push, or merge was performed.
+
+## Fix round 5 — bounded validation and Captain-derived execution evidence
+
+### Review findings closed
+
+- Bound the sealed static source bundle to the exact assignment `max_files` before decoding, parsing, traversing, or materializing it. Hard package ceilings now additionally cover total files, source/test counts, ASCII-safe relative paths, path length, individual source/archive bytes, and aggregate bytes.
+- Added bounded UTF-8/token validation before `ast.parse`, including token, string-literal, bracket, and indentation limits. The iterative Captain AST validator now checks the deadline on every node and enforces node-count, depth, integer, literal, container-size, and fanout limits without `ast.walk`.
+- Propagated the exact Captain deadline into the sealed runner and checks it during bundle preflight, lexical validation, AST traversal, evaluation, function calls, materialization, and evidence writes. Expiry is typed and fail closed.
+- Removed the generated `emit_evidence` primitive and all generated truth-payload authority. Generated tests execute the actual source entrypoint, then Captain resets all observations and invokes the fixed `run_sales_pipeline` entrypoint itself with Captain-owned input.
+- Restricted execution now exposes only narrow observed primitives for the opaque credential accessor, required account/scoring tools, optional industry tool, ordered handoff recording, and denied external writes. Captain alone derives the trace, tool results, optional policy, credential use, business result, blocked-write counters, and assertion input evidence from those calls and the entrypoint return value.
+- The adversarial bundle whose source returns `WRONG` while its generated test asserts true and submits a fabricated success payload is rejected before either command evidence or real-case success evidence exists.
+
+### RED → GREEN evidence
+
+- RED: the seven initial adversarial cases failed because runtime authority had no assignment-bound file count, unsafe Unicode/long paths were accepted, validation materialized before resource/deadline rejection, and generated `emit_evidence` could still submit a fabricated truth payload.
+- GREEN: assignment file-count, oversized source, deep syntax, oversized literal, invalid UTF-8, AST depth/container abuse, Unicode/long paths, incremental deadline expiry, and fabricated evidence all fail typed before success. The focused authority file passes 14 tests.
+- GREEN: the exact four-agent happy path and all five negative variants remain fail closed through the full Task-9 authority/E2E set (`20 passed`).
+
+### Fix-round verification
+
+- Exact Task-9 authority and E2E: `20 passed`.
+- Focused Root Task-9 regressions: `93 passed, 3 skipped` (MariaDB-gated skips).
+- Full Root Agent Factory/Gateway non-live area: `1874 passed, 132 skipped`.
+- Full isolated Minibook non-live suite, run in a separate process with Minibook's top-level `tests` package: `259 passed, 1 deselected`.
+- Portal: `47 passed`; lint and production build passed.
+- Architecture/import/workstream: `18 passed`.
+- Python compileall and `git diff --check`: passed. Ruff remains unavailable in the existing virtual environment; no dependency installation was performed.
+
+### Non-claims
+
+- The restricted static engine remains an injected hermetic Task-9 path, not default/live composition and not a Task-10 runtime.
+- No live Hermes/Codex evidence, OpenFang action, promotion, deployment, push, merge, or external-service mutation was performed.
