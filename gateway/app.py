@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path as FileSystemPath
@@ -151,11 +152,16 @@ from gateway.capability_assembly_api import (
     create_production_capability_assembly_router,
     unavailable_capability_assembly_composition,
 )
+from gateway.capability_assembly_production import RepositoryFactoryInputArtifactStore
 from agenten.agent_factory.holdout_store import PrivateHoldoutStore
 from gateway.capability_assembly_bootstrap import (
     CapabilityAssemblyFactoryRuntime,
+    CapabilityAssemblyFactoryRuntimePlan,
+    CapabilityAssemblyBootstrapSettings,
     GatewayPrivateHoldoutStore,
-    build_capability_assembly_factory_runtime_from_environment,
+    materialize_capability_assembly_factory_runtime,
+    plan_capability_assembly_factory_runtime_from_environment,
+    plan_production_capability_assembly_from_environment,
     build_production_capability_assembly_from_environment,
     close_production_capability_assembly,
     load_capability_assembly_bootstrap_settings,
@@ -176,7 +182,43 @@ from gateway.portal_live_contracts import (
 logger = logging.getLogger(__name__)
 
 
-CapabilityAssemblyRuntimeBuilder = Callable[..., CapabilityAssemblyFactoryRuntime]
+@dataclass(frozen=True, repr=False)
+class GatewayProductionAppPlan:
+    repository_root: FileSystemPath
+    environment: Mapping[str, str]
+    settings: GatewaySettings
+    bootstrap: CapabilityAssemblyBootstrapSettings
+    factory_runtime: CapabilityAssemblyFactoryRuntimePlan
+
+
+def plan_production_app_from_environment(
+    *,
+    environment: Mapping[str, str] | None = None,
+    repository_root: FileSystemPath | None = None,
+) -> GatewayProductionAppPlan:
+    """Validate every local production authority before any materialization."""
+
+    source = dict(os.environ if environment is None else environment)
+    root = (repository_root or FileSystemPath.cwd()).resolve(strict=True)
+    configured = GatewaySettings.from_env(source)
+    bootstrap = load_capability_assembly_bootstrap_settings(
+        environment=source,
+        repository_root=root,
+    )
+    factory_runtime = plan_capability_assembly_factory_runtime_from_environment(
+        repository_root=root,
+        environment=source,
+        artifact_root=bootstrap.artifact_root,
+        authority_root=bootstrap.authority_root,
+        repository_revision=bootstrap.assembly.expected_repository_revision,
+    )
+    return GatewayProductionAppPlan(
+        repository_root=root,
+        environment=source,
+        settings=configured,
+        bootstrap=bootstrap,
+        factory_runtime=factory_runtime,
+    )
 
 
 class Mirror(Protocol):
@@ -1585,21 +1627,23 @@ def create_production_app_from_environment(
     *,
     environment: Mapping[str, str] | None = None,
     repository_root: FileSystemPath | None = None,
-    runtime_builder: CapabilityAssemblyRuntimeBuilder = (
-        build_capability_assembly_factory_runtime_from_environment
+    runtime_materializer: Callable[..., CapabilityAssemblyFactoryRuntime] = (
+        materialize_capability_assembly_factory_runtime
     ),
 ) -> FastAPI:
     """Build the shipped production app once after complete, pure validation."""
 
-    source = dict(os.environ if environment is None else environment)
-    root = (repository_root or FileSystemPath.cwd()).resolve(strict=True)
-    configured = GatewaySettings.from_env(source)
-    bootstrap = load_capability_assembly_bootstrap_settings(
-        environment=source,
-        repository_root=root,
+    plan = plan_production_app_from_environment(
+        environment=environment,
+        repository_root=repository_root,
     )
+    source = plan.environment
+    root = plan.repository_root
+    configured = plan.settings
+    bootstrap = plan.bootstrap
     clock = lambda: datetime.now(timezone.utc)
     artifacts = ContentAddressedArtifactAdapter(bootstrap.artifact_root)
+    source_artifacts = RepositoryFactoryInputArtifactStore(artifacts=artifacts)
     gateway = GatewayStore(
         MariaDBStorage(configured.ledger_dsn.get_secret_value()),
         claim_ttl=timedelta(seconds=configured.claim_ttl_seconds),
@@ -1630,12 +1674,19 @@ def create_production_app_from_environment(
             verification_source=portal_bundle.verification_source,
         )
     private_catalog = GatewayPrivateHoldoutStore(gateway_store=gateway)
-    runtime = runtime_builder(
+    runtime = runtime_materializer(
+        plan.factory_runtime,
+        store=gateway,
+        private_benchmark_catalog=private_catalog,
+        clock=clock,
+        source_artifacts=source_artifacts,
+    )
+    plan_production_capability_assembly_from_environment(
         repository_root=root,
         environment=source,
         store=gateway,
+        runtime=runtime,
         private_benchmark_catalog=private_catalog,
-        settings=bootstrap,
         clock=clock,
     )
     return create_app(

@@ -36,6 +36,7 @@ from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_runtime.production_bootstrap import (
     RuntimeAdapterManifestError,
     load_verified_repository_module,
+    read_verified_repository_bytes,
 )
 from agenten.delivery.minibook_client import MinibookClient, validate_service_base_url
 from agenten.delivery.minibook_events import (
@@ -1333,13 +1334,174 @@ class CapabilityAssemblyFactoryRuntime:
 
 
 @dataclass(frozen=True, repr=False)
-class CapabilityAssemblyFactoryContext:
-    """Inputs exposed to one digest-verified repository-owned Factory constructor."""
+class CapabilityAssemblyFactoryConfiguration:
+    """Strict non-secret configuration exposed to the Factory constructor."""
 
     repository_root: Path
-    environment: Mapping[str, str]
+    artifact_root: Path
+    authority_root: Path
+    provider: str
+    model: str
+    execution_policy: FactoryExecutionPolicyV1
+
+
+@dataclass(frozen=True, repr=False)
+class CapabilityAssemblyFactoryAuthorities:
+    """Materialized authorities supplied separately from non-secret configuration."""
+
     store: GatewayStore
+    private_benchmark_catalog: GatewayPrivateHoldoutStore
+    source_artifacts: RepositoryFactoryInputArtifactStore
     clock: Callable[[], datetime]
+
+
+class CapabilityAssemblyFactoryRuntimeDescriptorV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    schema_name: Literal["captain.capability-factory-runtime-plan.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    adapter_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    constructor_signature: str
+    clock_signature: str
+    model_client_signature: str
+    factory_type: str
+    repository_type: str
+    team_execution_type: str
+    ports_provider_type: str
+    model_client_type: str
+    budget_type: str
+    pricing_authority_type: str
+    pricing_source_type: str
+    replay_store_type: str
+    candidate_provider_type: str
+    skill_root: str
+    replay_root: str
+    store_authority: str
+    clock_authority: str
+    provider: str
+    model: str
+
+
+_FACTORY_RUNTIME_DESCRIPTOR_BINDINGS = {
+    "constructor_signature": "(configuration, authorities)",
+    "clock_signature": "() -> datetime",
+    "model_client_signature": "(job, invocation)",
+    "factory_type": "gateway.agent_factory_live_composition.AgentFactoryLiveComposition",
+    "repository_type": "gateway.factory_repository.GatewayFactoryRepository",
+    "team_execution_type": "gateway.agent_factory_live_composition.ProductionFactoryTeamExecutionPort",
+    "ports_provider_type": "gateway.agent_factory_live_composition.GatewayTechnicalTeamExecutionPortsProvider",
+    "model_client_type": "agenten.agent_factory.business_benchmark_production_ports.OpenAIBusinessBenchmarkModelClientBuilder",
+    "budget_type": "gateway.factory_repository.GatewayFactoryBudgetLedger",
+    "pricing_authority_type": "agenten.agent_factory.business_benchmark_production_ports.BusinessBenchmarkPricingAuthority",
+    "pricing_source_type": "agenten.agent_factory.business_benchmark_production_ports.ConfiguredBusinessBenchmarkPricingSource",
+    "replay_store_type": "agenten.agent_factory.hermes_cli.FilesystemFactorySkillReplayStore",
+    "candidate_provider_type": "agenten.agent_factory.candidate_evaluation.GatewayForgeCandidateProvider",
+    "skill_root": "agenten/agent_factory/skills",
+    "replay_root": ".captain-cook/private/business-benchmarks/runtime-state/factory-team-replays",
+    "store_authority": "gateway-sole-writer",
+    "clock_authority": "shared-production-clock",
+    "provider": "openai",
+}
+
+
+@dataclass(frozen=True, repr=False)
+class CapabilityAssemblyFactoryRuntimePlan:
+    repository_root: Path
+    adapter_path: Path
+    adapter_sha256: str
+    descriptor_sha256: str
+    descriptor: CapabilityAssemblyFactoryRuntimeDescriptorV1
+    configuration: CapabilityAssemblyFactoryConfiguration
+
+
+def plan_capability_assembly_factory_runtime_from_environment(
+    *,
+    repository_root: Path,
+    environment: Mapping[str, str],
+    artifact_root: Path,
+    authority_root: Path,
+    repository_revision: str,
+) -> CapabilityAssemblyFactoryRuntimePlan:
+    """Attest all Factory constructor metadata without importing or constructing it."""
+
+    relative_path = environment.get("CAPTAIN_CAPABILITY_FACTORY_ADAPTER", "").strip()
+    adapter_sha256 = environment.get(
+        "CAPTAIN_CAPABILITY_FACTORY_ADAPTER_SHA256", ""
+    ).strip()
+    descriptor_raw = environment.get("CAPTAIN_CAPABILITY_FACTORY_PLAN_JSON", "")
+    descriptor_sha256 = environment.get(
+        "CAPTAIN_CAPABILITY_FACTORY_PLAN_SHA256", ""
+    ).strip()
+    policy_raw = environment.get("CAPTAIN_CAPABILITY_EXECUTION_POLICY_JSON", "")
+    try:
+        if (
+            not relative_path
+            or _SHA256.fullmatch(adapter_sha256) is None
+            or _SHA256.fullmatch(descriptor_sha256) is None
+            or not descriptor_raw
+            or not policy_raw
+        ):
+            raise ValueError("incomplete")
+        descriptor_payload = json.loads(descriptor_raw)
+        canonical_descriptor = json.dumps(
+            descriptor_payload, sort_keys=True, separators=(",", ":")
+        ).encode()
+        if not secrets.compare_digest(
+            hashlib.sha256(canonical_descriptor).hexdigest(), descriptor_sha256
+        ):
+            raise ValueError("descriptor digest")
+        descriptor = CapabilityAssemblyFactoryRuntimeDescriptorV1.model_validate(
+            descriptor_payload
+        )
+        if not secrets.compare_digest(descriptor.adapter_sha256, adapter_sha256):
+            raise ValueError("adapter binding")
+        expected = dict(_FACTORY_RUNTIME_DESCRIPTOR_BINDINGS)
+        expected["model"] = environment.get("CAPTAIN_BENCHMARK_MODEL", "").strip()
+        if any(getattr(descriptor, name) != value for name, value in expected.items()):
+            raise ValueError("descriptor binding")
+        if descriptor.provider != environment.get(
+            "CAPTAIN_BENCHMARK_PROVIDER", ""
+        ).strip():
+            raise ValueError("provider binding")
+        policy = FactoryExecutionPolicyV1.model_validate(json.loads(policy_raw))
+        if descriptor.model not in policy.allowed_models:
+            raise ValueError("policy model")
+        adapter_path, adapter_bytes = read_verified_repository_bytes(
+            relative_path,
+            expected_sha256=adapter_sha256,
+            expected_repository_revision=repository_revision,
+            repository_root=repository_root,
+        )
+        if not secrets.compare_digest(
+            hashlib.sha256(adapter_bytes).hexdigest(), adapter_sha256
+        ):
+            raise ValueError("adapter digest")
+        root = repository_root.resolve(strict=True)
+        for relative_root in (descriptor.skill_root, descriptor.replay_root):
+            candidate = Path(relative_root)
+            if candidate.is_absolute() or ".." in candidate.parts:
+                raise ValueError("root")
+            (root / candidate).resolve().relative_to(root)
+    except Exception:
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "capability assembly Factory runtime plan is invalid"
+        ) from None
+    return CapabilityAssemblyFactoryRuntimePlan(
+        repository_root=root,
+        adapter_path=adapter_path,
+        adapter_sha256=adapter_sha256,
+        descriptor_sha256=descriptor_sha256,
+        descriptor=descriptor,
+        configuration=CapabilityAssemblyFactoryConfiguration(
+            repository_root=root,
+            artifact_root=artifact_root,
+            authority_root=authority_root,
+            provider=descriptor.provider,
+            model=descriptor.model,
+            execution_policy=policy,
+        ),
+    )
 
 
 def build_capability_assembly_factory_runtime_from_environment(
@@ -1353,35 +1515,51 @@ def build_capability_assembly_factory_runtime_from_environment(
 ) -> CapabilityAssemblyFactoryRuntime:
     """Construct the native runtime around one verified local Factory composition."""
 
-    relative_path = environment.get("CAPTAIN_CAPABILITY_FACTORY_ADAPTER", "").strip()
-    expected_digest = environment.get(
-        "CAPTAIN_CAPABILITY_FACTORY_ADAPTER_SHA256", ""
-    ).strip()
-    policy_raw = environment.get("CAPTAIN_CAPABILITY_EXECUTION_POLICY_JSON", "")
-    if not relative_path or _SHA256.fullmatch(expected_digest) is None or not policy_raw:
-        raise CapabilityAssemblyBootstrapConfigurationError(
-            "capability assembly Factory constructor is incomplete"
-        )
+    plan = plan_capability_assembly_factory_runtime_from_environment(
+        repository_root=repository_root,
+        environment=environment,
+        artifact_root=settings.artifact_root,
+        authority_root=settings.authority_root,
+        repository_revision=settings.assembly.expected_repository_revision,
+    )
+    return materialize_capability_assembly_factory_runtime(
+        plan,
+        store=store,
+        private_benchmark_catalog=private_benchmark_catalog,
+        clock=clock,
+    )
+
+
+def materialize_capability_assembly_factory_runtime(
+    plan: CapabilityAssemblyFactoryRuntimePlan,
+    *,
+    store: GatewayStore,
+    private_benchmark_catalog: GatewayPrivateHoldoutStore,
+    clock: Callable[[], datetime],
+    source_artifacts: RepositoryFactoryInputArtifactStore | None = None,
+) -> CapabilityAssemblyFactoryRuntime:
+    """Import and construct only after the complete descriptor is attested."""
+
+    selected_source_artifacts = source_artifacts or RepositoryFactoryInputArtifactStore(
+        artifacts=ContentAddressedArtifactAdapter(plan.configuration.artifact_root)
+    )
+    authorities = CapabilityAssemblyFactoryAuthorities(
+        store=store,
+        private_benchmark_catalog=private_benchmark_catalog,
+        source_artifacts=selected_source_artifacts,
+        clock=clock,
+    )
     try:
-        policy_payload = json.loads(policy_raw)
-        policy = FactoryExecutionPolicyV1.model_validate(policy_payload)
         module = load_verified_repository_module(
-            relative_path,
-            expected_sha256=expected_digest,
-            repository_root=repository_root,
+            plan.adapter_path,
+            expected_sha256=plan.adapter_sha256,
+            repository_root=plan.repository_root,
         )
         constructor = getattr(module, "build_capability_factory", None)
         if not callable(constructor):
             raise ValueError("constructor")
-        factory = constructor(
-            CapabilityAssemblyFactoryContext(
-                repository_root=repository_root,
-                environment=environment,
-                store=store,
-                clock=clock,
-            )
-        )
-    except (RuntimeAdapterManifestError, ValueError, TypeError, json.JSONDecodeError):
+        factory = constructor(plan.configuration, authorities)
+    except Exception:
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly Factory constructor is invalid"
         ) from None
@@ -1390,16 +1568,13 @@ def build_capability_assembly_factory_runtime_from_environment(
             "capability assembly Factory constructor is invalid"
         )
     n8n = GatewayCapabilityN8nWorkBatchAuthority(gateway_store=store)
-    source_artifacts = RepositoryFactoryInputArtifactStore(
-        artifacts=ContentAddressedArtifactAdapter(settings.artifact_root)
-    )
     provisioning = CurrentAuthorityCapabilityFactoryProvisioner(
         repository=factory.repository,
-        source_artifacts=source_artifacts,  # type: ignore[arg-type]
+        source_artifacts=selected_source_artifacts,  # type: ignore[arg-type]
         holdout_store=private_benchmark_catalog,
         released_skills=factory.repository,
-        execution_policy=policy,
-        authority_root=settings.authority_root / "factory-inputs",
+        execution_policy=plan.configuration.execution_policy,
+        authority_root=plan.configuration.authority_root / "factory-inputs",
         clock=clock,
         work_batches=n8n,
         n8n_registry=n8n,
@@ -1727,8 +1902,11 @@ async def close_production_capability_assembly(
 __all__ = [
     "CapabilityAssemblyBootstrapConfigurationError",
     "CapabilityAssemblyBootstrapSettings",
+    "CapabilityAssemblyFactoryAuthorities",
+    "CapabilityAssemblyFactoryConfiguration",
     "CapabilityAssemblyFactoryRuntime",
-    "CapabilityAssemblyFactoryContext",
+    "CapabilityAssemblyFactoryRuntimeDescriptorV1",
+    "CapabilityAssemblyFactoryRuntimePlan",
     "CapabilityAssemblyProductionPlan",
     "CapabilityProductionBundleHealthV1",
     "CapabilityProductionBundleManifestV1",
@@ -1746,6 +1924,8 @@ __all__ = [
     "close_production_capability_assembly",
     "load_capability_assembly_bootstrap_settings",
     "load_capability_production_bundle_manifest",
+    "materialize_capability_assembly_factory_runtime",
     "materialize_production_capability_assembly",
+    "plan_capability_assembly_factory_runtime_from_environment",
     "plan_production_capability_assembly_from_environment",
 ]

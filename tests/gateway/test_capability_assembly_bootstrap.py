@@ -23,6 +23,7 @@ from gateway.capability_assembly_bootstrap import (
     GatewayCapabilityProjectionAuthority,
     build_production_capability_assembly_from_environment,
     load_capability_assembly_bootstrap_settings,
+    plan_capability_assembly_factory_runtime_from_environment,
 )
 from gateway.capability_generic_benchmark import (
     BenchmarkToolEvidenceVerificationRequest,
@@ -687,6 +688,61 @@ def test_shipped_gateway_rejects_partial_capability_configuration_before_store(
     assert effects == []
 
 
+def test_shipped_gateway_rejects_factory_plan_drift_before_all_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gateway.app as gateway_app
+
+    effects: list[str] = []
+    bootstrap = SimpleNamespace(
+        artifact_root=tmp_path / "cas",
+        authority_root=tmp_path / "authority",
+        assembly=SimpleNamespace(expected_repository_revision="a" * 40),
+    )
+    monkeypatch.setattr(
+        gateway_app,
+        "load_capability_assembly_bootstrap_settings",
+        lambda **_kwargs: bootstrap,
+    )
+    monkeypatch.setattr(
+        gateway_app,
+        "plan_capability_assembly_factory_runtime_from_environment",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            CapabilityAssemblyBootstrapConfigurationError(
+                "capability assembly Factory runtime plan is invalid"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        gateway_app, "ContentAddressedArtifactAdapter",
+        lambda *_args: effects.append("cas"),
+    )
+    monkeypatch.setattr(
+        gateway_app, "MariaDBStorage", lambda *_args: effects.append("storage")
+    )
+    monkeypatch.setattr(
+        gateway_app, "GatewayStore", lambda *_args, **_kwargs: effects.append("store")
+    )
+    environment = {
+        "LEDGER_DSN": "mysql://captain:secret@127.0.0.1:3306/captain_test",
+        "CAPTAIN_GATEWAY_TOKEN": "captain-only-token",
+        "WORKER_GATEWAY_TOKEN": "worker-only-token",
+        "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-only-token",
+    }
+
+    with pytest.raises(
+        CapabilityAssemblyBootstrapConfigurationError,
+        match="Factory runtime plan is invalid",
+    ):
+        gateway_app.create_production_app_from_environment(
+            environment=environment,
+            repository_root=tmp_path,
+        )
+
+    assert effects == []
+
+
 def test_shipped_gateway_builds_exact_runtime_and_app_once_after_preflight(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -704,9 +760,23 @@ def test_shipped_gateway_builds_exact_runtime_and_app_once_after_preflight(
         provider_paid_command_sha256="6" * 64,
         provider_hard_ceiling_enforced=True,
     )
+    factory_plan = SimpleNamespace()
+    configured = gateway_app.GatewaySettings.from_env({
+        "LEDGER_DSN": "mysql://captain:secret@127.0.0.1:3306/captain_test",
+        "CAPTAIN_GATEWAY_TOKEN": "captain-only-token",
+        "WORKER_GATEWAY_TOKEN": "worker-only-token",
+        "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-only-token",
+    })
     monkeypatch.setattr(
-        gateway_app, "load_capability_assembly_bootstrap_settings",
-        lambda **_kwargs: calls.append("preflight") or bootstrap,
+        gateway_app, "plan_production_app_from_environment",
+        lambda **_kwargs: calls.append("preflight") or gateway_app.GatewayProductionAppPlan(
+            repository_root=tmp_path,
+            environment={},
+            settings=configured,
+            bootstrap=bootstrap,
+            factory_runtime=factory_plan,  # type: ignore[arg-type]
+        ),
     )
     monkeypatch.setattr(
         gateway_app, "MariaDBStorage", lambda _dsn: calls.append("storage") or object()
@@ -715,13 +785,23 @@ def test_shipped_gateway_builds_exact_runtime_and_app_once_after_preflight(
     monkeypatch.setattr(
         gateway_app, "GatewayStore", lambda *_args, **_kwargs: calls.append("store") or store
     )
+    class Artifacts:
+        def put(self, content: bytes, media_type: str) -> object:
+            del content, media_type
+            raise AssertionError("materialization test must not write")
+
+        def read_bytes(self, reference: object) -> bytes:
+            del reference
+            raise AssertionError("materialization test must not read")
+
     monkeypatch.setattr(
         gateway_app, "ContentAddressedArtifactAdapter",
-        lambda _root: calls.append("artifacts") or SimpleNamespace(),
+        lambda _root: calls.append("artifacts") or Artifacts(),
     )
     runtime = SimpleNamespace()
-    def runtime_builder(**kwargs: object) -> object:
+    def runtime_builder(plan: object, **kwargs: object) -> object:
         calls.append("runtime")
+        assert plan is factory_plan
         assert kwargs["store"] is store
         return runtime
     application = SimpleNamespace(state=SimpleNamespace())
@@ -732,6 +812,11 @@ def test_shipped_gateway_builds_exact_runtime_and_app_once_after_preflight(
         application.state.gateway_settings = kwargs["settings"]
         return application
     monkeypatch.setattr(gateway_app, "create_app", app_builder)
+    monkeypatch.setattr(
+        gateway_app,
+        "plan_production_capability_assembly_from_environment",
+        lambda **_kwargs: calls.append("post-verify") or SimpleNamespace(),
+    )
     environment = {
         "LEDGER_DSN": "mysql://captain:secret@127.0.0.1:3306/captain_test",
         "CAPTAIN_GATEWAY_TOKEN": "captain-only-token",
@@ -743,11 +828,14 @@ def test_shipped_gateway_builds_exact_runtime_and_app_once_after_preflight(
     result = gateway_app.create_production_app_from_environment(
         environment=environment,
         repository_root=tmp_path,
-        runtime_builder=runtime_builder,  # type: ignore[arg-type]
+        runtime_materializer=runtime_builder,  # type: ignore[arg-type]
     )
 
     assert result is application
-    assert calls == ["preflight", "artifacts", "storage", "store", "runtime", "app"]
+    assert calls == [
+        "preflight", "artifacts", "storage", "store", "runtime",
+        "post-verify", "app",
+    ]
 
 
 def test_gateway_module_main_serves_the_fully_built_production_app(
@@ -777,6 +865,163 @@ def test_gateway_module_main_serves_the_fully_built_production_app(
         "build",
         (application, {"host": "127.0.0.1", "port": 8090, "workers": 1}),
     ]
+
+
+def _factory_runtime_descriptor(*, adapter_sha256: str) -> dict[str, object]:
+    return {
+        "schema": "captain.capability-factory-runtime-plan.v1",
+        "adapter_sha256": adapter_sha256,
+        "constructor_signature": "(configuration, authorities)",
+        "clock_signature": "() -> datetime",
+        "model_client_signature": "(job, invocation)",
+        "factory_type": "gateway.agent_factory_live_composition.AgentFactoryLiveComposition",
+        "repository_type": "gateway.factory_repository.GatewayFactoryRepository",
+        "team_execution_type": "gateway.agent_factory_live_composition.ProductionFactoryTeamExecutionPort",
+        "ports_provider_type": "gateway.agent_factory_live_composition.GatewayTechnicalTeamExecutionPortsProvider",
+        "model_client_type": "agenten.agent_factory.business_benchmark_production_ports.OpenAIBusinessBenchmarkModelClientBuilder",
+        "budget_type": "gateway.factory_repository.GatewayFactoryBudgetLedger",
+        "pricing_authority_type": "agenten.agent_factory.business_benchmark_production_ports.BusinessBenchmarkPricingAuthority",
+        "pricing_source_type": "agenten.agent_factory.business_benchmark_production_ports.ConfiguredBusinessBenchmarkPricingSource",
+        "replay_store_type": "agenten.agent_factory.hermes_cli.FilesystemFactorySkillReplayStore",
+        "candidate_provider_type": "agenten.agent_factory.candidate_evaluation.GatewayForgeCandidateProvider",
+        "skill_root": "agenten/agent_factory/skills",
+        "replay_root": ".captain-cook/private/business-benchmarks/runtime-state/factory-team-replays",
+        "store_authority": "gateway-sole-writer",
+        "clock_authority": "shared-production-clock",
+        "provider": "openai",
+        "model": "gpt-5.6-terra",
+    }
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("constructor_signature", "()"),
+        ("model_client_signature", "()"),
+        ("clock_signature", "(now)"),
+        ("ports_provider_type", "tests.FakePortsProvider"),
+        ("pricing_authority_type", "tests.FakePricingAuthority"),
+    ),
+)
+def test_factory_runtime_plan_rejects_signature_or_nested_authority_drift_purely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+) -> None:
+    import gateway.capability_assembly_bootstrap as bootstrap
+
+    adapter = b"def build_capability_factory(configuration, authorities): pass\n"
+    digest = hashlib.sha256(adapter).hexdigest()
+    descriptor = _factory_runtime_descriptor(adapter_sha256=digest)
+    descriptor[field] = value
+    effects: list[str] = []
+    monkeypatch.setattr(
+        bootstrap,
+        "read_verified_repository_bytes",
+        lambda *_args, **_kwargs: (tmp_path / "adapter.py", adapter),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "load_verified_repository_module",
+        lambda *_args, **_kwargs: effects.append("module") or SimpleNamespace(),
+    )
+    environment = {
+        "CAPTAIN_CAPABILITY_FACTORY_ADAPTER": "adapter.py",
+        "CAPTAIN_CAPABILITY_FACTORY_ADAPTER_SHA256": digest,
+        "CAPTAIN_CAPABILITY_FACTORY_PLAN_JSON": json.dumps(descriptor),
+        "CAPTAIN_CAPABILITY_FACTORY_PLAN_SHA256": hashlib.sha256(
+            json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "CAPTAIN_CAPABILITY_EXECUTION_POLICY_JSON": json.dumps({
+            "schema": "captain.factory-execution-policy.v1",
+            "mode": "release", "live_execution": True,
+            "max_cost_usd": "1.00", "max_runtime_seconds": 900,
+            "required_live_runs": 3, "allowed_models": ["gpt-5.6-terra"],
+            "live_capabilities": ["model.invoke"],
+        }),
+        "CAPTAIN_BENCHMARK_PROVIDER": "openai",
+        "CAPTAIN_BENCHMARK_MODEL": "gpt-5.6-terra",
+    }
+
+    with pytest.raises(
+        CapabilityAssemblyBootstrapConfigurationError,
+        match="Factory runtime plan is invalid",
+    ):
+        plan_capability_assembly_factory_runtime_from_environment(
+            repository_root=tmp_path,
+            environment=environment,
+            artifact_root=tmp_path / "artifacts",
+            authority_root=tmp_path / "authority",
+            repository_revision="a" * 40,
+        )
+
+    assert effects == []
+
+
+def test_factory_constructor_receives_only_allowlisted_config_and_redacts_any_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gateway.capability_assembly_bootstrap as bootstrap
+
+    adapter_sha256 = hashlib.sha256(b"adapter").hexdigest()
+    descriptor = bootstrap.CapabilityAssemblyFactoryRuntimeDescriptorV1.model_validate(
+        _factory_runtime_descriptor(adapter_sha256=adapter_sha256)
+    )
+    policy = bootstrap.FactoryExecutionPolicyV1.model_validate({
+        "schema": "captain.factory-execution-policy.v1",
+        "mode": "release", "live_execution": True,
+        "max_cost_usd": "1.00", "max_runtime_seconds": 900,
+        "required_live_runs": 3, "allowed_models": ["gpt-5.6-terra"],
+        "live_capabilities": ["model.invoke"],
+    })
+    configuration = bootstrap.CapabilityAssemblyFactoryConfiguration(
+        repository_root=tmp_path,
+        artifact_root=tmp_path / "artifacts",
+        authority_root=tmp_path / "authority",
+        provider="openai",
+        model="gpt-5.6-terra",
+        execution_policy=policy,
+    )
+    plan = bootstrap.CapabilityAssemblyFactoryRuntimePlan(
+        repository_root=tmp_path,
+        adapter_path=tmp_path / "adapter.py",
+        adapter_sha256=adapter_sha256,
+        descriptor_sha256="d" * 64,
+        descriptor=descriptor,
+        configuration=configuration,
+    )
+    received: list[object] = []
+    secret_marker = "must-never-escape-constructor"
+
+    def constructor(config: object, authorities: object) -> object:
+        received.extend((config, authorities))
+        raise RuntimeError(secret_marker)
+
+    monkeypatch.setattr(
+        bootstrap,
+        "load_verified_repository_module",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            build_capability_factory=constructor
+        ),
+    )
+
+    with pytest.raises(
+        CapabilityAssemblyBootstrapConfigurationError,
+        match="Factory constructor is invalid",
+    ) as captured:
+        bootstrap.materialize_capability_assembly_factory_runtime(
+            plan,
+            store=SimpleNamespace(),  # type: ignore[arg-type]
+            private_benchmark_catalog=SimpleNamespace(),  # type: ignore[arg-type]
+            clock=lambda: datetime.now(timezone.utc),
+        )
+
+    assert received[0] is configuration
+    assert not hasattr(received[0], "environment")
+    assert not hasattr(received[0], "gateway_token")
+    assert captured.value.__cause__ is None
+    assert secret_marker not in str(captured.value)
 
 
 def test_production_plan_is_pure_and_reuses_the_provisioner_source_authority(
