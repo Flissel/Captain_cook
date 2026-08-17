@@ -28,10 +28,15 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from agenten.agent_factory.capability_live_runner import CapabilityLiveStage
 from agenten.agent_factory.contracts import AgentFactoryJobV3
+from agenten.agent_factory.execution_policy import FactoryExecutionPolicyV1
 from agenten.agent_runtime.captain_production_adapters import (
     ContentAddressedArtifactAdapter,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_runtime.production_bootstrap import (
+    RuntimeAdapterManifestError,
+    load_verified_repository_module,
+)
 from agenten.delivery.minibook_client import MinibookClient, validate_service_base_url
 from agenten.delivery.minibook_events import (
     MinibookProjectionAcknowledgementV1,
@@ -1331,6 +1336,85 @@ class CapabilityAssemblyFactoryRuntime:
 
 
 @dataclass(frozen=True, repr=False)
+class CapabilityAssemblyFactoryContext:
+    """Inputs exposed to one digest-verified repository-owned Factory constructor."""
+
+    repository_root: Path
+    environment: Mapping[str, str]
+    store: GatewayStore
+    clock: Callable[[], datetime]
+
+
+def build_capability_assembly_factory_runtime_from_environment(
+    *,
+    repository_root: Path,
+    environment: Mapping[str, str],
+    store: GatewayStore,
+    private_benchmark_catalog: GatewayPrivateHoldoutStore,
+    settings: CapabilityAssemblyBootstrapSettings,
+    clock: Callable[[], datetime],
+) -> CapabilityAssemblyFactoryRuntime:
+    """Construct the native runtime around one verified local Factory composition."""
+
+    relative_path = environment.get("CAPTAIN_CAPABILITY_FACTORY_ADAPTER", "").strip()
+    expected_digest = environment.get(
+        "CAPTAIN_CAPABILITY_FACTORY_ADAPTER_SHA256", ""
+    ).strip()
+    policy_raw = environment.get("CAPTAIN_CAPABILITY_EXECUTION_POLICY_JSON", "")
+    if not relative_path or _SHA256.fullmatch(expected_digest) is None or not policy_raw:
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "capability assembly Factory constructor is incomplete"
+        )
+    try:
+        policy_payload = json.loads(policy_raw)
+        policy = FactoryExecutionPolicyV1.model_validate(policy_payload)
+        module = load_verified_repository_module(
+            relative_path,
+            expected_sha256=expected_digest,
+            repository_root=repository_root,
+        )
+        constructor = getattr(module, "build_capability_factory", None)
+        if not callable(constructor):
+            raise ValueError("constructor")
+        factory = constructor(
+            CapabilityAssemblyFactoryContext(
+                repository_root=repository_root,
+                environment=environment,
+                store=store,
+                clock=clock,
+            )
+        )
+    except (RuntimeAdapterManifestError, ValueError, TypeError, json.JSONDecodeError):
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "capability assembly Factory constructor is invalid"
+        ) from None
+    if type(factory) is not AgentFactoryLiveComposition:
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "capability assembly Factory constructor is invalid"
+        )
+    n8n = GatewayCapabilityN8nWorkBatchAuthority(gateway_store=store)
+    source_artifacts = RepositoryFactoryInputArtifactStore(
+        artifacts=ContentAddressedArtifactAdapter(settings.artifact_root)
+    )
+    provisioning = CurrentAuthorityCapabilityFactoryProvisioner(
+        repository=factory.repository,
+        source_artifacts=source_artifacts,  # type: ignore[arg-type]
+        holdout_store=private_benchmark_catalog,
+        released_skills=factory.repository,
+        execution_policy=policy,
+        authority_root=settings.authority_root / "factory-inputs",
+        clock=clock,
+        work_batches=n8n,
+        n8n_registry=n8n,
+    )
+    return CapabilityAssemblyFactoryRuntime(
+        factory=factory,
+        provisioning=provisioning,
+        n8n=n8n,
+    )
+
+
+@dataclass(frozen=True, repr=False)
 class CapabilityAssemblyProductionPlan:
     """Pure, validated inputs for the explicit production materialization step."""
 
@@ -1647,6 +1731,7 @@ __all__ = [
     "CapabilityAssemblyBootstrapConfigurationError",
     "CapabilityAssemblyBootstrapSettings",
     "CapabilityAssemblyFactoryRuntime",
+    "CapabilityAssemblyFactoryContext",
     "CapabilityAssemblyProductionPlan",
     "CapabilityProductionBundleHealthV1",
     "CapabilityProductionBundleManifestV1",
@@ -1660,6 +1745,7 @@ __all__ = [
     "GatewayPrivateHoldoutStore",
     "StoreBoundGatewayCapabilityResumeClient",
     "build_production_capability_assembly_from_environment",
+    "build_capability_assembly_factory_runtime_from_environment",
     "close_production_capability_assembly",
     "load_capability_assembly_bootstrap_settings",
     "load_capability_production_bundle_manifest",

@@ -109,3 +109,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     uvicorn.run(app, host="127.0.0.1", port=args.port, workers=1, log_level="warning")
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

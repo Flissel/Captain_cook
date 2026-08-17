@@ -656,6 +656,129 @@ def test_app_composes_injected_production_bundle_once_at_startup(
     assert calls == ["build", "attest", "close"]
 
 
+def test_shipped_gateway_rejects_partial_capability_configuration_before_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gateway.app as gateway_app
+
+    effects: list[str] = []
+    monkeypatch.setattr(
+        gateway_app, "MariaDBStorage", lambda *_args: effects.append("storage")
+    )
+    monkeypatch.setattr(
+        gateway_app, "GatewayStore", lambda *_args, **_kwargs: effects.append("store")
+    )
+    environment = {
+        "LEDGER_DSN": "mysql://captain:secret@127.0.0.1:3306/captain_test",
+        "CAPTAIN_GATEWAY_TOKEN": "captain-only-token",
+        "WORKER_GATEWAY_TOKEN": "worker-only-token",
+        "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-only-token",
+    }
+
+    with pytest.raises(
+        CapabilityAssemblyBootstrapConfigurationError,
+        match="configuration is incomplete",
+    ):
+        gateway_app.create_production_app_from_environment(
+            environment=environment, repository_root=tmp_path,
+        )
+
+    assert effects == []
+
+
+def test_shipped_gateway_builds_exact_runtime_and_app_once_after_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gateway.app as gateway_app
+
+    calls: list[str] = []
+    bootstrap = SimpleNamespace(
+        artifact_root=tmp_path / "cas",
+        provider_url="http://127.0.0.1:18091",
+        provider_policy_sha256="1" * 64,
+        provider_price_card_sha256="2" * 64,
+        provider_context_sha256="3" * 64,
+        provider_proxy_executable_sha256="4" * 64,
+        provider_proxy_code_sha256="5" * 64,
+        provider_paid_command_sha256="6" * 64,
+        provider_hard_ceiling_enforced=True,
+    )
+    monkeypatch.setattr(
+        gateway_app, "load_capability_assembly_bootstrap_settings",
+        lambda **_kwargs: calls.append("preflight") or bootstrap,
+    )
+    monkeypatch.setattr(
+        gateway_app, "MariaDBStorage", lambda _dsn: calls.append("storage") or object()
+    )
+    store = SimpleNamespace()
+    monkeypatch.setattr(
+        gateway_app, "GatewayStore", lambda *_args, **_kwargs: calls.append("store") or store
+    )
+    monkeypatch.setattr(
+        gateway_app, "ContentAddressedArtifactAdapter",
+        lambda _root: calls.append("artifacts") or SimpleNamespace(),
+    )
+    runtime = SimpleNamespace()
+    def runtime_builder(**kwargs: object) -> object:
+        calls.append("runtime")
+        assert kwargs["store"] is store
+        return runtime
+    application = SimpleNamespace(state=SimpleNamespace())
+    def app_builder(**kwargs: object) -> object:
+        calls.append("app")
+        assert kwargs["gateway_store"] is store
+        assert kwargs["capability_assembly_factory_runtime"] is runtime
+        application.state.gateway_settings = kwargs["settings"]
+        return application
+    monkeypatch.setattr(gateway_app, "create_app", app_builder)
+    environment = {
+        "LEDGER_DSN": "mysql://captain:secret@127.0.0.1:3306/captain_test",
+        "CAPTAIN_GATEWAY_TOKEN": "captain-only-token",
+        "WORKER_GATEWAY_TOKEN": "worker-only-token",
+        "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-only-token",
+    }
+
+    result = gateway_app.create_production_app_from_environment(
+        environment=environment,
+        repository_root=tmp_path,
+        runtime_builder=runtime_builder,  # type: ignore[arg-type]
+    )
+
+    assert result is application
+    assert calls == ["preflight", "artifacts", "storage", "store", "runtime", "app"]
+
+
+def test_gateway_module_main_serves_the_fully_built_production_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uvicorn
+    import gateway.app as gateway_app
+
+    application = SimpleNamespace(
+        state=SimpleNamespace(gateway_settings=SimpleNamespace(host="127.0.0.1", port=8090))
+    )
+    observed: list[object] = []
+    monkeypatch.setattr(
+        gateway_app,
+        "create_production_app_from_environment",
+        lambda: observed.append("build") or application,
+    )
+    monkeypatch.setattr(
+        uvicorn,
+        "run",
+        lambda app, **kwargs: observed.append((app, kwargs)),
+    )
+
+    gateway_app.main()
+
+    assert observed == [
+        "build",
+        (application, {"host": "127.0.0.1", "port": 8090, "workers": 1}),
+    ]
+
+
 def test_production_plan_is_pure_and_reuses_the_provisioner_source_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

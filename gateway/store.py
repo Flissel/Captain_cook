@@ -291,6 +291,9 @@ class GatewayStore:
             RuntimeUsagePricingSnapshotV1, ...
         ] = (),
         runtime_provider_proxy_bindings: tuple[tuple[str, str, str], ...] = (),
+        runtime_provider_bundle_bindings: tuple[
+            tuple[str, str, str, str, str, str, str, bool], ...
+        ] = (),
     ):
         if claim_ttl <= timedelta(0):
             raise ValueError("claim_ttl must be positive")
@@ -302,6 +305,9 @@ class GatewayStore:
         self._runtime_usage_pricing_snapshots = runtime_usage_pricing_snapshots
         self._runtime_provider_proxy_bindings = frozenset(
             runtime_provider_proxy_bindings
+        )
+        self._runtime_provider_bundle_bindings = frozenset(
+            runtime_provider_bundle_bindings
         )
         self._ensure_schema()
         self._portal_tickets = PortalTicketStore(storage)

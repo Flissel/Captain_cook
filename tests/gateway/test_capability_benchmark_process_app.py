@@ -102,3 +102,31 @@ def test_benchmark_process_rejects_digest_mismatch_before_executor() -> None:
     assert response.status_code == 409
     assert response.json() == {"detail": "benchmark execution request is invalid"}
     assert executor.requests == []
+
+
+def test_benchmark_process_module_main_runs_the_isolated_app(
+    monkeypatch,
+) -> None:
+    import gateway.capability_benchmark_process_app as process_app
+
+    application = object()
+    observed = []
+    monkeypatch.setattr(
+        process_app,
+        "create_capability_benchmark_process_app_from_environment",
+        lambda environment: observed.append(environment) or application,
+    )
+    monkeypatch.setattr(
+        process_app.uvicorn,
+        "run",
+        lambda app, **kwargs: observed.append((app, kwargs)),
+    )
+    monkeypatch.setenv("CAPTAIN_CAPABILITY_BENCHMARK_PORT", "18092")
+
+    process_app.main()
+
+    assert len(observed) == 2
+    assert observed[1] == (
+        application,
+        {"host": "127.0.0.1", "port": 18092, "workers": 1},
+    )

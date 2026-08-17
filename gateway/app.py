@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path as FileSystemPath
@@ -153,8 +154,11 @@ from gateway.capability_assembly_api import (
 from agenten.agent_factory.holdout_store import PrivateHoldoutStore
 from gateway.capability_assembly_bootstrap import (
     CapabilityAssemblyFactoryRuntime,
+    GatewayPrivateHoldoutStore,
+    build_capability_assembly_factory_runtime_from_environment,
     build_production_capability_assembly_from_environment,
     close_production_capability_assembly,
+    load_capability_assembly_bootstrap_settings,
 )
 from gateway.portal_live_contracts import (
     PortalLiveEvidenceQueryV1,
@@ -170,6 +174,9 @@ from gateway.portal_live_contracts import (
 
 
 logger = logging.getLogger(__name__)
+
+
+CapabilityAssemblyRuntimeBuilder = Callable[..., CapabilityAssemblyFactoryRuntime]
 
 
 class Mirror(Protocol):
@@ -335,6 +342,11 @@ def create_app(
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
+    def environment_value(name: str) -> str:
+        source = capability_assembly_environment or os.environ
+        value = source.get(name, "")
+        return value if isinstance(value, str) else ""
+
     def configured_store(
         target_storage: MariaDBStorage,
         configured: GatewaySettings | None,
@@ -360,6 +372,20 @@ def create_app(
                     configured.provider_proxy_url,
                     configured.provider_policy_sha256,
                     configured.provider_price_card_sha256,
+                ),
+            )
+            if configured is not None and configured.provider_proxy_url is not None
+            else (),
+            runtime_provider_bundle_bindings=(
+                (
+                    configured.provider_proxy_url.removesuffix("/v1"),
+                    environment_value("CAPTAIN_PROVIDER_POLICY_SHA256"),
+                    environment_value("CAPTAIN_PROVIDER_PRICE_CARD_SHA256"),
+                    environment_value("CAPTAIN_PROVIDER_CONTEXT_SHA256"),
+                    environment_value("CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256"),
+                    environment_value("CAPTAIN_PROVIDER_PROXY_CODE_SHA256"),
+                    environment_value("CAPTAIN_PROVIDER_PAID_COMMAND_SHA256"),
+                    os.environ.get("CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED") == "true",
                 ),
             )
             if configured is not None and configured.provider_proxy_url is not None
@@ -1555,15 +1581,75 @@ def create_app(
     return app
 
 
+def create_production_app_from_environment(
+    *,
+    environment: Mapping[str, str] | None = None,
+    repository_root: FileSystemPath | None = None,
+    runtime_builder: CapabilityAssemblyRuntimeBuilder = (
+        build_capability_assembly_factory_runtime_from_environment
+    ),
+) -> FastAPI:
+    """Build the shipped production app once after complete, pure validation."""
+
+    source = dict(os.environ if environment is None else environment)
+    root = (repository_root or FileSystemPath.cwd()).resolve(strict=True)
+    configured = GatewaySettings.from_env(source)
+    bootstrap = load_capability_assembly_bootstrap_settings(
+        environment=source,
+        repository_root=root,
+    )
+    clock = lambda: datetime.now(timezone.utc)
+    artifacts = ContentAddressedArtifactAdapter(bootstrap.artifact_root)
+    gateway = GatewayStore(
+        MariaDBStorage(configured.ledger_dsn.get_secret_value()),
+        claim_ttl=timedelta(seconds=configured.claim_ttl_seconds),
+        runtime_usage_artifacts=artifacts,
+        runtime_provider_proxy_bindings=((
+            configured.provider_proxy_url,
+            configured.provider_policy_sha256,
+            configured.provider_price_card_sha256,
+        ),) if configured.provider_proxy_url is not None else (),
+        runtime_provider_bundle_bindings=((
+            bootstrap.provider_url,
+            bootstrap.provider_policy_sha256,
+            bootstrap.provider_price_card_sha256,
+            bootstrap.provider_context_sha256,
+            bootstrap.provider_proxy_executable_sha256,
+            bootstrap.provider_proxy_code_sha256,
+            bootstrap.provider_paid_command_sha256,
+            bootstrap.provider_hard_ceiling_enforced,
+        ),),
+    )
+    private_catalog = GatewayPrivateHoldoutStore(gateway_store=gateway)
+    runtime = runtime_builder(
+        repository_root=root,
+        environment=source,
+        store=gateway,
+        private_benchmark_catalog=private_catalog,
+        settings=bootstrap,
+        clock=clock,
+    )
+    return create_app(
+        settings=configured,
+        gateway_store=gateway,
+        capability_assembly_environment=source,
+        capability_assembly_factory_runtime=runtime,
+        capability_assembly_private_catalog=private_catalog,
+        capability_assembly_repository_root=root,
+        runtime_usage_artifacts=artifacts,
+        portal_clock=clock,
+    )
+
+
 app = create_app()
 
 
 def main() -> None:
     import uvicorn
 
-    settings = GatewaySettings.from_env()
-    app.state.gateway_settings = settings
-    uvicorn.run(app, host=settings.host, port=settings.port, workers=1)
+    production_app = create_production_app_from_environment()
+    settings = production_app.state.gateway_settings
+    uvicorn.run(production_app, host=settings.host, port=settings.port, workers=1)
 
 
 if __name__ == "__main__":

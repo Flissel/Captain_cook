@@ -53,6 +53,19 @@ def test_runner_script_can_load_package_from_scripts_directory() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+def test_provider_proxy_package_module_exposes_real_entrypoint() -> None:
+    root = Path(__file__).resolve().parents[2]
+    completed = subprocess.run(
+        [sys.executable, "-m", "agenten.provider_proxy.entrypoint", "--help"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "--price-card" in completed.stdout
+
+
 @pytest.mark.asyncio
 async def test_runtime_finalizes_provider_before_gateway_cost_settlement() -> None:
     command = resume_command_with_cost()

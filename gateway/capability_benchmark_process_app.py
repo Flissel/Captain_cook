@@ -3,9 +3,19 @@
 from __future__ import annotations
 
 import secrets
+import os
+import re
 from decimal import Decimal
+from pathlib import Path
 from typing import Protocol
 from uuid import UUID
+
+import uvicorn
+
+from agenten.agent_runtime.production_bootstrap import (
+    RuntimeAdapterManifestError,
+    load_verified_repository_module,
+)
 
 from fastapi import FastAPI, Header, HTTPException, status
 
@@ -83,6 +93,58 @@ def create_capability_benchmark_process_app(
             ) from None
 
     return app
+
+
+def create_capability_benchmark_process_app_from_environment(
+    environment: dict[str, str] | None = None,
+    *,
+    repository_root: Path | None = None,
+) -> FastAPI:
+    """Load the isolated executor only from digest-verified repository code."""
+
+    source = dict(os.environ if environment is None else environment)
+    root = (repository_root or Path.cwd()).resolve(strict=True)
+    relative = source.get("CAPTAIN_CAPABILITY_BENCHMARK_EXECUTOR", "").strip()
+    digest = source.get("CAPTAIN_CAPABILITY_BENCHMARK_EXECUTOR_SHA256", "").strip()
+    token = source.get("CAPTAIN_CAPABILITY_BENCHMARK_TOKEN", "").strip()
+    authority = source.get("CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID", "").strip()
+    if (
+        not relative
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or len(token) < 16
+        or not authority
+    ):
+        raise ValueError("benchmark process configuration is incomplete")
+    try:
+        module = load_verified_repository_module(
+            relative, expected_sha256=digest, repository_root=root
+        )
+        constructor = getattr(module, "build_capability_benchmark_executor", None)
+        if not callable(constructor):
+            raise ValueError("constructor")
+        executor = constructor()
+        authority_id = UUID(authority)
+    except (RuntimeAdapterManifestError, TypeError, ValueError):
+        raise ValueError("benchmark process configuration is invalid") from None
+    if not callable(getattr(executor, "execute", None)):
+        raise ValueError("benchmark process executor is invalid")
+    return create_capability_benchmark_process_app(
+        executor=executor,
+        bearer_token=token,
+        authority_id=authority_id,
+    )
+
+
+def main() -> None:
+    source = dict(os.environ)
+    try:
+        port = int(source.get("CAPTAIN_CAPABILITY_BENCHMARK_PORT", "8092"))
+    except ValueError:
+        raise ValueError("benchmark process configuration is invalid") from None
+    if port < 1 or port > 65535:
+        raise ValueError("benchmark process configuration is invalid")
+    application = create_capability_benchmark_process_app_from_environment(source)
+    uvicorn.run(application, host="127.0.0.1", port=port, workers=1)
 
 
 def _parse_request(payload: dict[str, object]) -> GenericBenchmarkExecutionRequest:
@@ -181,4 +243,9 @@ def _serialize_evidence(evidence: GenericBenchmarkExecutionEvidence) -> dict[str
 __all__ = [
     "CapabilityBenchmarkProcessExecutor",
     "create_capability_benchmark_process_app",
+    "create_capability_benchmark_process_app_from_environment",
 ]
+
+
+if __name__ == "__main__":
+    main()
