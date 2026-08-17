@@ -32,6 +32,7 @@ def _manifest(**updates: object) -> object:
     credential_names = {
         "gateway": "CAPTAIN_GATEWAY_TOKEN",
         "benchmark": "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+        "tool_host": "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN",
         "runtime": "CAPTAIN_RUNTIME_TOKEN",
         "factory": "CAPTAIN_FACTORY_RUNTIME_TOKEN",
         "provider_proxy": "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
@@ -48,6 +49,7 @@ def _manifest(**updates: object) -> object:
             "minibook": "/health",
             "provider_proxy": "/v1/healthz",
             "benchmark": "/healthz",
+            "tool_host": "/healthz",
             "n8n": "/api/v1/workflows?limit=1",
         }[service]
         prefix = ("python", "-m", "gateway.capability_process_operator", "--service", service)
@@ -86,6 +88,7 @@ def _manifest(**updates: object) -> object:
         "provider_hard_ceiling_enforced": True,
         "gateway": binding("gateway"),
         "benchmark": binding("benchmark", execute=True),
+        "tool_host": binding("tool_host"),
         "runtime": binding("runtime"),
         "factory": binding("factory", execute=True),
         "provider_proxy": binding("provider_proxy"),
@@ -189,6 +192,8 @@ def test_real_d11_manifest_builder_is_compatible_with_d12_loader(tmp_path: Path)
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:18081/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-token",
         "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-token",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_URL": "http://127.0.0.1:18086",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN": "tool-host-token",
         "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:18082",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-token",
         "CAPTAIN_FACTORY_RUNTIME_URL": "http://127.0.0.1:18085",
@@ -339,7 +344,7 @@ def test_process_controls_are_typed_and_minibook_gap_remains_exact(
         configuration.require_minibook_evidence_readback()
     controls = configuration.require_operator_process_bootstrap()
     assert tuple(control.service for control in controls.services) == (
-        "gateway", "runtime", "factory", "provider_proxy", "benchmark", "minibook", "n8n"
+        "gateway", "runtime", "factory", "provider_proxy", "benchmark", "tool_host", "minibook", "n8n"
     )
     runtime = configuration.require_runtime_restart_control()
     assert runtime.service == "runtime"

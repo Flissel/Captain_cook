@@ -51,10 +51,10 @@ class FakeActions:
         return {"status": "stopped"}
 
 
-def test_default_actions_executes_all_seven_exact_d11_controls(
+def test_default_actions_executes_all_eight_exact_d11_controls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    services = ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "minibook", "n8n")
+    services = ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "tool_host", "minibook", "n8n")
     controls = tuple(
         SimpleNamespace(
             service=service,
@@ -95,10 +95,10 @@ def test_default_actions_executes_all_seven_exact_d11_controls(
     assert all(command[-1] == "start" for command in calls)
 
 
-def test_default_status_revalidates_all_seven_authenticated_health_contracts(
+def test_default_status_revalidates_all_eight_authenticated_health_contracts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    services = ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "minibook", "n8n")
+    services = ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "tool_host", "minibook", "n8n")
     state_root = tmp_path / "state"
     state_root.mkdir()
     controls = tuple(

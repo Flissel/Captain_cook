@@ -411,7 +411,7 @@ class CapabilityProductionProcessBindingV1(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
     service: Literal[
-        "gateway", "benchmark", "runtime", "factory", "provider_proxy", "minibook", "n8n"
+        "gateway", "benchmark", "tool_host", "runtime", "factory", "provider_proxy", "minibook", "n8n"
     ]
     base_url: str
     health_url: str
@@ -420,6 +420,7 @@ class CapabilityProductionProcessBindingV1(BaseModel):
     credential_env: Literal[
         "CAPTAIN_GATEWAY_TOKEN",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN",
         "CAPTAIN_RUNTIME_TOKEN",
         "CAPTAIN_FACTORY_RUNTIME_TOKEN",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
@@ -430,6 +431,7 @@ class CapabilityProductionProcessBindingV1(BaseModel):
     authenticated_health_credential_env: Literal[
         "CAPTAIN_GATEWAY_TOKEN",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN",
         "CAPTAIN_RUNTIME_TOKEN",
         "CAPTAIN_FACTORY_RUNTIME_TOKEN",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
@@ -461,6 +463,7 @@ class CapabilityProductionBundleManifestV1(BaseModel):
     factory_runtime_code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     gateway: CapabilityProductionProcessBindingV1
     benchmark: CapabilityProductionProcessBindingV1
+    tool_host: CapabilityProductionProcessBindingV1
     runtime: CapabilityProductionProcessBindingV1
     factory: CapabilityProductionProcessBindingV1
     provider_proxy: CapabilityProductionProcessBindingV1
@@ -485,6 +488,8 @@ _OPERATOR_REQUIRED_NAMES = (
     "CAPTAIN_GATEWAY_TOKEN",
     "CAPTAIN_CAPABILITY_BENCHMARK_URL",
     "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+    "CAPTAIN_CAPABILITY_TOOL_HOST_URL",
+    "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN",
     "CAPTAIN_RUNTIME_URL",
     "CAPTAIN_RUNTIME_TOKEN",
     "CAPTAIN_FACTORY_RUNTIME_URL",
@@ -553,6 +558,11 @@ def load_capability_production_bundle_manifest(
     minibook = _allowed_service_url(raw["MINIBOOK_BACKEND_URL"], allowed_hosts=allowed_hosts, label="Minibook")
     provider = _allowed_service_url(raw["CAPTAIN_PROVIDER_PROXY_URL"], allowed_hosts=allowed_hosts, label="provider proxy")
     benchmark = _allowed_endpoint(raw["CAPTAIN_CAPABILITY_BENCHMARK_URL"], allowed_hosts=allowed_hosts, label="benchmark")
+    tool_host = _allowed_service_url(
+        raw["CAPTAIN_CAPABILITY_TOOL_HOST_URL"],
+        allowed_hosts=allowed_hosts,
+        label="tool host",
+    )
     n8n = _allowed_service_url(
         environment.get("CAPTAIN_N8N_URL", "http://127.0.0.1:5679").strip(),
         allowed_hosts=allowed_hosts,
@@ -587,6 +597,10 @@ def load_capability_production_bundle_manifest(
             "benchmark", benchmark.removesuffix("/v1/execute"),
             benchmark.removesuffix("/v1/execute") + "/healthz", benchmark,
             credential_env="CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+        ),
+        "tool_host": _process_binding(
+            "tool_host", tool_host, f"{tool_host}/healthz",
+            credential_env="CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN",
         ),
         "runtime": _process_binding(
             "runtime", runtime, f"{runtime}/health",

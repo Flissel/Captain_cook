@@ -363,12 +363,12 @@ def test_missing_health_authority_causes_zero_http_and_zero_advances(
 
 @pytest.mark.parametrize(
     "failed_service",
-    ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "minibook", "n8n"),
+    ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "tool_host", "minibook", "n8n"),
 )
 def test_each_authenticated_health_failure_prevents_paid_effect(
     tmp_path: Path, failed_service: str,
 ) -> None:
-    services = ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "minibook", "n8n")
+    services = ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "tool_host", "minibook", "n8n")
     headers = {service: ("X-N8N-API-KEY" if service == "n8n" else "Authorization") for service in services}
 
     class Configuration:

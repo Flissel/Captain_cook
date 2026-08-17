@@ -34,7 +34,7 @@ class AuthorityHealthBinding:
 
 @dataclass(frozen=True, slots=True)
 class OperatorServiceControl:
-    service: Literal["gateway", "runtime", "factory", "provider_proxy", "benchmark", "minibook", "n8n"]
+    service: Literal["gateway", "runtime", "factory", "provider_proxy", "benchmark", "tool_host", "minibook", "n8n"]
     start_argv: tuple[str, ...]
     stop_argv: tuple[str, ...]
     restart_argv: tuple[str, ...]
@@ -64,6 +64,7 @@ GENERATED_SECRET_NAMES = (
     "WORKER_GATEWAY_TOKEN",
     "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN",
     "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+    "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN",
     "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
     "CAPTAIN_RUNTIME_TOKEN",
     "CAPTAIN_FACTORY_RUNTIME_TOKEN",
@@ -96,7 +97,7 @@ class DemoConfiguration:
         )
 
     def health_bindings(self) -> tuple[AuthorityHealthBinding, ...]:
-        names = ("gateway", "provider_proxy", "runtime", "factory", "benchmark", "minibook", "n8n")
+        names = ("gateway", "provider_proxy", "runtime", "factory", "benchmark", "tool_host", "minibook", "n8n")
         return tuple(
             AuthorityHealthBinding(
                 service=service,
@@ -172,7 +173,7 @@ class DemoConfiguration:
         return value
 
     def require_operator_process_bootstrap(self) -> OperatorProcessBootstrap:
-        expected = ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "minibook", "n8n")
+        expected = ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "tool_host", "minibook", "n8n")
         controls: list[OperatorServiceControl] = []
         for service in expected:
             binding = getattr(self.production_manifest, service, None)
@@ -343,6 +344,7 @@ def _validate_d11_manifest(manifest: object) -> None:
             "/healthz",
             "/v1/execute",
         ),
+        "tool_host": ("CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN", "/healthz", None),
         "runtime": ("CAPTAIN_RUNTIME_TOKEN", "/health", None),
         "provider_proxy": (
             "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
@@ -387,6 +389,7 @@ def _validate_d11_manifest(manifest: object) -> None:
         "runtime": ("/health", "CAPTAIN_RUNTIME_TOKEN", "Authorization"),
         "provider_proxy": ("/v1/healthz", "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN", "Authorization"),
         "benchmark": ("/healthz", "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN", "Authorization"),
+        "tool_host": ("/healthz", "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN", "Authorization"),
         "minibook": ("/api/v1/projection-health", "MINIBOOK_PROJECTION_API_KEY", "Authorization"),
         "n8n": ("/api/v1/workflows?limit=1", "CAPTAIN_N8N_API_KEY", "X-N8N-API-KEY"),
     }
