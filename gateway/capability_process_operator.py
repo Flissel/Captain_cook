@@ -1,4 +1,4 @@
-"""Semantic start/stop/restart operator for the six production processes."""
+"""Semantic start/stop/restart operator for the production process bundle."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from uuid import uuid4
 
 
 _SERVICES = (
-    "gateway", "runtime", "provider_proxy", "benchmark", "tool_host",
+    "gateway", "runtime", "factory", "provider_proxy", "benchmark", "tool_host",
     "minibook", "n8n",
 )
 _ACTIONS = ("start", "stop", "restart")
@@ -36,11 +36,13 @@ _SERVICE_SECRET_ENV = {
         "MINIBOOK_PROJECTION_API_KEY", "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN",
         "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN",
         "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN",
+        "CAPTAIN_FACTORY_RUNTIME_TOKEN",
     ),
     "runtime": (
         "CAPTAIN_RUNTIME_TOKEN", "CAPTAIN_GATEWAY_TOKEN",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
     ),
+    "factory": ("CAPTAIN_FACTORY_RUNTIME_TOKEN",),
     "provider_proxy": (
         "OPENAI_API_KEY", "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
         "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN", "CAPTAIN_RUNTIME_TOKEN",
@@ -74,12 +76,32 @@ _SERVICE_CONFIG_ENV = {
         "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256", "CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED",
         "MINIBOOK_BACKEND_URL", "CAPTAIN_CAPABILITY_ALLOWED_HOSTS",
         "CAPTAIN_GENERIC_TOOL_REGISTRY", "CAPTAIN_GENERIC_TOOL_REGISTRY_SHA256",
+        "CAPTAIN_FACTORY_RUNTIME_URL",
     ),
     "runtime": (
         "CAPTAIN_RUNTIME_URL", "CAPTAIN_RUNTIME_PORT", "CAPTAIN_GATEWAY_URL",
         "CAPTAIN_PROVIDER_PROXY_URL", "CAPTAIN_RUNTIME_ADAPTER_MANIFEST",
         "CAPTAIN_RUNTIME_ADAPTER_MANIFEST_SHA256", "CAPTAIN_CODEX_MODEL",
         "CAPTAIN_CODEX_REASONING_EFFORT", "CAPTAIN_CODEX_EXECUTABLE",
+    ),
+    "factory": (
+        "CAPTAIN_FACTORY_RUNTIME_URL", "CAPTAIN_FACTORY_RUNTIME_PORT",
+        "CAPTAIN_FACTORY_RUNTIME_CODE_SHA256",
+        "CAPTAIN_GATEWAY_URL", "CAPTAIN_CAPABILITY_ARTIFACT_ROOT",
+        "CAPTAIN_CAPABILITY_AUTHORITY_ROOT",
+        "CAPTAIN_CAPABILITY_ASSEMBLY_REPOSITORY_REVISION",
+        "CAPTAIN_CAPABILITY_FACTORY_ADAPTER",
+        "CAPTAIN_CAPABILITY_FACTORY_ADAPTER_SHA256",
+        "CAPTAIN_CAPABILITY_FACTORY_DESCRIPTOR",
+        "CAPTAIN_CAPABILITY_FACTORY_PLAN_SHA256",
+        "CAPTAIN_CAPABILITY_EXECUTION_POLICY_JSON",
+        "CAPTAIN_BENCHMARK_MODEL", "CAPTAIN_BENCHMARK_PROVIDER",
+        "CAPTAIN_PROVIDER_PROXY_URL", "CAPTAIN_PROVIDER_POLICY_SHA256",
+        "CAPTAIN_PROVIDER_PRICE_CARD_SHA256", "CAPTAIN_PROVIDER_CONTEXT_SHA256",
+        "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256",
+        "CAPTAIN_PROVIDER_PROXY_CODE_SHA256",
+        "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256",
+        "CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED", "MINIBOOK_BACKEND_URL",
     ),
     "provider_proxy": (
         "CAPTAIN_PROVIDER_PROXY_URL", "CAPTAIN_PROVIDER_PRICE_CARD_PATH",
@@ -445,6 +467,7 @@ def _authenticated_health_request(
         "provider_proxy": ("CAPTAIN_PROVIDER_PROXY_URL", "/v1/healthz", "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN", "Authorization"),
         "benchmark": ("CAPTAIN_CAPABILITY_BENCHMARK_URL", "/healthz", "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN", "Authorization"),
         "tool_host": ("CAPTAIN_CAPABILITY_TOOL_HOST_URL", "/healthz", "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN", "Authorization"),
+        "factory": ("CAPTAIN_FACTORY_RUNTIME_URL", "/healthz", "CAPTAIN_FACTORY_RUNTIME_TOKEN", "Authorization"),
         "minibook": ("MINIBOOK_BACKEND_URL", "/api/v1/projection-health", "MINIBOOK_PROJECTION_API_KEY", "Authorization"),
         "n8n": ("CAPTAIN_N8N_URL", "/api/v1/workflows?limit=1", "CAPTAIN_N8N_API_KEY", "X-N8N-API-KEY"),
     }
@@ -475,6 +498,25 @@ def _preflight_operation(
     _authenticated_health_request(service, environment=environment)
     if service == "minibook":
         _required(environment, "MINIBOOK_CREATION_DB")
+    if service == "factory":
+        digest = _required(environment, "CAPTAIN_FACTORY_RUNTIME_CODE_SHA256")
+        revision = _required(
+            environment, "CAPTAIN_CAPABILITY_ASSEMBLY_REPOSITORY_REVISION"
+        )
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("Factory process code authority is invalid")
+        if environment.get("CAPTAIN_PROCESS_OPERATOR_BACKEND") != "sentinel":
+            try:
+                result = subprocess.run(
+                    ("git", "show", f"{revision}:gateway/capability_factory_process_app.py"),
+                    cwd=repository_root, capture_output=True, check=True, timeout=10,
+                    env=_process_introspection_environment(environment),
+                )
+            except Exception:
+                raise ValueError("Factory process code authority is invalid") from None
+            import hashlib
+            if not secrets.compare_digest(hashlib.sha256(result.stdout).hexdigest(), digest):
+                raise ValueError("Factory process code authority is invalid")
     service_argv(
         service, environment=environment, repository_root=repository_root,
         action="start" if action == "restart" else action,
@@ -548,6 +590,12 @@ def service_argv(
         return (python, "-m", "gateway.capability_benchmark_process_app")
     if service == "tool_host":
         return (python, "-m", "gateway.capability_tool_host_app")
+    if service == "factory":
+        bootstrap = (
+            "import runpy,sys;sys.path.insert(0," + repr(str(repository_root))
+            + ");runpy.run_module('gateway.capability_factory_process_app',run_name='__main__')"
+        )
+        return (python, "-I", "-c", bootstrap)
     if service == "provider_proxy":
         provider_url = _required(environment, "CAPTAIN_PROVIDER_PROXY_URL")
         parsed = urlsplit(provider_url)

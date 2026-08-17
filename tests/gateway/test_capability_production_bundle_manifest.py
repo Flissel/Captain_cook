@@ -34,6 +34,10 @@ def _environment() -> dict[str, str]:
         "CAPTAIN_GENERIC_TOOL_REGISTRY_SHA256": "1cc99b7ef95ddedebc64f2b1c4ad3b88c5fcbfa748f536e93606af76c1994f5f",
         "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-token-value",
+        "CAPTAIN_FACTORY_RUNTIME_URL": "http://127.0.0.1:8093",
+        "CAPTAIN_FACTORY_RUNTIME_TOKEN": "factory-runtime-token-value",
+        "CAPTAIN_FACTORY_RUNTIME_CODE_SHA256": "9" * 64,
+        "CAPTAIN_CAPABILITY_ASSEMBLY_REPOSITORY_REVISION": "8" * 40,
         "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "provider-token-value",
         "OPENAI_API_KEY": "provider-only-test-key",
@@ -78,10 +82,12 @@ def test_operator_manifest_is_digest_bound_and_contains_real_process_contracts()
     assert manifest.benchmark.health_url == "http://127.0.0.1:8092/healthz"
     assert manifest.provider_proxy.health_url == "http://127.0.0.1:18091/v1/healthz"
     assert manifest.runtime.health_url == "http://127.0.0.1:8091/health"
+    assert manifest.factory.execute_url == "http://127.0.0.1:8093/v1/execute"
     assert manifest.minibook.health_url == "http://127.0.0.1:8080/health"
     assert manifest.gateway.credential_env == "CAPTAIN_GATEWAY_TOKEN"
     assert manifest.benchmark.credential_env == "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN"
     assert manifest.runtime.credential_env == "CAPTAIN_RUNTIME_TOKEN"
+    assert manifest.factory.credential_env == "CAPTAIN_FACTORY_RUNTIME_TOKEN"
     assert manifest.provider_proxy.credential_env == "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"
     assert manifest.minibook.credential_env == "MINIBOOK_API_KEY"
     assert manifest.minibook.authenticated_health_url == (
@@ -102,12 +108,12 @@ def test_operator_manifest_is_digest_bound_and_contains_real_process_contracts()
     assert all(
         binding.authenticated_health_header == "Authorization"
         for binding in (
-            manifest.gateway, manifest.runtime, manifest.provider_proxy,
+            manifest.gateway, manifest.runtime, manifest.factory, manifest.provider_proxy,
             manifest.benchmark, manifest.minibook,
         )
     )
     for binding in (
-        manifest.gateway, manifest.provider_proxy, manifest.runtime,
+        manifest.gateway, manifest.provider_proxy, manifest.runtime, manifest.factory,
         manifest.benchmark, manifest.minibook, manifest.n8n,
     ):
         assert binding.start_argv
@@ -126,7 +132,7 @@ def test_operator_manifest_is_digest_bound_and_contains_real_process_contracts()
     assert all(value not in rendered for name, value in environment.items() if "TOKEN" in name or "KEY" in name)
 
 
-def test_operator_executes_all_six_semantic_lifecycles_with_new_restart_identity(
+def test_operator_executes_all_seven_semantic_lifecycles_with_new_restart_identity(
     tmp_path: Path,
 ) -> None:
     environment = {
@@ -145,7 +151,7 @@ def test_operator_executes_all_six_semantic_lifecycles_with_new_restart_identity
         "minibook": "minibook.src.main",
     }
     for service in (
-        "gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n"
+        "gateway", "runtime", "factory", "provider_proxy", "benchmark", "minibook", "n8n"
     ):
         command = service_argv(
             service, environment=environment, repository_root=tmp_path
@@ -154,6 +160,9 @@ def test_operator_executes_all_six_semantic_lifecycles_with_new_restart_identity
             assert command[-2:] == (
                 str((tmp_path / "scripts" / "captain-n8n.ps1").resolve()), "start"
             )
+        elif service == "factory":
+            assert command[1:3] == ("-I", "-c")
+            assert "gateway.capability_factory_process_app" in command[3]
         else:
             assert command[1:3] == ("-m", expected_modules[service])
         started = operate(
@@ -207,7 +216,7 @@ def test_each_process_receives_only_its_allowlisted_environment() -> None:
         "MINIBOOK_PROJECTION_SERVICE_AGENT_ID": "captain-projection-service-v2",
     }
 
-    for service in ("gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n"):
+    for service in ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "minibook", "n8n"):
         child = process_operator._service_environment(service, environment)
         assert "UNRELATED_SECRET" not in child
         assert ("OPENAI_API_KEY" in child) is (service == "provider_proxy")

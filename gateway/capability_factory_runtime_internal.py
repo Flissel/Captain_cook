@@ -16,6 +16,9 @@ from agenten.agent_factory.minibook_forge import CaptainCreationJobMapper, Minib
 from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
 from gateway.capability_factory_benchmark_bridge import AssemblyOwnedGenericBenchmark
 from gateway.capability_factory_generic_real_case import GatewayD10GenericCandidateValidator
+from gateway.factory_gateway_store_client import (
+    GatewayFactoryForgeRpcClient, GatewayFactoryStoreRpcClient,
+)
 
 
 class _DeferredImprovementAuthority:
@@ -45,17 +48,20 @@ def build_capability_factory_runtime(configuration, authorities) -> AgentFactory
     )
     improvement = _DeferredImprovementAuthority()
     hermes = HermesCliFactory(settings=HermesCliSettings(skill_root=configuration.repository_root / "agenten/agent_factory/skills", evidence_root=configuration.authority_root / "runtime-state/hermes-evidence", working_directory=configuration.repository_root), released_skill_catalog=repository, workflow_artifacts=repository, clock=clock)
-    forge = MinibookForgeHttpClient(
-        mapper=CaptainCreationJobMapper(
-            evidence=CaptainForgeEvidenceBridge(
-                repository=repository, evidence_store=evidence_store,
-            )
-        ),
-        settings=MinibookForgeHttpSettings(
-            base_url=configuration.minibook_url,
-            api_key=authorities.minibook_api_key.get_secret_value(),
-        ),
-    )
+    if isinstance(store, GatewayFactoryStoreRpcClient):
+        forge = GatewayFactoryForgeRpcClient(gateway=store)
+    else:
+        forge = MinibookForgeHttpClient(
+            mapper=CaptainCreationJobMapper(
+                evidence=CaptainForgeEvidenceBridge(
+                    repository=repository, evidence_store=evidence_store,
+                )
+            ),
+            settings=MinibookForgeHttpSettings(
+                base_url=configuration.minibook_url,
+                api_key=authorities.minibook_api_key.get_secret_value(),
+            ),
+        )
     dispatcher = FactoryDispatcher(coordinator=coordinator, hermes=hermes, forge=forge, candidate_validator=candidate_validator, business_benchmark=business_benchmark, leases=lease_issuer, clock=_CallableFactoryClock(clock), improvements=improvement)
     runner = ProductionFactoryDispatchRunner(coordinator=coordinator, dispatcher=dispatcher, lease_issuer=lease_issuer, clock=clock)
     return AgentFactoryLiveComposition(repository=repository, coordinator=coordinator, lease_issuer=lease_issuer, hermes=hermes, team_execution=candidate_validator, candidate_validator=candidate_validator, business_benchmark=business_benchmark, dispatcher=dispatcher, runner=runner, improvement_authority=improvement, runtime_retry_authority=None)

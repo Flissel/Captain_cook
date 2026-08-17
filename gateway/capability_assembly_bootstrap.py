@@ -122,6 +122,8 @@ from gateway.capability_live_pipeline import (
 )
 from gateway.capability_live_provisioning import CurrentAuthorityCapabilityFactoryProvisioner
 from gateway.capability_resume_client import GatewayCapabilityResumeClient
+from gateway.capability_factory_process_client import GatewayFactoryProcessClient
+from gateway.minibook_creation_artifacts import GatewayMinibookCreationArtifactStore
 from gateway.registry_feed import factory_promotion_projection
 from gateway.store import GatewayStore
 
@@ -154,6 +156,8 @@ class CapabilityAssemblyBootstrapSettings:
     minibook_projection_api_key: SecretStr
     runtime_url: str
     runtime_token: SecretStr
+    factory_runtime_url: str
+    factory_runtime_token: SecretStr
     provider_token: SecretStr
     provider_url: str
     provider_policy_sha256: str
@@ -324,6 +328,18 @@ def load_capability_assembly_bootstrap_settings(
             allowed_hosts=allowed_hosts,
             label="Runtime",
         ),
+        factory_runtime_url=(
+            _allowed_service_url(
+                environment.get("CAPTAIN_FACTORY_RUNTIME_URL", "").strip(),
+                allowed_hosts=allowed_hosts,
+                label="Factory runtime",
+            )
+            if environment.get("CAPTAIN_FACTORY_RUNTIME_URL", "").strip()
+            else ""
+        ),
+        factory_runtime_token=SecretStr(
+            environment.get("CAPTAIN_FACTORY_RUNTIME_TOKEN", "").strip()
+        ),
         provider_token=SecretStr(raw["CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"]),
         provider_url=provider_url,
         provider_policy_sha256=raw["CAPTAIN_PROVIDER_POLICY_SHA256"],
@@ -395,7 +411,7 @@ class CapabilityProductionProcessBindingV1(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
     service: Literal[
-        "gateway", "benchmark", "runtime", "provider_proxy", "minibook", "n8n"
+        "gateway", "benchmark", "runtime", "factory", "provider_proxy", "minibook", "n8n"
     ]
     base_url: str
     health_url: str
@@ -405,6 +421,7 @@ class CapabilityProductionProcessBindingV1(BaseModel):
         "CAPTAIN_GATEWAY_TOKEN",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
         "CAPTAIN_RUNTIME_TOKEN",
+        "CAPTAIN_FACTORY_RUNTIME_TOKEN",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
         "MINIBOOK_API_KEY",
         "CAPTAIN_N8N_API_KEY",
@@ -414,6 +431,7 @@ class CapabilityProductionProcessBindingV1(BaseModel):
         "CAPTAIN_GATEWAY_TOKEN",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
         "CAPTAIN_RUNTIME_TOKEN",
+        "CAPTAIN_FACTORY_RUNTIME_TOKEN",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
         "MINIBOOK_PROJECTION_API_KEY",
         "CAPTAIN_N8N_API_KEY",
@@ -440,9 +458,11 @@ class CapabilityProductionBundleManifestV1(BaseModel):
     provider_proxy_code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     provider_paid_command_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     provider_hard_ceiling_enforced: Literal[True]
+    factory_runtime_code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     gateway: CapabilityProductionProcessBindingV1
     benchmark: CapabilityProductionProcessBindingV1
     runtime: CapabilityProductionProcessBindingV1
+    factory: CapabilityProductionProcessBindingV1
     provider_proxy: CapabilityProductionProcessBindingV1
     minibook: CapabilityProductionProcessBindingV1
     n8n: CapabilityProductionProcessBindingV1
@@ -467,6 +487,9 @@ _OPERATOR_REQUIRED_NAMES = (
     "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
     "CAPTAIN_RUNTIME_URL",
     "CAPTAIN_RUNTIME_TOKEN",
+    "CAPTAIN_FACTORY_RUNTIME_URL",
+    "CAPTAIN_FACTORY_RUNTIME_TOKEN",
+    "CAPTAIN_FACTORY_RUNTIME_CODE_SHA256",
     "CAPTAIN_PROVIDER_PROXY_URL",
     "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
     "CAPTAIN_PROVIDER_POLICY_SHA256",
@@ -526,6 +549,7 @@ def load_capability_production_bundle_manifest(
     )
     gateway = _allowed_service_url(raw["CAPTAIN_GATEWAY_URL"], allowed_hosts=allowed_hosts, label="Gateway")
     runtime = _allowed_service_url(raw["CAPTAIN_RUNTIME_URL"], allowed_hosts=allowed_hosts, label="Runtime")
+    factory = _allowed_service_url(raw["CAPTAIN_FACTORY_RUNTIME_URL"], allowed_hosts=allowed_hosts, label="Factory runtime")
     minibook = _allowed_service_url(raw["MINIBOOK_BACKEND_URL"], allowed_hosts=allowed_hosts, label="Minibook")
     provider = _allowed_service_url(raw["CAPTAIN_PROVIDER_PROXY_URL"], allowed_hosts=allowed_hosts, label="provider proxy")
     benchmark = _allowed_endpoint(raw["CAPTAIN_CAPABILITY_BENCHMARK_URL"], allowed_hosts=allowed_hosts, label="benchmark")
@@ -554,6 +578,7 @@ def load_capability_production_bundle_manifest(
         "provider_proxy_code_sha256": raw["CAPTAIN_PROVIDER_PROXY_CODE_SHA256"],
         "provider_paid_command_sha256": raw["CAPTAIN_PROVIDER_PAID_COMMAND_SHA256"],
         "provider_hard_ceiling_enforced": True,
+        "factory_runtime_code_sha256": raw["CAPTAIN_FACTORY_RUNTIME_CODE_SHA256"],
         "gateway": _process_binding(
             "gateway", gateway, f"{gateway}/v1/capability-assemblies/health",
             credential_env="CAPTAIN_GATEWAY_TOKEN",
@@ -566,6 +591,11 @@ def load_capability_production_bundle_manifest(
         "runtime": _process_binding(
             "runtime", runtime, f"{runtime}/health",
             credential_env="CAPTAIN_RUNTIME_TOKEN",
+        ),
+        "factory": _process_binding(
+            "factory", factory, f"{factory}/healthz",
+            f"{factory}/v1/execute",
+            credential_env="CAPTAIN_FACTORY_RUNTIME_TOKEN",
         ),
         "provider_proxy": _process_binding(
             "provider_proxy", provider_root, f"{provider_root}/v1/healthz",
@@ -1568,7 +1598,7 @@ def _promotion_benchmark_summary(store: GatewayStore, block: dict[str, Any]):
 class CapabilityAssemblyFactoryRuntime:
     """Already-composed current Factory graph; no arbitrary plugin seam."""
 
-    factory: AgentFactoryLiveComposition
+    factory: AgentFactoryLiveComposition | GatewayFactoryProcessClient
     provisioning: CurrentAuthorityCapabilityFactoryProvisioner
     n8n: GatewayCapabilityN8nWorkBatchAuthority
 
@@ -1592,6 +1622,7 @@ class CapabilityAssemblyFactoryConfiguration:
     provider_paid_command_sha256: str = ""
     provider_hard_ceiling_enforced: bool = False
     minibook_url: str = ""
+    factory_runtime_url: str = ""
 
 
 @dataclass(frozen=True, repr=False)
@@ -2100,6 +2131,9 @@ def plan_capability_assembly_factory_runtime_from_environment(
                 environment.get("CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED") == "true"
             ),
             minibook_url=environment.get("MINIBOOK_BACKEND_URL", "").strip(),
+            factory_runtime_url=environment.get(
+                "CAPTAIN_FACTORY_RUNTIME_URL", ""
+            ).strip().rstrip("/"),
         ),
     )
 
@@ -2129,6 +2163,7 @@ def build_capability_assembly_factory_runtime_from_environment(
         clock=clock,
         provider_token=settings.provider_token,
         minibook_api_key=settings.minibook_api_key,
+        factory_runtime_token=settings.factory_runtime_token,
     )
 
 
@@ -2141,6 +2176,8 @@ def materialize_capability_assembly_factory_runtime(
     source_artifacts: RepositoryFactoryInputArtifactStore | None = None,
     provider_token: SecretStr | None = None,
     minibook_api_key: SecretStr | None = None,
+    factory_runtime_token: SecretStr | None = None,
+    use_factory_process_client: bool = True,
 ) -> CapabilityAssemblyFactoryRuntime:
     """Import and construct only after the complete descriptor is attested."""
 
@@ -2157,6 +2194,39 @@ def materialize_capability_assembly_factory_runtime(
         provider_token=provider_token or SecretStr("unconfigured-provider-token"),
         minibook_api_key=minibook_api_key or SecretStr("unconfigured-minibook-token"),
     )
+    if plan.configuration.factory_runtime_url and use_factory_process_client:
+        token = "" if factory_runtime_token is None else factory_runtime_token.get_secret_value()
+        if len(token) < 16:
+            raise CapabilityAssemblyBootstrapConfigurationError(
+                "capability assembly Factory process is unavailable"
+            )
+        repository = GatewayFactoryRepository(store)
+        candidate_provider = GatewayForgeCandidateProvider(
+            repository=repository,
+            artifacts=GatewayMinibookCreationArtifactStore(
+                plan.configuration.authority_root / "minibook-creation-cas"
+            ),
+        )
+        factory = GatewayFactoryProcessClient(
+            repository=repository,
+            process_url=plan.configuration.factory_runtime_url,
+            factory_runtime_token=token,
+            candidate_resolver=candidate_provider,
+        )
+        provisioning = CurrentAuthorityCapabilityFactoryProvisioner(
+            repository=repository,
+            source_artifacts=selected_source_artifacts,  # type: ignore[arg-type]
+            holdout_store=private_benchmark_catalog,
+            released_skills=repository,
+            execution_policy=plan.configuration.execution_policy,
+            authority_root=plan.configuration.authority_root / "factory-inputs",
+            clock=clock,
+            work_batches=n8n,
+            n8n_registry=n8n,
+        )
+        return CapabilityAssemblyFactoryRuntime(
+            factory=factory, provisioning=provisioning, n8n=n8n,
+        )
     try:
         finder = _VerifiedFactoryClosureFinder(plan.closure_modules)
         finder.require_preloaded_origins()
@@ -2428,6 +2498,24 @@ def _native_runtime_is_bound(
     factory = getattr(runtime, "factory", None)
     provisioning = getattr(runtime, "provisioning", None)
     n8n = getattr(runtime, "n8n", None)
+    if type(factory) is GatewayFactoryProcessClient:
+        repository = getattr(factory, "repository", None)
+        return (
+            type(repository) is GatewayFactoryRepository
+            and getattr(repository, "_store", None) is store
+            and type(provisioning) is CurrentAuthorityCapabilityFactoryProvisioner
+            and getattr(provisioning, "_repository", None) is repository
+            and type(n8n) is GatewayCapabilityN8nWorkBatchAuthority
+            and n8n.gateway_store is store
+            and getattr(provisioning, "_work_batches", None) is n8n
+            and getattr(provisioning, "_n8n_registry", None) is n8n
+            and type(private_benchmark_catalog) is GatewayPrivateHoldoutStore
+            and private_benchmark_catalog.gateway_store is store
+            and getattr(
+                getattr(provisioning, "_compiler", None), "_holdout_store", None
+            ) is private_benchmark_catalog
+            and getattr(factory, "_url", "").startswith("http://127.0.0.1:")
+        )
     if (
         type(factory) is not AgentFactoryLiveComposition
         or type(provisioning) is not CurrentAuthorityCapabilityFactoryProvisioner

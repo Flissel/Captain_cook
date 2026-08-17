@@ -181,7 +181,13 @@ class CurrentCapabilityFactoryAdapter:
                     snapshot,
                     occurred_at=self._clock(),
                 )
-                self._composition.coordinator.record(promotion)
+                record_transition = getattr(
+                    self._composition, "record_captain_transition", None
+                )
+                if callable(record_transition):
+                    record_transition(promotion)
+                else:
+                    self._composition.coordinator.record(promotion)
             except (RuntimeError, ValueError) as exc:
                 raise CapabilityLiveAuthorityUnavailable(
                     "Captain promotion authority is unavailable"

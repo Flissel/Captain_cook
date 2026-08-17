@@ -24,6 +24,10 @@ _FACTORY_STORE_OPERATIONS = frozenset(
         "business_benchmark_summary_by_artifact",
         "generic_benchmark_quality_evidence",
         "bundle",
+        "active_n8n_work_batch_id",
+        "forge_submit",
+        "forge_status",
+        "forge_result",
     }
 )
 

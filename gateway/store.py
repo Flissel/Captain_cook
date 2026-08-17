@@ -335,6 +335,21 @@ class GatewayStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS factory_runtime_rpc_receipts (
+                        idempotency_key CHAR(64) NOT NULL PRIMARY KEY,
+                        request_id CHAR(36) NOT NULL UNIQUE,
+                        job_id CHAR(36) NOT NULL,
+                        correlation_id CHAR(36) NOT NULL,
+                        operation VARCHAR(64) NOT NULL,
+                        request_sha256 CHAR(64) NOT NULL,
+                        payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                        INDEX idx_factory_rpc_job (job_id, created_at)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS ledger_state (
                         id TINYINT NOT NULL PRIMARY KEY,
                         next_block_index BIGINT NOT NULL
@@ -8047,3 +8062,89 @@ class GatewayStore:
                 )
                 self._insert(cursor, block)
         return block
+
+    def factory_runtime_rpc_receipt(
+        self, idempotency_key: str,
+    ) -> dict[str, object] | None:
+        """Read the exact durable Factory-process response, if already committed."""
+
+        if re.fullmatch(r"[0-9a-f]{64}", idempotency_key) is None:
+            raise HTTPException(status_code=422, detail="Factory RPC key is invalid")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT payload FROM factory_runtime_rpc_receipts
+                    WHERE idempotency_key = %s
+                    """,
+                    (idempotency_key,),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=409, detail="Factory RPC receipt is invalid")
+        return payload
+
+    def record_factory_runtime_rpc_receipt(
+        self,
+        *,
+        idempotency_key: str,
+        request_id: UUID,
+        job_id: UUID,
+        correlation_id: UUID,
+        operation: str,
+        request_sha256: str,
+        response: dict[str, object],
+    ) -> dict[str, object]:
+        """Persist a post-effect response; identical retries return byte-equivalent data."""
+
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", idempotency_key) is None
+            or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+            or not operation
+        ):
+            raise HTTPException(status_code=422, detail="Factory RPC receipt is invalid")
+        encoded = json.dumps(response, sort_keys=True, separators=(",", ":"))
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT IGNORE INTO factory_runtime_rpc_receipts (
+                        idempotency_key, request_id, job_id, correlation_id,
+                        operation, request_sha256, payload
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        idempotency_key, str(request_id), str(job_id),
+                        str(correlation_id), operation, request_sha256, encoded,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    SELECT request_id, job_id, correlation_id, operation,
+                           request_sha256, payload
+                    FROM factory_runtime_rpc_receipts
+                    WHERE idempotency_key = %s
+                    FOR UPDATE
+                    """,
+                    (idempotency_key,),
+                )
+                row = cursor.fetchone()
+        if row is None or (
+            str(row["request_id"]) != str(request_id)
+            or str(row["job_id"]) != str(job_id)
+            or str(row["correlation_id"]) != str(correlation_id)
+            or row["operation"] != operation
+            or row["request_sha256"] != request_sha256
+        ):
+            raise HTTPException(status_code=409, detail="Factory RPC replay changed")
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if payload != response:
+            raise HTTPException(status_code=409, detail="Factory RPC response changed")
+        return response

@@ -184,6 +184,16 @@ from gateway.portal_live_contracts import (
     PortalProviderProbeRequestV1,
     PortalRestartReceiptV1,
 )
+from gateway.factory_process_rpc import (
+    FactoryGatewayRpcCommand, FactoryGatewayRpcService,
+)
+from gateway.factory_gateway_store_authority import GatewayStoreFactoryRpcAuthority
+from gateway.capability_factory_process_client import GatewayFactoryProcessClient
+from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
+from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
+from agenten.agent_factory.minibook_forge import (
+    CaptainCreationJobMapper, MinibookForgeHttpClient, MinibookForgeHttpSettings,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -219,6 +229,13 @@ def plan_production_app_from_environment(
         authority_root=bootstrap.authority_root,
         repository_revision=bootstrap.assembly.expected_repository_revision,
     )
+    if (
+        not source.get("CAPTAIN_FACTORY_RUNTIME_URL", "").strip()
+        or len(source.get("CAPTAIN_FACTORY_RUNTIME_TOKEN", "").strip()) < 16
+    ):
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "capability assembly bootstrap configuration is incomplete"
+        )
     return GatewayProductionAppPlan(
         repository_root=root,
         environment=source,
@@ -390,6 +407,8 @@ def create_app(
     ] = (),
     capability_benchmark_execution_service: GatewayBenchmarkExecutionService | None = None,
     capability_benchmark_gateway_token: str | None = None,
+    factory_gateway_rpc_service: FactoryGatewayRpcService | None = None,
+    factory_runtime_token: str | None = None,
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
@@ -1687,6 +1706,26 @@ def create_app(
                 status_code=409, detail="benchmark execution is unavailable"
             ) from None
 
+    @app.post("/v1/factory-runtime/store")
+    def execute_factory_runtime_store(
+        command: FactoryGatewayRpcCommand,
+        authorization: str | None = Header(default=None),
+    ) -> object:
+        expected = factory_runtime_token or environment_value(
+            "CAPTAIN_FACTORY_RUNTIME_TOKEN"
+        )
+        if (
+            len(expected) < 16 or authorization is None
+            or not secrets.compare_digest(authorization, "Bearer " + expected)
+        ):
+            raise HTTPException(status_code=401, detail="Factory runtime authentication failed")
+        if factory_gateway_rpc_service is None:
+            raise HTTPException(status_code=503, detail="Factory Gateway operation is unavailable")
+        try:
+            return factory_gateway_rpc_service.execute(command)
+        except Exception:
+            raise HTTPException(status_code=409, detail="Factory Gateway operation is unavailable") from None
+
     @app.post("/v1/capability-benchmark/sessions/prepare")
     async def prepare_capability_benchmark(
         payload: dict[str, object],
@@ -1865,6 +1904,7 @@ def create_production_app_from_environment(
         source_artifacts=source_artifacts,
         provider_token=bootstrap.provider_token,
         minibook_api_key=bootstrap.minibook_api_key,
+        factory_runtime_token=getattr(bootstrap, "factory_runtime_token", None),
     )
     plan_production_capability_assembly_from_environment(
         repository_root=root,
@@ -1874,6 +1914,29 @@ def create_production_app_from_environment(
         private_benchmark_catalog=private_catalog,
         clock=clock,
     )
+    factory_rpc = None
+    if isinstance(getattr(runtime, "factory", None), GatewayFactoryProcessClient):
+        factory_repository = runtime.factory.repository
+        factory_evidence = FilesystemFactoryEvidenceStore(
+            bootstrap.authority_root / "runtime-state" / "factory-evidence"
+        )
+        factory_forge = MinibookForgeHttpClient(
+            mapper=CaptainCreationJobMapper(
+                evidence=CaptainForgeEvidenceBridge(
+                    repository=factory_repository,
+                    evidence_store=factory_evidence,
+                )
+            ),
+            settings=MinibookForgeHttpSettings(
+                base_url=bootstrap.minibook_url,
+                api_key=bootstrap.minibook_api_key.get_secret_value(),
+            ),
+        )
+        factory_rpc = FactoryGatewayRpcService(
+            authority=GatewayStoreFactoryRpcAuthority(
+                store=gateway, forge=factory_forge, n8n=runtime.n8n,
+            )
+        )
     return create_app(
         settings=configured,
         gateway_store=gateway,
@@ -1883,6 +1946,11 @@ def create_production_app_from_environment(
         capability_assembly_repository_root=root,
         runtime_usage_artifacts=artifacts,
         portal_clock=clock,
+        factory_gateway_rpc_service=factory_rpc,
+        factory_runtime_token=(
+            bootstrap.factory_runtime_token.get_secret_value()
+            if factory_rpc is not None else None
+        ),
     )
 
 

@@ -41,6 +41,7 @@ from agenten.delivery.minibook_events import (
 )
 from agenten.delivery.projector import MinibookProjector, ProjectionResult
 from gateway.agent_factory_live_composition import AgentFactoryLiveComposition
+from gateway.capability_factory_process_client import GatewayFactoryProcessClient
 from gateway.capability_assembly_admission import (
     RepositoryCapabilityAssemblyInputAdmission,
 )
@@ -863,7 +864,7 @@ class CapabilityAssemblyProductionSettings:
 @dataclass(frozen=True, repr=False)
 class CapabilityAssemblyProductionAuthorities:
     store: GatewayStore
-    factory: AgentFactoryLiveComposition
+    factory: AgentFactoryLiveComposition | GatewayFactoryProcessClient
     provisioning: CapabilityFactoryProvisioningPort
     resume_gateway: CapabilityResumeGatewayPort
     reconciliation: CapabilityAssemblyReconciliationPort
@@ -1063,7 +1064,7 @@ class ProductionCapabilityAssemblyComposition:
                  private_catalog: VerifiedFilePrivateBenchmarkCatalog | None = None,
                  private_catalog_configuration_digest: str | None = None,
                  private_cases: GenericPrivateBenchmarkRepository | None = None,
-                 factory: AgentFactoryLiveComposition | None = None,
+                 factory: AgentFactoryLiveComposition | GatewayFactoryProcessClient | None = None,
                  benchmark_tool_authority: BenchmarkToolEvidenceAuthorityPort | None = None) -> None:
         if (_seal is not _PRODUCTION_COMPOSITION_SEAL
                 or type(controller) is not CapabilityAssemblyController
@@ -1121,7 +1122,7 @@ class ProductionCapabilityAssemblyComposition:
         return registry
 
     @property
-    def benchmark_host_factory(self) -> AgentFactoryLiveComposition:
+    def benchmark_host_factory(self) -> AgentFactoryLiveComposition | GatewayFactoryProcessClient:
         if self.__factory is None:
             raise AttributeError("production benchmark host Factory is absent")
         return self.__factory
@@ -1475,7 +1476,9 @@ def _preflight_composition(
     clock: object,
     require_isolated_executor: bool,
 ) -> None:
-    if not isinstance(factory_composition, AgentFactoryLiveComposition):
+    if not isinstance(
+        factory_composition, (AgentFactoryLiveComposition, GatewayFactoryProcessClient)
+    ):
         raise CapabilityAssemblyProductionConfigurationError(
             "factory composition is not the current Gateway authority"
         )

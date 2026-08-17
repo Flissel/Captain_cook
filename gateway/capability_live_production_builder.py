@@ -24,6 +24,7 @@ from gateway.agent_factory_live_composition import (
     GatewayCapabilityLiveCompositionError,
     compose_gateway_capability_live_runner,
 )
+from gateway.capability_factory_process_client import GatewayFactoryProcessClient
 from gateway.capability_live_factory_adapter import CapabilityFactoryProvisioningPort
 from gateway.capability_live_current_adapters import (
     CapabilityProjectionEffectsPort,
@@ -226,7 +227,9 @@ def _require_method_contract(
 def _validate_authority_bindings(
     authorities: CapabilityLiveCurrentAuthorities,
 ) -> None:
-    if not isinstance(authorities.factory, AgentFactoryLiveComposition):
+    if not isinstance(
+        authorities.factory, (AgentFactoryLiveComposition, GatewayFactoryProcessClient)
+    ):
         raise CapabilityLiveProductionConfigurationError(
             "current capability live authority factory binding is invalid"
         )

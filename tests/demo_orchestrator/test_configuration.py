@@ -33,6 +33,7 @@ def _manifest(**updates: object) -> object:
         "gateway": "CAPTAIN_GATEWAY_TOKEN",
         "benchmark": "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
         "runtime": "CAPTAIN_RUNTIME_TOKEN",
+        "factory": "CAPTAIN_FACTORY_RUNTIME_TOKEN",
         "provider_proxy": "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
         "minibook": "MINIBOOK_API_KEY",
         "n8n": "CAPTAIN_N8N_API_KEY",
@@ -43,6 +44,7 @@ def _manifest(**updates: object) -> object:
         health_suffix = {
             "gateway": "/v1/capability-assemblies/health",
             "runtime": "/health",
+            "factory": "/healthz",
             "minibook": "/health",
             "provider_proxy": "/v1/healthz",
             "benchmark": "/healthz",
@@ -85,6 +87,7 @@ def _manifest(**updates: object) -> object:
         "gateway": binding("gateway"),
         "benchmark": binding("benchmark", execute=True),
         "runtime": binding("runtime"),
+        "factory": binding("factory", execute=True),
         "provider_proxy": binding("provider_proxy"),
         "minibook": binding("minibook"),
         "n8n": binding("n8n"),
@@ -188,6 +191,9 @@ def test_real_d11_manifest_builder_is_compatible_with_d12_loader(tmp_path: Path)
         "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-token",
         "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:18082",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-token",
+        "CAPTAIN_FACTORY_RUNTIME_URL": "http://127.0.0.1:18085",
+        "CAPTAIN_FACTORY_RUNTIME_TOKEN": "factory-runtime-token",
+        "CAPTAIN_FACTORY_RUNTIME_CODE_SHA256": "7" * 64,
         "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18083",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "proxy-token",
         "CAPTAIN_PROVIDER_POLICY_SHA256": "1" * 64,
@@ -333,7 +339,7 @@ def test_process_controls_are_typed_and_minibook_gap_remains_exact(
         configuration.require_minibook_evidence_readback()
     controls = configuration.require_operator_process_bootstrap()
     assert tuple(control.service for control in controls.services) == (
-        "gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n"
+        "gateway", "runtime", "factory", "provider_proxy", "benchmark", "minibook", "n8n"
     )
     runtime = configuration.require_runtime_restart_control()
     assert runtime.service == "runtime"

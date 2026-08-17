@@ -34,7 +34,7 @@ class AuthorityHealthBinding:
 
 @dataclass(frozen=True, slots=True)
 class OperatorServiceControl:
-    service: Literal["gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n"]
+    service: Literal["gateway", "runtime", "factory", "provider_proxy", "benchmark", "minibook", "n8n"]
     start_argv: tuple[str, ...]
     stop_argv: tuple[str, ...]
     restart_argv: tuple[str, ...]
@@ -66,6 +66,7 @@ GENERATED_SECRET_NAMES = (
     "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
     "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
     "CAPTAIN_RUNTIME_TOKEN",
+    "CAPTAIN_FACTORY_RUNTIME_TOKEN",
     "MINIBOOK_API_KEY",
     "MINIBOOK_PROJECTION_API_KEY",
 )
@@ -95,7 +96,7 @@ class DemoConfiguration:
         )
 
     def health_bindings(self) -> tuple[AuthorityHealthBinding, ...]:
-        names = ("gateway", "provider_proxy", "runtime", "benchmark", "minibook", "n8n")
+        names = ("gateway", "provider_proxy", "runtime", "factory", "benchmark", "minibook", "n8n")
         return tuple(
             AuthorityHealthBinding(
                 service=service,
@@ -171,7 +172,7 @@ class DemoConfiguration:
         return value
 
     def require_operator_process_bootstrap(self) -> OperatorProcessBootstrap:
-        expected = ("gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n")
+        expected = ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "minibook", "n8n")
         controls: list[OperatorServiceControl] = []
         for service in expected:
             binding = getattr(self.production_manifest, service, None)
