@@ -425,3 +425,85 @@ Round-7 non-claims:
   reachable.
 - Hermes collection/readiness is not claimed because the required submodule
   runtime and fixture files are absent from this checkout.
+
+## Final Review Fix Round 8
+
+Commits:
+
+1. `be69d1f` — uses the actual Factory job UUID as the one canonical promotion
+   subject through Store emission, execution, projection, acknowledgement, and
+   immutable readback.
+2. `8e8e550`, `77b0bc1`, `324897b`, and `b240151` — ship the authenticated,
+   HEAD/digest-attested loopback tool host and content-addressed Sales,
+   Incident, and Claims demo-fixture datasets. The host journals the exact
+   typed effect result and receipt before responding and replays it after
+   restart without recomputation.
+3. `00efe80` and `fdef424` — move HostAutoGen exclusively into the isolated
+   authenticated benchmark process. Gateway persists WorkBatch, command,
+   per-case/tool call and single-use lease before the host effect, then persists
+   terminal result and receipt before the response. The child dependency
+   versions/origins are attested under a fresh `python -I` interpreter.
+4. `545e499` — replaces the legacy profile-bound real-case path with exact
+   generic D10 V3 quality evidence for all three canonical inputs. Fifteen
+   job-specific cases and thirty independent evaluation refs reach
+   `VALIDATE_FOR_PROMOTION` without Claims/Renewal reuse or private leakage.
+5. `1ab2ef9`, `b372739`, and `73849fb` — define and ship the separate
+   `FACTORY_RUNTIME` role and bounded typed Factory-to-Gateway RPC. Production
+   Gateway materializes only a process client; the fresh isolated Factory child
+   builds the verified closure and receives no DB, Gateway-admin, provider,
+   OpenAI, or Minibook credential. Gateway remains sole writer and sole Forge
+   credential holder. Every command binds job, correlation, public input,
+   attempt, operation, request, idempotency key, and exact revision.
+6. `8246439` — corrects the immutable-promotion behavioral fixture to use a
+   valid production-shaped UUIDv4 subject; product subject encoding was not
+   weakened.
+
+Round-8 RED to GREEN evidence:
+
+- The first Factory RPC test was RED because no repository-owned boundary
+  existed. GREEN covers the distinct bearer role, operation allowlist, 1 MiB
+  payload ceiling, cross-job/revision rejection, fixed redacted failures, and
+  durable replay.
+- The process crash test constructs a fresh app, executor, and Store client
+  after the first adapter return. The restarted process reads the same durable
+  Gateway receipt, returns byte-identical evidence, and the injected host
+  effect counter remains exactly one.
+- Production Factory execution now traverses `GatewayFactoryProcessClient` to
+  `gateway.capability_factory_process_app`; repository and control mutations
+  return through the authenticated Gateway sole-writer API. Forge remains a
+  Gateway control effect, so the child never receives `MINIBOOK_API_KEY`.
+- The operator and D12 consumer now carry seven exact semantic services,
+  including Factory start/stop/restart, authenticated `/healthz`, fresh
+  isolated interpreter argv, its own credential env, and no cross-service
+  secrets. The shipped Factory entrypoint and graph are revision/digest/closure
+  attested before materialization.
+- Focused D11/D12/process/bootstrap/production gate: 252 passed, five warnings.
+  Post-commit closure/process/manifest/D12 revalidation: 94 passed, four
+  warnings. RPC payload/crash gate: 6 passed.
+
+Round-8 verification:
+
+- The first unbounded offline root run produced 3,707 passes, 137 skips, and
+  12 failures. Eleven failures are exclusively the absent/uninitialized
+  `hermes-agent` runtime and fixture files. The one in-scope failure was an old
+  non-v4 test UUID and was corrected without changing production validation.
+- Corrected offline product gate, explicitly excluding `tests/live` and only
+  `tests/contracts/test_hermes_runtime_readiness.py` plus
+  `tests/contracts/test_work_package_compatibility.py`: 3,701 passed, 137
+  skipped, five documented warnings, zero failures.
+- Minibook offline suite: 132 passed, one live test deselected.
+- Architecture/import/workstream: 18 passed. `compileall`, submission verifier,
+  full `8f0b303..HEAD` diff check, and added-line high-confidence credential
+  scan passed; secret-pattern matches: 0.
+- `TEST_MARIADB_DSN` was absent, so the MariaDB authority gate was not run. No
+  database was contacted.
+
+Round-8 non-claims:
+
+- No live network service, paid provider, Docker/PowerShell managed service,
+  n8n deployment/volume, or database was contacted or mutated.
+- Tool-host datasets are explicitly demo-fixture evidence, not claims about
+  production-world state. External n8n/workflow provisioning and reachability
+  remain separate live evidence.
+- Hermes collection/readiness remains unclaimed because this checkout does not
+  contain the required initialized submodule runtime and fixture files.
