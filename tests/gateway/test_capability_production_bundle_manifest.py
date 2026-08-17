@@ -192,6 +192,9 @@ def test_each_process_receives_only_its_allowlisted_environment() -> None:
         "LEDGER_DSN": "mysql://captain:redacted@127.0.0.1/captain",
         "OPENAI_API_KEY": "provider-only-key-value",
         "UNRELATED_SECRET": "must-not-cross-process-boundary",
+        "MINIBOOK_CREATION_DB": ".captain-cook/minibook/creation.sqlite3",
+        "MINIBOOK_PROJECTION_PROJECT_ID": "captain-runtime-projection-v2",
+        "MINIBOOK_PROJECTION_SERVICE_AGENT_ID": "captain-projection-service-v2",
     }
 
     for service in ("gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n"):
@@ -201,6 +204,9 @@ def test_each_process_receives_only_its_allowlisted_environment() -> None:
         assert ("CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN" in child) is (
             service in {"gateway", "provider_proxy"}
         )
+    minibook = process_operator._service_environment("minibook", environment)
+    assert minibook["MINIBOOK_CREATION_DB"].endswith("creation.sqlite3")
+    assert "CAPTAIN_GATEWAY_TOKEN" not in minibook
 
 
 def test_health_rejects_attacker_url_before_reading_token_or_request(

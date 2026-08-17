@@ -1011,7 +1011,8 @@ def test_repository_factory_adapter_matches_committed_descriptor() -> None:
     assert b"_DeferredBenchmarkInputs" not in implementation
     assert b"InMemoryBusinessBenchmarkRepository" not in implementation
     assert b"MinibookForgeHttpClient" in implementation
-    assert b"GatewayD10BusinessBenchmarkInputs" in implementation
+    assert b"AssemblyOwnedGenericBenchmark" in implementation
+    assert b"BusinessBenchmarkDispatchInputs" not in implementation
     closure = json.loads(
         (root / descriptor.closure_path).read_text(encoding="utf-8")
     )

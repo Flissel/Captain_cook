@@ -5,18 +5,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from agenten.agent_factory.business_benchmark import BusinessBenchmarkEvaluator
-from agenten.agent_factory.business_benchmark_dispatch import BusinessBenchmarkDispatchService
-from agenten.agent_factory.business_benchmark_factory import BusinessBenchmarkFactoryComposition
 from agenten.agent_factory.business_benchmark_production_ports import BusinessBenchmarkContentAddressedArtifactStore, BusinessBenchmarkPricingAuthority, ConfiguredBusinessBenchmarkPricingSource, ProxyBoundResponsesModelClientBuilder
 from agenten.agent_factory.candidate_evaluation import CandidateEvaluationFactory, GatewayForgeCandidateProvider
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
-from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
 from agenten.agent_factory.hermes_cli import FilesystemFactorySkillReplayStore, HermesCliFactory, HermesCliSettings
 from agenten.agent_factory.orchestration import FactoryDispatcher
 from agenten.agent_factory.production_dispatch_runner import ProductionFactoryDispatchRunner
 from agenten.agent_factory.service import FactoryCoordinator
-from agenten.agent_factory.team_evaluation import TeamEvaluationService
+from agenten.agent_factory.orchestration import FactoryDispatchError
 from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
 from gateway.agent_factory_live_composition import AgentFactoryLiveComposition, GatewayTechnicalTeamExecutionPortsProvider, ProductionFactoryTeamExecutionPort, _CallableFactoryClock
 from gateway.factory_repository import GatewayFactoryBudgetLedger, GatewayFactoryRepository
@@ -25,16 +21,14 @@ from agenten.agent_factory.minibook_forge import CaptainCreationJobMapper, Minib
 from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
 
 
-class GatewayD10BusinessBenchmarkInputs:
-    """Concrete readiness gate over the Gateway-materialized D10 catalog."""
+class AssemblyOwnedGenericBenchmark:
+    """Prevent the generic runtime from entering the incompatible legacy gate."""
 
-    def __init__(self, catalog):
-        self._catalog = catalog
-
-    def resolve(self, request):
-        for reference in request.job.private_holdout_refs:
-            self._catalog.get(reference.uri)
-        return None
+    async def dispatch(self, request):
+        del request
+        raise FactoryDispatchError(
+            "generic benchmark dispatch is owned by the capability assembly"
+        )
 
 
 class _DeferredImprovementAuthority:
@@ -69,8 +63,7 @@ def build_capability_factory_runtime(configuration, authorities) -> AgentFactory
     ports = GatewayTechnicalTeamExecutionPortsProvider(candidate_bindings=candidate_provider, technical_holdout_root=configuration.authority_root / "technical-holdouts", model_client_for=model_client, budget=GatewayFactoryBudgetLedger(store), pricing_authority=pricing, replay_store=FilesystemFactorySkillReplayStore(configuration.repository_root / ".captain-cook/private/business-benchmarks/runtime-state/factory-team-replays"), released_skill_catalog=repository, skill_root=configuration.repository_root / "agenten/agent_factory/skills", provider=configuration.provider, model=configuration.model, max_cost_per_call=maximum, clock=clock)
     team_execution = ProductionFactoryTeamExecutionPort(evidence_store=evidence_store, ports_for=ports, holdout_selector=None)
     candidate_validator = CandidateEvaluationFactory(provider=candidate_provider, evidence_store=evidence_store, team_execution=team_execution, workflow_artifacts=repository)
-    benchmark_composition = BusinessBenchmarkFactoryComposition(private_repository=authorities.private_benchmark_catalog, gateway_repository=repository, evaluator=BusinessBenchmarkEvaluator(clock=clock), team_evaluator=TeamEvaluationService(clock=clock), feedback_builder=FactoryFeedbackBuilder(clock=clock))
-    business_benchmark = BusinessBenchmarkDispatchService(composition=benchmark_composition, inputs=GatewayD10BusinessBenchmarkInputs(authorities.private_benchmark_catalog), clock=clock)
+    business_benchmark = AssemblyOwnedGenericBenchmark()
     improvement = _DeferredImprovementAuthority()
     hermes = HermesCliFactory(settings=HermesCliSettings(skill_root=configuration.repository_root / "agenten/agent_factory/skills", evidence_root=configuration.authority_root / "runtime-state/hermes-evidence", working_directory=configuration.repository_root), released_skill_catalog=repository, workflow_artifacts=repository, clock=clock)
     forge = MinibookForgeHttpClient(
