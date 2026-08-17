@@ -1164,6 +1164,31 @@ def test_shipped_closure_accepts_real_preloaded_modules_and_covers_packages() ->
     bootstrap._VerifiedFactoryClosureFinder(modules).require_preloaded_origins()
 
 
+def test_verified_closure_rejects_poisoned_imported_module_global(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agenten.agent_factory.business_benchmark_production_ports as ports
+    import gateway.capability_assembly_bootstrap as bootstrap
+
+    root = Path(__file__).parents[2]
+    payload = json.loads(
+        (root / "gateway/capability_factory_runtime_closure.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    modules = {
+        entry["module"]: (
+            (root / entry["path"]).resolve(),
+            (root / entry["path"]).read_bytes(),
+        )
+        for entry in payload["entries"]
+    }
+    monkeypatch.setattr(ports, "httpx", object())
+
+    with pytest.raises(ValueError, match="preloaded Factory closure module"):
+        bootstrap._VerifiedFactoryClosureFinder(modules).require_preloaded_origins()
+
+
 def test_shipped_verified_closure_materializes_the_real_factory_graph(
     tmp_path: Path,
 ) -> None:

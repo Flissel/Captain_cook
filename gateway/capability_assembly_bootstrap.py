@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import inspect
+import importlib
 import importlib.abc
 import importlib.util
 import json
@@ -1663,6 +1664,55 @@ def _preloaded_module_matches_verified_code(
             return False
         if _stable_code_fingerprint(actual_code) != _stable_code_fingerprint(expected_code):
             return False
+    return _preloaded_import_bindings_match(module, syntax, path)
+
+
+def _preloaded_import_bindings_match(
+    module: ModuleType, syntax: ast.Module, path: Path,
+) -> bool:
+    """Require exact objects for every unconditional source import binding."""
+
+    package = module.__name__ if path.name == "__init__.py" else module.__name__.rpartition(".")[0]
+    for node in syntax.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound_name = alias.asname or alias.name.split(".", 1)[0]
+                imported_name = alias.name if alias.asname else bound_name
+                try:
+                    expected = importlib.import_module(imported_name)
+                except (ImportError, ValueError):
+                    return False
+                if module.__dict__.get(bound_name) is not expected:
+                    return False
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "__future__":
+                continue
+            relative = "." * node.level + (node.module or "")
+            try:
+                imported_name = (
+                    importlib.util.resolve_name(relative, package)
+                    if node.level else node.module
+                )
+                if not imported_name:
+                    return False
+                imported = importlib.import_module(imported_name)
+            except (ImportError, ValueError):
+                return False
+            for alias in node.names:
+                if alias.name == "*":
+                    return False
+                bound_name = alias.asname or alias.name
+                try:
+                    expected = getattr(imported, alias.name)
+                except AttributeError:
+                    try:
+                        expected = importlib.import_module(
+                            f"{imported_name}.{alias.name}"
+                        )
+                    except ImportError:
+                        return False
+                if module.__dict__.get(bound_name) is not expected:
+                    return False
     return True
 
 
