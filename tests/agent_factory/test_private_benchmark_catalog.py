@@ -48,55 +48,55 @@ CATEGORIES = {
 NAMESPACE = UUID("e9a5fc44-f475-5c40-b1c6-c51257723968")
 EXPECTED_SCENARIOS = {
     INPUTS[0]: (
-        ("rank_complete_accounts", "normal", "Given three accounts"),
-        ("rank_top_account", "normal", "Given three opportunities"),
-        ("normalize_stale_account", "normal", "older than ninety days"),
-        ("equal_score_tie", "boundary", "equal aggregate score tie"),
-        ("ninety_day_staleness", "boundary", "ninety-day staleness boundary"),
-        ("rules_digest_boundary", "boundary", "digest and version acceptance boundary"),
-        ("missing_champion", "missing", "verified_champion"),
-        ("missing_scoring_rules", "missing", "opportunity_scoring_rules"),
-        ("missing_account_identifiers", "missing", "required_account_identifiers"),
-        ("interest_vs_delay", "conflicting", "product_interest"),
-        ("value_vs_staleness", "conflicting", "reported_amount"),
-        ("discount_vs_authority", "conflicting", "requested_discount"),
-        ("stop_sales_mutation", "mandatory_escalation", "sales owner"),
-        ("stop_human_approval", "mandatory_escalation", "sales owner"),
-        ("stop_bounded_attempt", "mandatory_escalation", "sales owner"),
+        ("rank_complete_accounts", "normal", "weekly_pipeline", "account_snapshot_reader"),
+        ("rank_top_account", "normal", "top_account", "opportunity_scoring_rules"),
+        ("normalize_stale_account", "normal", "stale_activity", "account_snapshot_reader"),
+        ("equal_score_tie", "boundary", "score_tie", "opportunity_scoring_rules"),
+        ("deterministic_replay", "boundary", "deterministic_rank", "opportunity_scoring_rules"),
+        ("schema_complete", "boundary", "schema_complete", "account_snapshot_reader"),
+        ("incomplete_champion", "missing", "incomplete_champion", "account_snapshot_reader"),
+        ("missing_contact", "missing", "evidence_bound", "account_snapshot_reader"),
+        ("missing_scoring_rules", "missing", "stop_2", "opportunity_scoring_rules"),
+        ("interest_vs_delay", "conflicting", "conflicting_signals", "account_snapshot_reader"),
+        ("discount_control", "conflicting", "discount_request", "opportunity_scoring_rules"),
+        ("human_control", "conflicting", "human_control", "opportunity_scoring_rules"),
+        ("stop_sales_mutation", "mandatory_escalation", "stop_1", "account_snapshot_reader"),
+        ("stop_human_approval", "mandatory_escalation", "stop_5", "opportunity_scoring_rules"),
+        ("stop_discount_approval", "mandatory_escalation", "discount_request", "opportunity_scoring_rules"),
     ),
     INPUTS[1]: (
-        ("focused_application_regression", "normal", "clear application regression"),
-        ("database_pressure_readonly", "normal", "rising connection wait time"),
-        ("focused_specialist_selection", "normal", "authentication anomaly"),
-        ("eight_message_limit", "boundary", "eight messages"),
-        ("observability_unavailable", "boundary", "observability query fails"),
-        ("audit_unavailable", "boundary", "audit query fails"),
-        ("missing_audit_evidence", "missing", "audit_log_evidence"),
-        ("missing_observability_evidence", "missing", "observability_evidence"),
-        ("missing_adapter_digest", "missing", "released_adapter_digest"),
-        ("errors_vs_database", "conflicting", "application_error_rate"),
-        ("auth_vs_audit_gap", "conflicting", "authentication_failures"),
-        ("latency_vs_component", "conflicting", "latency_alert"),
-        ("stop_production_mutation", "mandatory_escalation", "human incident commander"),
-        ("stop_unresolved_severity", "mandatory_escalation", "human incident commander"),
-        ("stop_scope_digest", "mandatory_escalation", "human incident commander"),
+        ("focused_application_regression", "normal", "selective_routing", "alert_context_reader"),
+        ("database_pressure_readonly", "normal", "pool_exhaustion", "service_dependency_map"),
+        ("focused_specialist_selection", "normal", "redacted_audit", "audit_log_query"),
+        ("message_limit", "boundary", "stop_3", "alert_context_reader"),
+        ("observability_unavailable", "boundary", "observability_failure", "alert_context_reader"),
+        ("audit_unavailable", "boundary", "audit_log_failure", "audit_log_query"),
+        ("missing_telemetry", "missing", "uncertainty_safe", "alert_context_reader"),
+        ("missing_observability_result", "missing", "observability_failure", "service_dependency_map"),
+        ("missing_audit_result", "missing", "audit_log_failure", "audit_log_query"),
+        ("errors_vs_database", "conflicting", "app_regression", "alert_context_reader"),
+        ("auth_vs_audit_gap", "conflicting", "auth_uncertainty", "audit_log_query"),
+        ("latency_without_component", "conflicting", "ambiguous_latency", "service_dependency_map"),
+        ("stop_production_mutation", "mandatory_escalation", "authority_preserved", "alert_context_reader"),
+        ("stop_unavailable_observability", "mandatory_escalation", "observability_failure", "alert_context_reader"),
+        ("stop_unresolved_severity", "mandatory_escalation", "stop_4", "audit_log_query"),
     ),
     INPUTS[2]: (
-        ("covered_water_loss", "normal", "complete water-loss claim"),
-        ("effective_endorsement", "normal", "water-loss claim with policy"),
-        ("auditable_resolution", "normal", "complete covered-loss scenario"),
-        ("optional_ocr_failure", "boundary", "optional OCR fails"),
-        ("handoff_message_limit", "boundary", "five handoffs"),
-        ("fraud_threshold_boundary", "boundary", "no-fraud threshold"),
-        ("missing_claim_record", "missing", "required_claim_record"),
-        ("missing_policy_version", "missing", "effective_policy_version"),
-        ("missing_specialist_output", "missing", "required_specialist_output"),
-        ("duplicate_vs_chronology", "conflicting", "duplicate_evidence"),
-        ("image_vs_consistency", "conflicting", "reused_image_identifier"),
-        ("coverage_vs_fraud", "conflicting", "coverage_specialist_output"),
-        ("stop_binding_claim_decision", "mandatory_escalation", "authorized human adjuster"),
-        ("stop_conflicting_specialists", "mandatory_escalation", "authorized human adjuster"),
-        ("stop_identity_schema_digest", "mandatory_escalation", "authorized human adjuster"),
+        ("covered_water_loss", "normal", "covered_water_loss", "claim_evidence_reader"),
+        ("effective_endorsement", "normal", "effective_endorsement", "policy_lookup"),
+        ("auditable_resolution", "normal", "auditable_resolution", "policy_lookup"),
+        ("optional_ocr_failure", "boundary", "document_ocr_failure", "claim_evidence_reader"),
+        ("handoff_message_limit", "boundary", "stop_4", "claim_evidence_reader"),
+        ("duplicate_photo_review", "boundary", "duplicate_photo", "claim_evidence_reader"),
+        ("missing_claim_record", "missing", "claims_system_failure", "claim_evidence_reader"),
+        ("missing_policy_version", "missing", "stop_2", "policy_lookup"),
+        ("missing_optional_ocr", "missing", "ocr_unavailable", "claim_evidence_reader"),
+        ("duplicate_vs_chronology", "conflicting", "suspicious_duplicate", "claim_evidence_reader"),
+        ("image_vs_consistency", "conflicting", "duplicate_photo", "claim_evidence_reader"),
+        ("conflicting_evidence", "conflicting", "conflicting_evidence", "policy_lookup"),
+        ("stop_binding_claim_decision", "mandatory_escalation", "no_side_effect", "policy_lookup"),
+        ("stop_conflicting_specialists", "mandatory_escalation", "stop_5", "claim_evidence_reader"),
+        ("stop_binding_action", "mandatory_escalation", "stop_1", "policy_lookup"),
     ),
 }
 
@@ -147,11 +147,15 @@ def test_each_generated_category_is_a_grounded_behavioral_transformation(
     document = load_factory_input(ROOT / relative_path)
     suite = generate_private_benchmark_suite(document, seed=b"semantic-transform-seed-value!!" * 2)
     sources = {
-        case.case_key: (case.observable_setup, case.observable_action, case.observable_expected)
+        case.case_key: (
+            case.observable_setup, case.observable_action, case.observable_expected,
+        )
         for case in (*document.acceptance_outcomes, *document.real_cases)
     }
     sources.update({
-        case.case_key: (case.observable_setup, case.observable_action, case.observable_expected)
+        case.case_key: (
+            case.observable_setup, case.observable_action, case.observable_expected,
+        )
         for agent in document.agents for case in agent.real_cases
     })
     for integration in document.integrations:
@@ -165,32 +169,44 @@ def test_each_generated_category_is_a_grounded_behavioral_transformation(
             integration.trigger, integration.operation, integration.success_behavior,
         )
     sources.update({
-        f"authority_{index}": (
-            "Given a bounded Captain authority", "Exercise the authority boundary", rule,
-        )
+        f"authority_{index}": (rule, rule, rule)
         for index, rule in enumerate(document.authority_boundaries, 1)
     })
     sources.update({
-        f"security_{index}": (
-            "Given the compiled capability", "Exercise the security boundary", rule,
-        )
+        f"security_{index}": (rule, rule, rule)
         for index, rule in enumerate(document.security_requirements, 1)
     })
     sources.update({
-        f"stop_{index}": (
-            "Given a controlled failure", "Exercise the stop condition", rule,
-        )
+        f"stop_{index}": (rule, rule, rule)
         for index, rule in enumerate(document.stop_conditions, 1)
     })
+    sources.update({
+        f"tool_{tool.tool_key}": (
+            tool.description, tool.description, tool.description,
+        )
+        for tool in document.declared_tools
+    })
+    if document.tool_policy_guard is not None:
+        sources["tool_policy_guard"] = (
+            document.tool_policy_guard,
+            document.tool_policy_guard,
+            document.tool_policy_guard,
+        )
 
     expected = EXPECTED_SCENARIOS[relative_path]
     assert len(suite.cases) == len(expected) == 15
-    for case, (slug, category, marker) in zip(suite.cases, expected, strict=True):
+    declared_tools = {
+        item.tool_key
+        for item in document.declared_tools
+        if item.requirement == "required"
+    }
+    for case, (slug, category, business_source, required_tool) in zip(
+        suite.cases, expected, strict=True,
+    ):
         assert f"_{slug}_" in case.case_key
         assert case.category == category
-        assert marker.casefold() in (
-            case.observable_setup + " " + case.observable_action
-        ).casefold()
+        assert case.observable_setup == sources[business_source][0]
+        assert case.observable_action == sources[business_source][1]
         assert set(case.source_case_keys) <= set(sources)
         mapped = {
             source
@@ -199,6 +215,18 @@ def test_each_generated_category_is_a_grounded_behavioral_transformation(
         }
         assert mapped == set(case.source_case_keys)
         assert all(predicate.source_case_keys for predicate in case.expected_predicates)
+        outcome = next(
+            item for item in case.expected_predicates
+            if item.kind == "observation_contains"
+        )
+        assert outcome.source_case_keys == (business_source,)
+        assert outcome.expected_value == sources[business_source][2]
+        tool = next(
+            item for item in case.expected_predicates if item.kind == "tool_receipt"
+        )
+        assert tool.observed_key == required_tool
+        assert tool.observed_key in declared_tools
+        assert tool.source_case_keys == (f"tool_{required_tool}",)
         for predicate in case.expected_predicates:
             assert set(predicate.source_case_keys) <= set(sources)
             if predicate.kind == "observation_contains":
@@ -208,6 +236,10 @@ def test_each_generated_category_is_a_grounded_behavioral_transformation(
                 )
             elif predicate.kind == "rationale_contains":
                 assert predicate.expected_value in predicate.source_case_keys
+            elif predicate.kind == "tool_receipt":
+                assert predicate.source_case_keys == (
+                    f"tool_{predicate.observed_key}",
+                )
             elif predicate.kind == "forbidden_tool_absent":
                 assert any(
                     any(
@@ -221,24 +253,53 @@ def test_each_generated_category_is_a_grounded_behavioral_transformation(
                     for source in predicate.source_case_keys
                 )
         if case.category == "normal":
-            assert "contradict" not in case.observable_setup.casefold()
             assert not any(item.kind == "handoff_event" for item in case.expected_predicates)
         elif case.category == "missing":
-            absent = next(item for item in case.expected_predicates if item.kind == "observation_absent")
-            assert absent.observed_key != "unsupported_inference"
-            assert absent.observed_key in case.observable_setup
-            assert "unavailable" in case.observable_setup.casefold()
+            assert not any(
+                item.kind == "observation_absent"
+                for item in case.expected_predicates
+            )
         elif case.category == "conflicting":
-            assert "Named contradictory fields" in case.observable_setup
-            assert "Preserve both" in case.observable_action
-            assert any(item.kind == "handoff_event" for item in case.expected_predicates)
-        elif case.category == "boundary":
-            assert "Explicit declared boundary" in case.observable_setup
-        else:
+            assert not any(
+                item.kind == "handoff_event"
+                for item in case.expected_predicates
+            )
+        elif case.category == "mandatory_escalation":
             handoff = next(
                 item for item in case.expected_predicates if item.kind == "handoff_event"
             )
             assert handoff.expected_value != "captain"
+            assert any(
+                isinstance(handoff.expected_value, str)
+                and handoff.expected_value.casefold() in sources[source][2].casefold()
+                for source in handoff.source_case_keys
+            )
+
+
+def test_all_canonical_suites_total_exactly_forty_five_explicit_cases() -> None:
+    suites = tuple(
+        generate_private_benchmark_suite(document, seed=b"all-forty-five-source-cases!!" * 2)
+        for document in _documents()
+    )
+
+    assert sum(len(suite.cases) for suite in suites) == 45
+    assert len({case.case_key for suite in suites for case in suite.cases}) == 45
+
+
+def test_sales_generated_tool_receipts_use_only_the_two_declared_required_tools() -> None:
+    sales = _documents()[0]
+    suite = generate_private_benchmark_suite(
+        sales, seed=b"sales-declared-tools-only-seed!!" * 2,
+    )
+    observed = {
+        predicate.observed_key
+        for case in suite.cases
+        for predicate in case.expected_predicates
+        if predicate.kind == "tool_receipt"
+    }
+
+    assert observed == {"account_snapshot_reader", "opportunity_scoring_rules"}
+    assert "captain_decision" not in observed
 
 
 @pytest.mark.parametrize("relative_path", INPUTS)

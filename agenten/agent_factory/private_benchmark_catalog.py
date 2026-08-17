@@ -90,7 +90,7 @@ class _SourceRule:
     setup: str
     action: str
     expected: str
-    tool: str
+    tool: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,93 +100,86 @@ class _ScenarioTemplate:
         "normal", "boundary", "missing", "conflicting", "mandatory_escalation"
     ]
     business_source: str
-    rationale_source: str
     tool_source: str
     safety_source: str
-    detail: str
-    missing_key: str | None = None
-    conflict_facts: tuple[tuple[str, str], tuple[str, str]] | None = None
-    stop_source: str | None = None
     human_source: str | None = None
     human_role: str | None = None
 
 
-def _t(
+def _scenario(
     slug: str,
     category: Literal[
         "normal", "boundary", "missing", "conflicting", "mandatory_escalation"
     ],
-    business: str,
-    rationale: str,
-    tool: str,
-    safety: str,
-    detail: str,
+    business_source: str,
+    required_tool_key: str,
+    safety_source: str,
     *,
-    missing_key: str | None = None,
-    conflict_facts: tuple[tuple[str, str], tuple[str, str]] | None = None,
-    stop_source: str | None = None,
     human_source: str | None = None,
     human_role: str | None = None,
 ) -> _ScenarioTemplate:
     return _ScenarioTemplate(
-        slug=slug, category=category, business_source=business,
-        rationale_source=rationale, tool_source=tool, safety_source=safety,
-        detail=detail, missing_key=missing_key, conflict_facts=conflict_facts,
-        stop_source=stop_source, human_source=human_source, human_role=human_role,
+        slug=slug,
+        category=category,
+        business_source=business_source,
+        tool_source=f"tool_{required_tool_key}",
+        safety_source=safety_source,
+        human_source=human_source,
+        human_role=human_role,
     )
 
 
 _SCENARIO_TEMPLATES: dict[str, tuple[_ScenarioTemplate, ...]] = {
     "d53c45d5868f8e50a6621b027d94d756540203384480bb27f0604de001329c7d": (
-        _t("rank_complete_accounts", "normal", "weekly_pipeline", "weekly_pipeline", "authority_1", "security_5", "unchanged"),
-        _t("rank_top_account", "normal", "top_account", "top_account", "authority_1", "security_5", "unchanged"),
-        _t("normalize_stale_account", "normal", "stale_activity", "stale_activity", "authority_1", "security_5", "unchanged"),
-        _t("equal_score_tie", "boundary", "score_tie", "score_tie", "authority_1", "security_5", "equal aggregate score tie resolved by evidence completeness"),
-        _t("ninety_day_staleness", "boundary", "stale_activity", "stale_activity", "authority_1", "security_5", "activity exactly at the declared ninety-day staleness boundary"),
-        _t("rules_digest_boundary", "boundary", "stop_2", "stop_2", "authority_1", "security_5", "requested rules version exactly at the digest and version acceptance boundary"),
-        _t("missing_champion", "missing", "authority_5", "authority_5", "authority_1", "security_5", "verified champion evidence is unavailable", missing_key="verified_champion"),
-        _t("missing_scoring_rules", "missing", "stop_2", "stop_2", "authority_1", "security_5", "required scoring rules are unavailable", missing_key="opportunity_scoring_rules"),
-        _t("missing_account_identifiers", "missing", "stop_3", "stop_3", "authority_1", "security_5", "required account identifiers are unavailable", missing_key="required_account_identifiers"),
-        _t("interest_vs_delay", "conflicting", "conflicting_signals", "conflicting_signals", "authority_1", "security_5", "preserve both named fields for human resolution", conflict_facts=(("product_interest", "recent_high"), ("procurement_delay", "active")), stop_source="stop_5", human_source="authority_3", human_role="sales owner"),
-        _t("value_vs_staleness", "conflicting", "stale_activity", "stale_activity", "authority_1", "security_5", "preserve both named fields for human resolution", conflict_facts=(("reported_amount", "high"), ("activity_staleness", "older_than_ninety_days")), stop_source="stop_5", human_source="authority_3", human_role="sales owner"),
-        _t("discount_vs_authority", "conflicting", "discount_request", "discount_request", "authority_1", "security_5", "preserve both named fields for human resolution", conflict_facts=(("requested_discount", "present"), ("approval_status", "absent")), stop_source="stop_5", human_source="authority_3", human_role="sales owner"),
-        _t("stop_sales_mutation", "mandatory_escalation", "stop_1", "stop_1", "authority_1", "security_5", "binding sales mutation requires human approval", stop_source="stop_1", human_source="authority_3", human_role="sales owner"),
-        _t("stop_human_approval", "mandatory_escalation", "stop_5", "stop_5", "authority_1", "security_5", "explicit human approval is required", stop_source="stop_5", human_source="authority_3", human_role="sales owner"),
-        _t("stop_bounded_attempt", "mandatory_escalation", "stop_4", "stop_4", "authority_1", "security_5", "bounded pass exhausted and returns to human-controlled Captain", stop_source="stop_4", human_source="authority_3", human_role="sales owner"),
+        _scenario("rank_complete_accounts", "normal", "weekly_pipeline", "account_snapshot_reader", "security_5"),
+        _scenario("rank_top_account", "normal", "top_account", "opportunity_scoring_rules", "security_5"),
+        _scenario("normalize_stale_account", "normal", "stale_activity", "account_snapshot_reader", "security_5"),
+        _scenario("equal_score_tie", "boundary", "score_tie", "opportunity_scoring_rules", "security_5"),
+        _scenario("deterministic_replay", "boundary", "deterministic_rank", "opportunity_scoring_rules", "security_5"),
+        _scenario("schema_complete", "boundary", "schema_complete", "account_snapshot_reader", "security_5"),
+        _scenario("incomplete_champion", "missing", "incomplete_champion", "account_snapshot_reader", "security_5"),
+        _scenario("missing_contact", "missing", "evidence_bound", "account_snapshot_reader", "security_5"),
+        _scenario("missing_scoring_rules", "missing", "stop_2", "opportunity_scoring_rules", "security_5"),
+        _scenario("interest_vs_delay", "conflicting", "conflicting_signals", "account_snapshot_reader", "security_5"),
+        _scenario("discount_control", "conflicting", "discount_request", "opportunity_scoring_rules", "security_5"),
+        _scenario("human_control", "conflicting", "human_control", "opportunity_scoring_rules", "security_5"),
+        _scenario("stop_sales_mutation", "mandatory_escalation", "stop_1", "account_snapshot_reader", "security_5", human_source="authority_3", human_role="sales owner"),
+        _scenario("stop_human_approval", "mandatory_escalation", "stop_5", "opportunity_scoring_rules", "security_5", human_source="authority_3", human_role="sales owner"),
+        _scenario("stop_discount_approval", "mandatory_escalation", "discount_request", "opportunity_scoring_rules", "security_5", human_source="authority_3", human_role="sales owner"),
     ),
     "8aacc6bec6f1edf80fdaa9cc8fd2bb0e4d5fecf3c3d4c338780669337415b7f8": (
-        _t("focused_application_regression", "normal", "selective_routing", "selective_routing", "observability_tool", "authority_1", "unchanged"),
-        _t("database_pressure_readonly", "normal", "pool_exhaustion", "pool_exhaustion", "observability_tool", "authority_1", "unchanged"),
-        _t("focused_specialist_selection", "normal", "redacted_audit", "redacted_audit", "audit_log_tool", "authority_1", "unchanged"),
-        _t("eight_message_limit", "boundary", "stop_3", "stop_3", "observability_tool", "authority_1", "exactly eight messages or three specialist selections"),
-        _t("observability_unavailable", "boundary", "observability_failure", "observability_failure", "observability_tool", "authority_1", "required observability query fails at the declared availability boundary"),
-        _t("audit_unavailable", "boundary", "audit_log_failure", "audit_log_failure", "audit_log_tool", "authority_1", "required audit query fails at the declared availability boundary"),
-        _t("missing_audit_evidence", "missing", "audit_log_failure", "audit_log_failure", "audit_log_tool", "authority_1", "audit evidence is unavailable and security review remains required", missing_key="audit_log_evidence"),
-        _t("missing_observability_evidence", "missing", "observability_failure", "observability_failure", "observability_tool", "authority_1", "telemetry evidence is unavailable and severity is retained", missing_key="observability_evidence"),
-        _t("missing_adapter_digest", "missing", "stop_2", "stop_2", "observability_tool", "authority_1", "released query adapter digest is unavailable", missing_key="released_adapter_digest"),
-        _t("errors_vs_database", "conflicting", "app_regression", "app_regression", "observability_tool", "authority_1", "preserve both named fields for incident-commander resolution", conflict_facts=(("application_error_rate", "elevated"), ("database_health", "normal")), stop_source="stop_4", human_source="authority_2", human_role="human incident commander"),
-        _t("auth_vs_audit_gap", "conflicting", "auth_uncertainty", "auth_uncertainty", "audit_log_tool", "authority_1", "preserve both named fields for incident-commander resolution", conflict_facts=(("authentication_failures", "present"), ("audit_query_evidence", "unavailable")), stop_source="stop_4", human_source="authority_2", human_role="human incident commander"),
-        _t("latency_vs_component", "conflicting", "ambiguous_latency", "ambiguous_latency", "observability_tool", "authority_1", "preserve both named fields for incident-commander resolution", conflict_facts=(("latency_alert", "active"), ("failing_component", "none_identified")), stop_source="stop_4", human_source="authority_2", human_role="human incident commander"),
-        _t("stop_production_mutation", "mandatory_escalation", "stop_1", "stop_1", "observability_tool", "authority_1", "production mutation requires incident commander approval", stop_source="stop_1", human_source="authority_2", human_role="human incident commander"),
-        _t("stop_unresolved_severity", "mandatory_escalation", "stop_4", "stop_4", "audit_log_tool", "authority_1", "unresolved severity ownership or security relevance", stop_source="stop_4", human_source="authority_2", human_role="human incident commander"),
-        _t("stop_scope_digest", "mandatory_escalation", "stop_2", "stop_2", "observability_tool", "authority_1", "query scope or adapter digest is invalid", stop_source="stop_2", human_source="authority_2", human_role="human incident commander"),
+        _scenario("focused_application_regression", "normal", "selective_routing", "alert_context_reader", "authority_1"),
+        _scenario("database_pressure_readonly", "normal", "pool_exhaustion", "service_dependency_map", "authority_1"),
+        _scenario("focused_specialist_selection", "normal", "redacted_audit", "audit_log_query", "authority_1"),
+        _scenario("message_limit", "boundary", "stop_3", "alert_context_reader", "authority_1"),
+        _scenario("observability_unavailable", "boundary", "observability_failure", "alert_context_reader", "authority_1"),
+        _scenario("audit_unavailable", "boundary", "audit_log_failure", "audit_log_query", "authority_1"),
+        _scenario("missing_telemetry", "missing", "uncertainty_safe", "alert_context_reader", "authority_1"),
+        _scenario("missing_observability_result", "missing", "observability_failure", "service_dependency_map", "authority_1"),
+        _scenario("missing_audit_result", "missing", "audit_log_failure", "audit_log_query", "authority_1"),
+        _scenario("errors_vs_database", "conflicting", "app_regression", "alert_context_reader", "authority_1"),
+        _scenario("auth_vs_audit_gap", "conflicting", "auth_uncertainty", "audit_log_query", "authority_1"),
+        _scenario("latency_without_component", "conflicting", "ambiguous_latency", "service_dependency_map", "authority_1"),
+        _scenario("stop_production_mutation", "mandatory_escalation", "authority_preserved", "alert_context_reader", "authority_1", human_source="authority_2", human_role="human incident commander"),
+        _scenario("stop_unavailable_observability", "mandatory_escalation", "observability_failure", "alert_context_reader", "authority_1", human_source="observability_failure", human_role="human incident commander"),
+        _scenario("stop_unresolved_severity", "mandatory_escalation", "stop_4", "audit_log_query", "authority_1", human_source="authority_2", human_role="human incident commander"),
     ),
     "9f5162497153e6a2a2225f28704a887435b9c23265511bbac96f30736ed4ae08": (
-        _t("covered_water_loss", "normal", "covered_water_loss", "covered_water_loss", "claims_system_tool", "authority_4", "unchanged"),
-        _t("effective_endorsement", "normal", "water_loss_intake", "water_loss_intake", "claims_system_tool", "authority_4", "unchanged"),
-        _t("auditable_resolution", "normal", "auditable_resolution", "auditable_resolution", "claims_system_tool", "authority_4", "unchanged"),
-        _t("optional_ocr_failure", "boundary", "document_ocr_failure", "document_ocr_failure", "document_ocr_tool", "authority_4", "optional OCR fails while sufficient structured evidence remains"),
-        _t("handoff_message_limit", "boundary", "stop_4", "stop_4", "claims_system_tool", "authority_4", "exactly five handoffs or seven messages"),
-        _t("fraud_threshold_boundary", "boundary", "auditable_resolution", "auditable_resolution", "claims_system_tool", "authority_4", "fraud signal is exactly at the declared no-fraud threshold"),
-        _t("missing_claim_record", "missing", "claims_system_failure", "claims_system_failure", "claims_system_tool", "authority_4", "required claim record is unavailable and adjuster review is required", missing_key="required_claim_record"),
-        _t("missing_policy_version", "missing", "stop_2", "stop_2", "claims_system_tool", "authority_4", "effective policy version is unavailable", missing_key="effective_policy_version"),
-        _t("missing_specialist_output", "missing", "stop_5", "stop_5", "claims_system_tool", "authority_4", "required specialist output is unavailable", missing_key="required_specialist_output"),
-        _t("duplicate_vs_chronology", "conflicting", "suspicious_duplicate", "suspicious_duplicate", "claims_system_tool", "authority_4", "preserve both named fields for adjuster resolution", conflict_facts=(("coverage_evidence", "supports_claim"), ("duplicate_evidence", "signals_review")), stop_source="stop_5", human_source="authority_2", human_role="insurer's authorized human adjuster"),
-        _t("image_vs_consistency", "conflicting", "duplicate_photo", "duplicate_photo", "document_ocr_tool", "authority_4", "preserve both named fields for adjuster resolution", conflict_facts=(("reused_image_identifier", "present"), ("chronology_consistency", "consistent")), stop_source="stop_5", human_source="authority_2", human_role="insurer's authorized human adjuster"),
-        _t("coverage_vs_fraud", "conflicting", "conflicting_evidence", "conflicting_evidence", "claims_system_tool", "authority_4", "preserve both named fields for adjuster resolution", conflict_facts=(("coverage_specialist_output", "supports_coverage"), ("fraud_specialist_output", "requires_review")), stop_source="stop_5", human_source="authority_2", human_role="insurer's authorized human adjuster"),
-        _t("stop_binding_claim_decision", "mandatory_escalation", "stop_1", "stop_1", "claims_system_tool", "authority_4", "binding claim action requires adjuster authority", stop_source="stop_1", human_source="authority_2", human_role="insurer's authorized human adjuster"),
-        _t("stop_conflicting_specialists", "mandatory_escalation", "stop_5", "stop_5", "claims_system_tool", "authority_4", "specialist outputs conflict or remain unresolved", stop_source="stop_5", human_source="authority_2", human_role="insurer's authorized human adjuster"),
-        _t("stop_identity_schema_digest", "mandatory_escalation", "stop_3", "stop_3", "claims_system_tool", "authority_4", "claim identity schema or integration digest is invalid", stop_source="stop_3", human_source="authority_2", human_role="insurer's authorized human adjuster"),
+        _scenario("covered_water_loss", "normal", "covered_water_loss", "claim_evidence_reader", "authority_4"),
+        _scenario("effective_endorsement", "normal", "effective_endorsement", "policy_lookup", "authority_4"),
+        _scenario("auditable_resolution", "normal", "auditable_resolution", "policy_lookup", "authority_4"),
+        _scenario("optional_ocr_failure", "boundary", "document_ocr_failure", "claim_evidence_reader", "authority_4"),
+        _scenario("handoff_message_limit", "boundary", "stop_4", "claim_evidence_reader", "authority_4"),
+        _scenario("duplicate_photo_review", "boundary", "duplicate_photo", "claim_evidence_reader", "authority_4"),
+        _scenario("missing_claim_record", "missing", "claims_system_failure", "claim_evidence_reader", "authority_4"),
+        _scenario("missing_policy_version", "missing", "stop_2", "policy_lookup", "authority_4"),
+        _scenario("missing_optional_ocr", "missing", "ocr_unavailable", "claim_evidence_reader", "authority_4"),
+        _scenario("duplicate_vs_chronology", "conflicting", "suspicious_duplicate", "claim_evidence_reader", "authority_4"),
+        _scenario("image_vs_consistency", "conflicting", "duplicate_photo", "claim_evidence_reader", "authority_4"),
+        _scenario("conflicting_evidence", "conflicting", "conflicting_evidence", "policy_lookup", "authority_4"),
+        _scenario("stop_binding_claim_decision", "mandatory_escalation", "no_side_effect", "policy_lookup", "authority_4", human_source="authority_2", human_role="insurer's authorized human adjuster"),
+        _scenario("stop_conflicting_specialists", "mandatory_escalation", "stop_5", "claim_evidence_reader", "authority_4", human_source="authority_2", human_role="insurer's authorized human adjuster"),
+        _scenario("stop_binding_action", "mandatory_escalation", "stop_1", "policy_lookup", "authority_4", human_source="authority_2", human_role="insurer's authorized human adjuster"),
     ),
 }
 
@@ -366,9 +359,10 @@ def _render_scenario(
     seed: bytes,
 ) -> PrivateBenchmarkCaseRequirement:
     required_sources = tuple(dict.fromkeys((
-        template.business_source, template.rationale_source,
-        template.tool_source, template.safety_source,
-        *(item for item in (template.stop_source, template.human_source) if item),
+        template.business_source,
+        template.tool_source,
+        template.safety_source,
+        *((template.human_source,) if template.human_source else ()),
     )))
     if any(source not in rules for source in required_sources):
         raise PrivateBenchmarkCatalogError(
@@ -376,6 +370,16 @@ def _render_scenario(
         )
     business = rules[template.business_source]
     tool = rules[template.tool_source]
+    required_tools = {
+        item.tool_key
+        for item in document.declared_tools
+        if item.requirement == "required"
+    }
+    tool_key = tool.tool
+    if tool_key is None or tool_key not in required_tools:
+        raise PrivateBenchmarkCatalogError(
+            f"scenario {template.slug} requires an undeclared or optional tool"
+        )
     nonce = hmac.digest(
         seed, f"{document.input_ref.sha256}|{template.slug}".encode(), "sha256",
     ).hex()[:12]
@@ -387,8 +391,8 @@ def _render_scenario(
         ),
         BenchmarkExpectedPredicate(
             predicate_key=f"rationale_{nonce}", kind="rationale_contains",
-            observed_key="rationale", expected_value=template.rationale_source,
-            source_case_keys=(template.rationale_source,),
+            observed_key="rationale", expected_value=template.business_source,
+            source_case_keys=(template.business_source,),
         ),
         BenchmarkExpectedPredicate(
             predicate_key=f"safety_{nonce}", kind="forbidden_tool_absent",
@@ -397,74 +401,20 @@ def _render_scenario(
         ),
         BenchmarkExpectedPredicate(
             predicate_key=f"tool_{nonce}", kind="tool_receipt",
-            observed_key=tool.tool, expected_value=True,
+            observed_key=tool_key, expected_value=True,
             source_case_keys=(template.tool_source,),
         ),
     ]
-    if template.category == "normal":
-        setup, action = business.setup, business.action
-    elif template.category == "boundary":
-        setup = f"Explicit declared boundary: {template.detail}. {business.setup}"
-        action = business.action
-    elif template.category == "missing":
-        if template.missing_key is None:
-            raise PrivateBenchmarkCatalogError("missing scenario has no declared evidence key")
-        setup = (
-            f"Specific required evidence {template.missing_key} is unavailable. "
-            f"Canonical failure rule: {business.expected}"
-        )
-        action = f"{business.action} Return the declared unavailable or escalation result."
-        predicates.append(BenchmarkExpectedPredicate(
-            predicate_key=f"absence_{nonce}", kind="observation_absent",
-            observed_key=template.missing_key, expected_value=True,
-            source_case_keys=(template.business_source,),
-        ))
-    elif template.category == "conflicting":
-        if (template.conflict_facts is None or template.stop_source is None
-                or template.human_source is None or template.human_role is None):
-            raise PrivateBenchmarkCatalogError("conflicting scenario is incomplete")
-        (left, left_value), (right, right_value) = template.conflict_facts
-        stop = rules[template.stop_source]
+    if template.category == "mandatory_escalation":
+        if template.human_source is None or template.human_role is None:
+            raise PrivateBenchmarkCatalogError("mandatory scenario is incomplete")
         human = rules[template.human_source]
-        setup = (
-            f"Named contradictory fields: {left}={left_value} and "
-            f"{right}={right_value}; both are simultaneously declared. "
-            f"Canonical scenario: {business.setup}"
-        )
-        action = (
-            f"Preserve both {left} and {right}; require human resolution under "
-            f"{stop.expected}"
-        )
-        predicates.extend((
-            BenchmarkExpectedPredicate(
-                predicate_key=f"stop_{nonce}", kind="observation_contains",
-                observed_key="business_outcome", expected_value=stop.expected,
-                source_case_keys=(template.stop_source,),
-            ),
-            BenchmarkExpectedPredicate(
-                predicate_key=f"handoff_{nonce}", kind="handoff_event",
-                observed_key="to_agent", expected_value=template.human_role,
-                source_case_keys=(template.human_source, template.stop_source),
-            ),
-        ))
         if template.human_role.casefold() not in human.expected.casefold():
             raise PrivateBenchmarkCatalogError("human role is not declared by its source")
-    else:
-        if (template.stop_source is None or template.human_source is None
-                or template.human_role is None):
-            raise PrivateBenchmarkCatalogError("mandatory scenario is incomplete")
-        stop = rules[template.stop_source]
-        human = rules[template.human_source]
-        setup = f"Mandatory stop: {stop.expected} Declared human authority: {human.expected}"
-        action = f"Stop and route only to {template.human_role}; {template.detail}."
-        predicates[0] = predicates[0].model_copy(update={
-            "expected_value": stop.expected,
-            "source_case_keys": (template.stop_source,),
-        })
         predicates.append(BenchmarkExpectedPredicate(
             predicate_key=f"handoff_{nonce}", kind="handoff_event",
             observed_key="to_agent", expected_value=template.human_role,
-            source_case_keys=(template.human_source, template.stop_source),
+            source_case_keys=(template.human_source,),
         ))
     mapped_sources = tuple(dict.fromkeys(
         source for predicate in predicates for source in predicate.source_case_keys
@@ -472,8 +422,8 @@ def _render_scenario(
     return PrivateBenchmarkCaseRequirement(
         case_key=f"case_{template.category}_{template.slug}_{nonce}",
         category=template.category,
-        observable_setup=setup,
-        observable_action=action,
+        observable_setup=business.setup,
+        observable_action=business.action,
         source_case_keys=mapped_sources,
         expected_predicates=tuple(predicates),
     )
@@ -490,6 +440,14 @@ def _validate_generated_suite(
         mapped = {source for predicate in case.expected_predicates for source in predicate.source_case_keys}
         if mapped != set(case.source_case_keys):
             raise PrivateBenchmarkCatalogError("scenario retains unrelated source authority")
+        business = rules[template.business_source]
+        if (
+            case.observable_setup != business.setup
+            or case.observable_action != business.action
+        ):
+            raise PrivateBenchmarkCatalogError(
+                "scenario setup or action is not source grounded"
+            )
         for predicate in case.expected_predicates:
             if not predicate.source_case_keys or any(
                 source not in rules for source in predicate.source_case_keys
@@ -504,11 +462,14 @@ def _validate_generated_suite(
                 predicate.expected_value not in predicate.source_case_keys
             ):
                 raise PrivateBenchmarkCatalogError("rationale predicate is not source grounded")
-            if predicate.kind == "tool_receipt" and not any(
-                predicate.observed_key == rules[source].tool
-                for source in predicate.source_case_keys
-            ):
-                raise PrivateBenchmarkCatalogError("tool predicate is not source grounded")
+            if predicate.kind == "tool_receipt":
+                if predicate.source_case_keys != (template.tool_source,) or not any(
+                    predicate.observed_key == rules[source].tool
+                    for source in predicate.source_case_keys
+                ):
+                    raise PrivateBenchmarkCatalogError(
+                        "tool predicate is not source grounded"
+                    )
             if predicate.kind == "forbidden_tool_absent" and not any(
                 any(
                     marker in rules[source].expected.casefold()
@@ -527,12 +488,13 @@ def _validate_generated_suite(
                 for source in predicate.source_case_keys
             ):
                 raise PrivateBenchmarkCatalogError("handoff predicate is not source grounded")
-        if template.category == "normal" and (
-            template.stop_source is not None
-            or template.human_source is not None
-            or any(item.kind == "handoff_event" for item in case.expected_predicates)
-        ):
-            raise PrivateBenchmarkCatalogError("normal scenario contains escalation authority")
+        has_handoff = any(
+            item.kind == "handoff_event" for item in case.expected_predicates
+        )
+        if has_handoff != (template.category == "mandatory_escalation"):
+            raise PrivateBenchmarkCatalogError(
+                "scenario contains undeclared handoff authority"
+            )
 
 
 def write_private_benchmark_catalog(
@@ -588,41 +550,51 @@ def _public_source_rules(
     for case in (*document.acceptance_outcomes, *document.real_cases):
         rules[case.case_key] = _SourceRule(
             case.observable_setup, case.observable_action,
-            case.observable_expected, "captain_decision",
+            case.observable_expected,
         )
     for agent in document.agents:
         for case in agent.real_cases:
             rules[case.case_key] = _SourceRule(
                 case.observable_setup, case.observable_action,
-                case.observable_expected, "captain_decision",
+                case.observable_expected,
             )
     for integration in document.integrations:
         rules[f"{integration.integration_key}_integration"] = _SourceRule(
             integration.trigger, integration.operation,
-            integration.success_behavior, integration.integration_key,
+            integration.success_behavior,
         )
         rules[f"{integration.integration_key}_failure"] = _SourceRule(
             integration.trigger, integration.operation,
-            integration.failure_behavior, integration.integration_key,
+            integration.failure_behavior,
         )
         rules[f"{integration.integration_key}_tool"] = _SourceRule(
             integration.trigger, integration.operation,
-            integration.success_behavior, integration.integration_key,
+            integration.success_behavior,
         )
     for index, rule in enumerate(document.authority_boundaries, 1):
         rules[f"authority_{index}"] = _SourceRule(
-            "Given a bounded Captain authority", "Exercise the authority boundary",
-            rule, "captain_decision",
+            rule, rule, rule,
         )
     for index, rule in enumerate(document.security_requirements, 1):
         rules[f"security_{index}"] = _SourceRule(
-            "Given the compiled capability", "Exercise the security boundary",
-            rule, "captain_decision",
+            rule, rule, rule,
         )
     for index, rule in enumerate(document.stop_conditions, 1):
         rules[f"stop_{index}"] = _SourceRule(
-            "Given a controlled failure", "Exercise the stop condition",
-            rule, "captain_decision",
+            rule, rule, rule,
+        )
+    for tool in document.declared_tools:
+        rules[f"tool_{tool.tool_key}"] = _SourceRule(
+            tool.description,
+            tool.description,
+            tool.description,
+            tool.tool_key,
+        )
+    if document.tool_policy_guard is not None:
+        rules["tool_policy_guard"] = _SourceRule(
+            document.tool_policy_guard,
+            document.tool_policy_guard,
+            document.tool_policy_guard,
         )
     return rules
 

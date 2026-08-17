@@ -168,6 +168,13 @@ class RequestedIntegration(_FrozenContract):
         return self
 
 
+class DeclaredTool(_FrozenContract):
+    tool_key: str = Field(pattern=IDENTIFIER_PATTERN)
+    requirement: Literal["required", "optional"]
+    location: Literal["local", "integration"]
+    description: str = Field(min_length=1)
+
+
 class RequestedAgent(_FrozenContract):
     agent_key: str = Field(pattern=IDENTIFIER_PATTERN)
     purpose: str = Field(min_length=1)
@@ -198,6 +205,8 @@ class FactoryInputDocumentV2(_FrozenContract):
     real_cases: tuple[RealCaseRequirement, ...] = Field(min_length=1)
     helpful_resources: tuple[str, ...] = Field(min_length=1)
     stop_conditions: tuple[str, ...] = Field(min_length=1)
+    declared_tools: tuple[DeclaredTool, ...] = ()
+    tool_policy_guard: str | None = None
     benchmark_policy: BenchmarkPolicyRequirement
     sections: tuple[InputSection, ...] = Field(min_length=10)
     extra_sections: tuple[InputSection, ...] = ()
@@ -206,10 +215,13 @@ class FactoryInputDocumentV2(_FrozenContract):
     def validate_stable_names(self) -> "FactoryInputDocumentV2":
         agent_keys = tuple(item.agent_key for item in self.agents)
         integration_keys = tuple(item.integration_key for item in self.integrations)
+        tool_keys = tuple(item.tool_key for item in self.declared_tools)
         if len(agent_keys) != len(set(agent_keys)):
             raise ValueError("duplicate agent stable name")
         if len(integration_keys) != len(set(integration_keys)):
             raise ValueError("duplicate integration stable name")
+        if len(tool_keys) != len(set(tool_keys)):
+            raise ValueError("duplicate declared tool stable name")
         known_agents = set(agent_keys)
         known_integrations = set(integration_keys)
         public_source_keys = (
@@ -222,6 +234,8 @@ class FactoryInputDocumentV2(_FrozenContract):
             *(f"authority_{index}" for index, _ in enumerate(self.authority_boundaries, 1)),
             *(f"security_{index}" for index, _ in enumerate(self.security_requirements, 1)),
             *(f"stop_{index}" for index, _ in enumerate(self.stop_conditions, 1)),
+            *(f"tool_{item.tool_key}" for item in self.declared_tools),
+            *(("tool_policy_guard",) if self.tool_policy_guard else ()),
         )
         if len(public_source_keys) != len(set(public_source_keys)):
             raise ValueError("benchmark public source keys must be unique")

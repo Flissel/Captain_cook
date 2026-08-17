@@ -126,6 +126,22 @@ class FactoryInputCompiler:
         for index, rule in enumerate(document.stop_conditions, 1):
             case = RealCaseRequirement(case_key=f"stop_{index}", observable_setup="Given a controlled failure", observable_action="Exercise the stop condition", observable_expected=rule)
             sources.append((("Stop conditions", case.case_key), case, "recovery"))
+        for tool in document.declared_tools:
+            case = RealCaseRequirement(
+                case_key=f"tool_{tool.tool_key}",
+                observable_setup=tool.description,
+                observable_action=tool.description,
+                observable_expected=tool.description,
+            )
+            sources.append((("Tool policy", case.case_key), case, "integration"))
+        if document.tool_policy_guard is not None:
+            case = RealCaseRequirement(
+                case_key="tool_policy_guard",
+                observable_setup=document.tool_policy_guard,
+                observable_action=document.tool_policy_guard,
+                observable_expected=document.tool_policy_guard,
+            )
+            sources.append((("Tool policy", case.case_key), case, "security"))
         for path, case, kind in sources:
             assertion_id = "assert-" + _short_id(document.input_ref.sha256, path, case.observable_expected)
             result.append(AcceptanceAssertion(assertion_id=assertion_id, source_path=path, observable_setup=case.observable_setup, observable_action=case.observable_action, observable_expected=case.observable_expected, kind=kind))

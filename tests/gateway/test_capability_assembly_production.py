@@ -1630,10 +1630,11 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
     public_source_key_text = " | ".join(
         grounded_input.document.benchmark_policy.source_case_keys
     )
-    benchmark_tool_keys = tuple(dict.fromkeys((
-        "captain_decision",
-        *(item.integration_key for item in grounded_input.document.integrations),
-    )))
+    benchmark_tool_keys = tuple(
+        item.tool_key
+        for item in grounded_input.document.declared_tools
+        if item.requirement == "required"
+    )
 
     class Bindings:
         def binding_for(self, request: object) -> object:
