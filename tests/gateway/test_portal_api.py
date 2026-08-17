@@ -205,10 +205,13 @@ class FakePortalGatewayStore:
         self.used.append((principal.organization_id, request.action))
         return self.persisted
 
-    def portal_factory_actions(self, *, principal, status, now):
+    def portal_factory_actions(
+        self, *, principal, status, now, after_request_id=None, limit=100
+    ):
+        del after_request_id
         if principal.organization_id != self.owner:
             return ()
-        return (self.factory_action,) if status == self.factory_action.status else ()
+        return (self.factory_action,)[:limit] if status == self.factory_action.status else ()
 
     def portal_factory_action(self, *, request_id, principal, now):
         if principal.organization_id != self.owner or request_id != self.factory_action.request_id:

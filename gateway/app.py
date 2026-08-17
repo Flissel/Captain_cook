@@ -373,6 +373,11 @@ def create_app(
         resume_dispatcher = get_factory_action_resume_dispatcher()
         try:
             if resume_dispatcher is not None:
+                recover_credentials = getattr(
+                    get_store(), "recover_factory_credentials", None
+                )
+                if recover_credentials is not None:
+                    recover_credentials(now=portal_clock())
                 resume_dispatcher.recover()
             yield
         finally:
@@ -760,10 +765,13 @@ def create_app(
         status_filter: Literal["pending", "answered", "expired", "consumed"] = Query(
             default="pending", alias="status"
         ),
+        cursor: UUID | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=100),
         principal: PortalPrincipalV1 = Depends(require_portal_principal),
     ) -> tuple[FactoryActionRequestV1, ...]:
         return get_store().portal_factory_actions(
-            principal=principal, status=status_filter, now=portal_clock()
+            principal=principal, status=status_filter, now=portal_clock(),
+            after_request_id=cursor, limit=limit,
         )
 
     @app.get("/v1/portal/factory-actions/{request_id}")

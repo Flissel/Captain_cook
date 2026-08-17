@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
+from time import sleep
 from time import monotonic
+from uuid import UUID
 
 import pytest
 
@@ -417,4 +419,46 @@ def test_resume_service_recovers_all_durable_answered_rows_on_restart() -> None:
     )
     service.recover()
     assert entered.wait(timeout=1)
+    service.close()
+
+
+def test_resume_recovery_bounds_concurrency_and_retained_futures_without_deadlock() -> None:
+    request = FactoryActionRequestV1.model_validate_json(
+        (FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8")
+    )
+    guard = Lock()
+    current = 0
+    maximum = 0
+    completed: list[UUID] = []
+
+    class CountingCoordinator:
+        def resume(self, *, request_id, tenant_id):
+            nonlocal current, maximum
+            assert tenant_id == "tenant-a"
+            with guard:
+                current += 1
+                maximum = max(maximum, current)
+            try:
+                sleep(0.01)
+                if request_id.int % 7 == 0:
+                    raise RuntimeError("retryable fixture failure")
+                completed.append(request_id)
+            finally:
+                with guard:
+                    current -= 1
+
+    identities = tuple(
+        UUID(int=request.request_id.int + offset) for offset in range(1, 31)
+    )
+    service = FactoryActionResumeService(
+        coordinator=CountingCoordinator(),
+        recovery_source=lambda: ((identity, "tenant-a") for identity in identities),
+        max_in_flight=3,
+    )
+
+    service.recover()
+
+    assert maximum <= 3
+    assert len(service._futures) <= 3
+    assert set(completed) == {identity for identity in identities if identity.int % 7}
     service.close()

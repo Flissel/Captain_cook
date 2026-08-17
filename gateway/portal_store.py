@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Final, Protocol, runtime_checkable
+from typing import Callable, Final, Iterator, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from blockchain.mariadb_storage import MariaDBStorage
@@ -31,16 +32,45 @@ class FactoryCredentialAdapter(Protocol):
         reservation_key: str,
         tenant_id: str,
         request_id: UUID,
-        credential_alias: str,
+        expected_subject_version: int,
+        purpose: str,
         secret_value: str,
-    ) -> str: ...
+    ) -> "FactoryCredentialReceipt": ...
+
+    def lookup_credential(
+        self, reservation_key: str
+    ) -> "FactoryCredentialReceipt | None": ...
 
     def revoke_credential(
         self, *, reservation_key: str, credential_ref: str
     ) -> None: ...
 
 
+@dataclass(frozen=True)
+class FactoryCredentialReceipt:
+    """Secret-free binding for one idempotent external credential effect."""
+
+    reservation_key: str
+    tenant_id: str
+    request_id: UUID
+    request_version: int
+    purpose: str
+    opaque_reference: str
+    reference_sha256: str
+
+    def __post_init__(self) -> None:
+        if len(self.reservation_key) != 64:
+            raise ValueError("credential receipt reservation key is invalid")
+        expected = hashlib.sha256(self.opaque_reference.encode("utf-8")).hexdigest()
+        if not secrets.compare_digest(self.reference_sha256, expected):
+            raise ValueError("credential receipt reference digest conflicts")
+
+
 class FactoryCredentialReservationStore(Protocol):
+    def iter_credential_reservations(
+        self,
+    ) -> Iterator[tuple[UUID, str, int, str, str]]: ...
+
     def reserve_credential(
         self, request_id: UUID, *, tenant_id: str,
         expected_subject_version: int, credential_alias: str, now: datetime,
@@ -76,27 +106,105 @@ class FactoryCredentialCoordinator:
             expected_subject_version=expected_subject_version,
             credential_alias=credential_alias, now=reserved_at,
         )
-        reference: str | None = None
+        receipt: FactoryCredentialReceipt | None = None
         try:
-            reference = self._adapter.store_credential(
+            receipt = self._adapter.lookup_credential(reservation_key)
+            if receipt is None:
+                try:
+                    receipt = self._adapter.store_credential(
+                        reservation_key=reservation_key, tenant_id=tenant_id,
+                        request_id=request_id,
+                        expected_subject_version=expected_subject_version,
+                        purpose=credential_alias,
+                        secret_value=secret_value,
+                    )
+                except Exception:
+                    receipt = self._adapter.lookup_credential(reservation_key)
+                    if receipt is None:
+                        raise
+            self._validate_receipt(
+                receipt,
                 reservation_key=reservation_key, tenant_id=tenant_id,
-                request_id=request_id, credential_alias=credential_alias,
-                secret_value=secret_value,
+                request_id=request_id, expected_subject_version=expected_subject_version,
+                purpose=credential_alias,
             )
             self._store.complete_credential_reservation(
                 request_id, tenant_id=tenant_id, reservation_key=reservation_key,
-                credential_ref=reference, now=self._clock(),
+                credential_ref=receipt.opaque_reference, now=self._clock(),
             )
-            return reference
+            return receipt.opaque_reference
         except Exception:
-            if reference is not None:
-                self._adapter.revoke_credential(
-                    reservation_key=reservation_key, credential_ref=reference
+            try:
+                if isinstance(receipt, FactoryCredentialReceipt):
+                    self._adapter.revoke_credential(
+                        reservation_key=reservation_key,
+                        credential_ref=receipt.opaque_reference,
+                    )
+            finally:
+                self._store.release_credential_reservation(
+                    request_id, tenant_id=tenant_id, reservation_key=reservation_key
                 )
-            self._store.release_credential_reservation(
-                request_id, tenant_id=tenant_id, reservation_key=reservation_key
-            )
             raise
+
+    def recover(self) -> None:
+        """Reconcile secret-free durable reservations after process restart."""
+
+        for request_id, tenant_id, version, purpose, reservation_key in (
+            self._store.iter_credential_reservations()
+        ):
+            receipt = self._adapter.lookup_credential(reservation_key)
+            if receipt is None:
+                self._store.release_credential_reservation(
+                    request_id, tenant_id=tenant_id, reservation_key=reservation_key
+                )
+                continue
+            try:
+                self._validate_receipt(
+                    receipt,
+                    reservation_key=reservation_key,
+                    tenant_id=tenant_id,
+                    request_id=request_id,
+                    expected_subject_version=version,
+                    purpose=purpose,
+                )
+                self._store.complete_credential_reservation(
+                    request_id,
+                    tenant_id=tenant_id,
+                    reservation_key=reservation_key,
+                    credential_ref=receipt.opaque_reference,
+                    now=self._clock(),
+                )
+            except Exception:
+                try:
+                    if isinstance(receipt, FactoryCredentialReceipt):
+                        self._adapter.revoke_credential(
+                            reservation_key=reservation_key,
+                            credential_ref=receipt.opaque_reference,
+                        )
+                finally:
+                    self._store.release_credential_reservation(
+                        request_id, tenant_id=tenant_id, reservation_key=reservation_key
+                    )
+
+    @staticmethod
+    def _validate_receipt(
+        receipt: FactoryCredentialReceipt,
+        *,
+        reservation_key: str,
+        tenant_id: str,
+        request_id: UUID,
+        expected_subject_version: int,
+        purpose: str,
+    ) -> None:
+        if not isinstance(receipt, FactoryCredentialReceipt) or (
+            receipt.reservation_key != reservation_key
+            or receipt.tenant_id != tenant_id
+            or receipt.request_id != request_id
+            or receipt.request_version != expected_subject_version
+            or receipt.purpose != purpose
+            or not receipt.opaque_reference.startswith(f"credential://{tenant_id}/")
+        ):
+            raise ValueError("credential receipt conflicts with reservation")
 
 
 class PortalTicketStore:

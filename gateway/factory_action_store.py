@@ -67,6 +67,10 @@ class FactoryActionRepository(Protocol):
         self, *, after_request_id: UUID | None, limit: int
     ) -> tuple[FactoryActionRow, ...]: ...
 
+    def credential_rows(
+        self, *, after_request_id: UUID | None, limit: int
+    ) -> tuple[FactoryActionRow, ...]: ...
+
     def locked(
         self, request_id: UUID, *, tenant_id: str
     ) -> ContextManager[FactoryActionRow | None]: ...
@@ -97,7 +101,7 @@ class FactoryActionStore:
             if repository is not None
             else MariaDBFactoryActionRepository(storage)  # type: ignore[arg-type]
         )
-        if page_size < 1 or page_size > 1000:
+        if page_size < 1 or page_size > 100:
             raise ValueError("factory action page_size is invalid")
         self._page_size = page_size
 
@@ -110,22 +114,20 @@ class FactoryActionStore:
         return request
 
     def list(
-        self, *, tenant_id: str, status: ActionStatus, now: datetime
+        self, *, tenant_id: str, status: ActionStatus, now: datetime,
+        after_request_id: UUID | None = None, limit: int | None = None,
     ) -> tuple[FactoryActionRequestV1, ...]:
+        page_limit = self._page_size if limit is None else limit
+        if page_limit < 1 or page_limit > 100:
+            raise ValueError("factory action list limit is invalid")
         self._repository.expire(tenant_id=tenant_id, now=_aware_utc(now))
-        results: list[FactoryActionRequestV1] = []
-        cursor: UUID | None = None
-        while True:
-            page = self._repository.list_rows(
-                tenant_id=tenant_id, status=status,
-                after_request_id=cursor, limit=self._page_size,
-            )
-            results.extend(
-                row.request.model_copy(update={"status": row.status}) for row in page
-            )
-            if len(page) < self._page_size:
-                return tuple(results)
-            cursor = page[-1].request.request_id
+        page = self._repository.list_rows(
+            tenant_id=tenant_id, status=status,
+            after_request_id=after_request_id, limit=page_limit,
+        )
+        return tuple(
+            row.request.model_copy(update={"status": row.status}) for row in page
+        )
 
     def resume_candidates(self, *, now: datetime) -> tuple[tuple[UUID, str], ...]:
         return tuple(self.iter_resume_candidates(now=now))
@@ -146,6 +148,30 @@ class FactoryActionStore:
                     )
                 else:
                     yield row.request.request_id, row.tenant_id
+            if len(page) < self._page_size:
+                break
+            cursor = page[-1].request.request_id
+
+    def iter_credential_reservations(
+        self,
+    ) -> Iterator[tuple[UUID, str, int, str, str]]:
+        cursor: UUID | None = None
+        while True:
+            page = self._repository.credential_rows(
+                after_request_id=cursor, limit=self._page_size
+            )
+            for row in page:
+                if row.credential_reservation_key is None or row.credential_alias is None:
+                    raise FactoryActionDurabilityError(
+                        "factory credential reservation is incomplete"
+                    )
+                yield (
+                    row.request.request_id,
+                    row.tenant_id,
+                    row.request.expected_subject_version,
+                    row.credential_alias,
+                    row.credential_reservation_key,
+                )
             if len(page) < self._page_size:
                 break
             cursor = page[-1].request.request_id
@@ -593,6 +619,8 @@ class MariaDBFactoryActionRepository:
         self, *, tenant_id: str, status: str,
         after_request_id: UUID | None, limit: int,
     ) -> tuple[FactoryActionRow, ...]:
+        if limit < 1 or limit > 100:
+            raise ValueError("factory action repository limit is invalid")
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -605,11 +633,28 @@ class MariaDBFactoryActionRepository:
     def resume_rows(
         self, *, after_request_id: UUID | None, limit: int
     ) -> tuple[FactoryActionRow, ...]:
+        if limit < 1 or limit > 100:
+            raise ValueError("factory action repository limit is invalid")
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT * FROM factory_action_inbox WHERE status = 'answered' "
                     "AND request_id > %s ORDER BY request_id LIMIT %s",
+                    ("" if after_request_id is None else str(after_request_id), limit),
+                )
+                return tuple(_db_row(row) for row in cursor.fetchmany(limit))
+
+    def credential_rows(
+        self, *, after_request_id: UUID | None, limit: int
+    ) -> tuple[FactoryActionRow, ...]:
+        if limit < 1 or limit > 100:
+            raise ValueError("factory action repository limit is invalid")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT * FROM factory_action_inbox WHERE "
+                    "credential_reservation_key IS NOT NULL AND request_id > %s "
+                    "ORDER BY request_id LIMIT %s",
                     ("" if after_request_id is None else str(after_request_id), limit),
                 )
                 return tuple(_db_row(row) for row in cursor.fetchmany(limit))

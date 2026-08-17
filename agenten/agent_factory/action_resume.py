@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime
 from threading import Lock
@@ -206,26 +206,40 @@ class FactoryActionResumeService:
         *,
         coordinator: FactoryActionResumeCoordinator,
         recovery_source: Callable[[], Iterable[tuple[UUID, str]]] | None = None,
+        max_in_flight: int = 8,
     ) -> None:
+        if max_in_flight < 1 or max_in_flight > 128:
+            raise ValueError("factory action max_in_flight is invalid")
         self._coordinator = coordinator
         self._recovery_source = recovery_source or (lambda: ())
+        self._max_in_flight = max_in_flight
         self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="factory-action-resume"
+            max_workers=max_in_flight, thread_name_prefix="factory-action-resume"
         )
         self._lock = Lock()
         self._futures: set[Future[object]] = set()
 
     def enqueue(self, *, request_id: UUID, tenant_id: str) -> None:
-        future = self._executor.submit(
-            self._coordinator.resume, request_id=request_id, tenant_id=tenant_id
-        )
         with self._lock:
+            if len(self._futures) >= self._max_in_flight:
+                raise RuntimeError("factory action resume service is at capacity")
+            future = self._executor.submit(
+                self._coordinator.resume, request_id=request_id, tenant_id=tenant_id
+            )
             self._futures.add(future)
         future.add_done_callback(self._completed)
 
     def recover(self) -> None:
+        batch: list[Future[object]] = []
         for request_id, tenant_id in self._recovery_source():
             self.enqueue(request_id=request_id, tenant_id=tenant_id)
+            with self._lock:
+                batch = list(self._futures)
+            if len(batch) >= self._max_in_flight:
+                wait(batch)
+                batch.clear()
+        if batch:
+            wait(batch)
 
     def _completed(self, future: Future[object]) -> None:
         with self._lock:

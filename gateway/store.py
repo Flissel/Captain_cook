@@ -300,15 +300,27 @@ class GatewayStore:
         """Expose the durable Action Inbox state machine to the resume worker."""
         return self._factory_actions
 
+    def recover_factory_credentials(self, *, now: datetime) -> None:
+        if self._factory_credential_adapter is None:
+            return
+        FactoryCredentialCoordinator(
+            store=self._factory_actions,
+            adapter=self._factory_credential_adapter,
+            clock=lambda: now,
+        ).recover()
+
     def portal_factory_actions(
         self,
         *,
         principal: PortalPrincipalV1,
         status: ActionStatus,
         now: datetime,
+        after_request_id: UUID | None = None,
+        limit: int = 100,
     ) -> tuple[FactoryActionRequestV1, ...]:
         return self._factory_actions.list(
-            tenant_id=principal.organization_id, status=status, now=now
+            tenant_id=principal.organization_id, status=status, now=now,
+            after_request_id=after_request_id, limit=limit,
         )
 
     def portal_factory_action(
