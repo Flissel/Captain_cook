@@ -45,3 +45,50 @@ export interface PortalSetupTicket {
   credentialAlias: string;
   expiresAt: string;
 }
+
+export const factoryActionRequestTypes = [
+  "clarification",
+  "credential_required",
+  "external_api_approval",
+  "n8n_approval",
+] as const;
+
+export const factoryActionStatuses = ["pending", "answered", "denied", "expired", "consumed"] as const;
+
+export const factoryActionDecisions = ["approve", "deny"] as const;
+
+export type FactoryActionRequestType = (typeof factoryActionRequestTypes)[number];
+export type FactoryActionStatus = (typeof factoryActionStatuses)[number];
+export type FactoryActionDecision = (typeof factoryActionDecisions)[number];
+
+export interface FactoryArtifactReference {
+  uri: string;
+  sha256: string;
+  mediaType: "application/json";
+}
+
+export interface FactoryActionRequest {
+  requestId: string;
+  factoryJobId: string;
+  creationJobId: string;
+  correlationId: string;
+  expectedSubjectVersion: number;
+  requestType: FactoryActionRequestType;
+  safeCheckpointRef: FactoryArtifactReference;
+  safeCheckpointSha256: string;
+  requiredScope: string;
+  allowedDecisions: FactoryActionDecision[];
+  message: string;
+  deadlineAt: string;
+  status: FactoryActionStatus;
+}
+
+export interface FactoryActionResponseDraft {
+  expectedSubjectVersion: number;
+  decision: FactoryActionDecision;
+  approvedScope: string;
+  credentialRef: string | null;
+  answerMetadata: Readonly<Record<string, string>>;
+  answeredAt: string;
+  idempotencyKey: string;
+}

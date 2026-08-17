@@ -1,11 +1,15 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, expect, it, vi } from "vitest";
+import { credentialAction } from "./test/fixtures";
+import type { FactoryActionRequest, FactoryActionStatus } from "./types";
 
 const mocks = vi.hoisted(() => ({
   getSetupSurface: vi.fn(),
   signInWithPassword: vi.fn(async () => ({ error: null })),
   unsubscribe: vi.fn(),
+  getFactoryActions: vi.fn<(accessToken: string, status?: FactoryActionStatus) => Promise<FactoryActionRequest[]>>(async () => []),
+  session: null as { access_token: string } | null,
 }));
 
 vi.mock("./api", async (importOriginal) => {
@@ -19,6 +23,9 @@ vi.mock("./api", async (importOriginal) => {
       verifyCredential: vi.fn(),
       requestRotation: vi.fn(),
       revokeCredential: vi.fn(),
+      getFactoryActions: mocks.getFactoryActions,
+      storeFactoryCredential: vi.fn(),
+      respondToFactoryAction: vi.fn(),
     }),
   };
 });
@@ -26,7 +33,7 @@ vi.mock("./api", async (importOriginal) => {
 vi.mock("./supabase", () => ({
   portalSupabase: () => ({
     auth: {
-      getSession: vi.fn(async () => ({ data: { session: null }, error: null })),
+      getSession: vi.fn(async () => ({ data: { session: mocks.session }, error: null })),
       onAuthStateChange: vi.fn(() => ({ data: { subscription: { unsubscribe: mocks.unsubscribe } } })),
       signInWithPassword: mocks.signInWithPassword,
       signOut: vi.fn(),
@@ -38,6 +45,21 @@ import App from "./App";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.session = null;
+});
+
+it("loads authenticated factory actions without replacing Integration Setup", async () => {
+  mocks.session = { access_token: "private-user-jwt" };
+  mocks.getFactoryActions.mockImplementation(async (accessToken, status) => {
+    expect(accessToken).toBe("private-user-jwt");
+    return status === "pending" ? [credentialAction] : [];
+  });
+
+  render(<App />);
+
+  expect(await screen.findByRole("heading", { name: "Factory actions" })).toBeVisible();
+  expect(screen.getByText("A CRM credential is required.")).toBeVisible();
+  expect(mocks.getFactoryActions).toHaveBeenCalledWith("private-user-jwt", "pending");
 });
 
 it("does not call Gateway while the real App is unauthenticated", async () => {

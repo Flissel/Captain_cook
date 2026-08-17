@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   PortalPublicError,
   createPortalApi,
+  parseFactoryAction,
   parseSetupSurface,
 } from "./api";
 
@@ -37,6 +38,27 @@ const surfacePayload = {
   ],
 };
 
+const factoryActionPayload = {
+  schema: "captain.factory-action-request.v1",
+  request_id: "00000000-0000-0000-0000-000000000601",
+  factory_job_id: "00000000-0000-0000-0000-000000000301",
+  creation_job_id: "00000000-0000-0000-0000-000000000401",
+  correlation_id: "00000000-0000-0000-0000-000000000302",
+  expected_subject_version: 1,
+  request_type: "credential_required",
+  safe_checkpoint_ref: {
+    uri: "artifact://minibook/checkpoint/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    sha256: "a".repeat(64),
+    media_type: "application/json",
+  },
+  safe_checkpoint_sha256: "a".repeat(64),
+  required_scope: "n8n.crm.read",
+  allowed_decisions: ["approve", "deny"],
+  message: "A CRM credential is required.",
+  deadline_at: "2026-08-09T12:00:00Z",
+  status: "pending",
+};
+
 function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -45,6 +67,54 @@ function response(body: unknown, status = 200): Response {
 }
 
 describe("portal API", () => {
+  it("loads strict factory actions and posts credential references without the raw value", async () => {
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      void init;
+      const url = String(input);
+      if (url.includes("?status=pending")) return response([factoryActionPayload]);
+      if (url.endsWith("/credentials")) return response({ credential_ref: "credential://tenant-a/n8n-salesforce" }, 201);
+      if (url.endsWith("/responses")) return response({
+        schema: "captain.factory-action-response.v1",
+        request_id: factoryActionPayload.request_id,
+        expected_subject_version: 1,
+        decision: "approve",
+        approved_scope: "n8n.crm.read",
+        credential_ref: "credential://tenant-a/n8n-salesforce",
+        answer_metadata: {},
+        answered_at: "2026-08-08T12:00:00.000Z",
+        idempotency_key: "c".repeat(64),
+      });
+      throw new Error(`unexpected URL ${url}`);
+    });
+    const api = createPortalApi(fetcher);
+
+    await expect(api.getFactoryActions(accessToken)).resolves.toMatchObject([{ requestId: factoryActionPayload.request_id }]);
+    await expect(api.storeFactoryCredential(factoryActionPayload.request_id, "n8n.crm.read", "secret-value", accessToken)).resolves.toBe("credential://tenant-a/n8n-salesforce");
+    await api.respondToFactoryAction(factoryActionPayload.request_id, {
+      expectedSubjectVersion: 1,
+      decision: "approve",
+      approvedScope: "n8n.crm.read",
+      credentialRef: "credential://tenant-a/n8n-salesforce",
+      answerMetadata: {},
+      answeredAt: "2026-08-08T12:00:00.000Z",
+      idempotencyKey: "c".repeat(64),
+    }, accessToken);
+
+    const responseRequest = fetcher.mock.calls.find(([url]) => String(url).endsWith("/responses"));
+    expect(responseRequest).toBeDefined();
+    expect(String(responseRequest?.[1]?.body)).not.toContain("secret-value");
+    expect(JSON.parse(String(responseRequest?.[1]?.body))).toMatchObject({
+      credential_ref: "credential://tenant-a/n8n-salesforce",
+      approved_scope: "n8n.crm.read",
+    });
+  });
+
+  it("rejects unsafe or malformed factory action payloads", () => {
+    expect(() => parseFactoryAction({ ...factoryActionPayload, message: "token=private-value" })).toThrow();
+    expect(() => parseFactoryAction({ ...factoryActionPayload, status: "not-a-status" })).toThrow();
+    expect(() => parseFactoryAction({ ...factoryActionPayload, safe_checkpoint_sha256: "b".repeat(64) })).toThrow();
+  });
+
   it("uses the bearer header without reflecting the credential in errors", async () => {
     const fetcher = vi.fn(async () => response({ detail: accessToken }, 401));
     const api = createPortalApi(fetcher);

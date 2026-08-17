@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { createPortalApi, PortalPublicError, type PortalApi } from "./api";
 import { IntegrationCard } from "./components/IntegrationCard";
+import { FactoryActionInbox } from "./components/FactoryActionInbox";
 import { SetupStatus } from "./components/SetupStatus";
 import { portalSupabase } from "./supabase";
-import type { PortalSetupSurface } from "./types";
+import type { FactoryActionRequest, FactoryActionStatus, PortalSetupSurface } from "./types";
 
 const genericMessage = "The integration request could not be completed.";
 
@@ -79,6 +80,8 @@ function PortalDashboard({ api }: { api: PortalApi }) {
   const [jobId, setJobId] = useState<string | null>(null);
   const [surface, setSurface] = useState<PortalSetupSurface | null>(null);
   const [busyAlias, setBusyAlias] = useState<string | null>(null);
+  const [factoryActions, setFactoryActions] = useState<FactoryActionRequest[]>([]);
+  const [actionsLoading, setActionsLoading] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -114,6 +117,24 @@ function PortalDashboard({ api }: { api: PortalApi }) {
       setBusyAlias(null);
     }
   }
+
+  const loadFactoryActions = useCallback(async () => {
+    setActionsLoading(true);
+    try {
+      const accessToken = await currentAccessToken();
+      const statuses: FactoryActionStatus[] = ["pending", "answered", "expired", "consumed"];
+      const pages = await Promise.all(statuses.map((status) => api.getFactoryActions(accessToken, status)));
+      setFactoryActions(pages.flat());
+    } catch (caught) {
+      setError(publicMessage(caught));
+    } finally {
+      setActionsLoading(false);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void loadFactoryActions();
+  }, [loadFactoryActions]);
 
   return (
     <main className="portal-shell">
@@ -189,6 +210,18 @@ function PortalDashboard({ api }: { api: PortalApi }) {
             />
           ))}
         </section>
+      )}
+
+      {actionsLoading ? (
+        <p role="status" className="busy-message">Loading factory actions…</p>
+      ) : (
+        <FactoryActionInbox
+          api={api}
+          actions={factoryActions}
+          getAccessToken={currentAccessToken}
+          onRefresh={loadFactoryActions}
+          onError={setError}
+        />
       )}
     </main>
   );
