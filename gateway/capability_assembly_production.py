@@ -1063,6 +1063,7 @@ class ProductionCapabilityAssemblyComposition:
                  private_catalog: VerifiedFilePrivateBenchmarkCatalog | None = None,
                  private_catalog_configuration_digest: str | None = None,
                  private_cases: GenericPrivateBenchmarkRepository | None = None,
+                 factory: AgentFactoryLiveComposition | None = None,
                  benchmark_tool_authority: BenchmarkToolEvidenceAuthorityPort | None = None) -> None:
         if (_seal is not _PRODUCTION_COMPOSITION_SEAL
                 or type(controller) is not CapabilityAssemblyController
@@ -1076,6 +1077,7 @@ class ProductionCapabilityAssemblyComposition:
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__private_catalog", private_catalog)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__private_catalog_configuration_digest", private_catalog_configuration_digest)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__private_cases", private_cases)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__factory", factory)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__benchmark_tool_authority", benchmark_tool_authority)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__seal", _seal)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__sealed", True)
@@ -1110,6 +1112,19 @@ class ProductionCapabilityAssemblyComposition:
         if self.__private_cases is None or self.__benchmark_tool_authority is None:
             raise AttributeError("production benchmark execution authority is absent")
         return self.__private_cases, self.__benchmark_tool_authority
+
+    @property
+    def benchmark_tool_registry(self) -> object:
+        registry = getattr(self.__executor_client, "tool_registry", None)
+        if registry is None:
+            raise AttributeError("production generic tool registry is absent")
+        return registry
+
+    @property
+    def benchmark_host_factory(self) -> AgentFactoryLiveComposition:
+        if self.__factory is None:
+            raise AttributeError("production benchmark host Factory is absent")
+        return self.__factory
 
     def is_sealed(self) -> bool:
         try:
@@ -1375,6 +1390,7 @@ def build_capability_assembly_controller(
         private_catalog=private_catalog,
         private_catalog_configuration_digest=private_catalog_configuration_digest,
         private_cases=private_cases_sink[0],
+        factory=authorities.factory,
         benchmark_tool_authority=authorities.benchmark_tool_authority,
         _seal=_PRODUCTION_COMPOSITION_SEAL,
     )

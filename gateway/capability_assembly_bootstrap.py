@@ -98,6 +98,7 @@ from gateway.capability_benchmark_process_executor import (
     GatewayHttpBenchmarkProcessTransport,
     GatewayIsolatedBenchmarkExecutorClient,
 )
+from gateway.capability_benchmark_tools import load_verified_generic_tool_registry
 from gateway.capability_generic_benchmark import (
     BenchmarkToolEvidenceVerificationRequest,
     ContentAddressedBenchmarkEvidenceResolver,
@@ -158,6 +159,12 @@ class CapabilityAssemblyBootstrapSettings:
     provider_proxy_code_sha256: str
     provider_paid_command_sha256: str
     provider_hard_ceiling_enforced: bool
+    incident_tool_gateway_token: SecretStr = SecretStr("")
+    claims_tool_gateway_token: SecretStr = SecretStr("")
+    generic_tool_registry_path: str = "config/generic_tool_registry.json"
+    generic_tool_registry_sha256: str = (
+        "9a911de3261a96591e8eea2fabfb0aa2956c10b7b80d818982959fd7c3448ba8"
+    )
     allowed_hosts: tuple[str, ...] = ()
 
 
@@ -233,6 +240,17 @@ def load_capability_assembly_bootstrap_settings(
     if raw["CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED"] != "true":
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly provider authority is invalid"
+        )
+    registry_path = environment.get(
+        "CAPTAIN_GENERIC_TOOL_REGISTRY", "config/generic_tool_registry.json"
+    ).strip()
+    registry_sha256 = environment.get(
+        "CAPTAIN_GENERIC_TOOL_REGISTRY_SHA256",
+        "9a911de3261a96591e8eea2fabfb0aa2956c10b7b80d818982959fd7c3448ba8",
+    ).strip()
+    if not registry_path or _SHA256.fullmatch(registry_sha256) is None:
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "generic tool registry authority is invalid"
         )
     try:
         benchmark_authority_id = UUID(raw["CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID"])
@@ -312,6 +330,14 @@ def load_capability_assembly_bootstrap_settings(
         provider_proxy_code_sha256=raw["CAPTAIN_PROVIDER_PROXY_CODE_SHA256"],
         provider_paid_command_sha256=raw["CAPTAIN_PROVIDER_PAID_COMMAND_SHA256"],
         provider_hard_ceiling_enforced=True,
+        incident_tool_gateway_token=SecretStr(
+            environment.get("CAPTAIN_INCIDENT_TOOL_GATEWAY_TOKEN", "").strip()
+        ),
+        claims_tool_gateway_token=SecretStr(
+            environment.get("CAPTAIN_CLAIMS_TOOL_GATEWAY_TOKEN", "").strip()
+        ),
+        generic_tool_registry_path=registry_path,
+        generic_tool_registry_sha256=registry_sha256,
         allowed_hosts=allowed_hosts,
     )
 
@@ -2230,6 +2256,19 @@ def materialize_production_capability_assembly(
     source_artifacts = plan.source_artifacts
     selected_clock = plan.clock
     artifacts = source_artifacts._artifacts
+    generic_tool_registry = load_verified_generic_tool_registry(
+        repository_root=plan.repository_root,
+        relative_path=settings.generic_tool_registry_path,
+        expected_sha256=settings.generic_tool_registry_sha256,
+        environment={
+            "CAPTAIN_INCIDENT_TOOL_GATEWAY_TOKEN": (
+                settings.incident_tool_gateway_token.get_secret_value()
+            ),
+            "CAPTAIN_CLAIMS_TOOL_GATEWAY_TOKEN": (
+                settings.claims_tool_gateway_token.get_secret_value()
+            ),
+        },
+    )
     benchmark_executor = GatewayIsolatedBenchmarkExecutorClient(
         gateway_store=store,
         authority_id=settings.benchmark_authority_id,
@@ -2238,6 +2277,7 @@ def materialize_production_capability_assembly(
         transport=GatewayHttpBenchmarkProcessTransport(
             bearer_token=settings.benchmark_token
         ),
+        tool_registry=generic_tool_registry,
     )
     benchmark_evidence = ContentAddressedBenchmarkEvidenceResolver(
         gateway_store=store, artifacts=artifacts

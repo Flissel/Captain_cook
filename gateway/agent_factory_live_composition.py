@@ -143,6 +143,8 @@ class FactoryLiveTeamExecutionPortsProvider(Protocol):
 
     def __call__(self, job: AgentFactoryJobV3) -> FactoryLiveTeamExecutionPorts: ...
 
+    def candidate_for(self, job: AgentFactoryJobV3) -> ResolvedFactoryCandidate: ...
+
 
 def select_technical_business_holdout(job: AgentFactoryJobV3) -> PrivateHoldoutRef:
     """Select the canonical redacted execution case, never the private suite."""
@@ -260,7 +262,7 @@ class GatewayTechnicalTeamExecutionPortsProvider:
         )
 
     def __call__(self, job: AgentFactoryJobV3) -> FactoryLiveTeamExecutionPorts:
-        candidate = self._candidate_bindings.candidate_for(job)
+        candidate = self.candidate_for(job)
         if not isinstance(candidate, ResolvedFactoryCandidate):
             raise ValueError("technical team candidate is not resolved")
         holdouts = CaptainTechnicalBusinessHoldoutEvaluator(
@@ -286,6 +288,12 @@ class GatewayTechnicalTeamExecutionPortsProvider:
             clock=self._clock,
             allowed_tools_for=holdouts.allowed_tools_for,
         )
+
+    def candidate_for(self, job: AgentFactoryJobV3) -> ResolvedFactoryCandidate:
+        candidate = self._candidate_bindings.candidate_for(job)
+        if not isinstance(candidate, ResolvedFactoryCandidate):
+            raise ValueError("technical team candidate is not resolved")
+        return candidate
 
 
 class CaptainImprovementAuthorityRequired(FactoryDispatchError):
@@ -434,6 +442,26 @@ class ProductionFactoryTeamExecutionPort(FactoryTeamExecutionPort):
                 )
             ]
         )
+
+    def benchmark_authorities(
+        self, job: AgentFactoryJobV3,
+    ) -> tuple[
+        ResolvedFactoryCandidate,
+        FactoryLiveTeamExecutionPorts,
+        FilesystemFactoryEvidenceStore,
+    ]:
+        """Expose the concrete released host graph without creating a new authority."""
+
+        ports = self._ports_for(job)
+        resolver = getattr(self._ports_for, "candidate_for", None)
+        if not isinstance(ports, FactoryLiveTeamExecutionPorts) or not callable(resolver):
+            raise FactoryDispatchError(
+                "benchmark host execution authoritative ports are unavailable"
+            )
+        candidate = resolver(job)
+        if not isinstance(candidate, ResolvedFactoryCandidate):
+            raise FactoryDispatchError("benchmark host candidate is unavailable")
+        return candidate, ports, self._evidence_store
 
     def _adapter(
         self,

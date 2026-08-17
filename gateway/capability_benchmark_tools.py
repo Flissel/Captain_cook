@@ -11,6 +11,8 @@ from pathlib import Path
 from types import ModuleType
 from urllib.parse import urlsplit
 
+import httpx
+
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agenten.agent_runtime.production_bootstrap import (
@@ -40,6 +42,9 @@ class GenericToolAdapterDescriptor(BaseModel):
         default=None, pattern=r"^CAPTAIN_[A-Z0-9_]{2,120}$"
     )
     endpoint: str | None = None
+    endpoint_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     implementation_path: str | None = None
     implementation_sha256: str | None = Field(
         default=None, pattern=r"^[0-9a-f]{64}$"
@@ -52,6 +57,7 @@ class GenericToolAdapterDescriptor(BaseModel):
                 self.allowed_operation != "read"
                 or self.credential_env_name is not None
                 or self.endpoint is not None
+                or self.endpoint_sha256 is not None
                 or self.implementation_path is None
                 or self.implementation_sha256 is None
             ):
@@ -60,6 +66,7 @@ class GenericToolAdapterDescriptor(BaseModel):
             if (
                 self.credential_env_name is None
                 or self.endpoint is None
+                or self.endpoint_sha256 is None
                 or self.implementation_path is not None
                 or self.implementation_sha256 is not None
             ):
@@ -75,6 +82,8 @@ class GenericToolAdapterDescriptor(BaseModel):
                 or not parsed.path.startswith("/v1/")
             ):
                 raise ValueError("remote tool endpoint must be an exact loopback v1 route")
+            if hashlib.sha256(self.endpoint.encode()).hexdigest() != self.endpoint_sha256:
+                raise ValueError("remote tool endpoint digest does not match")
         return self
 
 
@@ -141,9 +150,7 @@ class VerifiedGenericToolRegistry:
                 "generic tool operation is not authorized"
             )
         if entry.adapter_kind != "local_readonly":
-            raise GenericToolRegistryConfigurationError(
-                "remote generic tool execution requires the authenticated broker"
-            )
+            return self._execute_remote(entry, arguments)
         function = getattr(self._modules[tool_key], "execute_generic_tool", None)
         if not callable(function):
             raise GenericToolRegistryConfigurationError(
@@ -164,6 +171,66 @@ class VerifiedGenericToolRegistry:
         if not isinstance(result, dict) or result.get("schema") != expected_schema:
             raise GenericToolRegistryConfigurationError(
                 "generic tool adapter returned the wrong schema"
+            )
+        return dict(result)
+
+    def _execute_remote(
+        self, entry: GenericToolAdapterDescriptor,
+        arguments: Mapping[str, object],
+    ) -> dict[str, object]:
+        assert entry.endpoint is not None
+        assert entry.endpoint_sha256 is not None
+        token = self._credentials.get(entry.tool_key, "")
+        if len(token) < 16:
+            raise GenericToolRegistryConfigurationError(
+                "generic tool credential is unavailable"
+            )
+        request = {
+            "schema": "captain.generic-tool-execution.v1",
+            "tool_key": entry.tool_key,
+            "operation": entry.allowed_operation,
+            "endpoint_sha256": entry.endpoint_sha256,
+            "registry_sha256": self.digest,
+            "arguments": dict(arguments),
+        }
+        try:
+            with httpx.Client(
+                timeout=httpx.Timeout(10.0), follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                response = client.post(
+                    entry.endpoint,
+                    headers={
+                        "Authorization": "Bearer " + token,
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                    content=json.dumps(
+                        request, sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode(),
+                )
+            if response.status_code != 200 or len(response.content) > 1024 * 1024:
+                raise ValueError("status")
+            result = response.json()
+        except Exception:
+            raise GenericToolRegistryConfigurationError(
+                "remote generic tool execution failed"
+            ) from None
+        expected_schema = f"{entry.schema_name}.v{entry.schema_version}"
+        if (
+            not isinstance(result, dict)
+            or set(result) != {
+                "schema", "tool_key", "operation", "endpoint_sha256", "result"
+            }
+            or result.get("schema") != expected_schema
+            or result.get("tool_key") != entry.tool_key
+            or result.get("operation") != entry.allowed_operation
+            or result.get("endpoint_sha256") != entry.endpoint_sha256
+            or not isinstance(result.get("result"), dict)
+        ):
+            raise GenericToolRegistryConfigurationError(
+                "remote generic tool returned the wrong typed readback"
             )
         return dict(result)
 

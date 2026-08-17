@@ -5,9 +5,13 @@ import json
 from pathlib import Path
 
 import pytest
+import httpx
 
 from gateway.capability_benchmark_tools import (
+    GenericToolAdapterDescriptor,
+    GenericToolRegistryManifest,
     GenericToolRegistryConfigurationError,
+    VerifiedGenericToolRegistry,
     load_verified_generic_tool_registry,
 )
 
@@ -39,6 +43,7 @@ def _tracked_registry(tmp_path: Path) -> tuple[Path, str]:
             "allowed_operation": "read",
             "credential_env_name": None,
             "endpoint": None,
+            "endpoint_sha256": None,
             "implementation_path": "readonly_adapter.py",
             "implementation_sha256": adapter_sha,
         }],
@@ -46,6 +51,61 @@ def _tracked_registry(tmp_path: Path) -> tuple[Path, str]:
     subprocess.run(("git", "add", "."), cwd=root, check=True)
     subprocess.run(("git", "commit", "-q", "-m", "test: registry"), cwd=root, check=True)
     return root, hashlib.sha256(registry.read_bytes()).hexdigest()
+
+
+def test_shipped_registry_covers_every_declared_tool_for_three_demo_inputs() -> None:
+    root = Path(__file__).resolve().parents[2]
+    manifest = json.loads((root / "demo_inputs/agent_factory/manifest.json").read_text())
+    registry = GenericToolRegistryManifest.model_validate_json(
+        (root / "config/generic_tool_registry.json").read_bytes()
+    )
+    available = {item.tool_key for item in registry.entries}
+    for item in manifest["inputs"][:3]:
+        assert set(item["required_tools"] + item["optional_tools"]) <= available
+
+
+def test_remote_registry_executes_exact_authenticated_typed_readback(monkeypatch) -> None:
+    endpoint = "http://127.0.0.1:8110/v1/alerts/context"
+    endpoint_sha256 = hashlib.sha256(endpoint.encode()).hexdigest()
+    entry = GenericToolAdapterDescriptor(
+        tool_key="alert_context_reader", adapter_kind="http_readonly",
+        schema_name="captain.incident-alert-context", schema_version=1,
+        allowed_operation="read",
+        credential_env_name="CAPTAIN_INCIDENT_TOOL_GATEWAY_TOKEN",
+        endpoint=endpoint, endpoint_sha256=endpoint_sha256,
+        implementation_path=None, implementation_sha256=None,
+    )
+    observed: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(request)
+        return httpx.Response(200, json={
+            "schema": "captain.incident-alert-context.v1",
+            "tool_key": "alert_context_reader", "operation": "read",
+            "endpoint_sha256": endpoint_sha256,
+            "result": {"alert_refs": ["alert://redacted/1"]},
+        })
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        "gateway.capability_benchmark_tools.httpx.Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    registry = VerifiedGenericToolRegistry(
+        digest="a" * 64,
+        manifest=GenericToolRegistryManifest(
+            schema="captain.generic-tool-registry.v1", entries=(entry,),
+        ), modules={},
+        credentials={"alert_context_reader": "incident-tool-token-123"},
+    )
+    value = registry.execute(
+        tool_key="alert_context_reader", operation="read",
+        arguments={"alert_ref": "alert://redacted/1"},
+    )
+    assert value["result"] == {"alert_refs": ["alert://redacted/1"]}
+    assert len(observed) == 1
+    assert observed[0].headers["Authorization"] == "Bearer incident-tool-token-123"
+    assert observed[0].url == endpoint
 
 
 def test_registry_loads_head_attested_adapter_and_executes_exact_schema(tmp_path: Path) -> None:
@@ -82,6 +142,10 @@ def test_registry_fails_closed_before_adapter_effect(tmp_path: Path, fault: str)
                 "https://attacker.invalid/v1/read" if fault == "endpoint"
                 else "http://127.0.0.1:8099/v1/read"
             ),
+            "endpoint_sha256": hashlib.sha256((
+                "https://attacker.invalid/v1/read" if fault == "endpoint"
+                else "http://127.0.0.1:8099/v1/read"
+            ).encode()).hexdigest(),
             "implementation_path": None,
             "implementation_sha256": None,
         })

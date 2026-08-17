@@ -371,11 +371,15 @@ def test_gateway_tool_registry_persists_case_bound_entry() -> None:
             if kwargs["block_type"] == "agent_runtime_command":
                 return {"data": {
                     "event_id": str(command_id), "correlation_id": str(correlation_id),
-                    "payload": {"batch_id": "n8n-benchmark-batch", "operation": "codex.run"},
+                        "payload": {
+                            "batch_id": "n8n-benchmark-batch",
+                            "operation": "autogen.benchmark",
+                        },
                 }}
             return {"data": {
                 "event_id": str(execution_result_id), "command_id": str(command_id),
-                "correlation_id": str(correlation_id), "operation": "codex.run",
+                    "correlation_id": str(correlation_id),
+                    "operation": "autogen.benchmark",
                 "status": "succeeded",
                 "artifact_refs": [{"sha256": refs[0].sha256}], "evidence_refs": [],
             }}
@@ -386,7 +390,7 @@ def test_gateway_tool_registry_persists_case_bound_entry() -> None:
         job_id=job_id,
         case_digest="d" * 64,
         tool_key="crm.lookup",
-        operation="codex.run",
+            operation="read",
         trace_id=trace_id,
         run_id=run_id,
         model_policy_digest="e" * 64,

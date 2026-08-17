@@ -828,6 +828,16 @@ class GenericCapabilityBenchmarkAdapter:
                                     model_id: str,
                                     policy_digest: str) -> GenericBenchmarkPair:
         execution_plan = self._execution_plan(request, job, model_id, policy_digest)
+        registry = getattr(self._executor, "tool_registry", None)
+        if registry is not None:
+            try:
+                registry.require_declared(tuple(
+                    item.tool_key for item in request.input.document.declared_tools
+                ))
+            except Exception:
+                raise CapabilityLiveAuthorityUnavailable(
+                    "declared generic tool adapter is unavailable"
+                ) from None
         common = dict(job_id=job.job_id, capability_id=job.required_capability,
                       input_ref=request.input.source_ref, case_ref=case,
                       model_id=model_id, model_policy_digest=policy_digest,
@@ -878,6 +888,9 @@ class GenericCapabilityBenchmarkAdapter:
                 "released benchmark candidate authority is invalid"
             )
         try:
+            execution_policy_sha256 = hashlib.sha256(_canonical(
+                job.execution_policy.model_dump(mode="json", by_alias=True)
+            ).encode()).hexdigest()
             with FactoryCandidateEvaluator().verified_team_workspace(candidate) as (_, manifest):
                 names = tuple(agent.name for agent in manifest.agents)
                 if len(names) < 2:
@@ -888,9 +901,14 @@ class GenericCapabilityBenchmarkAdapter:
                     "candidate_ref": candidate.candidate.source_archive_ref.model_dump(mode="json"),
                     "source_agent": names[0],
                     "agent_name": baseline_name,
+                    "system_prompt_ref": manifest.agents[0].system_prompt_ref.model_dump(mode="json"),
                     "model_id": model_id,
                     "model_policy_digest": policy_digest,
+                    "execution_policy_sha256": execution_policy_sha256,
+                    "allowed_tools": list(request.input.document.declared_tools),
                     "conversation_pattern": "single_agent",
+                    "max_messages": manifest.max_messages,
+                    "max_tool_calls": manifest.max_tool_calls,
                     "max_handoffs": 0,
                 }).encode())
                 model_ref = self._evidence.record_evaluation(_canonical({
@@ -900,6 +918,7 @@ class GenericCapabilityBenchmarkAdapter:
                 policy_ref = self._evidence.record_evaluation(_canonical({
                     "schema": "captain.generic-benchmark-execution-policy.v1",
                     "model_policy_digest": policy_digest,
+                    "execution_policy_sha256": execution_policy_sha256,
                 }).encode())
         except Exception:
             raise CapabilityLiveAuthorityUnavailable(

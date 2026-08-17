@@ -113,11 +113,13 @@ class GatewayIsolatedBenchmarkExecutorClient:
     __slots__ = (
         "gateway_store", "authority_id", "_endpoint", "_transport", "_sealed",
         "_allowed_hosts", "_configuration_digest",
+        "tool_registry",
     )
 
     def __init__(self, *, gateway_store: object, authority_id: UUID,
                  endpoint: str, transport: CapabilityBenchmarkProcessTransport,
-                 allowed_hosts: tuple[str, ...] = ()) -> None:
+                 allowed_hosts: tuple[str, ...] = (),
+                 tool_registry: object | None = None) -> None:
         parsed = urlsplit(endpoint)
         if (parsed.scheme not in {"http", "https"} or not parsed.netloc
                 or parsed.username is not None or parsed.password is not None
@@ -139,6 +141,7 @@ class GatewayIsolatedBenchmarkExecutorClient:
         object.__setattr__(self, "_endpoint", endpoint)
         object.__setattr__(self, "_transport", transport)
         object.__setattr__(self, "_allowed_hosts", normalized_allowed)
+        object.__setattr__(self, "tool_registry", tool_registry)
         object.__setattr__(self, "_configuration_digest", self._binding_digest())
         object.__setattr__(self, "_sealed", True)
 
@@ -169,6 +172,7 @@ class GatewayIsolatedBenchmarkExecutorClient:
             "authority_id": str(self.authority_id),
             "allowed_hosts": self._allowed_hosts,
             "transport_digest": transport_digest,
+            "tool_registry_digest": getattr(self.tool_registry, "digest", None),
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def __repr__(self) -> str:

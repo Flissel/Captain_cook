@@ -111,15 +111,26 @@ class _RuntimeEffect:
         self.tools = tools
         self.calls = 0
 
-    async def execute(self, command, *, execution_plan, team_kind, authorized_tools):
+    async def execute(
+        self, command, *, execution_plan, team_kind, authorized_tools,
+        tool_broker, execution_case,
+    ):
         self.calls += 1
         assert execution_plan == self.artifacts_plan
+        assert execution_case.setup == self.request.execution_case.setup
+        assert execution_case.action == self.request.execution_case.action
+        assert execution_case.declared_tool_keys == self.request.execution_case.declared_tool_keys
         self.authorized_tools = authorized_tools
-        refs = {
-            tool: self.artifacts.put(
-                ("runtime-result:" + tool).encode(), "application/json"
-            ) for tool in self.tools
-        }
+        authorized = {item.tool_key: item for item in authorized_tools}
+        refs = {}
+        for tool in self.tools:
+            lease = authorized.get(tool)
+            refs[tool] = tool_broker.execute(
+                tool_key=tool,
+                call_id=(lease.call_id if lease else "foreign-call"),
+                lease_id=(lease.lease_id if lease else "foreign-lease"),
+                operation="read", arguments={"tool_key": tool},
+            )
         result = AgentRuntimeResult(
             schema="captain.agent-runtime-result.v1", event_id=uuid4(),
             command_id=command.event_id,
@@ -144,11 +155,35 @@ class _RuntimeEffect:
         )
 
 
+class _ToolRegistry:
+    digest = "9" * 64
+
+    def __init__(self, tools) -> None:
+        self.tools = tuple(tools)
+        self.calls = []
+
+    def require_declared(self, tools):
+        if any(tool not in {"captain_tool", "second_tool"} for tool in tools):
+            raise RuntimeError("unknown tool")
+
+    def operation_for(self, tool):
+        self.require_declared((tool,))
+        return "read"
+
+    def execute(self, *, tool_key, operation, arguments):
+        assert operation == "read"
+        self.calls.append((tool_key, dict(arguments)))
+        return {
+            "schema": "captain.test-benchmark-tool-result.v1",
+            "tool_key": tool_key,
+        }
 def _service(tmp_path, request, tools):
     artifacts = ContentAddressedArtifactAdapter(tmp_path / "cas")
     store = _Store(request)
     effect = _RuntimeEffect(artifacts=artifacts, tools=tools)
+    effect.request = request
     effect.artifacts_plan = request.execution_plan
+    registry = _ToolRegistry(tools)
     issuer = CaptainBenchmarkToolEvidenceAuthority(
         gateway_store=store, artifacts=artifacts,
     )
@@ -156,7 +191,8 @@ def _service(tmp_path, request, tools):
         store=store, artifacts=artifacts,
         private_cases=_PrivateCases(request),
         executor_authority_id=uuid4(), runtime_effect=effect,
-        tool_issuer=issuer, clock=lambda: __import__("datetime").datetime.now(
+        tool_issuer=issuer, tool_registry=registry,
+        clock=lambda: __import__("datetime").datetime.now(
             __import__("datetime").timezone.utc
         ),
     ), store, effect

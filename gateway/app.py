@@ -158,6 +158,7 @@ from gateway.capability_benchmark_execution_service import (
     GatewayBenchmarkExecutionService,
     GatewayRuntimeBenchmarkEffect,
 )
+from gateway.capability_host_autogen_benchmark import FactoryHostAutoGenBenchmarkEffect
 from gateway.capability_benchmark_process_app import _parse_request as _parse_benchmark_request
 from gateway.capability_benchmark_process_app import _serialize_evidence as _serialize_benchmark_evidence
 from agenten.agent_factory.holdout_store import PrivateHoldoutStore
@@ -509,30 +510,19 @@ def create_app(
                 private_cases, tool_issuer = (
                     production_composition.benchmark_execution_authorities
                 )
-                configured = load_gateway_settings(app)
-                if (
-                    configured.captain_runtime_url is None
-                    or configured.captain_runtime_token is None
-                ):
-                    raise ValueError("benchmark Runtime authority is unavailable")
-                runtime_http_client = httpx.AsyncClient(
-                    verify=configured.tls_ca_bundle_path or True, timeout=300.0,
-                )
-                runtime_executor = AgentRuntimeHttpExecutor(
-                    base_url=configured.captain_runtime_url,
-                    token=configured.captain_runtime_token.get_secret_value(),
-                    client=runtime_http_client,
-                )
                 benchmark_execution_service = GatewayBenchmarkExecutionService(
                     store=store, artifacts=runtime_usage_artifacts,
                     private_cases=private_cases,
                     executor_authority_id=UUID(environment_value(
                         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID"
                     )),
-                    runtime_effect=GatewayRuntimeBenchmarkEffect(
-                        executor=runtime_executor, artifacts=runtime_usage_artifacts,
+                    runtime_effect=FactoryHostAutoGenBenchmarkEffect(
+                        factory=production_composition.benchmark_host_factory,
+                        artifacts=runtime_usage_artifacts, clock=portal_clock,
                     ),
-                    tool_issuer=tool_issuer, clock=portal_clock,
+                    tool_issuer=tool_issuer,
+                    tool_registry=production_composition.benchmark_tool_registry,
+                    clock=portal_clock,
                 )
         start = getattr(mirror, "start", None)
         if start:

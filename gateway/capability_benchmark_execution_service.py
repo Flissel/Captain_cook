@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from collections.abc import Mapping
 from typing import Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -47,12 +48,111 @@ class BenchmarkRuntimeEffectResult:
     agent_names: tuple[str, ...]
 
 
+class BenchmarkToolRegistryPort(Protocol):
+    digest: str
+
+    def require_declared(self, tool_keys: tuple[str, ...]) -> None: ...
+
+    def operation_for(self, tool_key: str) -> str: ...
+
+    def execute(
+        self, *, tool_key: str, operation: str,
+        arguments: Mapping[str, object],
+    ) -> dict[str, object]: ...
+
+
+class GatewayBenchmarkToolBrokerSession:
+    """Single-use broker for the exact pre-authorized calls in one execution."""
+
+    def __init__(
+        self, *, registry: BenchmarkToolRegistryPort,
+        artifacts: "BenchmarkEvidenceArtifactsPort",
+        authorizations: tuple[GenericAuthorizedToolCall, ...],
+    ) -> None:
+        registry.require_declared(tuple(item.tool_key for item in authorizations))
+        self.registry_digest = registry.digest
+        self._registry = registry
+        self._artifacts = artifacts
+        self._by_key = {item.tool_key: item for item in authorizations}
+        if len(self._by_key) != len(authorizations):
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool authorization is ambiguous"
+            )
+        self._results: dict[str, ArtifactRef] = {}
+
+    def execute(
+        self, *, tool_key: str, call_id: str, lease_id: str,
+        operation: str, arguments: Mapping[str, object],
+    ) -> ArtifactRef:
+        authorization = self._by_key.get(tool_key)
+        if (
+            authorization is None
+            or authorization.call_id != call_id
+            or authorization.lease_id != lease_id
+            or tool_key in self._results
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool lease is invalid or already consumed"
+            )
+        try:
+            result = self._registry.execute(
+                tool_key=tool_key, operation=operation, arguments=arguments,
+            )
+            payload = json.dumps(
+                result, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+            reference = self._artifacts.put(payload, "application/json")
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool effect failed"
+            ) from None
+        if (
+            reference.sha256 != hashlib.sha256(payload).hexdigest()
+            or callable(getattr(self._artifacts, "read_bytes", None))
+            and self._artifacts.read_bytes(reference) != payload
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool result readback failed"
+            )
+        self._results[tool_key] = reference
+        return reference
+
+    def execute_for_host(
+        self, *, tool_key: str, call_id: str, lease_id: str,
+        operation: str, arguments: Mapping[str, object],
+    ) -> dict[str, object]:
+        reference = self.execute(
+            tool_key=tool_key, call_id=call_id, lease_id=lease_id,
+            operation=operation, arguments=arguments,
+        )
+        try:
+            value = json.loads(self._artifacts.read_bytes(reference))  # type: ignore[attr-defined]
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool result readback failed"
+            ) from None
+        if not isinstance(value, dict):
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool result readback failed"
+            )
+        return value
+
+    def result_refs(self) -> dict[str, ArtifactRef]:
+        return dict(self._results)
+
+    def operation_for(self, tool_key: str) -> str:
+        return self._registry.operation_for(tool_key)
+
+
 class BenchmarkRuntimeEffectPort(Protocol):
     async def execute(
         self, command: AgentRuntimeCommand, *,
         execution_plan: object,
         team_kind: str,
         authorized_tools: tuple[GenericAuthorizedToolCall, ...],
+        tool_broker: GatewayBenchmarkToolBrokerSession,
+        execution_case: GenericExecutionCaseView | None = None,
     ) -> BenchmarkRuntimeEffectResult: ...
 
 
@@ -72,11 +172,14 @@ class GatewayRuntimeBenchmarkEffect:
         execution_plan: object,
         team_kind: str,
         authorized_tools: tuple[GenericAuthorizedToolCall, ...],
+        tool_broker: GatewayBenchmarkToolBrokerSession,
+        execution_case: GenericExecutionCaseView | None = None,
     ) -> BenchmarkRuntimeEffectResult:
         if not authorized_tools:
             raise CapabilityLiveAuthorityUnavailable(
                 "benchmark tool authorization is unavailable"
             )
+        del tool_broker, execution_case
         result = await self._executor.execute(command)
         if not isinstance(result, AgentRuntimeResult):
             raise CapabilityLiveAuthorityUnavailable(
@@ -177,6 +280,7 @@ class GatewayBenchmarkExecutionService:
                  private_cases: object, executor_authority_id: UUID,
                  runtime_effect: BenchmarkRuntimeEffectPort,
                  tool_issuer: BenchmarkToolIssuerPort,
+                 tool_registry: BenchmarkToolRegistryPort,
                  clock=lambda: datetime.now(timezone.utc)) -> None:
         self._store = store
         self._artifacts = artifacts
@@ -184,6 +288,7 @@ class GatewayBenchmarkExecutionService:
         self._executor_authority_id = executor_authority_id
         self._runtime_effect = runtime_effect
         self._tool_issuer = tool_issuer
+        self._tool_registry = tool_registry
         self._clock = clock
 
     async def execute(
@@ -275,12 +380,12 @@ class GatewayBenchmarkExecutionService:
             subject_id=subtask_id,
             subject_version=job.subject_version,
             payload=AgentRuntimeCommandPayload(
-                operation=RuntimeOperation.CODEX_RUN,
+                operation=RuntimeOperation.AUTOGEN_BENCHMARK,
                 project_id=str(request.job_id), batch_id=batch_id,
                 subtask_id=subtask_id,
                 workspace_ref=f"workspace://capability-benchmark/{request.job_id}",
                 prompt_ref=prompt_ref, integration_intent=IntegrationIntent.NONE,
-                capability_profile=CapabilityProfile.FACTORY_TOOL_INTEGRATOR,
+                capability_profile=CapabilityProfile.FACTORY_REAL_CASE_TESTER,
                 limits=RuntimeLimits(wall_seconds=300, max_iterations=1),
             ),
         )
@@ -295,7 +400,8 @@ class GatewayBenchmarkExecutionService:
         authorized_tools = tuple(
             self._tool_issuer.authorize(
                 job_id=request.job_id, case_ref=canonical_case_ref,
-                tool_key=tool_key, operation=RuntimeOperation.CODEX_RUN.value,
+                tool_key=tool_key,
+                operation=self._tool_registry.operation_for(tool_key),
                 call_id=f"call-{command_id}-{tool_key}",
                 lease_id=f"lease-{command_id}-{tool_key}",
                 trace_id=trace_id, run_id=run_id,
@@ -310,11 +416,17 @@ class GatewayBenchmarkExecutionService:
             )
             for tool_key in tools
         )
+        broker = GatewayBenchmarkToolBrokerSession(
+            registry=self._tool_registry, artifacts=self._artifacts,
+            authorizations=authorized_tools,
+        )
         effect = await self._runtime_effect.execute(
             command,
             execution_plan=request.execution_plan,
             team_kind=request.team_kind,
             authorized_tools=authorized_tools,
+            tool_broker=broker,
+            execution_case=request.execution_case,
         )
         result = effect.result
         expected_execution_ref = (
@@ -330,13 +442,14 @@ class GatewayBenchmarkExecutionService:
         if (
             result.command_id != command_id
             or result.correlation_id != job.correlation_id
-            or result.operation is not RuntimeOperation.CODEX_RUN
+            or result.operation is not RuntimeOperation.AUTOGEN_BENCHMARK
             or result.status is not RuntimeStatus.SUCCEEDED
             or result.subject_version != job.subject_version
             or effect.candidate_ref != request.execution_plan.candidate_ref
             or effect.execution_ref != expected_execution_ref
             or effect.agent_names != expected_agents
             or set(effect.tool_result_refs) != set(tools)
+            or effect.tool_result_refs != broker.result_refs()
             or any(
                 reference not in (*result.artifact_refs, *result.evidence_refs)
                 for reference in effect.tool_result_refs.values()
@@ -376,7 +489,9 @@ class GatewayBenchmarkExecutionService:
             self._tool_issuer.complete(
                 authorization,
                 job_id=request.job_id, case_ref=canonical_case_ref,
-                operation=RuntimeOperation.CODEX_RUN.value,
+                operation=self._tool_registry.operation_for(
+                    authorization.tool_key
+                ),
                 trace_id=trace_id, run_id=run_id,
                 model_policy_digest=request.model_policy_digest,
                 result_ref_sha256=effect.tool_result_refs[authorization.tool_key].sha256,

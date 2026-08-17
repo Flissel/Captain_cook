@@ -6943,13 +6943,15 @@ class GatewayStore:
                 if (
                     result is None or result_data.get("status") != "succeeded"
                     or result_data.get("correlation_id") != correlation_id
-                    or result_data.get("operation") != operation
+                    or result_data.get("operation")
+                    != RuntimeOperation.AUTOGEN_BENCHMARK.value
                     or command is None
                     or command_data.get("correlation_id") != correlation_id
                     or str(command_data.get("event_id"))
                     != str(batch_binding["command_id"])
                     or command_payload.get("batch_id") != batch_id
-                    or command_payload.get("operation") != operation
+                    or command_payload.get("operation")
+                    != RuntimeOperation.AUTOGEN_BENCHMARK.value
                     or not any(ref.get("sha256") == result_ref_sha256 for ref in result_refs)
                 ):
                     raise HTTPException(status_code=409, detail="tool execution result is unavailable")
