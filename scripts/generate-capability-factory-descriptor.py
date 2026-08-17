@@ -18,6 +18,10 @@ def main() -> int:
     source = ADAPTER.read_bytes()
     tree = ast.parse(source, filename=ADAPTER.as_posix())
     payload = json.loads(DESCRIPTOR.read_text(encoding="utf-8"))
+    payload["model_client_type"] = (
+        "agenten.agent_factory.business_benchmark_production_ports."
+        "ProxyBoundResponsesModelClientBuilder"
+    )
     payload["adapter_sha256"] = hashlib.sha256(source).hexdigest()
     payload["adapter_ast_sha256"] = hashlib.sha256(
         ast.dump(tree, annotate_fields=True, include_attributes=False).encode("utf-8")

@@ -8,7 +8,7 @@ from decimal import Decimal
 from agenten.agent_factory.business_benchmark import BusinessBenchmarkEvaluator
 from agenten.agent_factory.business_benchmark_dispatch import BusinessBenchmarkDispatchService
 from agenten.agent_factory.business_benchmark_factory import BusinessBenchmarkFactoryComposition
-from agenten.agent_factory.business_benchmark_production_ports import BusinessBenchmarkContentAddressedArtifactStore, BusinessBenchmarkPricingAuthority, ConfiguredBusinessBenchmarkPricingSource, OpenAIBusinessBenchmarkModelClientBuilder
+from agenten.agent_factory.business_benchmark_production_ports import BusinessBenchmarkContentAddressedArtifactStore, BusinessBenchmarkPricingAuthority, ConfiguredBusinessBenchmarkPricingSource, ProxyBoundResponsesModelClientBuilder
 from agenten.agent_factory.business_benchmark_store import InMemoryBusinessBenchmarkRepository
 from agenten.agent_factory.candidate_evaluation import CandidateEvaluationFactory, GatewayForgeCandidateProvider
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
@@ -50,7 +50,18 @@ def build_capability_factory_runtime(configuration, authorities) -> AgentFactory
     candidate_provider = GatewayForgeCandidateProvider(repository=repository, artifacts=GatewayMinibookCreationArtifactStore(configuration.authority_root / "minibook-creation-cas"))
     maximum = configuration.execution_policy.max_cost_usd
     artifacts = BusinessBenchmarkContentAddressedArtifactStore(configuration.authority_root / "cas")
-    model_client = OpenAIBusinessBenchmarkModelClientBuilder(provider=configuration.provider, model=configuration.model, _api_key=authorities.provider_token.get_secret_value())
+    model_client = ProxyBoundResponsesModelClientBuilder(
+        provider=configuration.provider, model=configuration.model,
+        proxy_url=configuration.provider_proxy_url,
+        context_sha256=configuration.provider_context_sha256,
+        policy_sha256=configuration.provider_policy_sha256,
+        price_card_sha256=configuration.provider_price_card_sha256,
+        executable_sha256=configuration.provider_proxy_executable_sha256,
+        code_sha256=configuration.provider_proxy_code_sha256,
+        paid_command_sha256=configuration.provider_paid_command_sha256,
+        hard_ceiling_enforced=configuration.provider_hard_ceiling_enforced,
+        _client_token=authorities.provider_token.get_secret_value(),
+    )
     pricing = BusinessBenchmarkPricingAuthority(ConfiguredBusinessBenchmarkPricingSource(provider=configuration.provider, model=configuration.model, version="capability-production-v1", effective_at=datetime(2026, 1, 1, tzinfo=timezone.utc), max_cost_per_call=maximum, input_cost_per_million=Decimal("1.25"), output_cost_per_million=Decimal("10.00"), minimum_cost_usd=Decimal("0.000001"), artifacts=artifacts))
     ports = GatewayTechnicalTeamExecutionPortsProvider(candidate_bindings=candidate_provider, technical_holdout_root=configuration.authority_root / "technical-holdouts", model_client_for=model_client, budget=GatewayFactoryBudgetLedger(store), pricing_authority=pricing, replay_store=FilesystemFactorySkillReplayStore(configuration.repository_root / ".captain-cook/private/business-benchmarks/runtime-state/factory-team-replays"), released_skill_catalog=repository, skill_root=configuration.repository_root / "agenten/agent_factory/skills", provider=configuration.provider, model=configuration.model, max_cost_per_call=maximum, clock=clock)
     team_execution = ProductionFactoryTeamExecutionPort(evidence_store=evidence_store, ports_for=ports, holdout_selector=None)

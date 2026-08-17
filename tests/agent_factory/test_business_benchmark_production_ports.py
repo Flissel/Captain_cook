@@ -362,6 +362,37 @@ def test_openai_builder_can_defer_process_secret_until_paid_effect() -> None:
         builder(job, invocation(job))
 
 
+def test_proxy_builder_uses_exact_responses_authority_without_openai_key() -> None:
+    from agenten.agent_factory.business_benchmark_production_ports import (
+        ProxyBoundResponsesModelClientBuilder,
+    )
+
+    observed: dict[str, object] = {}
+    replay = replay_client(["unused"])
+
+    def build(**kwargs: object):
+        observed.update(kwargs)
+        return replay
+
+    builder = ProxyBoundResponsesModelClientBuilder(
+        provider="openai", model="approved-model-id",
+        proxy_url="http://127.0.0.1:18091",
+        context_sha256="c" * 64, policy_sha256="a" * 64,
+        price_card_sha256="b" * 64, executable_sha256="d" * 64,
+        code_sha256="e" * 64, paid_command_sha256="f" * 64,
+        hard_ceiling_enforced=True, _client_token="proxy-client-token",
+        _client_factory=build,
+    )
+
+    assert builder(live_job(), invocation(live_job())) is replay
+    assert observed["endpoint"] == "http://127.0.0.1:18091/v1/responses"
+    assert "api.openai.com" not in repr(observed)
+    assert observed["token"] == "proxy-client-token"
+    assert observed["context_reference"] == (
+        "gateway://provider-budget-contexts/" + "c" * 64
+    )
+
+
 def test_production_module_does_not_import_global_llm_environment_config() -> None:
     import agenten.agent_factory.business_benchmark_production_ports as ports
 

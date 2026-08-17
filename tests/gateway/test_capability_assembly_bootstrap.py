@@ -886,7 +886,7 @@ def _factory_runtime_descriptor(*, adapter_sha256: str) -> dict[str, object]:
         "repository_type": "gateway.factory_repository.GatewayFactoryRepository",
         "team_execution_type": "gateway.agent_factory_live_composition.ProductionFactoryTeamExecutionPort",
         "ports_provider_type": "gateway.agent_factory_live_composition.GatewayTechnicalTeamExecutionPortsProvider",
-        "model_client_type": "agenten.agent_factory.business_benchmark_production_ports.OpenAIBusinessBenchmarkModelClientBuilder",
+        "model_client_type": "agenten.agent_factory.business_benchmark_production_ports.ProxyBoundResponsesModelClientBuilder",
         "budget_type": "gateway.factory_repository.GatewayFactoryBudgetLedger",
         "pricing_authority_type": "agenten.agent_factory.business_benchmark_production_ports.BusinessBenchmarkPricingAuthority",
         "pricing_source_type": "agenten.agent_factory.business_benchmark_production_ports.ConfiguredBusinessBenchmarkPricingSource",

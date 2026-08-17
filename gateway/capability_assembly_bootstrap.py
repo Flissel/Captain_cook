@@ -1371,6 +1371,14 @@ class CapabilityAssemblyFactoryConfiguration:
     provider: str
     model: str
     execution_policy: FactoryExecutionPolicyV1
+    provider_proxy_url: str = ""
+    provider_policy_sha256: str = ""
+    provider_price_card_sha256: str = ""
+    provider_context_sha256: str = ""
+    provider_proxy_executable_sha256: str = ""
+    provider_proxy_code_sha256: str = ""
+    provider_paid_command_sha256: str = ""
+    provider_hard_ceiling_enforced: bool = False
 
 
 @dataclass(frozen=True, repr=False)
@@ -1426,7 +1434,7 @@ _FACTORY_RUNTIME_DESCRIPTOR_BINDINGS = {
     "repository_type": "gateway.factory_repository.GatewayFactoryRepository",
     "team_execution_type": "gateway.agent_factory_live_composition.ProductionFactoryTeamExecutionPort",
     "ports_provider_type": "gateway.agent_factory_live_composition.GatewayTechnicalTeamExecutionPortsProvider",
-    "model_client_type": "agenten.agent_factory.business_benchmark_production_ports.OpenAIBusinessBenchmarkModelClientBuilder",
+    "model_client_type": "agenten.agent_factory.business_benchmark_production_ports.ProxyBoundResponsesModelClientBuilder",
     "budget_type": "gateway.factory_repository.GatewayFactoryBudgetLedger",
     "pricing_authority_type": "agenten.agent_factory.business_benchmark_production_ports.BusinessBenchmarkPricingAuthority",
     "pricing_source_type": "agenten.agent_factory.business_benchmark_production_ports.ConfiguredBusinessBenchmarkPricingSource",
@@ -1616,6 +1624,16 @@ def plan_capability_assembly_factory_runtime_from_environment(
             provider=descriptor.provider,
             model=descriptor.model,
             execution_policy=policy,
+            provider_proxy_url=environment.get("CAPTAIN_PROVIDER_PROXY_URL", "").strip(),
+            provider_policy_sha256=environment.get("CAPTAIN_PROVIDER_POLICY_SHA256", "").strip(),
+            provider_price_card_sha256=environment.get("CAPTAIN_PROVIDER_PRICE_CARD_SHA256", "").strip(),
+            provider_context_sha256=environment.get("CAPTAIN_PROVIDER_CONTEXT_SHA256", "").strip(),
+            provider_proxy_executable_sha256=environment.get("CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256", "").strip(),
+            provider_proxy_code_sha256=environment.get("CAPTAIN_PROVIDER_PROXY_CODE_SHA256", "").strip(),
+            provider_paid_command_sha256=environment.get("CAPTAIN_PROVIDER_PAID_COMMAND_SHA256", "").strip(),
+            provider_hard_ceiling_enforced=(
+                environment.get("CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED") == "true"
+            ),
         ),
     )
 
