@@ -146,3 +146,53 @@ claim a live MariaDB or external credential-adapter run.
 - Focused Task 7: `python -m pytest --no-cov tests/gateway/test_factory_action_store.py tests/gateway/test_portal_api.py tests/agent_factory/test_action_resume.py -q`
   -> `117 passed, 7 skipped`.
 - `python -m compileall -q gateway` and `git diff --check` -> passed.
+
+## Unbound credential revocation hardening round 4
+
+### Delivered decision
+
+- Restart reconciliation never forwards an opaque credential reference until
+  the typed receipt has passed reservation-key, tenant, request, version,
+  purpose, tenant-reference, and digest validation. A conflicting typed
+  receipt is cleaned up only by the trusted reservation key with
+  `credential_ref=None`; if the adapter cannot perform authoritative key-only
+  revocation, the durable `revoke_pending` reservation remains for a later
+  reconciliation. A validated receipt may still supply its exact reference.
+- The same validated-reference fence protects request-time cleanup after a
+  receipt conflict, so an unbound reference is never accepted as revocation or
+  linked-credential authority.
+
+### RED to GREEN evidence
+
+- RED: `python -m pytest --no-cov tests/gateway/test_factory_action_store.py -q -k "unexpired_revoke_pending_restart or revoke_pending_restart_never_uses_conflicting"`
+  -> `1 failed, 1 passed, 85 deselected`; the conflicting tenant-B receipt
+  caused `revoke_credential` to receive
+  `credential://tenant-b/another-request`.
+- GREEN: same command after the validated-reference fence
+  -> `2 passed, 85 deselected`.
+- Normal validated-path regression records two restart revoke attempts with
+  the exact validated tenant-A reference, while the adversarial spy records
+  only `(reservation_key, None)` and the unavailable key-only adapter leaves
+  the reservation in `revoke_pending` without linking it.
+
+### Final verification
+
+- `python -m pytest --no-cov tests/gateway/test_factory_action_store.py -q`
+  -> `83 passed, 4 skipped`.
+- `python -m pytest --no-cov tests/gateway/test_factory_action_store.py tests/gateway/test_portal_api.py tests/agent_factory/test_action_resume.py -q`
+  -> `118 passed, 7 skipped, 1 warning`.
+- `python -m pytest --no-cov tests/gateway -q`
+  -> `485 passed, 132 skipped, 1 warning`.
+- `python -m pytest --no-cov tests/test_architecture_fitness.py tests/test_import_boundaries.py tests/test_workstream_docs.py -q`
+  -> `18 passed`.
+- `python -m compileall -q agenten blockchain chats config gateway`,
+  `git diff --check`, and the added-line credential-shaped literal scan
+  -> passed with `0` credential-shaped findings.
+
+### Non-claims
+
+`TEST_MARIADB_DSN` remained unset, so MariaDB-gated tests were skipped. The
+offline dependency set also emitted the pre-existing Requests compatibility
+warning and one Starlette TestClient deprecation warning. No live credential
+adapter, MariaDB, Minibook sink, scheduler, provider, or deployment run is
+claimed.

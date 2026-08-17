@@ -127,6 +127,7 @@ class FactoryCredentialCoordinator:
             credential_alias=credential_alias, now=reserved_at,
         )
         receipt: FactoryCredentialReceipt | None = None
+        validated_reference: str | None = None
         try:
             receipt = self._adapter.lookup_credential(reservation_key)
             if receipt is None:
@@ -152,6 +153,7 @@ class FactoryCredentialCoordinator:
                 request_id=request_id, expected_subject_version=expected_subject_version,
                 purpose=credential_alias,
             )
+            validated_reference = receipt.opaque_reference
             self._store.complete_credential_reservation(
                 request_id, tenant_id=tenant_id, reservation_key=reservation_key,
                 credential_ref=receipt.opaque_reference, now=self._clock(),
@@ -167,8 +169,8 @@ class FactoryCredentialCoordinator:
                     request_id, tenant_id=tenant_id
                 )
                 if (
-                    isinstance(receipt, FactoryCredentialReceipt)
-                    and linked_reference == receipt.opaque_reference
+                    validated_reference is not None
+                    and linked_reference == validated_reference
                 ):
                     return linked_reference
                 if isinstance(receipt, FactoryCredentialReceipt):
@@ -178,7 +180,7 @@ class FactoryCredentialCoordinator:
                     )
                     self._adapter.revoke_credential(
                         reservation_key=reservation_key,
-                        credential_ref=receipt.opaque_reference,
+                        credential_ref=validated_reference,
                     )
                     self._store.clear_credential_revocation(
                         request_id, tenant_id=tenant_id, reservation_key=reservation_key
@@ -257,6 +259,7 @@ class FactoryCredentialCoordinator:
                 # Validate the typed receipt for audit/binding purposes, but a
                 # previously committed revoke decision is terminal: it can only
                 # clean up, never complete or link a credential on restart.
+                validated_reference: str | None = None
                 try:
                     self._validate_receipt(
                         receipt,
@@ -266,19 +269,21 @@ class FactoryCredentialCoordinator:
                         expected_subject_version=version,
                         purpose=purpose,
                     )
+                    validated_reference = receipt.opaque_reference
                 except Exception:
                     pass
                 try:
                     self._revoke_pending(
                         request_id=request_id, tenant_id=tenant_id,
                         reservation_key=reservation_key,
-                        credential_ref=receipt.opaque_reference,
+                        credential_ref=validated_reference,
                     )
                 except Exception:
                     # Do not retry in the same startup pass: durable state
                     # records the failure for the next reconciliation.
                     continue
                 continue
+            validated_reference = None
             try:
                 self._validate_receipt(
                     receipt,
@@ -288,6 +293,7 @@ class FactoryCredentialCoordinator:
                     expected_subject_version=version,
                     purpose=purpose,
                 )
+                validated_reference = receipt.opaque_reference
                 self._store.complete_credential_reservation(
                     request_id,
                     tenant_id=tenant_id,
@@ -301,7 +307,7 @@ class FactoryCredentialCoordinator:
                         self._revoke_pending(
                             request_id=request_id, tenant_id=tenant_id,
                             reservation_key=reservation_key,
-                            credential_ref=receipt.opaque_reference,
+                            credential_ref=validated_reference,
                         )
                 except Exception:
                     # Leave the durable revoke-pending record for startup retry.
@@ -317,13 +323,21 @@ class FactoryCredentialCoordinator:
         expected_subject_version: int,
         purpose: str,
     ) -> None:
-        if not isinstance(receipt, FactoryCredentialReceipt) or (
+        if not isinstance(receipt, FactoryCredentialReceipt):
+            raise ValueError("credential receipt conflicts with reservation")
+        expected_reference_sha256 = hashlib.sha256(
+            receipt.opaque_reference.encode("utf-8")
+        ).hexdigest()
+        if (
             receipt.reservation_key != reservation_key
             or receipt.tenant_id != tenant_id
             or receipt.request_id != request_id
             or receipt.request_version != expected_subject_version
             or receipt.purpose != purpose
             or not receipt.opaque_reference.startswith(f"credential://{tenant_id}/")
+            or not secrets.compare_digest(
+                receipt.reference_sha256, expected_reference_sha256
+            )
         ):
             raise ValueError("credential receipt conflicts with reservation")
 

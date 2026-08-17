@@ -1255,6 +1255,7 @@ def test_unexpired_revoke_pending_restart_never_links_typed_receipt() -> None:
         request.request_id, tenant_id="tenant-a", reservation_key=key, now=NOW
     )
     reference = "credential://tenant-a/n8n-crm-read"
+    revoked: list[tuple[str, str | None]] = []
     receipt = FactoryCredentialReceipt(
         key, "tenant-a", request.request_id, request.expected_subject_version,
         "n8n-crm-read", reference, hashlib.sha256(reference.encode()).hexdigest(),
@@ -1270,7 +1271,8 @@ def test_unexpired_revoke_pending_restart_never_links_typed_receipt() -> None:
         def store_credential(self, **kwargs):
             raise AssertionError(f"recovery must not write: {kwargs!r}")
 
-        def revoke_credential(self, **kwargs):
+        def revoke_credential(self, *, reservation_key, credential_ref):
+            revoked.append((reservation_key, credential_ref))
             self.attempts += 1
             if self.attempts == 1:
                 raise RuntimeError("temporary revoke failure")
@@ -1290,9 +1292,67 @@ def test_unexpired_revoke_pending_restart_never_links_typed_receipt() -> None:
     ).recover()
     durable = repository.rows[str(request.request_id)]
     assert adapter.attempts == 2
+    assert revoked == [(key, reference), (key, reference)]
     assert durable.credential_ref is None
     assert durable.credential_reservation_key is None
     assert durable.credential_revoke_phase is None
+
+
+def test_revoke_pending_restart_never_uses_conflicting_receipt_reference() -> None:
+    repository = TransactionalMemoryActionRepository()
+    store = FactoryActionStore(repository=repository)
+    request = pending_request()
+    store.create(request, tenant_id="tenant-a")
+    key = store.reserve_credential(
+        request.request_id,
+        tenant_id="tenant-a",
+        expected_subject_version=request.expected_subject_version,
+        credential_alias="n8n-crm-read",
+        now=NOW,
+    )
+    store.mark_credential_revoke_pending(
+        request.request_id,
+        tenant_id="tenant-a",
+        reservation_key=key,
+        now=NOW,
+    )
+    foreign_reference = "credential://tenant-b/another-request"
+    conflicting_receipt = FactoryCredentialReceipt(
+        key,
+        "tenant-b",
+        UUID(int=999),
+        request.expected_subject_version,
+        "n8n-crm-read",
+        foreign_reference,
+        hashlib.sha256(foreign_reference.encode()).hexdigest(),
+    )
+    revoked: list[tuple[str, str | None]] = []
+
+    class KeyOnlyUnavailableAdapter:
+        def lookup_credential(self, reservation_key):
+            assert reservation_key == key
+            return conflicting_receipt
+
+        def store_credential(self, **kwargs):
+            raise AssertionError(f"recovery must not write: {kwargs!r}")
+
+        def revoke_credential(self, *, reservation_key, credential_ref):
+            revoked.append((reservation_key, credential_ref))
+            if credential_ref is None:
+                raise RuntimeError("authoritative key-only revoke unavailable")
+            raise AssertionError("unvalidated credential reference was used")
+
+    FactoryCredentialCoordinator(
+        store=store,
+        adapter=KeyOnlyUnavailableAdapter(),
+        clock=lambda: NOW,
+    ).recover()
+
+    durable = repository.rows[str(request.request_id)]
+    assert revoked == [(key, None)]
+    assert durable.credential_ref is None
+    assert durable.credential_reservation_key == key
+    assert durable.credential_revoke_phase == "revoke_pending"
 
 
 def test_blocked_credential_write_that_crosses_deadline_is_revoked_and_not_persisted() -> None:
