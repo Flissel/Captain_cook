@@ -186,3 +186,77 @@ Round-4 non-claims:
 - No live service, network request, provider, Docker engine/container, n8n deployment/volume, or database was contacted or mutated.
 - The Gateway/D10 benchmark input port deliberately returns `incomplete` until exact job-specific dispatch inputs exist; this is not a paid benchmark-ready claim.
 - The full repository gate was not repeated in Round 4; Round 3's Hermes/worktree-environment failures remain the repository-wide non-claim. The changed D1/D4-D12 neighborhood is green as recorded above.
+
+## Review Fix Round 5
+
+Commits:
+
+1. `0cac64f` — canonicalizes the shared receipt authority as
+   `CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN`, limits it to Gateway and Provider
+   Proxy, passes only the n8n allowlist to every Docker/Pwsh operation, and
+   rejects non-loopback or route-drifted health URLs before attaching a token or
+   issuing a request.
+2. `7eb4fc5` — generates and attests the complete repository-local transitive
+   Factory import closure (102 modules), including source, AST, HEAD blob,
+   revision, and configuration digests, before any persistent constructor. A
+   scoped verified-byte finder/loader supplies the attested closure rather than
+   trusting disk import bytes.
+3. `0d4ae79` — completes the proxy-bound Responses AutoGen client: fixed high
+   reasoning, text and function-call parsing, assistant/function-result input
+   serialization, tools, JSON text formats, usage, and cancellation, with no
+   retry or direct OpenAI endpoint.
+4. `05550bf` — supplies the real Minibook creation/projection configuration and
+   removes the incompatible profile-bound Business Benchmark dependency from
+   the generic capability runtime. The reviewed generic assembly benchmark port
+   remains the sole benchmark authority and the legacy dispatcher fails closed.
+5. `1558699` — rejects substituted preloaded closure objects even when they
+   claim the expected file path.
+6. `785b9e1` — makes `starting` an exclusive durable claim. A subsequent start
+   reconciles the exact process/container and authenticated health before doing
+   anything; missing or ambiguous identity never spawns again. Failed process
+   tree enumeration is ambiguous and cannot be reported as stopped.
+
+Round-5 RED to GREEN evidence:
+
+- Group A authentication/environment and URL gate: 36 passed. Gateway and
+  Provider Proxy share exactly one receipt-token name; all other service
+  environments exclude it. Health URL validation proves zero request for an
+  attacker host or path drift.
+- Group B closure gate: 63 passed after the initial transitive/import-cache
+  adversarial cases. The additional same-origin non-module substitution test
+  was RED then GREEN before `1558699`.
+- Group C Responses/D7 contract gate: 24 passed against the D7 proxy transport,
+  including dynamic command context, eight-field authority headers, function
+  calls, JSON output, usage, and cancellation.
+- Group D concrete Factory/readiness gate: 141 passed. Generic first-dispatch
+  reaches the reviewed assembly benchmark authority; the incompatible legacy
+  profile contract is not presented as generic-ready.
+- Group E lifecycle adversarial gate: two new tests failed first, then the
+  complete manifest selection passed 18 tests. n8n timeout and incomplete OS
+  identity retain `starting`; a second start counter remains zero; process-tree
+  enumeration failure retains ambiguity.
+
+Round-5 verification:
+
+- D1/D4-D12 capability, Factory, provider-proxy, and demo neighborhood: 2,339
+  passed, 130 skipped; the skips are environment/live authorities excluded by
+  `-m "not live"`. One previously documented Pydantic enum-serialization warning
+  remains.
+- Minibook offline gate: 131 passed, one live test deselected.
+- Architecture/import/workstream: 18 passed.
+- `compileall`, submission verifier, full `f4fd254..HEAD` diff check, and
+  diff-scoped credential-pattern scan passed; credential matches: 0.
+- MariaDB was not run because `TEST_MARIADB_DSN` was absent. No database was
+  contacted.
+
+Round-5 non-claims:
+
+- No live network service, paid provider, Docker engine/container, n8n
+  deployment/volume, or database was contacted or mutated.
+- These gates establish offline production composition, authority validation,
+  and injected/sentinel lifecycle behavior. They do not claim a live deployment
+  or paid benchmark execution.
+- The broad suite must keep Minibook tests in a separate pytest invocation
+  because both roots contain a Python package named `tests`; combining the roots
+  causes collection namespace collisions. Both corrected invocations are green
+  above.
