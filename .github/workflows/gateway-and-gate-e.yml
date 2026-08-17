@@ -65,6 +65,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # windows-latest does not set core.longpaths. Several offline tests create
+      # git worktrees several directories deep under a pytest tmp_path (e.g.
+      # tests/agent_factory/test_codex_build_execution.py), which crosses the
+      # 260-character Windows MAX_PATH once git creates files beneath that
+      # path. Without this, `git worktree add` fails with exit 128 ("Filename
+      # too long") purely as a runner artifact, not a real code issue.
+      - name: Enable Windows long paths for git
+        shell: pwsh
+        run: git config --global core.longpaths true
       - name: Install Captain and Minibook dependencies
         shell: pwsh
         run: >-
