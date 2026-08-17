@@ -1041,6 +1041,24 @@ def test_verified_closure_rejects_sys_modules_substitution(
         finder.require_preloaded_origins()
 
 
+def test_verified_closure_rejects_same_origin_non_module_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    import gateway.capability_assembly_bootstrap as bootstrap
+
+    expected = tmp_path / "expected.py"
+    expected.write_text("VALUE = 'verified'\n", encoding="utf-8")
+    fake = SimpleNamespace(__file__=str(expected), VALUE="attacker")
+    monkeypatch.setitem(sys.modules, "captain_test_closure", fake)
+    finder = bootstrap._VerifiedFactoryClosureFinder({
+        "captain_test_closure": (expected, expected.read_bytes())
+    })
+
+    with pytest.raises(ValueError, match="preloaded Factory closure module"):
+        finder.require_preloaded_origins()
+
+
 def test_factory_constructor_receives_only_allowlisted_config_and_redacts_any_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

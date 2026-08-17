@@ -1570,6 +1570,8 @@ class _VerifiedFactoryClosureFinder(importlib.abc.MetaPathFinder):
             existing = sys.modules.get(name)
             if existing is None:
                 continue
+            if not isinstance(existing, ModuleType) or existing.__name__ != name:
+                raise ValueError("preloaded Factory closure module is invalid")
             origin = getattr(existing, "__file__", None)
             try:
                 matches = Path(str(origin)).resolve(strict=True) == path.resolve(strict=True)
