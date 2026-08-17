@@ -336,3 +336,102 @@ The implementation commit changed exactly those six product/test files.
 - After the implementation commit, `git status --short --branch` showed only
   `## codex/private-demo-benchmarks-d10`. The final handoff records the same
   clean status after the separate report commit.
+
+## Review Fix Round 3 — privacy stems and canonical source authority
+
+### Base and implementation commit
+
+- Review-fix starting commit: `a8974fedfd816aadae2ca6b8c6c356969d9cd67e`.
+- Review-fix implementation commit: `9dd271dbbf786242425e68260ad55617b8edb198`
+  (`fix(factory): classify private predicate source authority`).
+- Branch: `codex/private-demo-benchmarks-d10`.
+- The report append is the only file in the separate documentation commit; its
+  hash is recorded in the final handoff because a commit cannot self-reference
+  its own hash.
+
+### RED evidence
+
+1. Token-level privacy-stem and public-control group: `30 failed, 12 passed,
+   60 deselected`. `Confidentiality`, `Privately`, `Secretive`, `Internally`,
+   and `Nonpublicly` reached parser behavior at every heading level 1–6.
+   Existing `Hidden` variants and unrelated public controls passed.
+2. Compiler coordinated source-plus-expected group and authority encoding:
+   `4 failed, 2 passed, 47 deselected`. Business, rationale, and handoff
+   substitutions reached holdout writes; canonical `authority_type` was absent.
+   Safety and tool substitutions were already fail-closed.
+3. Gateway coordinated source-plus-expected group: `3 failed, 2 passed,
+   58 deselected`. Digest-consistent business, rationale, and handoff mutations
+   registered even though their admitted assertion authority was from another
+   dimension. Safety and tool substitutions were already fail-closed.
+
+The coordinated cases retained exactly the original aggregate source set,
+rewrote expected text to match the substituted admitted assertion, rewrote the
+predicate binding assertion ID/digest, and recomputed the private holdout
+digest. This isolates missing dimension-to-source authority rather than digest,
+text, or aggregate-set validation.
+
+### Implemented scope
+
+- `agenten/agent_factory/input_document.py`: normalized heading tokens now use
+  bounded privacy-marker stem predicates and grammatical suffixes. The guard
+  catches the required derived forms, punctuation, case, and plurals before
+  parser effects without matching unrelated interior substrings. The exact two
+  public policy headings remain allowed only at level 2.
+- `agenten/agent_factory/input_contracts.py`: the canonical private source
+  authority contract maps predicate kinds to `business`, `rationale`, `safety`,
+  `tool`, or `handoff`, and classifies admitted assertions from their kind,
+  top-level source path, source key, and source-authority semantics.
+- `agenten/agent_factory/input_compiler.py`: every private predicate binding now
+  records its canonical `authority_type`; every exact source must satisfy that
+  type before the atomic `put_many` holdout effect.
+- `gateway/capability_generic_benchmark.py`: the Gateway requires the private
+  authority type, derives the expected type from the predicate dimension, and
+  independently reclassifies digest-verified admitted assertions during suite
+  construction and evaluator access. Registration remains all-or-nothing.
+- `tests/agent_factory/test_input_document.py`: levels 1–6 privacy-stem matrix,
+  parser-effect counters, exact allowlist coverage, and unrelated public
+  controls.
+- `tests/agent_factory/test_private_benchmark_catalog.py`: coordinated
+  source/expected substitutions across all five dimensions, zero-write checks,
+  and canonical authority-type encoding.
+- `tests/gateway/test_capability_assembly_production.py`: digest-consistent
+  coordinated mutations across all five dimensions and zero-registration
+  checks.
+
+The implementation commit changed exactly those seven product/test files.
+
+### GREEN and verification evidence
+
+- Heading/allowlist/public target: `44 passed, 58 deselected in 8.20s`.
+- Compiler authority target: `11 passed, 42 deselected in 8.78s`.
+- Gateway coordinated/exact-swap target: `15 passed, 48 deselected in 18.45s`.
+- Complete focused input/catalog/Gateway gate: `218 passed in 19.28s`.
+- Relevant Agent Factory/Gateway/runtime gate: `1660 passed in 70.67s`.
+- Architecture/import/workstream gate: `18 passed in 8.34s`.
+- `python -m compileall -q agenten blockchain chats config gateway`: exit 0.
+- `scripts/verify_submission.py`: `Submission evidence check passed.`, exit 0.
+- `git diff --check`: exit 0 before the implementation commit.
+- Added-line credential-assignment plus bearer/private-key/credential-URL scan:
+  zero hits.
+- No `.coverage` or `.coverage.*` data artifact remained before the report
+  commit.
+
+### Privacy, compatibility, and nonclaims
+
+- All 45 explicit scenarios, exact tool authority, atomic compiler writes,
+  private holdout digests, and D11-facing digest seams remain covered by the
+  focused and relevant broad gates.
+- The new authority type and assertion classification exist only in private
+  holdout/evaluation authority. Expected predicates, answers, assertion bodies,
+  and source bindings remain absent from execution case views, worker bytes,
+  public projections, logs, and public evidence.
+- No live service, database, provider, Docker, n8n, Minibook, browser, or
+  network operation was run.
+- The six-minute full non-live suite and the separately authorized MariaDB
+  integration were not run in this bounded round. Only the gates listed above
+  are claimed.
+- No deployment, push, merge, rebase, credential change, or unrelated change
+  was performed.
+- After the implementation commit, `git status --short --branch` showed only
+  `## codex/private-demo-benchmarks-d10`. The final handoff records the same
+  clean status after the separate report commit.
