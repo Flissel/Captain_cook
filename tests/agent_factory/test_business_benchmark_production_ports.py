@@ -457,6 +457,7 @@ async def test_proxy_responses_client_serializes_autogen_and_parses_nested_outpu
     (
         "model", "input", "reasoning", "tools", "tool_choice", "text",
         "response_format", "json_schema", "context", "headers",
+        "instructions", "previous_response_id", "include", "metadata", "store",
     ),
 )
 async def test_proxy_responses_extra_args_cannot_change_request_authority(
@@ -484,6 +485,37 @@ async def test_proxy_responses_extra_args_cannot_change_request_authority(
         )
 
     assert requests == []
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_proxy_responses_extra_args_have_one_bounded_safe_field() -> None:
+    from agenten.agent_factory.business_benchmark_production_ports import (
+        ProxyResponsesChatCompletionClient,
+    )
+
+    requests: list[httpx.Request] = []
+    http = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: requests.append(request) or httpx.Response(200, json={
+            "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": "ok"},
+            ]}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+    ))
+    client = ProxyResponsesChatCompletionClient(
+        endpoint="http://127.0.0.1:18091/v1/responses",
+        token="proxy-token", model="authorized-model",
+        context_reference="gateway://provider-budget-contexts/" + "c" * 64,
+        client=http,
+    )
+
+    await client.create(
+        [UserMessage(content="authorized-input", source="captain")],
+        extra_create_args={"max_output_tokens": 512},
+    )
+
+    assert json.loads(requests[0].content)["max_output_tokens"] == 512
     await client.close()
 
 
