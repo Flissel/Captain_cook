@@ -341,6 +341,30 @@ class CapabilityAssemblyController:
             )
         )
 
+    async def final_evidence_and_publish(
+        self, assembly_id: UUID
+    ) -> CapabilityLiveDemoEvidence:
+        """Persist exact final evidence in Minibook and verify immutable readback."""
+
+        evidence = self.final_evidence(assembly_id)
+        publisher = getattr(self._projection, "publish_assembly_evidence", None)
+        if publisher is None or not inspect.iscoroutinefunction(publisher):
+            raise CapabilityAssemblyIncomplete(
+                "Minibook assembly evidence authority is unavailable"
+            )
+        payload = evidence.model_dump(mode="json", by_alias=True)
+        try:
+            readback = await publisher(assembly_id, payload)
+        except Exception:
+            raise CapabilityAssemblyIncomplete(
+                "Minibook assembly evidence authority is unavailable"
+            ) from None
+        if readback != payload:
+            raise CapabilityAssemblyConflict(
+                "Minibook assembly evidence changed Gateway final evidence"
+            )
+        return evidence
+
     async def _execute_next_slice(
         self,
         current: CapabilityAssemblyCheckpoint,

@@ -311,6 +311,29 @@ class AsyncMinibookProjectorAdapter:
             )
         return result
 
+    async def publish_assembly_evidence(
+        self, assembly_id: UUID, evidence: dict[str, object]
+    ) -> dict[str, object]:
+        try:
+            published = await asyncio.to_thread(
+                self._projector.publish_assembly_evidence,
+                str(assembly_id),
+                evidence,
+            )
+            readback = await asyncio.to_thread(
+                self._projector.assembly_evidence,
+                str(assembly_id),
+            )
+        except Exception:
+            raise CapabilityAssemblyProductionConfigurationError(
+                "Minibook assembly evidence authority is unavailable"
+            ) from None
+        if published != evidence or readback != evidence:
+            raise CapabilityAssemblyProductionConfigurationError(
+                "Minibook assembly evidence readback changed bytes"
+            )
+        return readback
+
 
 class GatewayMinibookProjectionEffectsAdapter:
     """Require feed -> project -> acknowledge -> Gateway read-back in order."""
@@ -525,6 +548,18 @@ class GenericGatewayMinibookCapabilityProjectionAdapter:
                 "Minibook projection readback is unavailable"
             )
         return self._authority(release, execution, event, readback)
+
+    async def publish_assembly_evidence(
+        self, assembly_id: UUID, evidence: dict[str, object]
+    ) -> dict[str, object]:
+        try:
+            return await self._effects._minibook.publish_assembly_evidence(
+                assembly_id, evidence
+            )
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Minibook assembly evidence authority is unavailable"
+            ) from None
 
     @staticmethod
     def _authority(
@@ -1356,6 +1391,12 @@ def _preflight_composition(
             (reconciliation, "reconcile", True, 1, "reconciliation.reconcile"),
             (minibook_effects, "project_and_ack", True, 1),
             (minibook_effects, "readback", True, 1),
+            (
+                getattr(minibook_effects, "_minibook", None),
+                "publish_assembly_evidence",
+                True,
+                2,
+            ),
             (benchmark_executor, "execute", True, 1),
             (benchmark_evidence, "resolve", False, 1),
             (benchmark_evidence, "record_evaluation", False, 1),

@@ -167,6 +167,8 @@ def _validated_controller(
 
 def _create_capability_assembly_router(
     resolve_controller: Callable[[], CapabilityAssemblyControllerPort | None],
+    *,
+    publish_final_evidence: bool = False,
 ) -> APIRouter:
     router = APIRouter(prefix="/v1/capability-assemblies")
     ready_health = CapabilityAssemblyApiHealth()
@@ -251,6 +253,9 @@ def _create_capability_assembly_router(
         controller: CapabilityAssemblyControllerPort = Depends(get_controller),
     ) -> CapabilityLiveDemoEvidence:
         try:
+            publish = getattr(controller, "final_evidence_and_publish", None)
+            if publish_final_evidence and publish is not None:
+                return await publish(assembly_id)
             return controller.final_evidence(assembly_id)
         except Exception as exc:
             raise _translate_error(exc) from None
@@ -299,4 +304,6 @@ def create_production_capability_assembly_router(
         except Exception:
             return None
 
-    return _create_capability_assembly_router(resolve_controller)
+    return _create_capability_assembly_router(
+        resolve_controller, publish_final_evidence=True
+    )

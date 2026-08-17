@@ -18,6 +18,7 @@ from datetime import datetime
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -296,6 +297,82 @@ ws_manager = HumanWSManager()
 @app.get("/health")
 async def health():
     return {"status": "ok", "hostname": HOSTNAME}
+
+
+@app.get("/api/v1/projection-health")
+async def projection_health(_projector: bool = Depends(require_projector)):
+    return {
+        "schema": "minibook.captain-projector-health.v1",
+        "status": "ready",
+        "project_id": PROJECTION_PROJECT_ID,
+        "service_agent_id": PROJECTION_SERVICE_AGENT_ID,
+    }
+
+
+@app.put("/api/v1/projection-assemblies/{assembly_id}/evidence")
+async def put_projection_assembly_evidence(
+    assembly_id: UUID,
+    payload: dict[str, object],
+    _projector: bool = Depends(require_projector),
+    db=Depends(get_db),
+):
+    """Persist one immutable canonical Gateway final-evidence document."""
+
+    if payload.get("schema") != "captain.capability-live-demo-evidence.v1":
+        raise HTTPException(422, "Capability assembly evidence is invalid")
+    encoded = json_module.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    digest = hashlib.sha256(encoded.encode()).hexdigest()
+    db.execute(text(
+        "CREATE TABLE IF NOT EXISTS captain_assembly_evidence ("
+        "assembly_id TEXT NOT NULL PRIMARY KEY, payload_sha256 TEXT NOT NULL, "
+        "payload TEXT NOT NULL)"
+    ))
+    existing = db.execute(
+        text("SELECT payload_sha256, payload FROM captain_assembly_evidence WHERE assembly_id = :assembly_id"),
+        {"assembly_id": str(assembly_id)},
+    ).mappings().first()
+    if existing is not None:
+        if existing["payload_sha256"] != digest or existing["payload"] != encoded:
+            db.rollback()
+            raise HTTPException(409, "Capability assembly evidence conflicts")
+        db.rollback()
+        return JSONResponse(content=payload)
+    db.execute(
+        text("INSERT INTO captain_assembly_evidence (assembly_id, payload_sha256, payload) "
+             "VALUES (:assembly_id, :digest, :payload)"),
+        {"assembly_id": str(assembly_id), "digest": digest, "payload": encoded},
+    )
+    db.commit()
+    return JSONResponse(content=payload)
+
+
+@app.get("/api/v1/projection-assemblies/{assembly_id}/evidence")
+async def get_projection_assembly_evidence(
+    assembly_id: UUID,
+    _projector: bool = Depends(require_projector),
+    db=Depends(get_db),
+):
+    db.execute(text(
+        "CREATE TABLE IF NOT EXISTS captain_assembly_evidence ("
+        "assembly_id TEXT NOT NULL PRIMARY KEY, payload_sha256 TEXT NOT NULL, "
+        "payload TEXT NOT NULL)"
+    ))
+    row = db.execute(
+        text("SELECT payload_sha256, payload FROM captain_assembly_evidence WHERE assembly_id = :assembly_id"),
+        {"assembly_id": str(assembly_id)},
+    ).mappings().first()
+    db.rollback()
+    if row is None:
+        raise HTTPException(404, "Capability assembly evidence is unavailable")
+    encoded = str(row["payload"])
+    if hashlib.sha256(encoded.encode()).hexdigest() != row["payload_sha256"]:
+        raise HTTPException(409, "Capability assembly evidence readback mismatch")
+    value = json_module.loads(encoded)
+    if not isinstance(value, dict):
+        raise HTTPException(409, "Capability assembly evidence readback mismatch")
+    return JSONResponse(content=value)
 
 
 @app.get("/api/v1/version")

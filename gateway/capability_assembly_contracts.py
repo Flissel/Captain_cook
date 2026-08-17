@@ -121,7 +121,10 @@ class CapabilityAssemblySubmitRequest(_FrozenContract):
     @field_validator("maximum_cost_usd", mode="before")
     @classmethod
     def require_positive_cost(cls, value: object) -> Decimal:
-        return _positive_decimal(value, "maximum_cost_usd")
+        amount = _positive_decimal(value, "maximum_cost_usd")
+        if amount > Decimal("6.00"):
+            raise ValueError("assembly cost ceiling cannot exceed USD 6.00")
+        return amount
 
     @model_validator(mode="after")
     def require_exact_three_input_envelope(self) -> "CapabilityAssemblySubmitRequest":

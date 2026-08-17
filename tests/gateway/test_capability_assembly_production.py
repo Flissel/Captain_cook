@@ -251,6 +251,11 @@ class _MinibookProjection:
         assert event.event_id == self._acknowledgement.projection_event_id
         return self._acknowledgement
 
+    async def publish_assembly_evidence(self, assembly_id, evidence):
+        del assembly_id
+        self.calls.append("assembly-evidence")
+        return evidence
+
 
 def test_projection_effects_require_feed_project_ack_and_gateway_readback() -> None:
     event = _event()

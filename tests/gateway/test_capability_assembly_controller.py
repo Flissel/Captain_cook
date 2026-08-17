@@ -388,6 +388,7 @@ class _Projection:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.requests: list[object] = []
+        self.assembly_evidence: dict[UUID, dict[str, object]] = {}
 
     async def project_and_readback(self, request, release, execution):
         self.requests.append(request)
@@ -403,6 +404,13 @@ class _Projection:
             projection_readback_id=_id(f"readback-{request.input.input_id}"),
             evidence_refs=(_ref(f"projection-{request.input.input_id}"),),
         )
+
+    async def publish_assembly_evidence(self, assembly_id, evidence):
+        existing = self.assembly_evidence.get(assembly_id)
+        if existing is not None and existing != evidence:
+            raise RuntimeError("assembly evidence conflicts")
+        self.assembly_evidence[assembly_id] = evidence
+        return self.assembly_evidence[assembly_id]
 
 
 class _Resume:
@@ -595,6 +603,23 @@ def test_submit_admits_exactly_three_repository_inputs_and_replays_without_readm
         "products/customer-c/TO_BE_BUILT.md",
     ]
     assert len(admission.calls) == 3
+
+
+def test_submit_rejects_more_than_usd_six_before_admission_or_effect() -> None:
+    original = _submission()
+    first = original.inputs[0].model_copy(update={
+        "reservation": original.inputs[0].reservation.model_copy(
+            update={"maximum_cost_usd": Decimal("2.01")}
+        )
+    })
+
+    with pytest.raises(ValueError, match="USD 6.00"):
+        CapabilityAssemblySubmitRequest(
+            assembly_id=original.assembly_id,
+            idempotency_key=original.idempotency_key,
+            maximum_cost_usd=Decimal("6.01"),
+            inputs=(first, *original.inputs[1:]),
+        )
 
 
 def test_real_canonical_admission_reaches_every_offline_stage_without_legacy_coercion() -> None:
@@ -1021,6 +1046,24 @@ def test_complete_assembly_returns_validated_final_evidence_and_uses_d1_chain() 
     assert evidence.restart.resume_actual_spend_usd == Decimal("0")
     assert evidence.restart.total_booked_cost_usd == Decimal("1.00")
     assert evidence.restart.resume_budget_violation is False
+
+
+def test_final_evidence_is_persisted_and_read_back_from_minibook_before_return() -> None:
+    controller, _, _, _, _, _, projection, *_ = _controller()
+    controller.submit(_submission())
+    while controller.projection(ASSEMBLY_ID).completed_slices < ASSEMBLY_TOTAL_SLICES:
+        completed = controller.projection(ASSEMBLY_ID).completed_slices
+        _advance(
+            controller,
+            operation=f"minibook-final-{completed}",
+            maximum_slices=min(8, ASSEMBLY_TOTAL_SLICES - completed),
+        )
+
+    evidence = asyncio.run(controller.final_evidence_and_publish(ASSEMBLY_ID))
+
+    assert projection.assembly_evidence[ASSEMBLY_ID] == evidence.model_dump(
+        mode="json", by_alias=True
+    )
 
 
 def test_missing_d1_authority_fails_closed_without_final_evidence() -> None:

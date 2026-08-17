@@ -110,6 +110,14 @@ class MinibookProjector:
             external_id=self.PROJECTION_PROJECT_ID,
         )
 
+    def publish_assembly_evidence(
+        self, assembly_id: str, evidence: dict[str, object]
+    ) -> dict[str, Any]:
+        return self.client.put_assembly_evidence(assembly_id, evidence)
+
+    def assembly_evidence(self, assembly_id: str) -> dict[str, Any]:
+        return self.client.assembly_evidence(assembly_id)
+
     def project(self, event: MinibookProjectionEvent) -> ProjectionResult:
         event = self._validated_event(event)
         store = self._require_cursor_store()

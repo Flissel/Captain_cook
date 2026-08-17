@@ -90,6 +90,23 @@ class MinibookClient:
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/health")
 
+    def projector_health(self) -> dict[str, Any]:
+        return self._projection_request("GET", "/api/v1/projection-health")
+
+    def put_assembly_evidence(
+        self, assembly_id: str, evidence: dict[str, object]
+    ) -> dict[str, Any]:
+        return self._projection_request(
+            "PUT",
+            f"/api/v1/projection-assemblies/{assembly_id}/evidence",
+            json=evidence,
+        )
+
+    def assembly_evidence(self, assembly_id: str) -> dict[str, Any]:
+        return self._projection_request(
+            "GET", f"/api/v1/projection-assemblies/{assembly_id}/evidence"
+        )
+
     def ensure_agent(self, name: str) -> dict[str, Any]:
         response = self._client.get(
             f"{self._base_url}/api/v1/agents/by-name/{name}", headers=self._headers

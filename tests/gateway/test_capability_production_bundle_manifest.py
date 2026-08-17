@@ -25,6 +25,8 @@ def _environment() -> dict[str, str]:
         "MINIBOOK_BACKEND_URL": "http://127.0.0.1:8080",
         "MINIBOOK_API_KEY": "minibook-token-value",
         "MINIBOOK_PROJECTION_API_KEY": "projection-token-value",
+        "CAPTAIN_N8N_URL": "http://127.0.0.1:5679",
+        "CAPTAIN_N8N_API_KEY": "n8n-token-value",
     }
 
 
@@ -49,6 +51,22 @@ def test_operator_manifest_is_digest_bound_and_contains_real_process_contracts()
     assert manifest.runtime.credential_env == "CAPTAIN_RUNTIME_TOKEN"
     assert manifest.provider_proxy.credential_env == "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"
     assert manifest.minibook.credential_env == "MINIBOOK_API_KEY"
+    assert manifest.minibook.authenticated_health_url == (
+        "http://127.0.0.1:8080/api/v1/projection-health"
+    )
+    assert manifest.minibook.authenticated_health_credential_env == (
+        "MINIBOOK_PROJECTION_API_KEY"
+    )
+    assert manifest.minibook_evidence_url_template.endswith(
+        "/api/v1/projection-assemblies/{assembly_id}/evidence"
+    )
+    assert manifest.n8n.credential_env == "CAPTAIN_N8N_API_KEY"
+    for binding in (
+        manifest.gateway, manifest.provider_proxy, manifest.runtime,
+        manifest.benchmark, manifest.minibook, manifest.n8n,
+    ):
+        assert binding.start_argv
+        assert binding.restart_argv
     assert len(manifest.manifest_sha256) == 64
     assert manifest.manifest_sha256 == load_capability_production_bundle_manifest(
         environment=environment

@@ -307,7 +307,9 @@ class CapabilityProductionProcessBindingV1(BaseModel):
     """Secret-free operator binding for one concrete production process."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
-    service: Literal["gateway", "benchmark", "runtime", "provider_proxy", "minibook"]
+    service: Literal[
+        "gateway", "benchmark", "runtime", "provider_proxy", "minibook", "n8n"
+    ]
     base_url: str
     health_url: str
     execute_url: str | None = None
@@ -318,7 +320,19 @@ class CapabilityProductionProcessBindingV1(BaseModel):
         "CAPTAIN_RUNTIME_TOKEN",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
         "MINIBOOK_API_KEY",
+        "CAPTAIN_N8N_API_KEY",
     ]
+    authenticated_health_url: str
+    authenticated_health_credential_env: Literal[
+        "CAPTAIN_GATEWAY_TOKEN",
+        "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+        "CAPTAIN_RUNTIME_TOKEN",
+        "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
+        "MINIBOOK_PROJECTION_API_KEY",
+        "CAPTAIN_N8N_API_KEY",
+    ]
+    start_argv: tuple[str, ...] = Field(min_length=1)
+    restart_argv: tuple[str, ...] = Field(min_length=1)
 
 
 class CapabilityProductionBundleManifestV1(BaseModel):
@@ -337,6 +351,8 @@ class CapabilityProductionBundleManifestV1(BaseModel):
     runtime: CapabilityProductionProcessBindingV1
     provider_proxy: CapabilityProductionProcessBindingV1
     minibook: CapabilityProductionProcessBindingV1
+    n8n: CapabilityProductionProcessBindingV1
+    minibook_evidence_url_template: str
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
@@ -364,6 +380,8 @@ _OPERATOR_REQUIRED_NAMES = (
     "MINIBOOK_BACKEND_URL",
     "MINIBOOK_API_KEY",
     "MINIBOOK_PROJECTION_API_KEY",
+    "CAPTAIN_N8N_URL",
+    "CAPTAIN_N8N_API_KEY",
 )
 
 
@@ -407,6 +425,7 @@ def load_capability_production_bundle_manifest(
     minibook = _allowed_service_url(raw["MINIBOOK_BACKEND_URL"], allowed_hosts=allowed_hosts, label="Minibook")
     provider = _allowed_service_url(raw["CAPTAIN_PROVIDER_PROXY_URL"], allowed_hosts=allowed_hosts, label="provider proxy")
     benchmark = _allowed_endpoint(raw["CAPTAIN_CAPABILITY_BENCHMARK_URL"], allowed_hosts=allowed_hosts, label="benchmark")
+    n8n = _allowed_service_url(raw["CAPTAIN_N8N_URL"], allowed_hosts=allowed_hosts, label="n8n")
     if not benchmark.endswith("/v1/execute"):
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly operator endpoint contract is invalid"
@@ -421,23 +440,40 @@ def load_capability_production_bundle_manifest(
         "gateway": _process_binding(
             "gateway", gateway, f"{gateway}/v1/capability-assemblies/health",
             credential_env="CAPTAIN_GATEWAY_TOKEN",
+            start_action="start", restart_action="gateway-restart",
         ),
         "benchmark": _process_binding(
             "benchmark", benchmark.removesuffix("/v1/execute"),
             benchmark.removesuffix("/v1/execute") + "/healthz", benchmark,
             credential_env="CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+            start_action="benchmark-start", restart_action="benchmark-restart",
         ),
         "runtime": _process_binding(
             "runtime", runtime, f"{runtime}/health",
             credential_env="CAPTAIN_RUNTIME_TOKEN",
+            start_action="start", restart_action="start",
         ),
         "provider_proxy": _process_binding(
             "provider_proxy", provider_root, f"{provider_root}/v1/healthz",
             credential_env="CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
+            start_action="start", restart_action="start",
         ),
         "minibook": _process_binding(
             "minibook", minibook, f"{minibook}/health",
             credential_env="MINIBOOK_API_KEY",
+            authenticated_health_url=f"{minibook}/api/v1/projection-health",
+            authenticated_health_credential_env="MINIBOOK_PROJECTION_API_KEY",
+            command_script="scripts/minibook-demo.ps1",
+            start_action="start", restart_action="start",
+        ),
+        "n8n": _process_binding(
+            "n8n", n8n, f"{n8n}/healthz",
+            credential_env="CAPTAIN_N8N_API_KEY",
+            command_script="scripts/captain-n8n.ps1",
+            start_action="start", restart_action="start",
+        ),
+        "minibook_evidence_url_template": (
+            f"{minibook}/api/v1/projection-assemblies/{{assembly_id}}/evidence"
         ),
     }
     digest = hashlib.sha256(
@@ -450,7 +486,10 @@ def load_capability_production_bundle_manifest(
 
 def _process_binding(
     service: str, base_url: str, health_url: str, execute_url: str | None = None,
-    *, credential_env: str,
+    *, credential_env: str, start_action: str, restart_action: str,
+    authenticated_health_url: str | None = None,
+    authenticated_health_credential_env: str | None = None,
+    command_script: str = "scripts/live-demo-services.ps1",
 ) -> dict[str, object]:
     return {
         "service": service,
@@ -459,6 +498,16 @@ def _process_binding(
         "execute_url": execute_url,
         "authentication": "bearer",
         "credential_env": credential_env,
+        "authenticated_health_url": authenticated_health_url or health_url,
+        "authenticated_health_credential_env": (
+            authenticated_health_credential_env or credential_env
+        ),
+        "start_argv": (
+            "pwsh", "-NoProfile", "-File", command_script, start_action,
+        ),
+        "restart_argv": (
+            "pwsh", "-NoProfile", "-File", command_script, restart_action,
+        ),
     }
 
 
