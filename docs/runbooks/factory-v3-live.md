@@ -128,8 +128,11 @@ Live success is not read from a scalar `evidence.json`. The locator index must
 carry the same signed-authority and active-skill digests as preflight. The gate
 then requires exactly one Ed25519-signed `mode=live` runner/session attestation
 bound to the preflight run, correlation, binaries, launcher, Hermes runtime,
-workspace policy/snapshot, assignment, effect, and Codex session. Hermetic or
-deterministic receipts cannot satisfy that contract.
+worker, exact workspace-policy digest/snapshot, assignment, effect, and Codex
+session. The policy must exactly reproduce the signed assignment's commands,
+writable/output roots, network denial, wall-clock/deadline, cost, file, retry,
+attempt, lease, and active released-skill authority. Hermetic or deterministic
+receipts cannot satisfy that contract.
 
 The verifier independently reads the typed Hermes/Codex/Minibook/Captain
 records and every Hermes evidence reference, Codex session/workspace/test
@@ -139,6 +142,15 @@ top-level package evidence must also agree byte-for-byte across the independent
 Minibook and Captain CAS views. A recursive secret scanner rejects
 secret-bearing keys and token-like values before any verified summary is
 emitted.
+
+Every Codex receipt edge is additionally resolved as typed canonical content:
+the build brief must be the exact Hermes build-brief evidence; candidate,
+source, session, snapshot, test, and build refs must match the assignment,
+effect, CreationResult, candidate/team manifests, and exact package-manifest
+paths. Same-digest URI aliases are rejected. The workspace ZIP is a closed
+`src`/`tests`/`evidence` set plus its canonical manifest. Each member is listed
+once, public-CAS bound, size bound, and checked for unsafe, sensitive, reserved,
+case-folding, Unicode-normalization, collision, and compression-ratio paths.
 
 ## Verification recorded on 2026-08-17
 
@@ -150,6 +162,20 @@ emitted.
 - Opt-in Task-10 live test: failed closed with the ten unmet checks above.
 
 The skipped tests were service/MariaDB-gated and are not live evidence.
+
+### Fix-round 3 offline verification
+
+- Live-evidence graph/ZIP focus: `61 passed`.
+- Authority/preflight/evidence focus: `100 passed`.
+- Root Agent Factory/Gateway selection: `1974 passed, 132 skipped`.
+- Full Root offline collection reached `3293 passed, 139 skipped, 8 deselected`
+  and `82.09%` coverage; its only 11 failures are the already-uninitialized
+  `hermes-agent` readiness/fixture checks. The ordinary Root command also
+  encounters three existing live-module import errors for that absent submodule
+  during collection.
+- Isolated Minibook: `259 passed, 1 deselected`; Portal: `47 passed` plus lint
+  and production build; architecture/import/workstream: `18 passed`.
+- The Task-10 live test was collected only. No live execution was attempted.
 
 ## Explicit non-claims
 
