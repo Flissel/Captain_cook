@@ -277,6 +277,51 @@ def test_privacy_marker_stem_headings_fail_before_parser_effects(
     assert parser_calls == 0
 
 
+@pytest.mark.parametrize("level", range(1, 7))
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "Privacy verdicts",
+        "PRIVACY-verdicts",
+        "Privacies: verdicts",
+        "Secrecy decisions",
+        "sEcReCy-decisions",
+        "Secrecies: decisions",
+    ),
+)
+def test_privacy_and_secrecy_noun_headings_fail_before_parser_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    level: int,
+    heading: str,
+) -> None:
+    sentinel = "CAPTAIN-PRIVACY-NOUN-SENTINEL"
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    parser_calls = 0
+    original = input_document_module._level_sections
+
+    def counted_parser(text: str):
+        nonlocal parser_calls
+        parser_calls += 1
+        return original(text)
+
+    monkeypatch.setattr(input_document_module, "_level_sections", counted_parser)
+    malformed = source.replace(
+        "## Helpful resources",
+        (
+            "## Helpful resources\n- Public resource\n"
+            f"{'#' * level} {heading}\n{sentinel}"
+        ),
+    )
+
+    with pytest.raises(FactoryInputError, match="private benchmark cases"):
+        parse_factory_input_bytes(
+            malformed.encode(), logical_name="TO_BE_BUILT.md",
+        )
+
+    assert parser_calls == 0
+    assert sentinel in malformed
+
+
 @pytest.mark.parametrize(
     "heading",
     (

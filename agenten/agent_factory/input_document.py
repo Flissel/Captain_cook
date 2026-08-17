@@ -222,18 +222,25 @@ def _is_reserved_private_heading(normalized: str) -> bool:
         return False
     ordered_tokens = normalized.split()
     tokens = set(ordered_tokens)
-    privacy_stems = (
-        "privat", "hidden", "secret", "confidential", "internal", "nonpublic",
-    )
-    privacy_suffixes = {
+    derivative_suffixes = {
         "", "e", "es", "s", "ly", "ely", "ive", "ively", "iveness",
         "ness", "ity", "ities",
+    }
+    privacy_families = {
+        "privat": derivative_suffixes,
+        "privac": {"y", "ies"},
+        "hidden": derivative_suffixes,
+        "secret": derivative_suffixes,
+        "secrec": {"y", "ies"},
+        "confidential": derivative_suffixes,
+        "internal": derivative_suffixes,
+        "nonpublic": derivative_suffixes,
     }
     authority = any(
         any(
             token.startswith(stem)
-            and token.removeprefix(stem) in privacy_suffixes
-            for stem in privacy_stems
+            and token.removeprefix(stem) in suffixes
+            for stem, suffixes in privacy_families.items()
         )
         for token in ordered_tokens
     ) or any(
