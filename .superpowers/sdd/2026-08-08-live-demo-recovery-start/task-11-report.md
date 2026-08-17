@@ -129,3 +129,30 @@ Round-2 non-claims:
 - No live provider, network service, Docker engine, n8n deployment, volume, or production database was contacted or mutated.
 - Authenticated health and container identity behavior is covered offline by injected/sentinel boundaries; this is not a live deployment claim.
 - The uninitialized Hermes submodule prevents a repository-wide all-green claim, but does not affect the focused D11/D12 gates above.
+
+## Review Fix Round 3
+
+Commits:
+
+1. `4bdf152` — ships the repository-owned Factory adapter and deterministic descriptor generator. Planning single-opens and HEAD-attests both descriptor and module, validates an exact fail-closed AST and constructor signature, and builds the complete deferred sole-writer graph without importing adapter code or constructing persistence, clients, directories, or processes. Explicit materialization binds the same authorities and revalidates their identities.
+2. `3349493` — isolates each managed service environment to an explicit allowlist and its own credentials. Existing processes are reused only after exact kernel or Docker identity plus authenticated health; n8n persists `process_id=null` with exact container ID and `StartedAt`. Start/health failure performs bounded, identity-scoped process-tree or container cleanup and retains ambiguous running state.
+3. `d706ebb` — makes D12 status and paid preflight consume all six exact D11 authenticated-health URL/header/credential contracts. Minibook uses `/api/v1/projection-health`; n8n uses `X-N8N-API-KEY`. Any missing, wrong, timed-out, or non-ready authority stops before a paid Gateway POST, advance, or provider effect.
+
+Round-3 RED to GREEN evidence:
+
+- Group A: operator-authored descriptors, same-hash descriptor drift, invalid signatures/top-level calls, and deep nested fake bindings were rejected before any constructor or filesystem effect. The shipped adapter/descriptor/deferred-graph gate passed 104 tests; the committed descriptor was then opened against the real HEAD successfully.
+- Group B: Windows exposed the expected cleanup RED because `SIGKILL` is unavailable. The GREEN implementation uses exact identity checks, bounded TERM plus Windows process-tree fallback, bounded Docker/Pwsh operations, and durable ambiguity retention. Manifest/process security gate: 8 passed.
+- Group C: the prior consumer trusted process state and omitted n8n from paid health. GREEN validates all six semantic contracts for both `status` and paid `run`/`resume`; each individual authority-failure case proves zero POST/advance. Focused D12 gate: 43 passed; combined D11/D12 gate: 202 passed.
+
+Round-3 verification:
+
+- D1/D4-D12 and prior critical capability/Factory/provider/demo regression selection: 1,940 passed, 2 skipped, with one pre-existing Pydantic serialization warning.
+- Full offline repository gate with `tests/live` explicitly excluded: 3,625 passed, 137 skipped, 14 failed. Eleven failures are the already documented uninitialized `hermes-agent` fixture/runtime surfaces. Three `tests/agent_runtime/test_generate_runtime_adapter_manifest.py` failures require a worktree-local `.venv/Scripts/python.exe`; this worktree intentionally uses the repository-root virtual environment and no local environment was created. These are environment non-claims, not an all-green repository claim.
+- Architecture/import/workstream: 18 passed. `compileall`, submission verifier, round diff check, and credential-pattern scan passed; credential matches: 0.
+- MariaDB authority gate: 14 skipped because `TEST_MARIADB_DSN` was absent. No production database was contacted.
+
+Round-3 non-claims:
+
+- No live network service, provider, Docker engine/container, n8n deployment/volume, or production database was contacted or mutated.
+- Process identity, authenticated health, and cleanup behavior are proven through offline injected/sentinel boundaries; this is not a live deployment claim.
+- The canonical deferred Factory ports are production graph authorities, but external Forge and benchmark-input provisioning remains an operator prerequisite before real paid dispatch.
