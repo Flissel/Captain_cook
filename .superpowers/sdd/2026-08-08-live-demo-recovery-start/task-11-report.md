@@ -264,3 +264,84 @@ Round-5 non-claims:
   because both roots contain a Python package named `tests`; combining the roots
   causes collection namespace collisions. Both corrected invocations are green
   above.
+
+## Final Review Fix Round 6
+
+Commits:
+
+1. `5f2aecd` — serializes cross-process service starts under an atomic durable
+   claim and validates the sealed health/config contract before state or spawn.
+2. `eb451e6` — rejects a Windows CIM process tree when any enumerated child
+   lacks a readable exact kernel identity; ambiguous cleanup retains state.
+3. `97f0f75` — protects every Minibook Creation route with the exact Minibook
+   bearer authority and requires the matching Gateway key and creation database
+   before spawn.
+4. `b00a9e5`, `c9331a3`, and `cd569a4` — complete relative/package import
+   closure generation, attest every source/AST/HEAD binding, and materialize the
+   real graph only from verified bytes without a `sys.modules` bypass.
+5. `dd70936` — validates the exact `AssemblyOwnedGenericBenchmark` and
+   `ProxyBoundResponsesModelClientBuilder` graph with all six D7 digests and the
+   hard-ceiling binding.
+6. `02d2c3f` — prevents `extra_create_args` from replacing model, input,
+   reasoning, tools, output schema/format, command context, or authority headers.
+7. `93f5a18` and `2e1c9d0` — bind tool evidence to durable Gateway benchmark
+   WorkBatch and Runtime command/result readback, then ship the authenticated
+   Gateway-owned execution API and repository-owned isolated executor. Public
+   `declared_tool_keys` are compiler-authority digest bound; zero, extra, wrong,
+   replayed, foreign-case/job/run evidence is rejected before issuance.
+8. `e3ed64c` — materializes the passed generic D10 suite as typed immutable
+   Factory V3 `QUALITY_REVIEWED` evidence: exactly 15 job-specific cases, three
+   per category, 30 independent evaluation references, and the exact public
+   Captain assertion set. It reaches `VALIDATE_FOR_PROMOTION` without inventing
+   legacy profile, workflow-feedback, Claims, or Renewal artifacts.
+9. `c50cb81` — verifies the atomic Gateway promotion replay and exact immutable
+   Minibook projection readback. A changed replay conflicts and cannot append a
+   second promotion.
+
+Round-6 RED to GREEN evidence:
+
+- Operator/Minibook/closure/validator/Responses packages were each reproduced
+  by the final reviewer adversarial cases before their focused green commits.
+- Gateway benchmark execution initially lacked a productive repository-owned
+  issuer route. GREEN focused execution/bootstrap/process gate: 127 passed.
+  The only injected fake is the offline Runtime effect boundary; counters prove
+  one effect while all call/lease/receipt identities come from persisted
+  Gateway WorkBatch and Runtime command/result authorities.
+- The prior generic Factory benchmark deliberately raised a deferred exception.
+  The new bridge tests were RED on the missing typed quality contract and
+  constructor, then GREEN. The shipped Store promotion test exposed and fixed
+  an invalid assumption that every Factory job UUID was version 4. Focused
+  Factory/benchmark/bootstrap/production gate: 196 passed, one pre-existing
+  Minibook escape-sequence warning.
+- Private-leak assertions confirm the durable public summary contains no
+  expected predicates, private holdout bodies/URIs, outcome answers, verdicts,
+  or evaluator internals.
+
+Round-6 verification:
+
+- First explicit offline root run: 3,667 passed, 137 skipped, 8 deselected, and
+  14 environment-only failures. Three generator tests require a missing
+  worktree-local `.venv`; eleven Hermes readiness/fixture tests require the
+  uninitialized `hermes-agent` submodule.
+- Corrected broad D1/D4-D12/Factory/Gateway run with `tests/live`, the three
+  environment-bound files above, and legacy tests explicitly excluded: 3,657
+  passed, 137 skipped, 8 deselected, with five documented warnings.
+- Minibook's reviewed `tests/` suite, run separately to avoid its legacy
+  top-level `test_api.py` credential-file collector: 132 passed, one live test
+  deselected.
+- Architecture/import/workstream: 18 passed. `compileall`, submission verifier,
+  full `628d149..HEAD` diff check, and diff-scoped credential scan passed;
+  credential-pattern matches: 0.
+- `TEST_MARIADB_DSN` was absent, so the MariaDB authority gate was not run. No
+  database was contacted.
+
+Round-6 non-claims:
+
+- No live network service, paid provider, Docker/PowerShell process, n8n
+  deployment/volume, or production/test database was contacted or mutated.
+- The offline Runtime effect in the productive Gateway execution contract is an
+  injected counted boundary; these tests do not claim a live Codex/provider run.
+- Repository-wide all-green is not claimed because the worktree has no local
+  `.venv` and its `hermes-agent` submodule is uninitialized. The explicitly
+  bounded D1/D4-D12 product neighborhood and corrected broad gate are green as
+  recorded above.
