@@ -278,8 +278,12 @@ def _collect_exact_process_tree(
             capture_output=True, text=True, check=False, timeout=10,
             env=_process_introspection_environment(os.environ),
         )
-        values = json.loads(result.stdout) if result.returncode == 0 else []
+        if result.returncode != 0:
+            raise RuntimeError("managed process tree is unavailable")
+        values = json.loads(result.stdout)
         pids = values if isinstance(values, list) else [values]
+        if root not in {int(raw) for raw in pids}:
+            raise RuntimeError("managed process tree is unavailable")
         for raw in pids:
             pid = int(raw)
             if pid == root:
@@ -287,8 +291,9 @@ def _collect_exact_process_tree(
             observed = _observed_process_identity(pid)
             if observed is not None:
                 identities.append((pid, observed[0], observed[1]))
-    except Exception:
-        pass
+    except (OSError, ValueError, TypeError, json.JSONDecodeError,
+            subprocess.SubprocessError):
+        raise RuntimeError("managed process tree is unavailable") from None
     return tuple(identities)
 
 
@@ -386,6 +391,57 @@ def _wait_authenticated_health(
     raise RuntimeError(f"authenticated health timed out for {service}")
 
 
+def _reconcile_starting(
+    service: str,
+    state: dict[str, object],
+    *,
+    environment: Mapping[str, str],
+    state_file: Path,
+) -> dict[str, object]:
+    """Resolve one exclusive starting claim without ever adopting or respawning."""
+
+    if state.get("identity_kind") == "sentinel":
+        raise RuntimeError("managed process start is ambiguous")
+    if service == "n8n":
+        if not isinstance(state.get("identity_value"), str):
+            raise RuntimeError("managed n8n start is ambiguous")
+        try:
+            container_id = _require_same_n8n_container(state, environment)
+        except RuntimeError:
+            raise RuntimeError("managed n8n start is ambiguous") from None
+        try:
+            _wait_authenticated_health(service, environment=environment, timeout_seconds=5.0)
+        except Exception:
+            subprocess.run(
+                ("docker", "kill", container_id), check=False, timeout=10,
+                env=_service_environment("n8n", environment),
+            )
+            if _observed_n8n_container_identity(environment) is None:
+                state["status"] = "stopped"
+                _write_state(state_file, state)
+            raise RuntimeError("authenticated start failed for n8n") from None
+    else:
+        if not all(state.get(name) for name in (
+            "process_id", "executable", "os_start_identity",
+        )):
+            raise RuntimeError("managed process start is ambiguous")
+        try:
+            _require_same_process(state)
+        except RuntimeError:
+            raise RuntimeError("managed process start is ambiguous") from None
+        try:
+            _wait_authenticated_health(service, environment=environment, timeout_seconds=5.0)
+        except Exception:
+            gone = _terminate_exact_process_tree(state)
+            if gone:
+                state["status"] = "stopped"
+                _write_state(state_file, state)
+            raise RuntimeError(f"authenticated start failed for {service}") from None
+    state["status"] = "running"
+    _write_state(state_file, state)
+    return state
+
+
 def service_argv(
     service: str, *, environment: Mapping[str, str], repository_root: Path,
     action: str = "start",
@@ -437,6 +493,10 @@ def operate(
     state_file = _state_root(environment, repository_root) / f"{service}.json"
     prior = _read_state(state_file)
     sentinel = environment.get("CAPTAIN_PROCESS_OPERATOR_BACKEND") == "sentinel"
+    if prior is not None and prior.get("status") == "starting":
+        prior = _reconcile_starting(
+            service, prior, environment=environment, state_file=state_file,
+        )
 
     if action in {"stop", "restart"}:
         if not sentinel and service == "n8n" and prior is not None:

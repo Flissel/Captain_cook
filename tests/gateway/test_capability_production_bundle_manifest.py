@@ -440,12 +440,13 @@ def test_cleanup_tracks_and_kills_an_exact_orphan_child(
 def test_n8n_start_timeout_retains_starting_without_pid_sentinel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        process_operator.subprocess, "run",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+    starts: list[str] = []
+    def timeout(*_args, **_kwargs):
+        starts.append("start")
+        return (_ for _ in ()).throw(
             process_operator.subprocess.TimeoutExpired("pwsh", 30)
-        ),
-    )
+        )
+    monkeypatch.setattr(process_operator.subprocess, "run", timeout)
     environment = {
         "CAPTAIN_PROCESS_STATE_ROOT": "state",
         "CAPTAIN_N8N_API_KEY": "n8n-token-value",
@@ -459,6 +460,105 @@ def test_n8n_start_timeout_retains_starting_without_pid_sentinel(
     assert state["status"] == "starting"
     assert state["process_id"] is None
     assert state["identity_kind"] == "docker_container"
+    with pytest.raises(RuntimeError, match="n8n start is ambiguous"):
+        operate("n8n", "start", environment=environment, repository_root=tmp_path)
+    assert starts == ["start"]
+
+
+def test_existing_ambiguous_starting_claim_never_spawns_second_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    (state_root / "gateway.json").write_text(json.dumps({
+        "schema": "captain.production-process-state.v1", "service": "gateway",
+        "status": "starting", "operation": "start", "process_id": 7000,
+        "process_identity": "claim", "identity_kind": "os_process",
+        "identity_value": None, "argv": ["python", "-m", "gateway.app"],
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        process_operator.subprocess, "Popen",
+        lambda *_args, **_kwargs: pytest.fail("exclusive starting claim respawned"),
+    )
+    environment = {
+        **_environment(), "WORKER_GATEWAY_TOKEN": "worker-token",
+        "LEDGER_DSN": "redacted-dsn", "CAPTAIN_PROCESS_STATE_ROOT": str(state_root),
+    }
+
+    with pytest.raises(RuntimeError, match="start is ambiguous"):
+        operate("gateway", "start", environment=environment, repository_root=tmp_path)
+
+    retained = json.loads((state_root / "gateway.json").read_text())
+    assert retained["status"] == "starting"
+    assert retained["process_id"] == 7000
+
+
+def test_existing_exact_healthy_starting_claim_becomes_running_without_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    (state_root / "gateway.json").write_text(json.dumps({
+        "schema": "captain.production-process-state.v1", "service": "gateway",
+        "status": "starting", "operation": "start", "process_id": 7100,
+        "process_identity": "claim", "identity_kind": "os_process",
+        "identity_value": "C:/python.exe:start-7100", "executable": "C:/python.exe",
+        "os_start_identity": "start-7100", "argv": ["python", "-m", "gateway.app"],
+    }), encoding="utf-8")
+    monkeypatch.setattr(process_operator, "_observed_process_identity", lambda _pid: ("C:/python.exe", "start-7100"))
+    monkeypatch.setattr(process_operator, "_wait_authenticated_health", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        process_operator.subprocess, "Popen",
+        lambda *_args, **_kwargs: pytest.fail("healthy starting claim respawned"),
+    )
+    environment = {
+        **_environment(), "WORKER_GATEWAY_TOKEN": "worker-token",
+        "LEDGER_DSN": "redacted-dsn", "CAPTAIN_PROCESS_STATE_ROOT": str(state_root),
+    }
+
+    reconciled = operate("gateway", "start", environment=environment, repository_root=tmp_path)
+
+    assert reconciled["status"] == "running"
+    assert reconciled["process_id"] == 7100
+
+
+def test_starting_cleanup_retains_claim_when_tree_enumeration_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    state = {
+        "schema": "captain.production-process-state.v1", "service": "gateway",
+        "status": "starting", "operation": "start", "process_id": 7200,
+        "process_identity": "claim", "identity_kind": "os_process",
+        "identity_value": "C:/python.exe:start-7200", "executable": "C:/python.exe",
+        "os_start_identity": "start-7200", "argv": ["python", "-m", "gateway.app"],
+    }
+    (state_root / "gateway.json").write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(
+        process_operator, "_observed_process_identity",
+        lambda _pid: ("C:/python.exe", "start-7200"),
+    )
+    monkeypatch.setattr(
+        process_operator, "_wait_authenticated_health",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("unhealthy")),
+    )
+    monkeypatch.setattr(
+        process_operator.subprocess, "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            process_operator.subprocess.TimeoutExpired("pwsh", 10)
+        ),
+    )
+    environment = {
+        **_environment(), "WORKER_GATEWAY_TOKEN": "worker-token",
+        "LEDGER_DSN": "redacted-dsn", "CAPTAIN_PROCESS_STATE_ROOT": str(state_root),
+    }
+
+    with pytest.raises(RuntimeError, match="process tree is unavailable"):
+        operate("gateway", "start", environment=environment, repository_root=tmp_path)
+
+    retained = json.loads((state_root / "gateway.json").read_text())
+    assert retained["status"] == "starting"
 
 
 def test_operator_manifest_fails_closed_before_probe_on_missing_or_reused_credentials() -> None:
