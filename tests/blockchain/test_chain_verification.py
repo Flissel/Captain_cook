@@ -30,6 +30,13 @@ def test_verify_chain_accepts_an_empty_chain():
     verify_chain([])
 
 
+def test_verify_chain_accepts_a_genesis_only_chain():
+    blocks = []
+    _append(blocks, "genesis", {}, status="completed")
+
+    verify_chain(blocks)
+
+
 def test_verify_chain_detects_a_mutated_payload():
     blocks = []
     _append(blocks, "genesis", {}, status="completed")
@@ -59,6 +66,12 @@ def test_status_is_outside_the_hash_by_design():
     `status` is deliberately excluded from compute_hash because the in-process
     pipeline updates it after append. Anyone reading verify_chain as full
     tamper-evidence needs to see this boundary spelled out.
+
+    The trailing `data` mutation proves this isn't just verify_chain being a
+    no-op: the same chain, on the same blocks, IS caught the moment the
+    mutation touches a hashed field. That keeps this test honest about what
+    "not detected" means — a live check with a known blind spot, not a check
+    that never fires.
     """
     blocks = []
     _append(blocks, "genesis", {}, status="completed")
@@ -67,3 +80,8 @@ def test_status_is_outside_the_hash_by_design():
     blocks[1].status = "aborted_infra"
 
     verify_chain(blocks)
+
+    blocks[1].data["batch_id"] = "b-2"
+
+    with pytest.raises(ChainVerificationError):
+        verify_chain(blocks)
