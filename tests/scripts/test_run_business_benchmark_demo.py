@@ -371,6 +371,15 @@ def test_factory_operator_cli_threads_stop_flag_and_emits_typed_results(
 # test's checkpoint logic runs -- real local/external tooling this test genuinely
 # depends on, not portable to any hosted runner or credential-free machine. See
 # https://github.com/Flissel/Captain_cook/issues/25
+#
+# This is manual-invocation-only: nothing in CI selects it. pytest.ini excludes
+# `live` by default, deterministic_windows runs `-m "not live"`, and gate_e_live
+# runs `-m live` scoped to tests/live/test_gate_a_codex_n8n.py and
+# tests/live/test_gate_e_release_decision.py specifically, not this file. Adding
+# this file to that Gate E run would pull in Codex/Hermes tooling Gate E does not
+# otherwise need. Run it by hand, on a machine with that tooling installed, via:
+#   .venv/Scripts/python.exe -m pytest -o addopts="" -m live \
+#       tests/scripts/test_run_business_benchmark_demo.py
 @pytest.mark.live
 def test_unresolved_provisioning_returns_factory_checkpoint_without_provider(
     tmp_path: Path,
@@ -1142,6 +1151,15 @@ print(json.dumps({
 # test's checkpoint logic runs -- real local/external tooling this test genuinely
 # depends on, not portable to any hosted runner or credential-free machine. See
 # https://github.com/Flissel/Captain_cook/issues/25
+#
+# This is manual-invocation-only: nothing in CI selects it. pytest.ini excludes
+# `live` by default, deterministic_windows runs `-m "not live"`, and gate_e_live
+# runs `-m live` scoped to tests/live/test_gate_a_codex_n8n.py and
+# tests/live/test_gate_e_release_decision.py specifically, not this file. Adding
+# this file to that Gate E run would pull in Codex/Hermes tooling Gate E does not
+# otherwise need. Run it by hand, on a machine with that tooling installed, via:
+#   .venv/Scripts/python.exe -m pytest -o addopts="" -m live \
+#       tests/scripts/test_run_business_benchmark_demo.py
 @pytest.mark.live
 def test_missing_provider_key_does_not_block_infrastructure_checkpoint(
     tmp_path: Path,
