@@ -119,6 +119,15 @@ class HermesFactoryCodexReceiptReaderPort(Protocol):
     def read_receipt(self, reference: ArtifactRef) -> CodexBuildReceiptV1: ...
 
 
+class HermesFactoryWorkerFailureReporterPort(Protocol):
+    def report(
+        self,
+        assignment: FactoryBuildAssignmentV2,
+        checkpoint: "HermesFactoryWorkerCheckpoint",
+        error: Exception,
+    ) -> None: ...
+
+
 class HermesFactoryAssignmentScope(BaseModel):
     """Identity fence for assignments produced by one live invocation."""
 
@@ -171,14 +180,17 @@ class HermesFactoryWorkerCheckpoint(BaseModel):
         "effect_submitted",
     ]
     effect: FactoryBuildEffectV2 | None = None
-    failure_kind: Literal[
-        "timeout",
-        "process_exit",
-        "null_or_untyped",
-        "validation_error",
-        "runtime_error",
-        "exception",
-    ] | None = None
+    failure_kind: (
+        Literal[
+            "timeout",
+            "process_exit",
+            "null_or_untyped",
+            "validation_error",
+            "runtime_error",
+            "exception",
+        ]
+        | None
+    ) = None
     failure_exit_code: int | None = Field(default=None, ge=-32768, le=32767)
     consumed_retry_authorizations: tuple[str, ...] = ()
 
@@ -356,7 +368,9 @@ class FilesystemHermesFactoryWorkerCheckpointStore:
                 0o600,
             )
         except FileExistsError as exc:
-            raise ValueError("Hermes Factory worker checkpoint creation conflicts") from exc
+            raise ValueError(
+                "Hermes Factory worker checkpoint creation conflicts"
+            ) from exc
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(content)
             stream.flush()
@@ -609,6 +623,7 @@ class HermesFactoryWorker:
         released_skill_sha256: str,
         checkpoint_store: FilesystemHermesFactoryWorkerCheckpointStore,
         codex_receipts: HermesFactoryCodexReceiptReaderPort,
+        failure_reporter: HermesFactoryWorkerFailureReporterPort | None = None,
         retry_authority: HermesFactoryRetryAuthorityPort | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -626,6 +641,7 @@ class HermesFactoryWorker:
         self._released_skill_sha256 = released_skill_sha256
         self._checkpoint_store = checkpoint_store
         self._codex_receipts = codex_receipts
+        self._failure_reporter = failure_reporter
         self._retry_authority = retry_authority
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -727,6 +743,17 @@ class HermesFactoryWorker:
                             failure_kind=failure_kind,
                             failure_exit_code=exit_code,
                         )
+                    failed_checkpoint = self._checkpoint_store.load(assignment)
+                    if (
+                        self._failure_reporter is not None
+                        and failed_checkpoint is not None
+                        and failed_checkpoint.state == "failed"
+                    ):
+                        self._failure_reporter.report(
+                            assignment,
+                            failed_checkpoint,
+                            exc,
+                        )
                     raise
                 receipt = build.codex_build_receipt
                 effect = FactoryBuildEffectV2(
@@ -770,5 +797,6 @@ __all__ = [
     "HermesFactoryMinibookPort",
     "HermesFactorySkillVerifierPort",
     "HermesFactoryWorker",
+    "HermesFactoryWorkerFailureReporterPort",
     "HermesFactoryWorkerCheckpoint",
 ]

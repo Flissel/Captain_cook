@@ -45,6 +45,12 @@ async def test_sales_pipeline_brief_builds_exact_team_and_resumes_credential_act
         "account_snapshot_reader",
         "opportunity_scoring_rules",
     }
+    assert run.optional_tool_policy_evidence == {
+        "industry_signal_reader": "typed_optional_gap",
+    }
+    assert run.external_write_attempts == 1
+    assert run.external_write_blocks == 1
+    assert run.child_sentinel_secret_seen is False
     assert run.executed_commands == (
         ("python", "-m", "compileall", "src"),
         ("python", "-m", "pytest"),
@@ -65,6 +71,25 @@ async def test_sales_pipeline_brief_builds_exact_team_and_resumes_credential_act
         "assert-3e8de9d245ae",
         "assert-3153de4c492a",
     )
+    assert run.public_assertion_sources == {
+        "assert-2b1d7c6a3666": ("Acceptance outcomes", "exact_team"),
+        "assert-7f77e654f907": ("Acceptance outcomes", "required_tools"),
+        "assert-b84ce004c78b": ("Real cases", "sales_pipeline"),
+        "assert-cc0a96c5fc02": ("Integrations", "account_snapshot_reader"),
+        "assert-9e6cdab86303": (
+            "Integrations",
+            "opportunity_scoring_rules",
+        ),
+        "assert-9a5995ebfcb8": ("Integrations", "industry_signal_reader"),
+        "assert-3e8de9d245ae": (
+            "Security requirements",
+            "only_opaque_credential_references_may_cross_the_action_boundary",
+        ),
+        "assert-3153de4c492a": (
+            "Security requirements",
+            "external_writes_are_forbidden",
+        ),
+    }
     assert run.minibook_readback_verified
     assert run.captain_readback_verified
     assert run.captain_sealed_receipt_verified

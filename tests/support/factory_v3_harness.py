@@ -15,7 +15,7 @@ from decimal import Decimal
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from threading import RLock
 from typing import Iterator, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -78,9 +78,16 @@ from agenten.agent_factory.orchestration import (
     FactoryDispatchError,
     FactoryDispatcher,
 )
+from agenten.agent_factory.request_observer import (
+    CaptainFactoryActionRequestCoordinator,
+    FactoryCredentialRequiredObservation,
+)
 from agenten.agent_factory.service import FactoryCoordinator, InMemoryFactoryRepository
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
+from agenten.agent_factory.worker_failure_projection import (
+    CaptainFactoryWorkerFailureCoordinator,
+)
 from agenten.agent_runtime.contracts import ArtifactRef as RuntimeArtifactRef
 from gateway.factory_action_store import (
     FactoryActionRow,
@@ -276,20 +283,14 @@ class _JsonFactoryActionRepository:
         if not self._path.exists():
             return {}
         payload = json.loads(self._path.read_text(encoding="utf-8"))
-        return {
-            key: self._row_from_payload(value)
-            for key, value in payload.items()
-        }
+        return {key: self._row_from_payload(value) for key, value in payload.items()}
 
     def _save(self, rows: dict[str, FactoryActionRow]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._path.with_suffix(".tmp")
         temporary.write_bytes(
             _canonical(
-                {
-                    key: self._row_to_payload(row)
-                    for key, row in sorted(rows.items())
-                },
+                {key: self._row_to_payload(row) for key, row in sorted(rows.items())},
                 newline=True,
             )
         )
@@ -363,9 +364,7 @@ class _JsonFactoryActionRepository:
                 str | None, payload.get("continuation_idempotency_key")
             ),
             continuation_intent_at=timestamp("continuation_intent_at"),
-            continuation_acknowledged_at=timestamp(
-                "continuation_acknowledged_at"
-            ),
+            continuation_acknowledged_at=timestamp("continuation_acknowledged_at"),
             consumed_at=timestamp("consumed_at"),
             credential_reservation_key=cast(
                 str | None, payload.get("credential_reservation_key")
@@ -400,6 +399,50 @@ class _EffectSink:
         receipt = FactoryActionEffectReceipt(effect_key, payload_sha256)
         self.receipts[effect_key] = receipt
         return receipt
+
+
+class _MinibookActionRequestProjection:
+    def __init__(self, store: CreationJobStore) -> None:
+        self._store = store
+
+    def project_action_request(
+        self, request: FactoryActionRequestV1, *, expected_version: int
+    ) -> None:
+        mirrored = MinibookActionRequestV1.model_validate(
+            request.model_dump(mode="json", by_alias=True)
+        )
+        self._store.record_action_request(mirrored, expected_version=expected_version)
+
+
+class _FailureArtifactProjection:
+    def __init__(self, store: _HermeticCreationArtifactStore) -> None:
+        self._store = store
+
+    def put_failure(self, content: bytes) -> ArtifactRef:
+        return _runtime_ref(
+            self._store.put(content, "application/json", namespace="build-failure")
+        )
+
+
+class _MinibookWorkerFailureProjection:
+    def __init__(self, store: CreationJobStore) -> None:
+        self._store = store
+
+    def block_worker_failure(
+        self,
+        assignment: FactoryBuildAssignmentV2,
+        *,
+        failure_code: str,
+        failure_summary: str,
+    ) -> None:
+        progress = self._store.progress(assignment.creation_job_id)
+        self._store.transition(
+            assignment.creation_job_id,
+            "blocked",
+            expected_version=progress.version,
+            checkpoint=f"build_handoff:{failure_code}",
+            snapshot={"failure_code": failure_code, "summary": failure_summary},
+        )
 
 
 class _ContinuationSink:
@@ -524,7 +567,9 @@ class _HermeticHermes:
         else:
             raise ValueError("Hermetic Hermes received an unsupported role")
         reference = _runtime_ref(
-            self._store.put(_canonical(payload), "application/json", namespace=namespace)
+            self._store.put(
+                _canonical(payload), "application/json", namespace=namespace
+            )
         )
         evidence_reference = _agent_runtime_ref(reference)
         if phase is FactoryPhase.BLUEPRINT_CREATED:
@@ -678,6 +723,22 @@ class FactoryV3Run:
         return self._harness.required_tools_with_passing_tests
 
     @property
+    def optional_tool_policy_evidence(self) -> dict[str, str]:
+        return self._harness.optional_tool_policy_evidence
+
+    @property
+    def external_write_attempts(self) -> int:
+        return self._harness.external_write_attempts
+
+    @property
+    def external_write_blocks(self) -> int:
+        return self._harness.external_write_blocks
+
+    @property
+    def child_sentinel_secret_seen(self) -> bool:
+        return self._harness.child_sentinel_secret_seen
+
+    @property
     def minibook_readback_verified(self) -> bool:
         return self._harness.minibook_readback_verified
 
@@ -708,6 +769,10 @@ class FactoryV3Run:
     @property
     def verified_public_assertion_ids(self) -> tuple[str, ...]:
         return self._harness.verified_public_assertion_ids
+
+    @property
+    def public_assertion_sources(self) -> dict[str, tuple[str, ...]]:
+        return self._harness.public_assertion_sources
 
     @property
     def captain_sealed_receipt_verified(self) -> bool:
@@ -781,7 +846,10 @@ class FactoryV3Harness:
         self._worker: HermesFactoryWorker | None = None
         self._coordinator: FactoryCoordinator | None = None
         self._authority_store: FilesystemCaptainCreationJobV3Store | None = None
-        self._worker_checkpoints: FilesystemHermesFactoryWorkerCheckpointStore | None = None
+        self._worker_checkpoints: (
+            FilesystemHermesFactoryWorkerCheckpointStore | None
+        ) = None
+        self._failure_coordinator: CaptainFactoryWorkerFailureCoordinator | None = None
         self._tampering_reader: _TamperingCaptainArtifactReader | None = None
         self._build_lease = None
         self._minibook_readback = False
@@ -805,7 +873,13 @@ class FactoryV3Harness:
         return FactoryV3Run(self)
 
     async def run_variant(self, variant: str) -> FactoryV3FailedOutcome:
-        if variant not in {"one_agent", "null_output", "timeout", "receipt_only", "tampered_cas"}:
+        if variant not in {
+            "one_agent",
+            "null_output",
+            "timeout",
+            "receipt_only",
+            "tampered_cas",
+        }:
             raise ValueError("unknown Factory V3 variant")
         codex_variant = "happy" if variant == "tampered_cas" else variant
         await self._begin(
@@ -817,13 +891,9 @@ class FactoryV3Harness:
             try:
                 await self._run_worker()
             except FactoryDispatchError as exc:
-                if str(exc) != "real-case execution evidence changed":
+                if getattr(exc, "failure_code", None) != "topology_drift":
                     raise
-                return self._block_worker_failure(
-                    expected_kind="runtime_error",
-                    failure_code="topology_drift",
-                    failure_summary=str(exc),
-                )
+                return self._observed_worker_failure()
             raise AssertionError("one-agent topology was accepted")
         if variant == "null_output":
             try:
@@ -831,21 +901,14 @@ class FactoryV3Harness:
             except ValueError as exc:
                 if str(exc) != "Hermes Factory requires a typed Codex build result":
                     raise
-                return self._block_worker_failure(
-                    expected_kind="validation_error",
-                    failure_code="codex_null_output",
-                    failure_summary=str(exc),
-                )
+                return self._observed_worker_failure()
             raise AssertionError("null Codex output was accepted")
         if variant == "timeout":
             try:
                 await self._run_worker()
             except TimeoutError as exc:
-                return self._block_worker_failure(
-                    expected_kind="timeout",
-                    failure_code="codex_timeout",
-                    failure_summary=str(exc),
-                )
+                del exc
+                return self._observed_worker_failure()
             raise AssertionError("timed-out Codex output was accepted")
 
         await self._run_worker()
@@ -989,9 +1052,7 @@ class FactoryV3Harness:
                 raise ValueError("Hermes planning evidence is unavailable")
             lease_ref = _agent_runtime_ref(
                 self._artifacts.put(
-                    _canonical(
-                        request.lease.model_dump(mode="json", by_alias=True)
-                    ),
+                    _canonical(request.lease.model_dump(mode="json", by_alias=True)),
                     "application/json",
                     namespace="captain-lease",
                 )
@@ -1007,12 +1068,10 @@ class FactoryV3Harness:
                 tool_plan_ref=hermes.tool_plan_ref,
                 required_agent_ids=compiled.required_agent_ids,
                 ordered_handoffs=tuple(
-                    item.model_dump(mode="json")
-                    for item in compiled.ordered_handoffs
+                    item.model_dump(mode="json") for item in compiled.ordered_handoffs
                 ),
                 tool_requirements=tuple(
-                    item.model_dump(mode="json")
-                    for item in compiled.tool_requirements
+                    item.model_dump(mode="json") for item in compiled.tool_requirements
                 ),
                 workspace_policy_ref=workspace_policy_ref,
                 clarification_policy={
@@ -1095,15 +1154,14 @@ class FactoryV3Harness:
             dispatcher.dispatch_next(self._job.job_id)
         )
         await self._wait_until(
-            lambda: self._forge is not None
-            and self._forge.creation_submissions == 1
+            lambda: self._forge is not None and self._forge.creation_submissions == 1
         )
         self._creation_job = self._authority_store.creation_job_for(self._job, 1)
         await self._wait_until(
-            lambda: self._minibook_store.progress(
-                self._creation_job.creation_job_id
-            ).status
-            == "awaiting_build"
+            lambda: (
+                self._minibook_store.progress(self._creation_job.creation_job_id).status
+                == "awaiting_build"
+            )
         )
         minibook_assignment = self._minibook_store.build_assignment_for_job(
             self._creation_job.creation_job_id
@@ -1135,9 +1193,18 @@ class FactoryV3Harness:
             artifact_cas=captain_cas,
             assignment=self._assignment,
             creation_job=self._creation_job,
+            compiled_specification=compiled,
             factory_job=self._job,
             lease=self._build_lease,
             released_skill=released,
+            clock=lambda: self._base_time,
+        )
+        self._failure_coordinator = CaptainFactoryWorkerFailureCoordinator(
+            minibook=_MinibookWorkerFailureProjection(self._minibook_store),
+            captain=self._coordinator,
+            artifacts=_FailureArtifactProjection(self._artifacts),
+            factory_job=self._job,
+            lease=self._build_lease,
             clock=lambda: self._base_time,
         )
         self._worker = HermesFactoryWorker(
@@ -1149,6 +1216,7 @@ class FactoryV3Harness:
             released_skill_sha256=released.content_sha256,
             checkpoint_store=checkpoint_store,
             codex_receipts=self._codex,
+            failure_reporter=self._failure_coordinator,
             clock=lambda: self._base_time,
         )
         if with_action:
@@ -1191,32 +1259,27 @@ class FactoryV3Harness:
                 namespace="checkpoint",
             )
         )
-        request = FactoryActionRequestV1(
-            schema_name="captain.factory-action-request.v1",
-            request_id=uuid5(
-                self._creation_job.creation_job_id, "crm-readonly-credential"
-            ),
-            factory_job_id=self._creation_job.factory_job_id,
-            creation_job_id=self._creation_job.creation_job_id,
-            correlation_id=self._creation_job.correlation_id,
-            expected_subject_version=self._creation_job.subject_version,
-            request_type="credential_required",
-            safe_checkpoint_ref=checkpoint_ref,
-            safe_checkpoint_sha256=checkpoint_ref.sha256,
-            required_scope="crm.account_snapshot.read",
-            allowed_decisions=("approve", "deny"),
-            message="Connect the approved read-only CRM account source.",
-            deadline_at=self._base_time + timedelta(minutes=30),
-            status="pending",
+        coordinator = CaptainFactoryActionRequestCoordinator(
+            creation_job=self._creation_job,
+            minibook_projection=_MinibookActionRequestProjection(self._minibook_store),
+            action_inbox=self._action_store,
+            progress_for=self._minibook_store.progress,
+            tenant_id=_TENANT,
+            deadline_for=lambda observed: observed + timedelta(minutes=30),
         )
-        mirrored = MinibookActionRequestV1.model_validate(
-            request.model_dump(mode="json", by_alias=True)
+        coordinator.observe(
+            FactoryCredentialRequiredObservation(
+                factory_job_id=self._creation_job.factory_job_id,
+                creation_job_id=self._creation_job.creation_job_id,
+                correlation_id=self._creation_job.correlation_id,
+                subject_version=self._creation_job.subject_version,
+                integration_key="account_snapshot_reader",
+                required_scope="crm.account_snapshot.read",
+                safe_checkpoint_ref=checkpoint_ref,
+                message="Connect the approved read-only CRM account source.",
+                observed_at=self._base_time,
+            )
         )
-        self._minibook_store.record_action_request(
-            mirrored,
-            expected_version=progress.version,
-        )
-        self._action_store.create(request, tenant_id=_TENANT)
         # Re-open the persistent repository before answering; the in-memory
         # object is not used as durability evidence.
         self._action_store = FactoryActionStore(
@@ -1293,9 +1356,7 @@ class FactoryV3Harness:
         )
         if effect is None:
             assert self._creation_job is not None
-            progress = self._minibook_store.progress(
-                self._creation_job.creation_job_id
-            )
+            progress = self._minibook_store.progress(self._creation_job.creation_job_id)
             claimable = self._minibook_store.next_claimable_build_assignment(
                 _WORKER_ID,
                 now=self._base_time,
@@ -1310,44 +1371,24 @@ class FactoryV3Harness:
         self._authority_store.record_effect(effect)
         await self._scheduler.join()
 
-    def _block_worker_failure(
-        self,
-        *,
-        expected_kind: str,
-        failure_code: str,
-        failure_summary: str,
-    ) -> FactoryV3FailedOutcome:
-        assert (
-            self._assignment is not None
-            and self._creation_job is not None
-            and self._worker_checkpoints is not None
-        )
-        checkpoint = self._worker_checkpoints.load(self._assignment)
+    def _observed_worker_failure(self) -> FactoryV3FailedOutcome:
+        assert self._failure_coordinator is not None
+        failure = self._failure_coordinator.last_failure
+        if failure is None:
+            raise AssertionError("production failure coordinator did not project")
+        assert self._creation_job is not None
+        progress = self._minibook_store.progress(self._creation_job.creation_job_id)
         if (
-            checkpoint is None
-            or checkpoint.state != "failed"
-            or checkpoint.failure_kind != expected_kind
+            progress.status != "blocked"
+            or progress.checkpoint != f"build_handoff:{failure.failure_code}"
         ):
-            raise AssertionError("durable Hermes worker failure evidence changed")
-        progress = self._minibook_store.progress(
-            self._creation_job.creation_job_id
-        )
-        self._minibook_store.transition(
-            self._creation_job.creation_job_id,
-            "blocked",
-            expected_version=progress.version,
-            checkpoint="build_handoff",
-        )
-        self._record_captain_failure(
-            failure_code=failure_code,
-            failure_summary=failure_summary,
-        )
+            raise AssertionError("Minibook did not persist the exact failure reason")
         return FactoryV3FailedOutcome(
             status="blocked",
             minibook_status=self.minibook_status,
             captain_status="failed",
-            failure_code=failure_code,
-            failure_summary=failure_summary,
+            failure_code=failure.failure_code,
+            failure_summary=failure.failure_summary,
             tamper_performed=False,
         )
 
@@ -1374,45 +1415,11 @@ class FactoryV3Harness:
     def _record_captain_failure(
         self, *, failure_code: str, failure_summary: str
     ) -> None:
-        assert (
-            self._job is not None
-            and self._coordinator is not None
-            and self._build_lease is not None
-        )
-        evidence_ref = _agent_runtime_ref(
-            self._artifacts.put(
-                _canonical(
-                    {
-                        "schema": "hermes.factory-build-failure.v1",
-                        "status": "failed",
-                        "factory_job_id": str(self._job.job_id),
-                        "failure_code": failure_code,
-                        "failure_summary": failure_summary,
-                    },
-                    newline=True,
-                ),
-                "application/json",
-                namespace="build-failure",
-            )
-        )
-        self._coordinator.record(
-            FactoryEvidenceBlock(
-                schema_name="captain.agent-factory-block.v1",
-                event_id=uuid5(self._job.job_id, "task-9-hermetic-build-failed"),
-                job_id=self._job.job_id,
-                correlation_id=self._job.correlation_id,
-                causation_id=self._job.event_id,
-                occurred_at=self._base_time,
-                producer="hermes",
-                subject_version=self._job.subject_version,
-                attempt=1,
-                phase=FactoryPhase.AGENT_CODE_CREATED,
-                role=FactoryRole.TOOL_INTEGRATOR,
-                status=FactoryBlockStatus.FAILED,
-                artifact_refs=(evidence_ref,),
-                evidence_refs=(evidence_ref,),
-                lease_id=self._build_lease.lease_id,
-            )
+        assert self._assignment is not None and self._failure_coordinator is not None
+        self._failure_coordinator.report_boundary_failure(
+            self._assignment,
+            failure_code=failure_code,
+            failure_summary=failure_summary,
         )
 
     async def _wait_for_result(self) -> CreationResultV2:
@@ -1487,12 +1494,30 @@ class FactoryV3Harness:
         return set() if self._codex is None else set(self._codex.tested_tools)
 
     @property
+    def optional_tool_policy_evidence(self) -> dict[str, str]:
+        return (
+            {}
+            if self._codex is None
+            else dict(self._codex.optional_tool_policy_evidence)
+        )
+
+    @property
+    def external_write_attempts(self) -> int:
+        return 0 if self._codex is None else self._codex.external_write_attempts
+
+    @property
+    def external_write_blocks(self) -> int:
+        return 0 if self._codex is None else self._codex.external_write_blocks
+
+    @property
+    def child_sentinel_secret_seen(self) -> bool:
+        return False if self._codex is None else self._codex.child_sentinel_secret_seen
+
+    @property
     def minibook_status(self) -> str:
         if self._creation_job is None:
             return "unsubmitted"
-        return self._minibook_store.progress(
-            self._creation_job.creation_job_id
-        ).status
+        return self._minibook_store.progress(self._creation_job.creation_job_id).status
 
     @property
     def executed_commands(self) -> tuple[tuple[str, ...], ...]:
@@ -1504,11 +1529,11 @@ class FactoryV3Harness:
 
     @property
     def verified_public_assertion_ids(self) -> tuple[str, ...]:
-        return (
-            ()
-            if self._codex is None
-            else self._codex.verified_public_assertion_ids
-        )
+        return () if self._codex is None else self._codex.verified_public_assertion_ids
+
+    @property
+    def public_assertion_sources(self) -> dict[str, tuple[str, ...]]:
+        return {} if self._codex is None else dict(self._codex.public_assertion_sources)
 
     @property
     def build_credential_refs(self) -> tuple[str, ...]:
