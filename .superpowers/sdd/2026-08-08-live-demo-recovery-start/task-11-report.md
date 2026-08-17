@@ -1,8 +1,11 @@
 # Task 11 round-2 report — production capability bundle
 
-Date: 2026-08-17  
-Branch: `codex/capability-production-bundle-d11`  
-Starting HEAD: `6219663`  
+Date: 2026-08-17
+
+Branch: `codex/capability-production-bundle-d11`
+
+Starting HEAD: `6219663`
+
 D10 integrated HEAD: `69aff22`
 
 ## Delivered
