@@ -118,6 +118,12 @@ describe("portal API", () => {
   it("fails closed on known and high-entropy tokens in every rendered factory field", () => {
     const longProse = "A display-safe explanation with ordinary words and spaces. ".repeat(5);
     expect(parseFactoryAction({ ...factoryActionPayload, message: longProse }).message).toBe(longProse);
+    const germanProse = "Bitte pruefe die Donaudampfschifffahrtsgesellschaft im DACH Markt.";
+    expect(parseFactoryAction({ ...factoryActionPayload, message: germanProse }).message).toBe(germanProse);
+    const safeIdentifier = "sales_pipeline_brief_for_dach_market_2026";
+    expect(parseFactoryAction({ ...factoryActionPayload, required_scope: safeIdentifier }).requiredScope).toBe(safeIdentifier);
+    const safeUuid = "123e4567-e89b-12d3-a456-426614174000";
+    expect(parseFactoryAction({ ...factoryActionPayload, message: safeUuid }).message).toBe(safeUuid);
     const digest = "0123456789abcdef".repeat(4);
     expect(parseFactoryAction({
       ...factoryActionPayload,
@@ -126,6 +132,9 @@ describe("portal API", () => {
     }).safeCheckpointSha256).toBe(digest);
     for (const patch of [
       { message: "Y7pL2vQ9xN4mR8sT6uW3aB5cD1eF0gHk" },
+      { message: "V2hhdGV2ZXJTdXBlclNlY3JldENyZWRlbnRpYWw" },
+      { message: "Q29uZmlkZW50aWFsVG9rZW5Gb3JUZXN0aW5nLTEyMw" },
+      { message: "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef" },
       { required_scope: "ghp_abcdefghijklmnopqrstuvwxyz0123456789" },
       { message: "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789" },
       { message: "credential://tenant-a/private-credential" },

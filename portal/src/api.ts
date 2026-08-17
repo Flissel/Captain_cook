@@ -26,6 +26,8 @@ const NON_WHITESPACE_PATTERN = /^\S+$/;
 const CREDENTIAL_TYPE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,127}$/;
 const PORTAL_API_PREFIX = "/v1/portal";
 const OPAQUE_TOKEN_PATTERN = /[A-Za-z0-9_+/-]{32,}={0,2}/g;
+const OPAQUE_TOKEN_SHAPE = /^[A-Za-z0-9_+/-]{32,}={0,2}$/;
+const HUMAN_READABLE_IDENTIFIER_PATTERN = /^[a-z]+(?:[_-](?:[a-z]+|v\d{1,3}|\d{1,8}))+$/;
 const UUID_VALUE_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const KNOWN_SECRET_PATTERN = /\b(?:sk_(?:live|test)_[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|gh[pours]_[A-Za-z0-9_-]+|xox[a-z]-[A-Za-z0-9-]+|AIza[A-Za-z0-9_-]+|(?:AKIA|ASIA)[A-Z0-9]{16}|[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,})/i;
 
@@ -139,6 +141,10 @@ function tokenEntropy(token: string): number {
   }).reduce((total, value) => total + value, 0);
 }
 
+function humanReadableIdentifier(token: string): boolean {
+  return /^[A-Za-z]+$/.test(token) || HUMAN_READABLE_IDENTIFIER_PATTERN.test(token);
+}
+
 function knownOrOpaqueSecret(value: string, allowDigest: boolean, uriSegments = false): boolean {
   if (KNOWN_SECRET_PATTERN.test(value)) return true;
   const tokens = uriSegments
@@ -150,7 +156,9 @@ function knownOrOpaqueSecret(value: string, allowDigest: boolean, uriSegments = 
       if (!allowDigest) return true;
       continue;
     }
-    if (/^[0-9a-f]{32,}$/i.test(token) || tokenEntropy(token) >= 3.5) return true;
+    if (!OPAQUE_TOKEN_SHAPE.test(token) || humanReadableIdentifier(token)) continue;
+    const hasOpaqueAlphabet = /[0-9_+/-=]/.test(token) || (/[a-z]/.test(token) && /[A-Z]/.test(token));
+    if (/^[0-9a-f]{32,}$/i.test(token) || (hasOpaqueAlphabet && tokenEntropy(token) >= 3.5)) return true;
   }
   return false;
 }
