@@ -103,7 +103,10 @@ from agenten.agent_factory.team_execution import (
     compose_live_team_execution,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
-from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
+from gateway.agent_factory_dispatch_runner import (
+    GatewayN8nWorkBatchSourcePort,
+    GatewayNextActionLeaseIssuer,
+)
 from gateway.capability_live_pipeline import (
     CapabilityBusinessBenchmarkPort,
     CapabilityFactoryPort,
@@ -549,6 +552,7 @@ def compose_agent_factory_live(
     hermes_settings: HermesCliSettings,
     clock: Callable[[], datetime],
     n8n_work_batches: Mapping[UUID, str] | None = None,
+    n8n_work_batch_source: GatewayN8nWorkBatchSourcePort | None = None,
     holdout_selector: Callable[[AgentFactoryJobV3], PrivateHoldoutRef] | None = None,
     improvements: FactoryImprovementAuthorizationPort | None = None,
     runtime_retries: FactoryRuntimeRetryAuthorizationPort | None = None,
@@ -579,6 +583,7 @@ def compose_agent_factory_live(
         store=store,
         workspace_namespace=workspace_namespace,
         n8n_work_batches=n8n_work_batches,
+        n8n_work_batch_source=n8n_work_batch_source,
     )
     evidence_store = FilesystemFactoryEvidenceStore(Path(evidence_root))
     hermes = HermesCliFactory(

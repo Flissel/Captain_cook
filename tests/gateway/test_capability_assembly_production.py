@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid5
 
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import SecretStr
 import gateway.capability_assembly_production as production_composition_module
 
@@ -85,6 +86,7 @@ from gateway.capability_benchmark_process_executor import (
     GatewayHttpBenchmarkProcessTransport,
     GatewayIsolatedBenchmarkExecutorClient,
 )
+from gateway.capability_benchmark_process_app import create_capability_benchmark_process_app
 from gateway.capability_live_current_adapters import CapabilityProjectionReadback
 from gateway.capability_live_factory_adapter import CurrentCapabilityFactoryAdapter
 from gateway.capability_live_pipeline import (
@@ -1851,15 +1853,36 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             def capability_tool_evidence(self, receipt_sha256: str):
                 return self.issued.get(receipt_sha256)
 
+            def record_capability_tool_evidence(self, **payload: object) -> None:
+                receipt_ref = payload["receipt_ref"]
+                self.issued[receipt_ref.sha256] = {
+                    "case_digest": payload["case_digest"],
+                    "tool_key": payload["tool_key"],
+                    "trace_id": str(payload["trace_id"]),
+                    "run_id": str(payload["run_id"]),
+                    "model_policy_digest": payload["model_policy_digest"],
+                    "call_ref": payload["call_ref"].model_dump(mode="json"),
+                    "lease_ref": payload["lease_ref"].model_dump(mode="json"),
+                    "receipt_ref": receipt_ref.model_dump(mode="json"),
+                    "batch_id": payload["batch_id"],
+                    "execution_result_id": str(payload["execution_result_id"]),
+                }
+
         gateway_store = ToolRegistry()
         bodies: dict[ArtifactRef, bytes] = {}
 
-        def put(self, value: dict[str, object]) -> ArtifactRef:
-            body = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        def put(
+            self, value: dict[str, object] | bytes,
+            media_type: str = "application/json",
+        ) -> ArtifactRef:
+            body = (
+                value if isinstance(value, bytes)
+                else json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+            )
             digest = hashlib.sha256(body).hexdigest()
             ref = ArtifactRef(
                 uri=f"artifact://sha256/{digest}", sha256=digest,
-                media_type="application/json",
+                media_type=media_type,
             )
             self.bodies[ref] = body
             return ref
@@ -1953,44 +1976,18 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             tool_calls = []
             for tool_key in benchmark_tool_keys:
                 call_id = f"call-{tool_key}-{execution_request.case_ref.case_id}-{kind}"
-                call_ref = evidence.put({
-                    "schema": "captain.capability-benchmark-tool-call.v1",
-                    **common,
-                    "tool_key": tool_key,
-                    "operation": "read",
-                    "call_id": call_id,
-                })
-                lease_ref = evidence.put({
-                    "schema": "captain.capability-benchmark-tool-lease.v1",
-                    **common,
-                    "tool_key": tool_key,
-                    "call_id": call_id,
-                    "call_sha256": call_ref.sha256,
-                    "lease_id": f"lease-{tool_key}-{execution_request.case_ref.case_id}-{kind}",
-                    "scope": ["read"],
-                })
-                receipt_ref = evidence.put({
-                    "schema": "captain.capability-benchmark-tool-receipt.v1",
-                    **common,
-                    "tool_key": tool_key,
-                    "call_id": call_id,
-                    "call_sha256": call_ref.sha256,
-                    "lease_sha256": lease_ref.sha256,
-                    "status": "succeeded",
-                    "result_ref_sha256": outcome_ref.sha256,
-                })
-                evidence.gateway_store.issued[receipt_ref.sha256] = {
-                    **common,
-                    "tool_key": tool_key,
-                    "call_ref": call_ref.model_dump(mode="json"),
-                    "lease_ref": lease_ref.model_dump(mode="json"),
-                    "receipt_ref": receipt_ref.model_dump(mode="json"),
-                    "batch_id": "n8n-benchmark-batch",
-                    "execution_result_id": str(_id(f"{kind}-execution-result")),
-                }
-                tool_calls.append(GenericToolCallEvidence(
-                    tool_key=tool_key, call_ref=call_ref,
-                    lease_ref=lease_ref, receipt_ref=receipt_ref,
+                tool_calls.append(tool_authority.issue(
+                    case_ref=execution_request.case_ref,
+                    tool_key=tool_key,
+                    operation="read",
+                    call_id=call_id,
+                    lease_id=f"lease-{tool_key}-{execution_request.case_ref.case_id}-{kind}",
+                    trace_id=trace_id,
+                    run_id=run_id,
+                    model_policy_digest=execution_request.model_policy_digest,
+                    result_ref_sha256=outcome_ref.sha256,
+                    batch_id="n8n-benchmark-batch",
+                    execution_result_id=_id(f"{kind}-execution-result"),
                 ))
             return GenericBenchmarkExecutionEvidence(
                 case_ref=execution_request.case_ref,
@@ -2024,33 +2021,59 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
                 evidence_refs=(_ref("generic-benchmark-recording"),),
             )
 
-    evidence, executor, recorder = Evidence(), Executor(), Recorder()
+    evidence, raw_executor, recorder = Evidence(), Executor(), Recorder()
     tool_authority = CaptainBenchmarkToolEvidenceAuthority(
         gateway_store=evidence.gateway_store,
         artifacts=evidence,
     )
     private_cases = _private_case_repository(
-        holdouts, executor_authority_id=executor.authority_id,
+        holdouts, executor_authority_id=raw_executor.authority_id,
     )
-    authority = asyncio.run(GenericCapabilityBenchmarkAdapter(
-        bindings=Bindings(), executor=executor, evidence=evidence,
-        tool_authority=tool_authority,
-        recorder=recorder,
-        private_cases=private_cases,
-    ).evaluate(request))
+    process_app = create_capability_benchmark_process_app(
+        executor=raw_executor,
+        bearer_token="unit-test-benchmark-process-token",
+        authority_id=raw_executor.authority_id,
+    )
+
+    with TestClient(process_app) as process_client:
+        class ProcessTransport:
+            async def post(self, endpoint: str, body: bytes) -> bytes:
+                assert endpoint == "http://127.0.0.1/v1/execute"
+                response = process_client.post(
+                    "/v1/execute", content=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer unit-test-benchmark-process-token",
+                    },
+                )
+                assert response.status_code == 200
+                return response.content
+
+        executor = GatewayIsolatedBenchmarkExecutorClient(
+            gateway_store=evidence.gateway_store,
+            authority_id=raw_executor.authority_id,
+            endpoint="http://127.0.0.1/v1/execute",
+            transport=ProcessTransport(),
+        )
+        authority = asyncio.run(GenericCapabilityBenchmarkAdapter(
+            bindings=Bindings(), executor=executor, evidence=evidence,
+            tool_authority=tool_authority,
+            recorder=recorder,
+            private_cases=private_cases,
+        ).evaluate(request))
 
     serialized = repr(recorder.request)
     for ref in grounded_input.compiled_specification.private_holdout_refs:
         assert holdouts.get(ref.uri) not in serialized
         assert ref.uri not in serialized
     assert "setup=" not in serialized and "expected=" not in serialized
-    assert len(executor.requests) == 30
+    assert len(raw_executor.requests) == 30
     assert authority.benchmark_summary_ref == _ref("generic-benchmark-summary")
     with pytest.raises(CapabilityLiveAuthorityUnavailable, match="stale"):
         private_cases.resolve(
-            executor.requests[0].case_ref,
+            raw_executor.requests[0].case_ref,
             purpose="execution",
-            authority_id=executor.authority_id,
+            authority_id=raw_executor.authority_id,
         )
 
 

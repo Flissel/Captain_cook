@@ -41,6 +41,10 @@ class GatewayFactoryLeaseStorePort(Protocol):
     def bundle(self, batch_id: str) -> dict[str, object]: ...
 
 
+class GatewayN8nWorkBatchSourcePort(Protocol):
+    def active_n8n_work_batch_id(self, job_id: UUID) -> str | None: ...
+
+
 class GatewayNextActionLeaseIssuer:
     """Issue the narrow lease that Gateway independently admits as next.
 
@@ -57,6 +61,7 @@ class GatewayNextActionLeaseIssuer:
         store: GatewayFactoryLeaseStorePort,
         workspace_namespace: str,
         n8n_work_batches: Mapping[UUID, str] | None = None,
+        n8n_work_batch_source: GatewayN8nWorkBatchSourcePort | None = None,
     ) -> None:
         namespace = workspace_namespace.strip().strip("/")
         if not namespace or any(
@@ -67,6 +72,7 @@ class GatewayNextActionLeaseIssuer:
         self._store = store
         self._workspace_namespace = namespace
         self._n8n_work_batches = dict(n8n_work_batches or {})
+        self._n8n_work_batch_source = n8n_work_batch_source
         self._authorized: dict[
             tuple[UUID, FactoryRole, int], tuple[FactoryJob, FactoryLease]
         ] = {}
@@ -184,6 +190,20 @@ class GatewayNextActionLeaseIssuer:
         expected = f"n8n-{job.job_id.hex[:24]}"
         if batch_id != expected:
             raise FactoryLeaseDenied("n8n WorkBatch is not derived from the Factory job")
+        if self._n8n_work_batch_source is not None:
+            try:
+                durable = self._n8n_work_batch_source.active_n8n_work_batch_id(
+                    job.job_id
+                )
+            except Exception as exc:
+                raise FactoryLeaseDenied(
+                    "n8n WorkBatch durable authority is unavailable"
+                ) from exc
+            if durable != batch_id:
+                raise FactoryLeaseDenied(
+                    "n8n WorkBatch durable authority changed for the Factory job"
+                )
+            return
         existing = self._n8n_work_batches.get(job.job_id)
         if existing is not None and existing != batch_id:
             raise FactoryLeaseDenied("n8n WorkBatch binding changed for the Factory job")
@@ -317,6 +337,20 @@ class GatewayNextActionLeaseIssuer:
         role: FactoryRole,
     ) -> IntegrationIntent:
         batch_id = self._n8n_work_batches.get(job.job_id)
+        if self._n8n_work_batch_source is not None:
+            try:
+                durable = self._n8n_work_batch_source.active_n8n_work_batch_id(
+                    job.job_id
+                )
+            except Exception as exc:
+                raise FactoryLeaseDenied(
+                    "n8n WorkBatch durable authority is unavailable"
+                ) from exc
+            if batch_id is not None and durable != batch_id:
+                raise FactoryLeaseDenied(
+                    "n8n WorkBatch durable authority changed for the Factory job"
+                )
+            batch_id = durable
         if (
             batch_id is None
             or role is not FactoryRole.TOOL_INTEGRATOR
@@ -352,4 +386,4 @@ class GatewayNextActionLeaseIssuer:
         return IntegrationIntent.N8N
 
 
-__all__ = ["GatewayNextActionLeaseIssuer"]
+__all__ = ["GatewayN8nWorkBatchSourcePort", "GatewayNextActionLeaseIssuer"]

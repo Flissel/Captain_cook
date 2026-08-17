@@ -283,6 +283,62 @@ def test_gateway_tool_registry_persists_case_bound_entry() -> None:
     assert store.capability_tool_evidence(refs[2].sha256)["case_digest"] == "d" * 64
 
 
+def test_gateway_tool_authority_issues_the_exact_registered_artifact_bytes(tmp_path) -> None:
+    records: dict[str, object] = {}
+
+    class Store:
+        def record_capability_tool_evidence(self, **payload: object) -> None:
+            records.update(payload)
+
+        def capability_tool_evidence(self, receipt_sha256: str):
+            assert receipt_sha256 == records["receipt_ref"].sha256
+            return {
+                "case_digest": records["case_digest"],
+                "tool_key": records["tool_key"],
+                "trace_id": str(records["trace_id"]),
+                "run_id": str(records["run_id"]),
+                "model_policy_digest": records["model_policy_digest"],
+                "call_ref": records["call_ref"].model_dump(mode="json"),
+                "lease_ref": records["lease_ref"].model_dump(mode="json"),
+                "receipt_ref": records["receipt_ref"].model_dump(mode="json"),
+                "batch_id": records["batch_id"],
+                "execution_result_id": str(records["execution_result_id"]),
+            }
+
+    artifacts = ContentAddressedArtifactAdapter(tmp_path / "artifacts")
+    authority = CaptainBenchmarkToolEvidenceAuthority(
+        gateway_store=Store(), artifacts=artifacts,
+    )
+    case = GenericPrivateCaseRef(
+        case_id="case-a", category=GenericBenchmarkCategory.NORMAL,
+        assertion_ids=("a",), case_digest="d" * 64,
+    )
+    trace_id, run_id = uuid4(), uuid4()
+
+    issued = authority.issue(
+        case_ref=case, tool_key="crm.lookup", operation="read",
+        call_id="call-crm-lookup", lease_id="lease-crm-lookup",
+        trace_id=trace_id, run_id=run_id, model_policy_digest="e" * 64,
+        result_ref_sha256="c" * 64, batch_id="n8n-benchmark-batch",
+        execution_result_id=uuid4(),
+    )
+
+    request = BenchmarkToolEvidenceVerificationRequest(
+        case_ref=case, tool_key=issued.tool_key, call_ref=issued.call_ref,
+        lease_ref=issued.lease_ref, receipt_ref=issued.receipt_ref,
+        trace_id=trace_id, run_id=run_id, model_policy_digest="e" * 64,
+    )
+    assert authority.verify(request) is True
+    for reference, schema in (
+        (issued.call_ref, "captain.capability-benchmark-tool-call.v1"),
+        (issued.lease_ref, "captain.capability-benchmark-tool-lease.v1"),
+        (issued.receipt_ref, "captain.capability-benchmark-tool-receipt.v1"),
+    ):
+        body = artifacts.read_bytes(reference)
+        assert hashlib.sha256(body).hexdigest() == reference.sha256
+        assert json.loads(body)["schema"] == schema
+
+
 class _Store:
     def __init__(self) -> None:
         self.storage = _SqlStorage()

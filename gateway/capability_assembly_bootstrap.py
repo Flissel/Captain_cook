@@ -77,6 +77,8 @@ from gateway.capability_generic_benchmark import (
     GenericBenchmarkCategory,
     GenericBenchmarkReceipt,
     GenericBenchmarkRecordingRequest,
+    GenericPrivateCaseRef,
+    GenericToolCallEvidence,
     generic_benchmark_passes,
 )
 from gateway.capability_live_current_adapters import CapabilityProjectionReadback
@@ -484,6 +486,122 @@ class CaptainBenchmarkToolEvidenceAuthority:
     def __init__(self, *, gateway_store: GatewayStore, artifacts: object) -> None:
         self.gateway_store = gateway_store
         self._artifacts = artifacts
+
+    def issue(
+        self,
+        *,
+        case_ref: GenericPrivateCaseRef,
+        tool_key: str,
+        operation: str,
+        call_id: str,
+        lease_id: str,
+        trace_id: UUID,
+        run_id: UUID,
+        model_policy_digest: str,
+        result_ref_sha256: str,
+        batch_id: str,
+        execution_result_id: UUID,
+    ) -> GenericToolCallEvidence:
+        """Issue canonical bytes and durably register their exact references."""
+
+        if (
+            not tool_key
+            or not operation
+            or not call_id
+            or not lease_id
+            or _SHA256.fullmatch(case_ref.case_digest) is None
+            or _SHA256.fullmatch(model_policy_digest) is None
+            or _SHA256.fullmatch(result_ref_sha256) is None
+            or not batch_id
+            or not isinstance(execution_result_id, UUID)
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool evidence issuance is invalid"
+            )
+        common = {
+            "case_digest": case_ref.case_digest,
+            "tool_key": tool_key,
+            "trace_id": str(trace_id),
+            "run_id": str(run_id),
+            "model_policy_digest": model_policy_digest,
+        }
+
+        def put(payload: dict[str, object]) -> ArtifactRef:
+            body = json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode()
+            reference = self._artifacts.put(body, "application/json")
+            if (
+                not isinstance(reference, ArtifactRef)
+                or reference.sha256 != hashlib.sha256(body).hexdigest()
+                or self._artifacts.read_bytes(reference) != body
+            ):
+                raise CapabilityLiveAuthorityUnavailable(
+                    "benchmark tool evidence artifact readback failed"
+                )
+            return reference
+
+        call_ref = put({
+            "schema": "captain.capability-benchmark-tool-call.v1",
+            **common,
+            "operation": operation,
+            "call_id": call_id,
+        })
+        lease_ref = put({
+            "schema": "captain.capability-benchmark-tool-lease.v1",
+            **common,
+            "call_id": call_id,
+            "call_sha256": call_ref.sha256,
+            "lease_id": lease_id,
+            "scope": [operation],
+        })
+        receipt_ref = put({
+            "schema": "captain.capability-benchmark-tool-receipt.v1",
+            **common,
+            "call_id": call_id,
+            "call_sha256": call_ref.sha256,
+            "lease_sha256": lease_ref.sha256,
+            "status": "succeeded",
+            "result_ref_sha256": result_ref_sha256,
+        })
+        try:
+            self.gateway_store.record_capability_tool_evidence(
+                case_digest=case_ref.case_digest,
+                tool_key=tool_key,
+                trace_id=trace_id,
+                run_id=run_id,
+                model_policy_digest=model_policy_digest,
+                call_ref=call_ref,
+                lease_ref=lease_ref,
+                receipt_ref=receipt_ref,
+                batch_id=batch_id,
+                execution_result_id=execution_result_id,
+            )
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool evidence registration failed"
+            ) from None
+        issued = GenericToolCallEvidence(
+            tool_key=tool_key,
+            call_ref=call_ref,
+            lease_ref=lease_ref,
+            receipt_ref=receipt_ref,
+        )
+        verification = BenchmarkToolEvidenceVerificationRequest(
+            case_ref=case_ref,
+            tool_key=tool_key,
+            call_ref=call_ref,
+            lease_ref=lease_ref,
+            receipt_ref=receipt_ref,
+            trace_id=trace_id,
+            run_id=run_id,
+            model_policy_digest=model_policy_digest,
+        )
+        if self.verify(verification) is not True:
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool evidence registry readback failed"
+            )
+        return issued
 
     def verify(self, request: BenchmarkToolEvidenceVerificationRequest) -> bool:
         try:
@@ -1306,6 +1424,7 @@ def _native_runtime_is_bound(
         or getattr(factory.coordinator, "_repository", None) is not factory.repository
         or type(factory.lease_issuer) is not GatewayNextActionLeaseIssuer
         or getattr(factory.lease_issuer, "_store", None) is not store
+        or getattr(factory.lease_issuer, "_n8n_work_batch_source", None) is not n8n
         or type(factory.hermes) is not HermesCliFactory
         or getattr(factory.hermes, "_workflow_artifacts", None) is not factory.repository
         or type(factory.team_execution) is not ProductionFactoryTeamExecutionPort
