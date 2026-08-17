@@ -115,3 +115,18 @@ def test_factory_gateway_rpc_rejects_cross_job_replay_and_stale_revision() -> No
         "/v1/factory-runtime/store", json=stale, headers=headers
     ).status_code == 409
     assert authority.effects == 1
+
+
+def test_factory_gateway_rpc_rejects_oversized_payload_before_authority() -> None:
+    authority = _DurableAuthority()
+    client = TestClient(create_factory_gateway_rpc_router(
+        service=FactoryGatewayRpcService(authority=authority),
+        factory_runtime_token="factory-runtime-token-0001",
+    ))
+    response = client.post(
+        "/v1/factory-runtime/store",
+        json=_command(payload={"job_id": str(uuid4()), "body": "x" * 1_048_576}),
+        headers={"Authorization": "Bearer factory-runtime-token-0001"},
+    )
+    assert response.status_code == 422
+    assert authority.effects == 0

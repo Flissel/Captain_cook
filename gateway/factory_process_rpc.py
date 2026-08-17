@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import secrets
+import json
 from typing import Literal, Protocol
 from uuid import UUID
 
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 _FACTORY_STORE_OPERATIONS = frozenset(
@@ -49,6 +50,18 @@ class FactoryGatewayRpcCommand(BaseModel):
     attempt: int = Field(ge=1)
     expected_revision: int = Field(ge=0)
     payload: dict[str, object]
+
+    @model_validator(mode="after")
+    def _bounded_payload(self) -> "FactoryGatewayRpcCommand":
+        try:
+            size = len(json.dumps(
+                self.payload, sort_keys=True, separators=(",", ":")
+            ).encode())
+        except (TypeError, ValueError):
+            raise ValueError("Factory Gateway payload is invalid") from None
+        if size > 1_048_576:
+            raise ValueError("Factory Gateway payload is too large")
+        return self
 
 
 class FactoryGatewayRpcResult(BaseModel):
