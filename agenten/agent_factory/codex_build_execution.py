@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 import math
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -605,15 +606,234 @@ _CAPTAIN_FACTORY_RUNTIME_SEAL = object()
 
 
 class _CaptainSealedFactoryCodexRunner:
-    """Captain-owned trust marker; no production sealer exists before Task10.
-
-    Candidate runners cannot opt into this boundary. A future Captain runtime
-    gate must implement the capabilities externally and construct this wrapper
-    inside this module before V3 execution can become available.
-    """
+    """Captain-owned wrapper for one digest-frozen, network-free static build."""
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         raise TypeError("Captain Factory runtime enforcement is unavailable")
+
+    @classmethod
+    def _create(
+        cls,
+        *,
+        authority: FactoryCodexRuntimeAuthority,
+        bundle: "CaptainStaticFactorySourceBundle",
+        expected_bundle_sha256: str,
+        interpreter_path: Path,
+        journal_path: Path,
+        maximum_runtime_seconds: int,
+        mode: Literal["execute", "null_output", "timeout"],
+    ) -> "_CaptainSealedFactoryCodexRunner":
+        actual = captain_static_factory_source_sha256(bundle)
+        if actual != expected_bundle_sha256:
+            raise FactoryDispatchError("static Factory source digest is not authorized")
+        if authority.network_allowed:
+            raise FactoryDispatchError("static Factory runtime must deny network access")
+        runner = object.__new__(cls)
+        runner._captain_runtime_seal = _CAPTAIN_FACTORY_RUNTIME_SEAL
+        runner.authority = authority
+        runner._bundle = bundle
+        runner._interpreter_path = interpreter_path.resolve(strict=True)
+        runner._journal_path = journal_path.resolve()
+        runner._maximum_runtime_seconds = maximum_runtime_seconds
+        runner._mode = mode
+        return runner
+
+    async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
+        if authorized.workspace.resolve() != self.authority.workspace_root:
+            raise FactoryDispatchError("static Factory workspace authority changed")
+        if self._mode == "null_output":
+            raise CaptainStaticFactoryNullOutput(
+                "Hermes Factory requires a typed Codex build result"
+            )
+        self._materialize_bundle()
+        if self._mode == "timeout":
+            return self._result(exit_code=124, terminal_status="timed_out")
+        environment = authorized.child_environment()
+        if set(environment) - {
+            "COMSPEC",
+            "FACTORY_CREDENTIAL_REF",
+            "PATH",
+            "PATHEXT",
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+            "PYTHONIOENCODING",
+            "PYTHONUTF8",
+            "SYSTEMROOT",
+            "SystemRoot",
+            "TEMP",
+            "TMP",
+            "WINDIR",
+        }:
+            raise FactoryDispatchError("static Factory child environment broadened authority")
+        executed: list[tuple[str, ...]] = []
+        started_at = time.monotonic()
+        for command in self.authority.allowed_commands:
+            if command not in {
+                ("python", "-m", "compileall", "src"),
+                ("python", "-m", "pytest"),
+            }:
+                raise FactoryDispatchError("static Factory command is unauthorized")
+            try:
+                remaining_seconds = self._maximum_runtime_seconds - (
+                    time.monotonic() - started_at
+                )
+                if remaining_seconds <= 0:
+                    return self._result(exit_code=124, terminal_status="timed_out")
+                await asyncio.to_thread(
+                    subprocess.run,
+                    command,
+                    executable=str(self._interpreter_path),
+                    cwd=self.authority.workspace_root,
+                    env=environment,
+                    check=True,
+                    capture_output=True,
+                    timeout=remaining_seconds,
+                )
+            except subprocess.TimeoutExpired:
+                return self._result(exit_code=124, terminal_status="timed_out")
+            except (OSError, subprocess.CalledProcessError) as exc:
+                raise FactoryDispatchError("static Factory command failed") from exc
+            executed.append(command)
+        evidence = {
+            "schema": "captain.static-factory-command-evidence.v1",
+            "executed_commands": [list(item) for item in executed],
+            "provider_cost_usd": 0.0,
+            "network_allowed": False,
+            "source_bundle_sha256": captain_static_factory_source_sha256(
+                self._bundle
+            ),
+        }
+        (self.authority.workspace_root / "test-evidence.json").write_text(
+            json.dumps(evidence, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        return self._result(exit_code=0, terminal_status="succeeded")
+
+    def _materialize_bundle(self) -> None:
+        root = self.authority.workspace_root
+        fixed_outputs = {
+            "candidate.zip",
+            "factory-candidate.json",
+            "team_manifest.json",
+        }
+        for relative, content in self._bundle.files:
+            normalized = relative.replace("\\", "/")
+            target = (root / normalized).resolve()
+            within_writable = any(
+                target == allowed or allowed in target.parents
+                for allowed in self.authority.writable_roots
+            )
+            if (
+                not normalized
+                or normalized.startswith(('/', '.'))
+                or ".." in normalized.split("/")
+                or (normalized not in fixed_outputs and not within_writable)
+                or root not in target.parents
+                or target.exists()
+            ):
+                raise FactoryDispatchError("static Factory source escaped authority")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+
+    def _result(
+        self,
+        *,
+        exit_code: int,
+        terminal_status: Literal["succeeded", "timed_out"],
+    ) -> CodexRunResult:
+        lines = (
+            json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": "captain-static-factory-v3",
+                },
+                sort_keys=True,
+            ),
+            json.dumps({"type": "turn.completed"}, sort_keys=True),
+        )
+        journal = "".join(f"{line}\n" for line in lines).encode("utf-8")
+        self._journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self._journal_path.write_bytes(journal)
+        return CodexRunResult(
+            exit_code=exit_code,
+            terminal_status=terminal_status,
+            process_cleanup_status="not_required",
+            journal_path=self._journal_path,
+            journal_sha256=hashlib.sha256(journal).hexdigest(),
+            artifact_references=(),
+            jsonl_lines=lines,
+        )
+
+
+@dataclass(frozen=True)
+class CaptainStaticFactorySourceBundle:
+    """Exact immutable files accepted by the Captain static runner."""
+
+    files: tuple[tuple[str, bytes], ...]
+
+    def __post_init__(self) -> None:
+        paths = tuple(path for path, _content in self.files)
+        if not paths or len(paths) != len(set(paths)) or paths != tuple(sorted(paths)):
+            raise ValueError("static Factory source paths must be unique and sorted")
+        if any(not content for _path, content in self.files):
+            raise ValueError("static Factory source files must be nonempty")
+
+
+def captain_static_factory_source_sha256(
+    bundle: CaptainStaticFactorySourceBundle,
+) -> str:
+    digest = hashlib.sha256()
+    for path, content in bundle.files:
+        encoded = path.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+class CaptainStaticFactoryNullOutput(ValueError):
+    failure_code = "codex_null_output"
+
+
+class CaptainStaticFactoryRunnerFactory:
+    """Construct the only sealed static runner accepted by the V3 executor."""
+
+    def __init__(
+        self,
+        *,
+        authority: FactoryCodexRuntimeAuthority,
+        bundle: CaptainStaticFactorySourceBundle,
+        expected_bundle_sha256: str,
+        interpreter_path: Path,
+        mode: Literal["execute", "null_output", "timeout"] = "execute",
+    ) -> None:
+        self.authority = authority
+        self.bundle = bundle
+        self.expected_bundle_sha256 = expected_bundle_sha256
+        self.interpreter_path = interpreter_path
+        self.mode = mode
+        self.calls = 0
+
+    def __call__(
+        self,
+        *,
+        session_id: str,
+        state_path: Path,
+        journal_path: Path,
+        maximum_runtime_seconds: int,
+        deadline_at: datetime,
+    ) -> CodexRunner:
+        del session_id, state_path, deadline_at
+        self.calls += 1
+        return _CaptainSealedFactoryCodexRunner._create(
+            authority=self.authority,
+            bundle=self.bundle,
+            expected_bundle_sha256=self.expected_bundle_sha256,
+            interpreter_path=self.interpreter_path,
+            journal_path=journal_path,
+            maximum_runtime_seconds=maximum_runtime_seconds,
+            mode=self.mode,
+        )
 
 
 class FactoryCodexProcessInspectorPort(Protocol):
@@ -4556,6 +4776,9 @@ def _is_captain_scaffold_status_line(line: str) -> bool:
 __all__ = [
     "CaptainCodexBuildExecutorPort",
     "CaptainCodexBuildSealer",
+    "CaptainStaticFactoryNullOutput",
+    "CaptainStaticFactoryRunnerFactory",
+    "CaptainStaticFactorySourceBundle",
     "CodexCliFactoryBuildExecutor",
     "CodexCliFactoryBuildSettings",
     "CompletedCodexBuild",
@@ -4572,5 +4795,6 @@ __all__ = [
     "GitDetachedFactoryWorkspacePreparer",
     "PreparedFactoryWorkspace",
     "PowerShellFactoryCodexProcessInspector",
+    "captain_static_factory_source_sha256",
     "write_once_codex_evidence",
 ]

@@ -24,6 +24,7 @@ async def test_sales_pipeline_brief_builds_exact_team_and_resumes_credential_act
 
     assert run.codex_sessions == 0
     assert run.minibook_status == "awaiting_user_input"
+    assert run.production_credential_emissions == 1
 
     await run.answer(
         action,
@@ -139,3 +140,4 @@ async def test_factory_v3_never_marks_invalid_build_successful(
     assert result.tamper_performed is (variant == "tampered_cas")
     assert factory_v3_harness.captain_success_events == ()
     assert len(factory_v3_harness.captain_failure_events) == 1
+    assert factory_v3_harness.automatic_failure_propagations == 1

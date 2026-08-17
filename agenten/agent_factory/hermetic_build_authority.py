@@ -1,24 +1,23 @@
 """Injectable Captain authority for bounded offline Factory V3 builds.
 
 This module is deliberately not part of the default or live composition.  It
-implements the existing Captain build-executor port for callers that provide a
-workspace generator and explicitly opt into network-free execution.
+provides bounded components used to compose the existing Captain Codex build
+executor with the sealed, digest-frozen offline runtime.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-import subprocess
 import sys
-from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
 
-from agenten.agent_factory.codex_build_execution import CompletedCodexBuild
+from agenten.agent_factory.codex_build_execution import (
+    PreparedFactoryWorkspace,
+)
 from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
     CodexBuildArtifactCas,
@@ -36,6 +35,7 @@ from agenten.agent_factory.forge_contracts import (
 from agenten.agent_factory.hermes_factory_worker import HermesFactoryCodexBuild
 from agenten.agent_factory.input_compiler import CompiledFactorySpecification
 from agenten.agent_factory.orchestration import FactoryDispatchError
+from agenten.execution.codex_policy import AuthorizedCodexRun, FrozenEnvironment
 
 
 _CANONICAL_COMMANDS = (
@@ -96,26 +96,12 @@ def minimal_hermetic_subprocess_environment(
     return environment
 
 
-class FactoryWorkspaceGeneratorPort(Protocol):
-    @property
-    def sessions(self) -> int: ...
-
-    @property
-    def provider_cost_usd(self) -> float: ...
-
-    def generate(self, assignment: FactoryBuildAssignmentV2) -> Path | None: ...
-
-
 class FactoryV3SemanticEvidenceError(FactoryDispatchError):
     """Real execution evidence did not prove one frozen public assertion."""
 
     def __init__(self, failure_code: str, message: str) -> None:
         super().__init__(message)
         self.failure_code = failure_code
-
-
-class FactoryV3NullOutputError(ValueError):
-    failure_code = "codex_null_output"
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,34 +212,94 @@ def assignment_public_assertion_ids(
     return tuple(item.assertion_id for item in compiled.assertions)
 
 
-class CaptainHermeticBuildExecutor:
-    """Exact network-free implementation behind Captain's existing build port."""
+class CaptainStaticFactoryCredentialSession:
+    """Release exactly one opaque action-approved credential reference."""
+
+    def __init__(self) -> None:
+        self._reference: str | None = None
+
+    @property
+    def reference(self) -> str:
+        if self._reference is None:
+            raise ValueError("approved account credential is required")
+        return self._reference
+
+    @property
+    def references(self) -> tuple[str, ...]:
+        return () if self._reference is None else (self._reference,)
+
+    def release(self, credential_ref: str) -> None:
+        if not credential_ref.startswith("credential://"):
+            raise ValueError("only opaque credential references may be released")
+        self._reference = credential_ref
+
+
+class CaptainStaticFactoryWorkspacePreparer:
+    """Create one empty, isolated workspace for the existing Codex executor."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve()
+
+    def prepare_or_recover(  # type: ignore[no-untyped-def]
+        self, request, invocation, brief, checkpoint
+    ):
+        del request, invocation, brief
+        if checkpoint is not None:
+            raise FactoryDispatchError("static Factory workspace cannot be resumed")
+        self.root.mkdir(parents=True, exist_ok=False)
+        return PreparedFactoryWorkspace(
+            root=self.root,
+            base_revision="0" * 40,
+        )
+
+
+class CaptainStaticFactoryExecutionAuthorizer:
+    """Bind logical Codex launch metadata to one exact workspace and env."""
+
+    def __init__(
+        self,
+        *,
+        workspace_root: Path,
+        credential_session: CaptainStaticFactoryCredentialSession,
+        host_environment: Mapping[str, str],
+    ) -> None:
+        self._root = workspace_root.resolve()
+        self._credential_session = credential_session
+        self._host_environment = host_environment
+
+    def authorize(self, request) -> AuthorizedCodexRun:  # type: ignore[no-untyped-def]
+        if request.workspace.resolve() != self._root or request.project_root != self._root:
+            raise FactoryDispatchError("static Factory workspace authority changed")
+        if request.command[:3] != ("codex", "exec", "--json"):
+            raise FactoryDispatchError("static Factory logical command changed")
+        environment = minimal_hermetic_subprocess_environment(
+            credential_ref=self._credential_session.reference,
+            host_environment=self._host_environment,
+            temporary_directory=self._root,
+        )
+        environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+        return AuthorizedCodexRun(
+            workspace=self._root,
+            command=request.command,
+            environment=FrozenEnvironment(environment),
+        )
+
+
+class CaptainStaticFactoryBuildObserver:
+    """Independently verify semantics emitted by the executed real case."""
 
     def __init__(
         self,
         *,
         assignment: FactoryBuildAssignmentV2,
-        creation_job: CreationJobV3,
         compiled_specification: CompiledFactorySpecification,
-        generator: FactoryWorkspaceGeneratorPort,
-        clock: Callable[[], datetime],
-        network_enabled: bool = False,
+        workspace_root: Path,
+        credential_session: CaptainStaticFactoryCredentialSession,
     ) -> None:
-        if network_enabled:
-            raise ValueError("hermetic Factory builds must disable network access")
-        if assignment.allowed_commands != _CANONICAL_COMMANDS:
-            raise ValueError("hermetic Factory command authority must be exact")
-        if (
-            creation_job.public_assertion_ids
-            != compiled_specification.public_assertion_ids
-        ):
-            raise ValueError("compiled assertion authority does not match creation job")
         self._assignment = assignment
-        self._creation_job = creation_job
         self._compiled = compiled_specification
-        self._generator = generator
-        self._clock = clock
-        self._credential_refs: tuple[str, ...] = ()
+        self.workspace_root = workspace_root.resolve()
+        self._credential_session = credential_session
         self.executed_commands: tuple[tuple[str, ...], ...] = ()
         self.real_case_handoff_trace: tuple[str, ...] = ()
         self.verified_public_assertion_ids: tuple[str, ...] = ()
@@ -263,70 +309,23 @@ class CaptainHermeticBuildExecutor:
         self.external_write_attempts = 0
         self.external_write_blocks = 0
         self.child_sentinel_secret_seen = False
-        self.sealed_evidence = None
-        self.workspace_root: Path | None = None
-
-    @property
-    def sessions(self) -> int:
-        return self._generator.sessions
 
     @property
     def build_credential_refs(self) -> tuple[str, ...]:
-        return self._credential_refs
+        return self._credential_session.references
 
-    def release_credential(self, credential_ref: str) -> None:
-        if not credential_ref.startswith("credential://"):
-            raise ValueError("only opaque credential references may be released")
-        self._credential_refs = (credential_ref,)
-
-    async def execute(self, request, invocation, brief) -> CompletedCodexBuild:  # type: ignore[no-untyped-def]
-        if not self._credential_refs:
-            raise ValueError("approved account credential is required")
-        if (
-            self._generator.provider_cost_usd
-            > self._assignment.limits.max_provider_cost_usd
-        ):
-            raise FactoryDispatchError(
-                "hermetic provider cost exceeded assignment limit"
-            )
-        workspace = self._generator.generate(self._assignment)
-        if workspace is None:
-            raise FactoryV3NullOutputError(
-                "Hermes Factory requires a typed Codex build result"
-            )
-        workspace = workspace.resolve(strict=True)
-        for relative_root in self._assignment.allowed_output_roots:
-            authorized_root = (workspace / relative_root).resolve()
-            if workspace not in authorized_root.parents or not authorized_root.is_dir():
-                raise FactoryDispatchError(
-                    "hermetic workspace did not materialize an authorized output root"
-                )
-        files = tuple(path for path in workspace.rglob("*") if path.is_file())
-        if len(files) > self._assignment.limits.max_files:
-            raise FactoryDispatchError("hermetic workspace exceeded file limit")
-        environment = minimal_hermetic_subprocess_environment(
-            credential_ref=self._credential_refs[0],
-            host_environment=os.environ,
-            temporary_directory=workspace,
+    def observe(self) -> None:
+        command_evidence = json.loads(
+            (self.workspace_root / "test-evidence.json").read_text(encoding="utf-8")
         )
-        executed: list[tuple[str, ...]] = []
-        for command in self._assignment.allowed_commands:
-            canonical = tuple(command)
-            if canonical not in _CANONICAL_COMMANDS:
-                raise FactoryDispatchError("unauthorized hermetic command")
-            subprocess.run(
-                canonical,
-                executable=sys.executable,
-                cwd=workspace,
-                env=environment,
-                check=True,
-                capture_output=True,
-                timeout=self._assignment.limits.max_wall_clock_seconds,
-            )
-            executed.append(canonical)
-        self.executed_commands = tuple(executed)
+        self.executed_commands = tuple(
+            tuple(str(part) for part in command)
+            for command in command_evidence["executed_commands"]
+        )
+        if self.executed_commands != _CANONICAL_COMMANDS:
+            raise FactoryDispatchError("Captain command evidence is not exact")
         real_case = json.loads(
-            (workspace / "evidence" / "real-case-output.json").read_text(
+            (self.workspace_root / "evidence" / "real-case-output.json").read_text(
                 encoding="utf-8"
             )
         )
@@ -334,15 +333,15 @@ class CaptainHermeticBuildExecutor:
             compiled=self._compiled,
             assignment=self._assignment,
             evidence=real_case,
-            credential_ref=self._credential_refs[0],
+            credential_ref=self._credential_session.reference,
         )
         self.real_case_handoff_trace = tuple(real_case["handoff_trace"])
         self.verified_public_assertion_ids = verification.passed_ids
         self.public_assertion_sources = verification.sources
-        tool_evidence = _dict(real_case, "tool_evidence")
+        tools = _dict(real_case, "tool_evidence")
         self.tested_tools = {
             tool_id
-            for tool_id, value in tool_evidence.items()
+            for tool_id, value in tools.items()
             if isinstance(value, dict) and value.get("test_passed") is True
         }
         optional = _dict(real_case, "optional_tool_policy")
@@ -352,61 +351,6 @@ class CaptainHermeticBuildExecutor:
         self.external_write_attempts = int(real_case["external_write_attempts"])
         self.external_write_blocks = int(real_case["external_write_blocks"])
         self.child_sentinel_secret_seen = bool(real_case["sentinel_secret_seen"])
-        evidence = {
-            "schema": "captain.hermetic-command-evidence.v1",
-            "status": "passed",
-            "executed_commands": [list(item) for item in self.executed_commands],
-            "assertion_sources": {
-                key: list(value) for key, value in verification.sources.items()
-            },
-        }
-        (workspace / "test-evidence.json").write_bytes(
-            _canonical(evidence, newline=True)
-        )
-        self.workspace_root = workspace
-        return CompletedCodexBuild(
-            workspace_root=workspace,
-            codex_session_receipt=_canonical(
-                {
-                    "schema": "codex.session.v1",
-                    "session_id": f"hermetic-{self._assignment.assignment_id}",
-                    "status": "completed",
-                }
-            ),
-            candidate_manifest_path="factory-candidate.json",
-            source_archive_path="candidate.zip",
-            test_evidence_paths=("test-evidence.json",),
-            completed_at=self._clock(),
-            output_snapshot_root=workspace,
-        )
-
-    async def execute_authorized_resume(self, request, invocation, brief):  # type: ignore[no-untyped-def]
-        raise FactoryDispatchError("hermetic execution does not authorize retries")
-
-    async def reconcile_pending(self, request, invocation, brief):  # type: ignore[no-untyped-def]
-        raise FactoryDispatchError("hermetic execution has no pending reconciliation")
-
-    def reconcile_failed(self, request, invocation, brief, **kwargs):  # type: ignore[no-untyped-def]
-        raise FactoryDispatchError("hermetic execution has no failed reconciliation")
-
-    def replay_sealed(self, _invocation):  # type: ignore[no-untyped-def]
-        return self.sealed_evidence
-
-    def validate_replay_authority(self, request, invocation) -> None:  # type: ignore[no-untyped-def]
-        if request.job.job_id != self._assignment.factory_job_id:
-            raise FactoryDispatchError("Captain replay authority changed")
-
-    def validate_completed_outputs(self, invocation, completed) -> None:  # type: ignore[no-untyped-def]
-        if completed.output_snapshot_root != completed.workspace_root:
-            raise FactoryDispatchError("Captain output snapshot changed")
-
-    def validate_issued_receipt(self, invocation, completed, receipt) -> None:  # type: ignore[no-untyped-def]
-        if receipt.factory_job_id != self._assignment.factory_job_id:
-            raise FactoryDispatchError("Captain issued receipt authority changed")
-
-    def persist_sealed(self, invocation, completed, evidence):  # type: ignore[no-untyped-def]
-        self.sealed_evidence = evidence
-        return evidence
 
 
 class CaptainFactoryV3PackageEvidenceIssuer:
@@ -418,12 +362,12 @@ class CaptainFactoryV3PackageEvidenceIssuer:
         cas: CodexBuildArtifactCas,
         receipt_issuer: CaptainCodexBuildReceiptIssuer,
         creation_job: CreationJobV3,
-        executor: CaptainHermeticBuildExecutor,
+        observer: CaptainStaticFactoryBuildObserver,
     ) -> None:
         self._cas = cas
         self._receipt_issuer = receipt_issuer
         self._creation_job = creation_job
-        self._executor = executor
+        self._observer = observer
 
     def issue(
         self,
@@ -432,17 +376,16 @@ class CaptainFactoryV3PackageEvidenceIssuer:
         sealed: HermesFactoryCodexBuild,
     ) -> tuple[CodexBuildReceiptV1, ArtifactRef, ArtifactRef]:
         if (
-            self._executor.executed_commands != _CANONICAL_COMMANDS
-            or self._executor.verified_public_assertion_ids
+            self._observer.executed_commands != _CANONICAL_COMMANDS
+            or self._observer.verified_public_assertion_ids
             != self._creation_job.public_assertion_ids
-            or self._executor.workspace_root is None
         ):
             raise FactoryDispatchError(
                 "Captain package evidence requires exact execution"
             )
         base = sealed.codex_build_receipt
         team_ref = self._cas.put_bytes(
-            (self._executor.workspace_root / "team_manifest.json").read_bytes(),
+            (self._observer.workspace_root / "team_manifest.json").read_bytes(),
             media_type="application/json",
             namespace="preliminary-team",
         )
@@ -473,7 +416,7 @@ class CaptainFactoryV3PackageEvidenceIssuer:
         real_case = PackageRealCaseEvidenceV1(
             producer="captain",
             outcome="passed",
-            assertion_ids=self._executor.verified_public_assertion_ids,
+            assertion_ids=self._observer.verified_public_assertion_ids,
             declared_test_paths=("tests/test_team.py",),
             evidence_refs=(build_ref,),
             **common,
@@ -574,9 +517,11 @@ def _dict_list(value: Mapping[str, object], key: str) -> list[dict[str, object]]
 
 __all__ = [
     "CaptainFactoryV3PackageEvidenceIssuer",
-    "CaptainHermeticBuildExecutor",
+    "CaptainStaticFactoryBuildObserver",
+    "CaptainStaticFactoryCredentialSession",
+    "CaptainStaticFactoryExecutionAuthorizer",
+    "CaptainStaticFactoryWorkspacePreparer",
     "FactoryV3AssertionVerifier",
     "FactoryV3SemanticEvidenceError",
-    "FactoryWorkspaceGeneratorPort",
     "minimal_hermetic_subprocess_environment",
 ]

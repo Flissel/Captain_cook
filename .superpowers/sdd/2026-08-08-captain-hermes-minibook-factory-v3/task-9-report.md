@@ -116,3 +116,36 @@
 
 - The offline injectable executor is not composed as a live/default fallback; the Task-5 PowerShell runner ruling remains fail closed.
 - No live Hermes/Codex claim, Task 10 evidence, OpenFang action, promotion, deployment, push, or merge was performed.
+
+## Fix round 3 — sealed runtime authority and automatic projections
+
+### Review findings closed
+
+- Removed `CaptainHermeticBuildExecutor` and its second direct host-subprocess path. The deterministic adapter now produces only an immutable source bundle; the existing `CodexCliFactoryBuildExecutor` and `CaptainCodexBuildSealer` remain the execution and sealing path.
+- Added a Captain-owned sealed static runner accepted by the existing executor's private runtime seal. The executor independently reconstructs and compares the exact workspace root, writable roots, canonical argv, `network_allowed=False`, and provider-cost cap before starting it. The runner accepts only a digest-allowlisted static source bundle, uses the approved Python interpreter for the two exact assignment argv values, and receives only the minimal explicit child environment plus the released opaque credential reference.
+- Added production static workspace preparation, execution authorization, credential session, and post-execution semantic observation. The generated test executes the four ordered handoffs and writes real-case evidence; only independently verified topology, tools, policy guards, and outputs enter final package evidence.
+- Moved credential-demand emission into the production Forge-submission seam. `FactoryDispatcher` invokes `CaptainFactoryCredentialActionEmitter`, which derives the missing required credential from the authoritative input and CreationJob, creates the safe checkpoint, and calls `CaptainFactoryActionRequestCoordinator`. The harness passes only the brief/configuration and observes the durable Action Inbox request; the behavioral counter proves one production emission.
+- Replaced caller-supplied boundary failure codes with typed `FactoryCreationResultRejected` and `FactoryCasReadbackRejected` exceptions. `FactoryDispatcher` catches only these typed failures and invokes `CaptainFactoryDispatchFailurePropagator`; the coordinator derives the code/summary, writes durable failure evidence, and records the Captain failed block. The harness no longer calls any failure recorder.
+- Timeout now travels through the existing `FactoryCodexBuildInterrupted(reason="codex_timed_out")` worker/checkpoint path and is durably projected as `codex_timeout`. Receipt-only uses the persisted Minibook terminal failure; tampered CAS mutates the addressed ZIP and is rejected by Captain's independent bounded readback.
+
+### RED → GREEN evidence
+
+- RED: the new authority test failed collection because `CaptainStaticFactoryRunnerFactory` and a production static build observer did not exist.
+- RED: the happy path reported a Codex session before Action approval, then the existing executor rejected the fixture's non-CAS input reference. Composition was corrected so the session begins only after resume and every scaffold input is a digest-verifiable CAS object without changing the frozen assertion identities.
+- RED: the timeout variant raised the existing typed interruption but was initially projected as generic `codex_failed`; the worker-failure coordinator now derives `codex_timeout` from that typed reason.
+- GREEN: the exact authority/E2E suite passes nine tests, including digest rejection, one production credential emission, and one automatic failure propagation for every negative variant.
+
+### Fix-round verification
+
+- Exact Task-9 E2E plus authority boundaries: `9 passed`.
+- Orchestration/candidate/authority/E2E focused rerun: `54 passed`.
+- Root Task-9 plus Codex/provenance/architecture/import/workstream gate: `303 passed, 3 skipped`.
+- Full Root Agent Factory/Gateway non-live gate: `1862 passed, 132 skipped`.
+- Focused Minibook contracts/state/API/package: `123 passed`; full isolated Minibook non-live suite: `259 passed, 1 deselected`.
+- Portal: `47 passed`; lint and production build passed.
+- Python compileall and `git diff --check`: passed. Ruff/Black were unavailable in the existing virtual environment; no package installation was performed.
+
+### Non-claims
+
+- The static runner is not part of default/live composition and does not weaken the Task-5 PowerShell live ruling.
+- No live Hermes/Codex claim, Task 10 evidence, OpenFang action, promotion, deployment, push, merge, or external-service mutation was performed.

@@ -32,6 +32,7 @@ from agenten.agent_factory.candidate_evaluation import (
     GatewayForgeCandidateProvider,
 )
 from agenten.agent_factory.codex_build_provenance import CodexBuildArtifactCas
+from agenten.agent_factory.codex_build_execution import FactoryCodexBuildInterrupted
 from agenten.agent_factory.codex_build_recovery import canonical_factory_codex_model
 from agenten.agent_factory.capability_resolution import CapabilityResolver
 from agenten.agent_factory.contracts import (
@@ -79,13 +80,13 @@ from agenten.agent_factory.orchestration import (
     FactoryDispatcher,
 )
 from agenten.agent_factory.request_observer import (
-    CaptainFactoryActionRequestCoordinator,
-    FactoryCredentialRequiredObservation,
+    CaptainFactoryCredentialActionEmitter,
 )
 from agenten.agent_factory.service import FactoryCoordinator, InMemoryFactoryRepository
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
 from agenten.agent_factory.worker_failure_projection import (
+    CaptainFactoryDispatchFailurePropagator,
     CaptainFactoryWorkerFailureCoordinator,
 )
 from agenten.agent_runtime.contracts import ArtifactRef as RuntimeArtifactRef
@@ -421,6 +422,11 @@ class _FailureArtifactProjection:
     def put_failure(self, content: bytes) -> ArtifactRef:
         return _runtime_ref(
             self._store.put(content, "application/json", namespace="build-failure")
+        )
+
+    def put_checkpoint(self, content: bytes) -> ArtifactRef:
+        return _runtime_ref(
+            self._store.put(content, "application/json", namespace="checkpoint")
         )
 
 
@@ -782,6 +788,10 @@ class FactoryV3Run:
     def build_credential_refs(self) -> tuple[str, ...]:
         return self._harness.build_credential_refs
 
+    @property
+    def production_credential_emissions(self) -> int:
+        return self._harness.production_credential_emissions
+
 
 class FactoryV3Harness:
     """Own one hermetic Task-9 run and expose only observable evidence."""
@@ -850,6 +860,7 @@ class FactoryV3Harness:
             FilesystemHermesFactoryWorkerCheckpointStore | None
         ) = None
         self._failure_coordinator: CaptainFactoryWorkerFailureCoordinator | None = None
+        self._credential_emitter: CaptainFactoryCredentialActionEmitter | None = None
         self._tampering_reader: _TamperingCaptainArtifactReader | None = None
         self._build_lease = None
         self._minibook_readback = False
@@ -906,8 +917,9 @@ class FactoryV3Harness:
         if variant == "timeout":
             try:
                 await self._run_worker()
-            except TimeoutError as exc:
-                del exc
+            except FactoryCodexBuildInterrupted as exc:
+                if exc.reason != "codex_timed_out":
+                    raise
                 return self._observed_worker_failure()
             raise AssertionError("timed-out Codex output was accepted")
 
@@ -932,10 +944,6 @@ class FactoryV3Harness:
         except FactoryDispatchError as exc:
             if str(exc) != "Captain CAS readback digest mismatch":
                 raise
-            self._record_captain_failure(
-                failure_code="captain_cas_readback_rejected",
-                failure_summary=str(exc),
-            )
             assert self._tampering_reader is not None
             return FactoryV3FailedOutcome(
                 status="blocked",
@@ -956,6 +964,14 @@ class FactoryV3Harness:
     ) -> None:
         fixture = json.loads(_FIXTURE.read_text(encoding="utf-8"))
         document = FactoryInputDocumentV2.model_validate(fixture["document"])
+        input_content = _canonical(document.model_dump(mode="json", by_alias=True), newline=True)
+        input_ref = _runtime_ref(
+            self._artifacts.put(
+                input_content,
+                "text/markdown",
+                namespace="factory-input",
+            )
+        )
         compiled = FactoryInputCompiler(
             holdout_store=InMemoryPrivateHoldoutStore()
         ).compile(document, subject_version=3)
@@ -1000,6 +1016,7 @@ class FactoryV3Harness:
             execution_policy=policy,
         )
         job_payload = built.model_dump(mode="json", by_alias=True)
+        job_payload["input_ref"] = input_ref.model_dump(mode="json")
         job_payload["compiled_spec_ref"] = compiled_ref.model_dump(mode="json")
         job_payload["dependency_graph_ref"] = graph_ref.model_dump(mode="json")
         self._job = AgentFactoryJobV3.model_validate(job_payload)
@@ -1124,6 +1141,29 @@ class FactoryV3Harness:
                 self._root / ".captain-cook" / "factory-evidence"
             ),
         )
+        if with_action:
+            self._credential_emitter = CaptainFactoryCredentialActionEmitter(
+                input_document=document,
+                creation_job_for=(
+                    lambda request, _submission: self._authority_store.creation_job_for(
+                        request.job, request.action.attempt
+                    )
+                ),
+                minibook_projection=_MinibookActionRequestProjection(
+                    self._minibook_store
+                ),
+                action_inbox=self._action_store,
+                progress_for=self._minibook_store.progress,
+                checkpoint_artifacts=_FailureArtifactProjection(self._artifacts),
+                scopes={"account_snapshot_reader": "crm.account_snapshot.read"},
+                tenant_id=_TENANT,
+                deadline_for=lambda observed: observed + timedelta(minutes=30),
+                clock=lambda: self._base_time,
+            )
+        failure_propagator = CaptainFactoryDispatchFailurePropagator(
+            assignment_for=self._assignment_for_dispatch,
+            coordinator_for=self._require_failure_coordinator,
+        )
         dispatcher = FactoryDispatcher(
             coordinator=self._coordinator,
             hermes=hermes,
@@ -1131,6 +1171,8 @@ class FactoryV3Harness:
             candidate_validator=validator,
             leases=leases,
             clock=_FixedClock(self._base_time),
+            forge_submission_observer=self._credential_emitter,
+            dispatch_failure_observer=failure_propagator,
         )
         self._coordinator.register(self._job)
         self._coordinator.record(
@@ -1160,7 +1202,7 @@ class FactoryV3Harness:
         await self._wait_until(
             lambda: (
                 self._minibook_store.progress(self._creation_job.creation_job_id).status
-                == "awaiting_build"
+                == ("awaiting_user_input" if with_action else "awaiting_build")
             )
         )
         minibook_assignment = self._minibook_store.build_assignment_for_job(
@@ -1191,6 +1233,7 @@ class FactoryV3Harness:
             variant=variant,
             root=self._root,
             artifact_cas=captain_cas,
+            artifact_reader=_CaptainArtifactReader(self._artifacts),
             assignment=self._assignment,
             creation_job=self._creation_job,
             compiled_specification=compiled,
@@ -1219,69 +1262,12 @@ class FactoryV3Harness:
             failure_reporter=self._failure_coordinator,
             clock=lambda: self._base_time,
         )
-        if with_action:
-            self._ensure_build_prerequisites(document)
-        else:
+        if not with_action:
             self._codex.release_credential(
                 "credential://tenant-a/preapproved-crm-readonly"
             )
 
-    def _ensure_build_prerequisites(self, document: FactoryInputDocumentV2) -> None:
-        assert self._assignment is not None and self._codex is not None
-        credential_tools = {
-            integration.integration_key
-            for integration in document.integrations
-            if integration.required and integration.credential_aliases
-        }
-        required_tools = {
-            requirement.tool_id
-            for requirement in self._assignment.tool_requirements
-            if requirement.required
-        }
-        if credential_tools & required_tools:
-            self._create_credential_action()
-
-    def _create_credential_action(self) -> None:
-        assert self._creation_job is not None
-        progress = self._minibook_store.progress(self._creation_job.creation_job_id)
-        checkpoint_ref = _runtime_ref(
-            self._artifacts.put(
-                _canonical(
-                    {
-                        "schema": "minibook.creation-checkpoint.v1",
-                        "creation_job_id": str(self._creation_job.creation_job_id),
-                        "status": progress.status,
-                        "version": progress.version,
-                    },
-                    newline=True,
-                ),
-                "application/json",
-                namespace="checkpoint",
-            )
-        )
-        coordinator = CaptainFactoryActionRequestCoordinator(
-            creation_job=self._creation_job,
-            minibook_projection=_MinibookActionRequestProjection(self._minibook_store),
-            action_inbox=self._action_store,
-            progress_for=self._minibook_store.progress,
-            tenant_id=_TENANT,
-            deadline_for=lambda observed: observed + timedelta(minutes=30),
-        )
-        coordinator.observe(
-            FactoryCredentialRequiredObservation(
-                factory_job_id=self._creation_job.factory_job_id,
-                creation_job_id=self._creation_job.creation_job_id,
-                correlation_id=self._creation_job.correlation_id,
-                subject_version=self._creation_job.subject_version,
-                integration_key="account_snapshot_reader",
-                required_scope="crm.account_snapshot.read",
-                safe_checkpoint_ref=checkpoint_ref,
-                message="Connect the approved read-only CRM account source.",
-                observed_at=self._base_time,
-            )
-        )
-        # Re-open the persistent repository before answering; the in-memory
-        # object is not used as durability evidence.
+    def _reopen_action_store(self) -> None:
         self._action_store = FactoryActionStore(
             repository=_JsonFactoryActionRepository(
                 self._action_repository_path,
@@ -1295,6 +1281,19 @@ class FactoryV3Harness:
             clock=lambda: self._base_time + timedelta(seconds=10),
         )
 
+    def _assignment_for_dispatch(
+        self, request: FactoryDispatch
+    ) -> FactoryBuildAssignmentV2:
+        assert self._authority_store is not None
+        return self._authority_store.assignment_for(request.job, request.action.attempt)
+
+    def _require_failure_coordinator(
+        self,
+    ) -> CaptainFactoryWorkerFailureCoordinator:
+        if self._failure_coordinator is None:
+            raise AssertionError("Factory failure coordinator is unavailable")
+        return self._failure_coordinator
+
     async def _wait_for_action(self, request_type: str) -> FactoryActionRequestV1:
         await self._wait_until(
             lambda: bool(
@@ -1305,6 +1304,7 @@ class FactoryV3Harness:
                 )
             )
         )
+        self._reopen_action_store()
         actions = self._action_store.list(
             tenant_id=_TENANT,
             status="pending",
@@ -1399,10 +1399,10 @@ class FactoryV3Harness:
             raise AssertionError("Minibook did not persist its terminal failure")
         exception_type = stored.failure.exception_type or "unknown"
         failure_summary = f"{stored.failure.summary} ({exception_type})"
-        self._record_captain_failure(
-            failure_code=stored.failure.code,
-            failure_summary=failure_summary,
-        )
+        assert self._failure_coordinator is not None
+        projected = self._failure_coordinator.last_failure
+        if projected is None or projected.failure_code != stored.failure.code:
+            raise AssertionError("Captain did not automatically project failure")
         return FactoryV3FailedOutcome(
             status="failed",
             minibook_status=self.minibook_status,
@@ -1410,16 +1410,6 @@ class FactoryV3Harness:
             failure_code=stored.failure.code,
             failure_summary=failure_summary,
             tamper_performed=False,
-        )
-
-    def _record_captain_failure(
-        self, *, failure_code: str, failure_summary: str
-    ) -> None:
-        assert self._assignment is not None and self._failure_coordinator is not None
-        self._failure_coordinator.report_boundary_failure(
-            self._assignment,
-            failure_code=failure_code,
-            failure_summary=failure_summary,
         )
 
     async def _wait_for_result(self) -> CreationResultV2:
@@ -1579,6 +1569,14 @@ class FactoryV3Harness:
             if block.phase is FactoryPhase.AGENT_CODE_CREATED
             and block.status is FactoryBlockStatus.FAILED
         )
+
+    @property
+    def production_credential_emissions(self) -> int:
+        return 0 if self._credential_emitter is None else self._credential_emitter.emissions
+
+    @property
+    def automatic_failure_propagations(self) -> int:
+        return 0 if self._failure_coordinator is None else self._failure_coordinator.propagations
 
 
 __all__ = ["FactoryV3FailedOutcome", "FactoryV3Harness", "FactoryV3Run"]

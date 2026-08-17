@@ -58,7 +58,12 @@ from agenten.agent_factory.forge_contracts import (
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
 from agenten.agent_factory.business_decision_tool import TOOL_NAME as BUSINESS_DECISION_TOOL
-from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
+from agenten.agent_factory.orchestration import (
+    FactoryCasReadbackRejected,
+    FactoryCreationResultRejected,
+    FactoryDispatch,
+    FactoryDispatchError,
+)
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationRequest,
     ReleasedHermesSkill,
@@ -1372,13 +1377,13 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
                 max_bytes=maximum_bytes,
             )
         except (AttributeError, OSError, RuntimeError, ValueError) as exc:
-            raise FactoryDispatchError("Captain CAS readback digest mismatch") from exc
+            raise FactoryCasReadbackRejected() from exc
         if (
             not content
             or len(content) > maximum_bytes
             or hashlib.sha256(content).hexdigest() != reference.sha256
         ):
-            raise FactoryDispatchError("Captain CAS readback digest mismatch")
+            raise FactoryCasReadbackRejected()
         return content
 
     @staticmethod
@@ -2211,9 +2216,7 @@ class CandidateEvaluationFactory:
                 "Minibook CreationResultV1 does not match the factory dispatch"
             )
         if result.status != "succeeded":
-            raise FactoryDispatchError(
-                "Minibook CreationResultV1 did not produce successful agent code"
-            )
+            raise FactoryCreationResultRejected(result)
         if isinstance(result, CreationResultV1) and not result.artifact_refs:
             raise FactoryDispatchError(
                 "successful Minibook CreationResultV1 has no generated code artifacts"

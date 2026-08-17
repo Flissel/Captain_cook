@@ -21,6 +21,11 @@ from agenten.agent_factory.forge_contracts import (
     FactoryBuildAssignmentV2,
 )
 from agenten.agent_factory.hermes_factory_worker import HermesFactoryWorkerCheckpoint
+from agenten.agent_factory.orchestration import (
+    FactoryCasReadbackRejected,
+    FactoryCreationResultRejected,
+    FactoryDispatch,
+)
 from agenten.agent_runtime.contracts import ArtifactRef as RuntimeArtifactRef
 
 
@@ -68,6 +73,7 @@ class CaptainFactoryWorkerFailureCoordinator:
         self._lease = lease
         self._clock = clock
         self.last_failure: FactoryProjectedFailure | None = None
+        self.propagations = 0
 
     def report(
         self,
@@ -83,6 +89,11 @@ class CaptainFactoryWorkerFailureCoordinator:
         ):
             raise ValueError("Hermes worker failure checkpoint is not authoritative")
         failure_code = getattr(error, "failure_code", None)
+        if (
+            not isinstance(failure_code, str)
+            and getattr(error, "reason", None) == "codex_timed_out"
+        ):
+            failure_code = "codex_timeout"
         if not isinstance(failure_code, str):
             failure_code = {
                 "timeout": "codex_timeout",
@@ -116,14 +127,15 @@ class CaptainFactoryWorkerFailureCoordinator:
             )
         )
         self.last_failure = FactoryProjectedFailure(failure_code, summary)
+        self.propagations += 1
 
-    def report_boundary_failure(
+    def report_dispatch_failure(
         self,
         assignment: FactoryBuildAssignmentV2,
-        *,
-        failure_code: str,
-        failure_summary: str,
+        error: FactoryCreationResultRejected | FactoryCasReadbackRejected,
     ) -> None:
+        failure_code = error.failure_code
+        failure_summary = error.failure_summary
         evidence_ref = self._artifacts.put_failure(
             json.dumps(
                 {
@@ -145,6 +157,7 @@ class CaptainFactoryWorkerFailureCoordinator:
             )
         )
         self.last_failure = FactoryProjectedFailure(failure_code, failure_summary)
+        self.propagations += 1
 
     def _failure_block(
         self,
@@ -179,4 +192,31 @@ class CaptainFactoryWorkerFailureCoordinator:
         )
 
 
-__all__ = ["CaptainFactoryWorkerFailureCoordinator", "FactoryProjectedFailure"]
+class CaptainFactoryDispatchFailurePropagator:
+    """Dispatcher observer that derives failure projection from typed errors only."""
+
+    def __init__(
+        self,
+        *,
+        assignment_for: Callable[[FactoryDispatch], FactoryBuildAssignmentV2],
+        coordinator_for: Callable[[], CaptainFactoryWorkerFailureCoordinator],
+    ) -> None:
+        self._assignment_for = assignment_for
+        self._coordinator_for = coordinator_for
+
+    def report_dispatch_failure(
+        self,
+        request: FactoryDispatch,
+        error: FactoryCreationResultRejected | FactoryCasReadbackRejected,
+    ) -> None:
+        self._coordinator_for().report_dispatch_failure(
+            self._assignment_for(request),
+            error,
+        )
+
+
+__all__ = [
+    "CaptainFactoryDispatchFailurePropagator",
+    "CaptainFactoryWorkerFailureCoordinator",
+    "FactoryProjectedFailure",
+]

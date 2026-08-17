@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-from pathlib import Path, PurePosixPath
+import os
+from pathlib import Path
+import sys
 from typing import Literal
 from uuid import UUID
 import zipfile
@@ -13,8 +15,13 @@ import zipfile
 from agenten.agent_factory.codex_build_execution import (
     CaptainCodexAssignmentBuilder,
     CaptainCodexBuildSealer,
+    CaptainStaticFactoryRunnerFactory,
+    CaptainStaticFactorySourceBundle,
     CaptainV3CodexRequestMapper,
+    CodexCliFactoryBuildExecutor,
     CodexCliFactoryBuildSettings,
+    FactoryCodexRuntimeAuthority,
+    captain_static_factory_source_sha256,
 )
 from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
@@ -31,7 +38,10 @@ from agenten.agent_factory.forge_contracts import (
 from agenten.agent_factory.hermes_factory_worker import HermesFactoryCodexBuild
 from agenten.agent_factory.hermetic_build_authority import (
     CaptainFactoryV3PackageEvidenceIssuer,
-    CaptainHermeticBuildExecutor,
+    CaptainStaticFactoryBuildObserver,
+    CaptainStaticFactoryCredentialSession,
+    CaptainStaticFactoryExecutionAuthorizer,
+    CaptainStaticFactoryWorkspacePreparer,
 )
 from agenten.agent_factory.input_compiler import CompiledFactorySpecification
 from agenten.agent_factory.orchestration import FactoryDispatchError
@@ -42,6 +52,10 @@ from agenten.agent_runtime.contracts import ArtifactRef as RuntimeArtifactRef
 
 _Variant = Literal["happy", "one_agent", "null_output", "timeout", "receipt_only"]
 _EXPECTED_COMMANDS = (("python", "-m", "compileall", "src"), ("python", "-m", "pytest"))
+_AUTHORIZED_SOURCE_DIGESTS = {
+    "four_agent": "2476885d5fa09c1b7f2c27a696ee5299c558a25b5ba57e30627eea7734f90d0a",
+    "one_agent": "a55d9705d08740067e22788fcc93a5f4efc4a2e27576a28bb59c7bcb56e5c257",
+}
 
 
 def _canonical(value: object, *, newline: bool = False) -> bytes:
@@ -81,9 +95,8 @@ class _PromptStore:
 class _DeterministicExternalModel:
     """The only test double: it replaces the unavailable external model."""
 
-    def __init__(self, *, variant: _Variant, root: Path) -> None:
+    def __init__(self, *, variant: _Variant) -> None:
         self._variant = variant
-        self._root = root
         self._sessions = 0
 
     @property
@@ -94,16 +107,10 @@ class _DeterministicExternalModel:
     def provider_cost_usd(self) -> float:
         return 0.0
 
-    def generate(self, assignment: FactoryBuildAssignmentV2) -> Path | None:
+    def generate_bundle(
+        self, assignment: FactoryBuildAssignmentV2
+    ) -> CaptainStaticFactorySourceBundle:
         self._sessions += 1
-        if self._variant == "null_output":
-            return None
-        if self._variant == "timeout":
-            raise TimeoutError("deterministic external model timeout")
-        workspace = self._root / assignment.assignment_id.hex
-        workspace.mkdir(parents=True, exist_ok=False)
-        for relative_root in assignment.allowed_output_roots:
-            (workspace / relative_root).mkdir(parents=True, exist_ok=True)
         agents = assignment.required_agent_ids
         handoffs = assignment.ordered_handoffs
         if self._variant == "one_agent":
@@ -165,11 +172,7 @@ class _DeterministicExternalModel:
                 or name == "factory-candidate.json"
             }
         )
-        for relative, content in files.items():
-            target = workspace / PurePosixPath(relative)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-        return workspace
+        return CaptainStaticFactorySourceBundle(tuple(sorted(files.items())))
 
     @staticmethod
     def _workspace_files(agents: tuple[str, ...]) -> dict[str, bytes]:
@@ -262,6 +265,7 @@ class CaptainAuthorizedHermeticCodexPort:
         variant: _Variant,
         root: Path,
         artifact_cas: CodexBuildArtifactCas,
+        artifact_reader,
         assignment: FactoryBuildAssignmentV2,
         creation_job: CreationJobV3,
         compiled_specification: CompiledFactorySpecification,
@@ -271,23 +275,30 @@ class CaptainAuthorizedHermeticCodexPort:
         clock,
     ) -> None:  # type: ignore[no-untyped-def]
         self.variant = variant
+        self._sessions = 0
         self._assignment = assignment
         self._artifact_cas = artifact_cas
         self._issuer = CaptainCodexBuildReceiptIssuer(artifact_cas)
-        self._executor = CaptainHermeticBuildExecutor(
+        self._model = _DeterministicExternalModel(variant=variant)
+        bundle = self._model.generate_bundle(assignment)
+        self.source_bundle_sha256 = captain_static_factory_source_sha256(bundle)
+        expected_source_digest = _AUTHORIZED_SOURCE_DIGESTS[
+            "one_agent" if variant == "one_agent" else "four_agent"
+        ]
+        workspace = (root / "codex-workspaces" / assignment.assignment_id.hex).resolve()
+        credential_session = CaptainStaticFactoryCredentialSession()
+        self._credential_session = credential_session
+        self._observer = CaptainStaticFactoryBuildObserver(
             assignment=assignment,
-            creation_job=creation_job,
             compiled_specification=compiled_specification,
-            generator=_DeterministicExternalModel(
-                variant=variant, root=root / "codex-workspaces"
-            ),
-            clock=clock,
+            workspace_root=workspace,
+            credential_session=credential_session,
         )
         self._package_issuer = CaptainFactoryV3PackageEvidenceIssuer(
             cas=artifact_cas,
             receipt_issuer=self._issuer,
             creation_job=creation_job,
-            executor=self._executor,
+            observer=self._observer,
         )
         lease_sha = hashlib.sha256(canonical_factory_codex_model(lease)).hexdigest()
         self._mapped_assignment = assignment.model_copy(
@@ -310,6 +321,40 @@ class CaptainAuthorizedHermeticCodexPort:
             deadline_at=assignment.deadline_at,
             enforce_assignment_budgets=True,
         )
+        runtime_authority = FactoryCodexRuntimeAuthority(
+            workspace_root=workspace,
+            writable_roots=tuple(
+                (workspace / item).resolve()
+                for item in assignment.allowed_output_roots
+            ),
+            allowed_commands=assignment.allowed_commands,
+            network_allowed=False,
+            maximum_provider_cost_usd=assignment.limits.max_provider_cost_usd,
+        )
+        executor = CodexCliFactoryBuildExecutor(
+            settings=settings,
+            workspace_preparer=CaptainStaticFactoryWorkspacePreparer(workspace),
+            artifact_reader=artifact_reader,
+            authorizer=CaptainStaticFactoryExecutionAuthorizer(
+                workspace_root=workspace,
+                credential_session=credential_session,
+                host_environment=os.environ,
+            ),
+            runner_factory=CaptainStaticFactoryRunnerFactory(
+                authority=runtime_authority,
+                bundle=bundle,
+                expected_bundle_sha256=expected_source_digest,
+                interpreter_path=Path(sys.executable),
+                mode=(
+                    "null_output"
+                    if variant == "null_output"
+                    else "timeout"
+                    if variant == "timeout"
+                    else "execute"
+                ),
+            ),
+            clock=clock,
+        )
         mapper = CaptainV3CodexRequestMapper(
             job_for=lambda _job_id: factory_job,
             lease_for=lambda _job, _attempt, _now: lease,
@@ -328,7 +373,7 @@ class CaptainAuthorizedHermeticCodexPort:
         )
         self._builder = CaptainCodexAssignmentBuilder(
             sealer=CaptainCodexBuildSealer(
-                executor=self._executor, issuer=self._issuer
+                executor=executor, issuer=self._issuer
             ),
             mapper=mapper,
             settings=settings,
@@ -339,7 +384,9 @@ class CaptainAuthorizedHermeticCodexPort:
     ) -> HermesFactoryCodexBuild:
         if assignment != self._assignment:
             raise FactoryDispatchError("Hermes assignment changed before build")
+        self._sessions += 1
         base = await self._builder.build(self._mapped_assignment)
+        self._observer.observe()
         receipt, receipt_ref, build_ref = self._package_issuer.issue(
             assignment=assignment, sealed=base
         )
@@ -357,13 +404,15 @@ class CaptainAuthorizedHermeticCodexPort:
         return build
 
     def release_credential(self, credential_ref: str) -> None:
-        self._executor.release_credential(credential_ref)
+        self._credential_session.release(credential_ref)
 
     def read_receipt(self, reference: ArtifactRef) -> CodexBuildReceiptV1:
         return self._issuer.read_receipt(reference)
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
-        return getattr(self._executor, name)
+        if name == "sessions":
+            return self._sessions
+        return getattr(self._observer, name)
 
 
 __all__ = ["CaptainAuthorizedHermeticCodexPort"]
