@@ -36,6 +36,7 @@ def test_tool_host_requires_auth_and_returns_content_addressed_demo_truth() -> N
         "tool_key": "alert_context_reader", "operation": "read",
         "endpoint_sha256": hashlib.sha256(b"http://127.0.0.1:8110/v1/alerts/context").hexdigest(),
         "registry_sha256": "b" * 64,
+        "effect_id": "e" * 64,
         "arguments": {"alert_id": "demo-alert-17", "caller_answer": "must-not-echo"},
     }
     with TestClient(app) as client:
@@ -63,6 +64,7 @@ def test_tool_host_rejects_route_binding_drift_before_dataset_readback() -> None
         "schema": "captain.generic-tool-execution.v1",
         "tool_key": "alert_context_reader", "operation": "read",
         "endpoint_sha256": "f" * 64, "registry_sha256": "b" * 64,
+        "effect_id": "e" * 64,
         "arguments": {"alert_id": "demo-alert-17"},
     }
     with TestClient(app) as client:
@@ -71,6 +73,34 @@ def test_tool_host_rejects_route_binding_drift_before_dataset_readback() -> None
             headers={"Authorization": "Bearer " + TOKEN},
         )
     assert response.status_code == 409
+
+
+def test_tool_host_restart_replays_durable_receipt_without_recomputing(tmp_path) -> None:
+    datasets, digests = _datasets()
+    payload = {
+        "schema": "captain.generic-tool-execution.v1",
+        "tool_key": "alert_context_reader", "operation": "read",
+        "endpoint_sha256": hashlib.sha256(b"http://127.0.0.1:8110/v1/alerts/context").hexdigest(),
+        "registry_sha256": "b" * 64, "effect_id": "e" * 64,
+        "arguments": {"alert_id": "demo-alert-17"},
+    }
+    headers = {"Authorization": "Bearer " + TOKEN}
+    first = create_capability_tool_host_app(
+        bearer_token=TOKEN, datasets=datasets, dataset_digests=digests,
+        implementation_sha256=CODE_SHA, journal_root=tmp_path,
+    )
+    with TestClient(first) as client:
+        expected = client.post("/v1/alerts/context", json=payload, headers=headers).json()
+    restarted = create_capability_tool_host_app(
+        bearer_token=TOKEN,
+        datasets={**datasets, "incident": {**datasets["incident"], "records": []}},
+        dataset_digests=digests, implementation_sha256=CODE_SHA,
+        journal_root=tmp_path,
+    )
+    with TestClient(restarted) as client:
+        replay = client.post("/v1/alerts/context", json=payload, headers=headers)
+    assert replay.status_code == 200
+    assert replay.json() == expected
 
 
 def test_tool_host_routes_cover_every_shipped_demo_tool() -> None:

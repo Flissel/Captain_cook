@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Callable
@@ -33,6 +34,69 @@ _ROUTES = {
     "/v1/claims/evidence": ("claim_evidence_reader", "read", "captain.claim-evidence.v1", "claims"),
     "/v1/ocr/extract": ("ocr_extractor", "read", "captain.claim-ocr-extraction.v1", "claims"),
 }
+
+
+class _ToolHostReceiptJournal:
+    def __init__(self, root: Path | None) -> None:
+        self._root = root
+        self._values: dict[str, dict[str, object]] = {}
+        self._lock = threading.Lock()
+        if root is not None:
+            root.mkdir(parents=True, exist_ok=True)
+
+    def read(
+        self, effect_id: str, *, request_sha256: str,
+    ) -> dict[str, object] | None:
+        if _SHA256.fullmatch(effect_id) is None or _SHA256.fullmatch(request_sha256) is None:
+            raise ValueError("tool effect identity is invalid")
+        with self._lock:
+            value = self._values.get(effect_id)
+            if value is None and self._root is not None:
+                path = self._root / f"{effect_id}.json"
+                if path.is_file():
+                    raw = json.loads(path.read_bytes())
+                    if isinstance(raw, dict):
+                        value = raw
+                        self._values[effect_id] = raw
+            if value is None:
+                return None
+            if value.get("request_sha256") != request_sha256:
+                raise ValueError("tool effect replay changed request")
+            response = value.get("response")
+            if not isinstance(response, dict):
+                raise ValueError("tool effect receipt is invalid")
+            return dict(response)
+
+    def write(
+        self, effect_id: str, *, request_sha256: str,
+        response: dict[str, object],
+    ) -> None:
+        record = {
+            "schema": "captain.capability-tool-host-receipt.v1",
+            "effect_id": effect_id, "request_sha256": request_sha256,
+            "response": response,
+        }
+        body = _canonical(record)
+        with self._lock:
+            existing = self._values.get(effect_id)
+            if existing is not None:
+                if _canonical(existing) != body:
+                    raise ValueError("tool effect receipt conflicts")
+                return
+            if self._root is not None:
+                final = self._root / f"{effect_id}.json"
+                temporary = self._root / f"{effect_id}.{os.getpid()}.tmp"
+                if final.exists():
+                    raw = json.loads(final.read_bytes())
+                    if _canonical(raw) != body:
+                        raise ValueError("tool effect receipt conflicts")
+                else:
+                    with temporary.open("xb") as handle:
+                        handle.write(body)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, final)
+            self._values[effect_id] = record
 
 
 def _canonical(value: object) -> bytes:
@@ -64,6 +128,7 @@ def _select(dataset: dict[str, object], arguments: Mapping[str, object]) -> dict
 def create_capability_tool_host_app(
     *, bearer_token: str, datasets: Mapping[str, dict[str, object]],
     dataset_digests: Mapping[str, str], implementation_sha256: str,
+    journal_root: Path | None = None,
 ) -> FastAPI:
     if len(bearer_token) < 16 or _SHA256.fullmatch(implementation_sha256) is None:
         raise ValueError("capability tool host authority is invalid")
@@ -79,6 +144,7 @@ def create_capability_tool_host_app(
         title="Captain Capability Tool Host", docs_url=None, redoc_url=None,
         openapi_url=None, redirect_slashes=False,
     )
+    journal = _ToolHostReceiptJournal(journal_root)
 
     def authorize(value: str | None) -> None:
         if value is None or not secrets.compare_digest(value, "Bearer " + bearer_token):
@@ -94,6 +160,24 @@ def create_capability_tool_host_app(
             "truth_scope": "demo_fixture_evidence",
         }
 
+    @app.post("/v1/effects/readback")
+    async def readback(
+        payload: dict[str, object],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        authorize(authorization)
+        if set(payload) != {"schema", "tool_key", "effect_id", "request_sha256"} or payload.get("schema") != "captain.generic-tool-effect-readback.v1":
+            raise HTTPException(status_code=409, detail="tool effect readback binding changed")
+        try:
+            value = journal.read(
+                str(payload["effect_id"]), request_sha256=str(payload["request_sha256"]),
+            )
+        except ValueError:
+            raise HTTPException(status_code=409, detail="tool effect readback binding changed") from None
+        if value is None or value.get("tool_key") != payload.get("tool_key"):
+            raise HTTPException(status_code=404, detail="tool effect receipt is unavailable")
+        return value
+
     def bind_route(
         path: str, tool_key: str, operation: str, schema: str, dataset_name: str,
     ) -> None:
@@ -102,7 +186,7 @@ def create_capability_tool_host_app(
             authorization: str | None = Header(default=None),
         ) -> dict[str, object]:
             authorize(authorization)
-            expected = {"schema", "tool_key", "operation", "endpoint_sha256", "registry_sha256", "arguments"}
+            expected = {"schema", "tool_key", "operation", "endpoint_sha256", "registry_sha256", "arguments", "effect_id"}
             endpoint_sha256 = hashlib.sha256(
                 ("http://127.0.0.1:8110" + path).encode()
             ).hexdigest()
@@ -113,9 +197,19 @@ def create_capability_tool_host_app(
                 or payload.get("operation") != operation
                 or payload.get("endpoint_sha256") != endpoint_sha256
                 or not isinstance(payload.get("arguments"), dict)
+                or _SHA256.fullmatch(str(payload.get("effect_id", ""))) is None
             ):
                 raise HTTPException(status_code=409, detail="tool execution binding changed")
             arguments = payload["arguments"]
+            request_sha256 = hashlib.sha256(_canonical(payload)).hexdigest()
+            try:
+                prior = journal.read(
+                    str(payload["effect_id"]), request_sha256=request_sha256,
+                )
+            except ValueError:
+                raise HTTPException(status_code=409, detail="tool effect replay changed request") from None
+            if prior is not None:
+                return prior
             query_sha256 = hashlib.sha256(_canonical(arguments)).hexdigest()
             result = _select(datasets[dataset_name], arguments)
             result.update({
@@ -124,10 +218,15 @@ def create_capability_tool_host_app(
                 "implementation_sha256": implementation_sha256,
                 "query_sha256": query_sha256,
             })
-            return {
+            response = {
                 "schema": schema, "tool_key": tool_key, "operation": operation,
                 "endpoint_sha256": endpoint_sha256, "result": result,
             }
+            journal.write(
+                str(payload["effect_id"]), request_sha256=request_sha256,
+                response=response,
+            )
+            return response
 
         execute.__name__ = "execute_" + tool_key
         app.post(path)(execute)
@@ -170,9 +269,18 @@ def create_capability_tool_host_app_from_environment(
             digests[name] = digest
     except (KeyError, OSError, ValueError, RuntimeAdapterManifestError, json.JSONDecodeError):
         raise ValueError("capability tool host configuration is invalid") from None
+    try:
+        journal_relative = Path(source["CAPTAIN_CAPABILITY_TOOL_HOST_JOURNAL_ROOT"])
+        if journal_relative.is_absolute() or ".." in journal_relative.parts:
+            raise ValueError("journal")
+        journal_root = (root / journal_relative).resolve()
+        journal_root.relative_to(root)
+    except (KeyError, OSError, ValueError):
+        raise ValueError("capability tool host configuration is invalid") from None
     return create_capability_tool_host_app(
         bearer_token=token, datasets=datasets, dataset_digests=digests,
         implementation_sha256=implementation_sha256,
+        journal_root=journal_root,
     )
 
 
