@@ -10,6 +10,12 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
+import httpx
+from autogen_core import FunctionCall
+from autogen_core.models import (
+    AssistantMessage, FunctionExecutionResult, FunctionExecutionResultMessage,
+    UserMessage,
+)
 
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryRole
@@ -391,6 +397,58 @@ def test_proxy_builder_uses_exact_responses_authority_without_openai_key() -> No
     assert observed["context_reference"] == (
         "gateway://provider-budget-contexts/" + "c" * 64
     )
+
+
+@pytest.mark.asyncio
+async def test_proxy_responses_client_serializes_autogen_and_parses_nested_output() -> None:
+    from agenten.agent_factory.business_benchmark_production_ports import (
+        ProxyResponsesChatCompletionClient,
+    )
+
+    seen: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={
+            "output": [{
+                "type": "message", "content": [
+                    {"type": "output_text", "text": "verified-response"}
+                ],
+            }],
+            "usage": {"input_tokens": 11, "output_tokens": 7},
+        })
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    client = ProxyResponsesChatCompletionClient(
+        endpoint="http://127.0.0.1:18091/v1/responses",
+        token="proxy-token", model="approved-model-id",
+        context_reference="gateway://provider-budget-contexts/" + "c" * 64,
+        client=http,
+    )
+    result = await client.create([
+        UserMessage(content="run", source="captain"),
+        AssistantMessage(
+            content=[FunctionCall(id="call-1", name="lookup", arguments="{}")],
+            source="assistant",
+        ),
+        FunctionExecutionResultMessage(content=[FunctionExecutionResult(
+            content="done", name="lookup", call_id="call-1", is_error=False,
+        )]),
+    ], json_output=True)
+
+    payload = json.loads(seen[0].content)
+    assert seen[0].url == "http://127.0.0.1:18091/v1/responses"
+    assert seen[0].headers["x-captain-provider-context-ref"].endswith("c" * 64)
+    assert payload["reasoning"] == {"effort": "high"}
+    assert payload["input"][1]["type"] == "function_call"
+    assert payload["input"][2] == {
+        "type": "function_call_output", "call_id": "call-1", "output": "done",
+    }
+    assert payload["text"] == {"format": {"type": "json_object"}}
+    assert result.content == "verified-response"
+    assert result.usage.prompt_tokens == 11
+    assert result.usage.completion_tokens == 7
+    await client.close()
 
 
 def test_production_module_does_not_import_global_llm_environment_config() -> None:

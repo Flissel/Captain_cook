@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import os
 import re
@@ -349,13 +350,24 @@ class ProxyResponsesChatCompletionClient(ChatCompletionClient):
                      tool_choice: Any = "auto", json_output: Any = None,
                      extra_create_args: Mapping[str, Any] = {},
                      cancellation_token: Any = None) -> CreateResult:
-        del json_output, cancellation_token
         inputs = []
         for message in messages:
             content = getattr(message, "content", None)
-            if not isinstance(content, str):
-                raise ValueError("proxy Responses client supports text messages only")
             kind = type(message).__name__
+            if kind == "AssistantMessage" and isinstance(content, list):
+                inputs.extend({
+                    "type": "function_call", "call_id": call.id,
+                    "name": call.name, "arguments": call.arguments,
+                } for call in content)
+                continue
+            if kind == "FunctionExecutionResultMessage" and isinstance(content, list):
+                inputs.extend({
+                    "type": "function_call_output", "call_id": result.call_id,
+                    "output": result.content,
+                } for result in content)
+                continue
+            if not isinstance(content, str):
+                raise ValueError("proxy Responses message content is invalid")
             role = "developer" if kind == "SystemMessage" else (
                 "assistant" if kind == "AssistantMessage" else "user"
             )
@@ -366,17 +378,41 @@ class ProxyResponsesChatCompletionClient(ChatCompletionClient):
             if not isinstance(schema, Mapping):
                 raise ValueError("proxy Responses tool schema is invalid")
             tool_payload.append({"type": "function", **dict(schema)})
-        payload = {"model": self._model, "input": inputs, **dict(extra_create_args)}
+        extra = dict(extra_create_args)
+        if "reasoning" in extra:
+            raise ValueError("proxy Responses reasoning authority cannot be overridden")
+        payload = {
+            "model": self._model, "input": inputs,
+            "reasoning": {"effort": "high"}, **extra,
+        }
         if tool_payload:
-            payload.update({"tools": tool_payload, "tool_choice": tool_choice})
-        response = await self._client.post(
-            self._endpoint,
-            headers={
-                "Authorization": f"Bearer {self._token}",
-                "X-Captain-Provider-Context-Ref": self._context_reference,
-            },
-            json=payload,
+            selected_choice = tool_choice
+            if not isinstance(tool_choice, str):
+                schema = getattr(tool_choice, "schema", None)
+                if not isinstance(schema, Mapping) or not schema.get("name"):
+                    raise ValueError("proxy Responses tool choice is invalid")
+                selected_choice = {"type": "function", "name": schema["name"]}
+            payload.update({"tools": tool_payload, "tool_choice": selected_choice})
+        if json_output is True:
+            payload["text"] = {"format": {"type": "json_object"}}
+        elif isinstance(json_output, type) and issubclass(json_output, BaseModel):
+            payload["text"] = {"format": {
+                "type": "json_schema", "name": json_output.__name__,
+                "schema": json_output.model_json_schema(), "strict": True,
+            }}
+        pending = asyncio.create_task(
+            self._client.post(
+                self._endpoint,
+                headers={
+                    "Authorization": f"Bearer {self._token}",
+                    "X-Captain-Provider-Context-Ref": self._context_reference,
+                },
+                json=payload,
+            )
         )
+        if cancellation_token is not None:
+            cancellation_token.link_future(pending)
+        response = await pending
         response.raise_for_status()
         value = response.json()
         usage = value.get("usage", {})
@@ -389,11 +425,18 @@ class ProxyResponsesChatCompletionClient(ChatCompletionClient):
             prompt_tokens=self._total.prompt_tokens + current.prompt_tokens,
             completion_tokens=self._total.completion_tokens + current.completion_tokens,
         )
+        output = value.get("output", [])
+        if not isinstance(output, list):
+            raise ValueError("proxy Responses output is invalid")
         calls = [
             FunctionCall(id=item["call_id"], name=item["name"], arguments=item["arguments"])
-            for item in value.get("output", []) if item.get("type") == "function_call"
+            for item in output if item.get("type") == "function_call"
         ]
-        content: str | list[FunctionCall] = calls or str(value.get("output_text", ""))
+        texts = [
+            part["text"] for item in output if item.get("type") == "message"
+            for part in item.get("content", []) if part.get("type") == "output_text"
+        ]
+        content: str | list[FunctionCall] = calls or "".join(texts)
         return CreateResult(
             finish_reason="function_calls" if calls else "stop",
             content=content, usage=current, cached=False,
