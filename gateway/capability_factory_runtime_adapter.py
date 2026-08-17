@@ -1,7 +1,5 @@
-"""Repository-owned entrypoint for the capability Factory runtime."""
-
-from gateway.capability_factory_runtime_internal import build_capability_factory_runtime as _build_capability_factory_runtime
+"""Repository-owned entrypoint; the verified loader injects the internal builder."""
 
 
 def build_capability_factory(configuration, authorities):
-    return _build_capability_factory_runtime(configuration, authorities)
+    return _verified_internal_builder(configuration, authorities)

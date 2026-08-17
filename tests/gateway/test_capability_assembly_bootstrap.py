@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import subprocess
@@ -874,6 +875,10 @@ def _factory_runtime_descriptor(*, adapter_sha256: str) -> dict[str, object]:
         "schema": "captain.capability-factory-runtime-plan.v1",
         "adapter_sha256": adapter_sha256,
         "adapter_ast_sha256": "0" * 64,
+        "implementation_path": "gateway/capability_factory_runtime_internal.py",
+        "implementation_sha256": "1" * 64,
+        "implementation_ast_sha256": "2" * 64,
+        "implementation_head_blob": "3" * 40,
         "constructor_signature": "(configuration, authorities)",
         "clock_signature": "() -> datetime",
         "model_client_signature": "(job, invocation)",
@@ -991,6 +996,14 @@ def test_repository_factory_adapter_matches_committed_descriptor() -> None:
 
     assert hashlib.sha256(source).hexdigest() == descriptor.adapter_sha256
     assert bootstrap._attest_factory_adapter_ast(source) == descriptor.adapter_ast_sha256
+    implementation = (root / descriptor.implementation_path).read_bytes()
+    assert hashlib.sha256(implementation).hexdigest() == descriptor.implementation_sha256
+    assert hashlib.sha256(
+        ast.dump(
+            ast.parse(implementation), annotate_fields=True, include_attributes=False
+        ).encode("utf-8")
+    ).hexdigest() == descriptor.implementation_ast_sha256
+    assert b"capability_factory_runtime_internal" not in source
 
 
 def test_factory_constructor_receives_only_allowlisted_config_and_redacts_any_error(
@@ -1021,24 +1034,20 @@ def test_factory_constructor_receives_only_allowlisted_config_and_redacts_any_er
         repository_root=tmp_path,
         adapter_path=tmp_path / "adapter.py",
         adapter_sha256=adapter_sha256,
+        adapter_bytes=(
+            b'"""verified"""\n\ndef build_capability_factory(configuration, authorities):\n'
+            b'    return _verified_internal_builder(configuration, authorities)\n'
+        ),
+        implementation_path=tmp_path / "internal.py",
+        implementation_bytes=(
+            b"def build_capability_factory_runtime(configuration, authorities):\n"
+            b"    raise RuntimeError('must-never-escape-constructor')\n"
+        ),
         descriptor_sha256="d" * 64,
         descriptor=descriptor,
         configuration=configuration,
     )
-    received: list[object] = []
     secret_marker = "must-never-escape-constructor"
-
-    def constructor(config: object, authorities: object) -> object:
-        received.extend((config, authorities))
-        raise RuntimeError(secret_marker)
-
-    monkeypatch.setattr(
-        bootstrap,
-        "load_verified_repository_module",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            build_capability_factory=constructor
-        ),
-    )
 
     with pytest.raises(
         CapabilityAssemblyBootstrapConfigurationError,
@@ -1051,9 +1060,8 @@ def test_factory_constructor_receives_only_allowlisted_config_and_redacts_any_er
             clock=lambda: datetime.now(timezone.utc),
         )
 
-    assert received[0] is configuration
-    assert not hasattr(received[0], "environment")
-    assert not hasattr(received[0], "gateway_token")
+    assert not hasattr(configuration, "environment")
+    assert not hasattr(configuration, "gateway_token")
     assert captured.value.__cause__ is None
     assert secret_marker not in str(captured.value)
 

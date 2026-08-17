@@ -17,6 +17,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import ModuleType
 from threading import Lock
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -1392,6 +1393,10 @@ class CapabilityAssemblyFactoryRuntimeDescriptorV1(BaseModel):
     )
     adapter_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     adapter_ast_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    implementation_path: str
+    implementation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    implementation_ast_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    implementation_head_blob: str = Field(pattern=r"^[0-9a-f]{40}$")
     constructor_signature: str
     clock_signature: str
     model_client_signature: str
@@ -1436,6 +1441,7 @@ _FACTORY_RUNTIME_DESCRIPTOR_BINDINGS = {
 
 _FACTORY_ADAPTER_PATH = "gateway/capability_factory_runtime_adapter.py"
 _FACTORY_DESCRIPTOR_PATH = "gateway/capability_factory_runtime_descriptor.json"
+_FACTORY_IMPLEMENTATION_PATH = "gateway/capability_factory_runtime_internal.py"
 
 
 def _attest_factory_adapter_ast(source: bytes) -> str:
@@ -1445,19 +1451,14 @@ def _attest_factory_adapter_ast(source: bytes) -> str:
         raise ValueError("adapter syntax") from None
     nodes = tree.body
     if (
-        len(nodes) != 3
+        len(nodes) != 2
         or not isinstance(nodes[0], ast.Expr)
         or not isinstance(nodes[0].value, ast.Constant)
         or not isinstance(nodes[0].value.value, str)
-        or not isinstance(nodes[1], ast.ImportFrom)
-        or nodes[1].module != "gateway.capability_factory_runtime_internal"
-        or len(nodes[1].names) != 1
-        or nodes[1].names[0].name != "build_capability_factory_runtime"
-        or nodes[1].names[0].asname != "_build_capability_factory_runtime"
-        or not isinstance(nodes[2], ast.FunctionDef)
+        or not isinstance(nodes[1], ast.FunctionDef)
     ):
         raise ValueError("adapter top level")
-    function = nodes[2]
+    function = nodes[1]
     arguments = function.args
     if (
         function.name != "build_capability_factory"
@@ -1472,7 +1473,7 @@ def _attest_factory_adapter_ast(source: bytes) -> str:
         or not isinstance(function.body[0], ast.Return)
         or not isinstance(function.body[0].value, ast.Call)
         or not isinstance(function.body[0].value.func, ast.Name)
-        or function.body[0].value.func.id != "_build_capability_factory_runtime"
+        or function.body[0].value.func.id != "_verified_internal_builder"
         or [item.id for item in function.body[0].value.args if isinstance(item, ast.Name)]
         != ["configuration", "authorities"]
         or len(function.body[0].value.args) != 2
@@ -1488,6 +1489,9 @@ class CapabilityAssemblyFactoryRuntimePlan:
     repository_root: Path
     adapter_path: Path
     adapter_sha256: str
+    adapter_bytes: bytes
+    implementation_path: Path
+    implementation_bytes: bytes
     descriptor_sha256: str
     descriptor: CapabilityAssemblyFactoryRuntimeDescriptorV1
     configuration: CapabilityAssemblyFactoryConfiguration
@@ -1561,6 +1565,31 @@ def plan_capability_assembly_factory_runtime_from_environment(
             descriptor.adapter_ast_sha256, adapter_ast_sha256
         ):
             raise ValueError("adapter AST digest")
+        if descriptor.implementation_path != _FACTORY_IMPLEMENTATION_PATH:
+            raise ValueError("implementation path")
+        implementation_path, implementation_bytes = read_verified_repository_bytes(
+            descriptor.implementation_path,
+            expected_sha256=descriptor.implementation_sha256,
+            expected_repository_revision=repository_revision,
+            repository_root=repository_root,
+        )
+        implementation_ast = hashlib.sha256(
+            ast.dump(
+                ast.parse(implementation_bytes, filename=descriptor.implementation_path),
+                annotate_fields=True,
+                include_attributes=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        if not secrets.compare_digest(
+            descriptor.implementation_ast_sha256, implementation_ast
+        ):
+            raise ValueError("implementation AST digest")
+        git_blob = hashlib.sha1(
+            b"blob " + str(len(implementation_bytes)).encode("ascii")
+            + b"\0" + implementation_bytes
+        ).hexdigest()
+        if not secrets.compare_digest(descriptor.implementation_head_blob, git_blob):
+            raise ValueError("implementation HEAD blob")
         root = repository_root.resolve(strict=True)
         for relative_root in (descriptor.skill_root, descriptor.replay_root):
             candidate = Path(relative_root)
@@ -1575,6 +1604,9 @@ def plan_capability_assembly_factory_runtime_from_environment(
         repository_root=root,
         adapter_path=adapter_path,
         adapter_sha256=adapter_sha256,
+        adapter_bytes=adapter_bytes,
+        implementation_path=implementation_path,
+        implementation_bytes=implementation_bytes,
         descriptor_sha256=descriptor_sha256,
         descriptor=descriptor,
         configuration=CapabilityAssemblyFactoryConfiguration(
@@ -1639,10 +1671,26 @@ def materialize_capability_assembly_factory_runtime(
         provider_token=provider_token or SecretStr("unconfigured-provider-token"),
     )
     try:
-        module = load_verified_repository_module(
-            plan.adapter_path,
-            expected_sha256=plan.adapter_sha256,
-            repository_root=plan.repository_root,
+        implementation = ModuleType("_captain_verified_factory_implementation")
+        implementation.__file__ = str(plan.implementation_path)
+        exec(
+            compile(
+                plan.implementation_bytes, str(plan.implementation_path), "exec",
+                dont_inherit=True,
+            ),
+            implementation.__dict__,
+        )
+        internal_builder = getattr(
+            implementation, "build_capability_factory_runtime", None
+        )
+        if not callable(internal_builder):
+            raise ValueError("implementation constructor")
+        module = ModuleType("_captain_verified_factory_adapter")
+        module.__file__ = str(plan.adapter_path)
+        module.__dict__["_verified_internal_builder"] = internal_builder
+        exec(
+            compile(plan.adapter_bytes, str(plan.adapter_path), "exec", dont_inherit=True),
+            module.__dict__,
         )
         constructor = getattr(module, "build_capability_factory", None)
         if not callable(constructor):
