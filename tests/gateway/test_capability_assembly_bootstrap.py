@@ -1119,6 +1119,78 @@ def test_shipped_closure_accepts_real_preloaded_modules_and_covers_packages() ->
     bootstrap._VerifiedFactoryClosureFinder(modules).require_preloaded_origins()
 
 
+def test_shipped_verified_closure_materializes_the_real_factory_graph(
+    tmp_path: Path,
+) -> None:
+    import gateway.capability_assembly_bootstrap as bootstrap
+
+    root = Path(__file__).parents[2]
+    descriptor_bytes = (
+        root / "gateway/capability_factory_runtime_descriptor.json"
+    ).read_bytes()
+    descriptor = bootstrap.CapabilityAssemblyFactoryRuntimeDescriptorV1.model_validate_json(
+        descriptor_bytes
+    )
+    closure = json.loads(
+        (root / descriptor.closure_path).read_text(encoding="utf-8")
+    )
+    modules = {
+        entry["module"]: (
+            (root / entry["path"]).resolve(),
+            (root / entry["path"]).read_bytes(),
+        )
+        for entry in closure["entries"]
+    }
+    policy = bootstrap.FactoryExecutionPolicyV1.model_validate({
+        "schema": "captain.factory-execution-policy.v1",
+        "mode": "release", "live_execution": True,
+        "max_cost_usd": "1.00", "max_runtime_seconds": 900,
+        "required_live_runs": 3, "allowed_models": ["gpt-5.6-terra"],
+        "live_capabilities": ["model.invoke"],
+    })
+    configuration = bootstrap.CapabilityAssemblyFactoryConfiguration(
+        repository_root=tmp_path,
+        artifact_root=tmp_path / ".captain-cook/artifacts",
+        authority_root=tmp_path / ".captain-cook/authority",
+        provider="openai", model="gpt-5.6-terra", execution_policy=policy,
+        provider_proxy_url="http://127.0.0.1:18091",
+        provider_policy_sha256="1" * 64, provider_price_card_sha256="2" * 64,
+        provider_context_sha256="3" * 64,
+        provider_proxy_executable_sha256="4" * 64,
+        provider_proxy_code_sha256="5" * 64,
+        provider_paid_command_sha256="6" * 64,
+        provider_hard_ceiling_enforced=True,
+        minibook_url="http://127.0.0.1:8080",
+    )
+    adapter = (root / "gateway/capability_factory_runtime_adapter.py").read_bytes()
+    implementation = (
+        root / "gateway/capability_factory_runtime_internal.py"
+    ).read_bytes()
+    plan = bootstrap.CapabilityAssemblyFactoryRuntimePlan(
+        repository_root=tmp_path,
+        adapter_path=root / "gateway/capability_factory_runtime_adapter.py",
+        adapter_sha256=hashlib.sha256(adapter).hexdigest(), adapter_bytes=adapter,
+        implementation_path=root / "gateway/capability_factory_runtime_internal.py",
+        implementation_bytes=implementation, repository_revision="a" * 40,
+        closure_modules=modules,
+        descriptor_sha256=hashlib.sha256(descriptor_bytes).hexdigest(),
+        descriptor=descriptor, configuration=configuration,
+    )
+
+    runtime = bootstrap.materialize_capability_assembly_factory_runtime(
+        plan, store=SimpleNamespace(),
+        private_benchmark_catalog=SimpleNamespace(),
+        clock=lambda: datetime.now(timezone.utc),
+        provider_token=SecretStr("provider-token"),
+        minibook_api_key=SecretStr("minibook-key"),
+    )
+
+    assert type(runtime.factory).__name__ == "AgentFactoryLiveComposition"
+    assert type(runtime.factory.business_benchmark).__name__ == (
+        "AssemblyOwnedGenericBenchmark"
+    )
+
+
 def test_factory_constructor_receives_only_allowlisted_config_and_redacts_any_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

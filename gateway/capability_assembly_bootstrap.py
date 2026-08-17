@@ -1564,6 +1564,7 @@ class _VerifiedFactoryClosureFinder(importlib.abc.MetaPathFinder):
         return importlib.util.spec_from_loader(
             fullname, _VerifiedFactoryClosureLoader(fullname, file_path, content),
             origin=str(file_path),
+            is_package=file_path.name == "__init__.py",
         )
 
     def require_preloaded_origins(self) -> None:
