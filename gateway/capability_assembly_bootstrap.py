@@ -1010,10 +1010,15 @@ class GatewayGenericCapabilityPromotion:
         converted = _current_stage_request(request)  # type: ignore[arg-type]
         if self._adapter._provisioning.binding_for(converted) != binding:
             raise CapabilityLiveAuthorityUnavailable("Factory promotion binding changed")
-        await self._factory.run(
-            binding.job.job_id,
-            stop_before_action=FactoryActionKind.VALIDATE_FOR_PROMOTION,
-        )
+        checkpoint = await self._factory.run(binding.job.job_id)
+        if (
+            getattr(checkpoint, "status", None) != "captain_action_required"
+            or getattr(getattr(checkpoint, "next_action", None), "kind", None)
+            is not FactoryActionKind.VALIDATE_FOR_PROMOTION
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "Factory is not at the Captain promotion authority"
+            )
         if request.suite_ref is None:  # type: ignore[union-attr]
             raise CapabilityLiveAuthorityUnavailable("generic benchmark suite is unavailable")
         receipt = self._recorder.receipt_for(

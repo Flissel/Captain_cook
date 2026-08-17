@@ -95,6 +95,7 @@ from agenten.agent_factory.state_machine import (
     apply_block,
     next_action,
 )
+from agenten.agent_factory.workflow_promotion import build_release_workflow_promotion
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
@@ -6377,13 +6378,22 @@ class GatewayStore:
                 if type(job) is not AgentFactoryJobV3:
                     raise HTTPException(status_code=409, detail="generic promotion job is invalid")
                 projection = self._factory_projection(cursor, job)
+                factory_blocks = self._factory_blocks(
+                    cursor, job_id, for_update=True
+                )
+                promotions = tuple(
+                    block for block in factory_blocks
+                    if block.phase is FactoryPhase.CAPABILITY_PROMOTED
+                )
                 if (
-                    projection.status is not FactoryLifecycleStatus.RUNNING
-                    or projection.phase is not FactoryPhase.QUALITY_REVIEWED
-                    or any(
-                        block.phase is FactoryPhase.CAPABILITY_PROMOTED
-                        for block in self._factory_blocks(cursor, job_id)
-                    )
+                    projection.status not in {
+                        FactoryLifecycleStatus.RUNNING,
+                        FactoryLifecycleStatus.READY_TO_USE,
+                    }
+                    or projection.phase not in {
+                        FactoryPhase.QUALITY_REVIEWED,
+                        FactoryPhase.CAPABILITY_PROMOTED,
+                    }
                 ):
                     raise HTTPException(status_code=409, detail="generic promotion is not admissible")
                 cursor.execute(
@@ -6443,9 +6453,76 @@ class GatewayStore:
                         existing["suite_sha256"] == suite_sha256
                         and existing["summary_sha256"] == summary_sha256
                         and self._decode_json(existing["projection_event"]) == canonical
+                        and projection.status is FactoryLifecycleStatus.READY_TO_USE
+                        and projection.phase is FactoryPhase.CAPABILITY_PROMOTED
+                        and len(promotions) == 1
                     ):
                         return canonical
                     raise HTTPException(status_code=409, detail="generic promotion conflicts")
+                if (
+                    projection.status is not FactoryLifecycleStatus.RUNNING
+                    or projection.phase is not FactoryPhase.QUALITY_REVIEWED
+                    or promotions
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="generic promotion is not atomically admissible",
+                    )
+                promotion = build_release_workflow_promotion(
+                    FactoryJobProjection(
+                        job=job,
+                        blocks=factory_blocks,
+                        leases=self._factory_leases(cursor, job_id),
+                        projection=projection,
+                    ),
+                    occurred_at=occurred_at,
+                )
+                (
+                    evaluation,
+                    release_decision,
+                    workflow_evaluation,
+                    feedback,
+                    benchmark_summary,
+                ) = self._factory_block_context(
+                    cursor,
+                    job,
+                    promotion,
+                    for_update=True,
+                )
+                try:
+                    promoted_projection = apply_block(
+                        projection,
+                        promotion,
+                        evaluation=evaluation,
+                        release_decision=release_decision,
+                        workflow_evaluation=workflow_evaluation,
+                        feedback=feedback,
+                        benchmark_summary=benchmark_summary,
+                    )
+                except FactoryLifecycleError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if (
+                    promoted_projection.status is not FactoryLifecycleStatus.READY_TO_USE
+                    or promoted_projection.phase is not FactoryPhase.CAPABILITY_PROMOTED
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="generic promotion did not reach ready_to_use",
+                    )
+                promotion_index = self._next_index(cursor)
+                promotion_block = self._new_block(
+                    cursor,
+                    index=promotion_index,
+                    block_type="agent_factory_block",
+                    data=promotion.model_dump(mode="json", by_alias=True),
+                    status=promotion.status.value,
+                    parent_index=job_block["index"],
+                    metadata={
+                        "schema": "captain.agent-factory-block.v1",
+                        "phase": promotion.phase.value,
+                    },
+                )
+                self._insert(cursor, promotion_block)
                 cursor.execute(
                     "INSERT INTO capability_generic_promotions "
                     "(event_id, job_id, suite_sha256, summary_sha256, projection_event) "

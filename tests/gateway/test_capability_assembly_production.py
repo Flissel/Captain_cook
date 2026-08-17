@@ -27,6 +27,7 @@ from agenten.agent_factory.input_contracts import (
     BenchmarkExpectedPredicate,
 )
 from agenten.agent_factory.input_document import FactoryInputError, load_factory_input, parse_factory_input_bytes
+from agenten.agent_factory.state_machine import FactoryActionKind
 from agenten.agent_factory.private_benchmark_catalog import (
     InMemoryPrivateBenchmarkCatalog,
     generate_private_benchmark_suite,
@@ -81,7 +82,10 @@ from gateway.capability_generic_benchmark import (
     build_generic_benchmark_suite,
 )
 from gateway.capability_assembly_repository import GatewayCapabilityAssemblyRepository
-from gateway.capability_assembly_bootstrap import CaptainBenchmarkToolEvidenceAuthority
+from gateway.capability_assembly_bootstrap import (
+    CaptainBenchmarkToolEvidenceAuthority,
+    GatewayGenericCapabilityPromotion,
+)
 from gateway.capability_benchmark_process_executor import (
     GatewayHttpBenchmarkProcessTransport,
     GatewayIsolatedBenchmarkExecutorClient,
@@ -2075,6 +2079,83 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             purpose="execution",
             authority_id=raw_executor.authority_id,
         )
+
+
+def test_generic_promotion_stops_at_captain_authority_before_atomic_gateway_commit(
+    monkeypatch,
+) -> None:
+    calls: list[object] = []
+
+    class Factory:
+        async def run(self, job_id, *, stop_before_action=None):
+            calls.append((job_id, stop_before_action))
+            return SimpleNamespace(
+                status="captain_action_required",
+                next_action=SimpleNamespace(
+                    kind=FactoryActionKind.VALIDATE_FOR_PROMOTION
+                ),
+            )
+
+        def workflow_budget_projection(self, job_id):
+            del job_id
+            return SimpleNamespace(consumed_usd=Decimal("0"))
+
+    class Provisioning:
+        def binding_for(self, request):
+            del request
+            return binding
+
+    class Recorder:
+        def receipt_for(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(
+                evidence_refs=(_ref("benchmark"),),
+                authority_id=_id("benchmark-authority"),
+                summary_ref=_ref("summary"),
+            )
+
+        def team_trace_ids(self, **kwargs):
+            del kwargs
+            return tuple(_id(f"trace-{index}") for index in range(15))
+
+    job = SimpleNamespace(
+        job_id=_id("atomic-promotion-job"),
+        correlation_id=_id("atomic-promotion-correlation"),
+        subject_version=1,
+        required_capability="incident_command",
+    )
+    binding = SimpleNamespace(job=job)
+    store = SimpleNamespace(
+        record_generic_capability_promotion=lambda **kwargs: {
+            "event_id": str(_id("atomic-promotion-event"))
+        }
+    )
+    promotion = GatewayGenericCapabilityPromotion(
+        gateway_store=store,
+        factory=Factory(),
+        provisioning=Provisioning(),
+        recorder=Recorder(),
+        clock=lambda: datetime(2026, 8, 17, tzinfo=timezone.utc),
+    )
+    request = SimpleNamespace(
+        suite_ref=_ref("suite"),
+        hermes_result_ref=_ref("hermes"),
+        input=SimpleNamespace(
+            input_id="input-a", source_ref=_ref("source"),
+        ),
+        run_id=_id("run"), correlation_id=job.correlation_id,
+        reservation=SimpleNamespace(), stage=CapabilityLiveStage.PROMOTE,
+        controlled_recovery_required=False, retry_number=0,
+    )
+    promotion._adapter._provisioning = Provisioning()
+    monkeypatch.setattr(
+        "gateway.capability_assembly_bootstrap._current_stage_request",
+        lambda value: value,
+    )
+
+    asyncio.run(promotion.promote_generic_capability(request, binding))
+
+    assert calls == [(job.job_id, None)]
 
 
 def test_benchmark_cas_resolver_rejects_forged_artifact_bytes() -> None:

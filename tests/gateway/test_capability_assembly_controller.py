@@ -1194,6 +1194,63 @@ def test_validated_terminal_authority_survives_crash_before_checkpoint_append() 
     assert len(reconciliation.calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("ordinal", "stage", "port_index"),
+    (
+        (0, CapabilityLiveStage.SCAFFOLD_AND_TEST_HARNESS, 3),
+        (1, CapabilityLiveStage.CODEX_IMPLEMENTATION, 3),
+        (2, CapabilityLiveStage.SEAL, 3),
+        (3, CapabilityLiveStage.EVALUATE, 4),
+        (4, CapabilityLiveStage.PROMOTE, 3),
+        (5, CapabilityLiveStage.EXECUTE, 5),
+        (6, CapabilityLiveStage.PROJECT, 6),
+    ),
+)
+def test_every_effectful_input_slice_reconciles_without_duplicate_after_checkpoint_crash(
+    ordinal: int,
+    stage: CapabilityLiveStage,
+    port_index: int,
+) -> None:
+    reconciliation = _TerminalJournalReconciliation()
+    parts = _controller(reconciliation=reconciliation)
+    controller, repo = parts[0], parts[1]
+    controller.submit(_submission())
+    if ordinal:
+        _advance(
+            controller,
+            operation=f"crash-matrix-prior-{ordinal}",
+            maximum_slices=ordinal,
+        )
+    request = CapabilityAssemblyAdvanceRequest(
+        assembly_id=ASSEMBLY_ID,
+        operation_id=_id(f"crash-matrix-{ordinal}"),
+        request_sha256=controller.projection(ASSEMBLY_ID).request_sha256,
+        maximum_slices=1,
+    )
+    original_append = repo.append
+
+    def crash_after_terminal(checkpoint, *, expected_revision):
+        if checkpoint.last_slice is not None and checkpoint.last_slice.ordinal == ordinal:
+            raise RuntimeError("simulated checkpoint interruption")
+        return original_append(checkpoint, expected_revision=expected_revision)
+
+    repo.append = crash_after_terminal  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="checkpoint interruption"):
+        asyncio.run(controller.advance(request))
+    original_port = parts[port_index]
+    original_effect_count = len(original_port.calls)
+    assert len(reconciliation.terminal) == ordinal + 1
+
+    repo.append = original_append  # type: ignore[method-assign]
+    restarted_parts = _controller(repo, reconciliation=reconciliation)
+    receipt = asyncio.run(restarted_parts[0].advance(request))
+
+    assert receipt.executed_slices == 1
+    assert len(original_port.calls) == original_effect_count
+    assert restarted_parts[port_index].calls == []
+    assert restarted_parts[0].projection(ASSEMBLY_ID).items[0].completed_stages[-1] is stage
+
+
 def _scaffold_readback(checkpoint: CapabilityAssemblyCheckpoint) -> CapabilityFactoryAuthority:
     item = checkpoint.items[0]
     return CapabilityFactoryAuthority(
