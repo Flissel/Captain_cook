@@ -215,6 +215,9 @@ Commits:
    reconciles the exact process/container and authenticated health before doing
    anything; missing or ambiguous identity never spawns again. Failed process
    tree enumeration is ambiguous and cannot be reported as stopped.
+7. `f8710e1` — fingerprints every source-declared function retained by a preloaded
+   closure module against the already-attested bytes. A real `ModuleType` with
+   the expected origin but substituted code is rejected before construction.
 
 Round-5 RED to GREEN evidence:
 
@@ -223,8 +226,9 @@ Round-5 RED to GREEN evidence:
   environments exclude it. Health URL validation proves zero request for an
   attacker host or path drift.
 - Group B closure gate: 63 passed after the initial transitive/import-cache
-  adversarial cases. The additional same-origin non-module substitution test
-  was RED then GREEN before `1558699`.
+  adversarial cases. The additional same-origin non-module and same-origin code
+  substitution tests were each RED then GREEN. The complete post-hardening
+  bootstrap/production selection passed 146 tests.
 - Group C Responses/D7 contract gate: 24 passed against the D7 proxy transport,
   including dynamic command context, eight-field authority headers, function
   calls, JSON output, usage, and cancellation.
