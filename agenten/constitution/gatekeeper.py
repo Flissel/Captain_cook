@@ -20,7 +20,7 @@ module still imports cleanly when `autogen_core` is absent.
 """
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from agenten.constitution.ruleset import ConstitutionRuleset
 from agenten.constitution.validators import run_deterministic_checks
@@ -89,6 +89,9 @@ class ConstitutionGatekeeper:
         self.ledger_query = ledger_query
         self.llm_judge = llm_judge
         self.llm_timeout_seconds = llm_timeout_seconds
+        # Subproblems this gate accepted but the Recorder has not persisted yet.
+        # Maps subproblem_id -> (root_problem_id, description).
+        self._accepted_in_flight: Dict[str, Tuple[str, str]] = {}
 
     async def handle_subproblem_proposed(self, event: SubproblemProposed) -> None:
         """Publishes SubproblemAccepted or SubproblemRejected via self.bus."""
@@ -150,7 +153,7 @@ class ConstitutionGatekeeper:
         try:
             blocks = self.ledger_query.blocks_in_stage(Stage.VALIDATING)
         except Exception:
-            return pending
+            blocks = []
         for block in blocks:
             if _field_from_block(block, "subproblem_id") == exclude_subproblem_id:
                 continue
@@ -158,7 +161,38 @@ class ConstitutionGatekeeper:
             block_description = _field_from_block(block, "description")
             if isinstance(block_root_id, str) and isinstance(block_description, str):
                 pending.append((block_root_id, block_description))
+
+        self._forget_persisted_acceptances()
+        for subproblem_id, entry in self._accepted_in_flight.items():
+            if subproblem_id == exclude_subproblem_id:
+                continue
+            pending.append(entry)
         return pending
+
+    def _forget_persisted_acceptances(self) -> None:
+        """Drop remembered verdicts the ledger has caught up on.
+
+        The Recorder enqueues its VALIDATING write rather than performing it,
+        so a sibling proposed in the same batch is invisible in that stage.
+        This gate therefore remembers what it accepted until the ledger can
+        see it, then hands authority back to the ledger view — otherwise the
+        memory would become a permanent, unbounded duplicate ban.
+        """
+        if not self._accepted_in_flight:
+            return
+        persisted: Set[str] = set()
+        for stage in Stage:
+            try:
+                blocks = self.ledger_query.blocks_in_stage(stage)
+            except Exception:
+                continue
+            for block in blocks:
+                subproblem_id = _field_from_block(block, "subproblem_id")
+                if isinstance(subproblem_id, str):
+                    persisted.add(subproblem_id)
+        for subproblem_id in list(self._accepted_in_flight):
+            if subproblem_id in persisted:
+                del self._accepted_in_flight[subproblem_id]
 
     async def _accept(self, event: SubproblemProposed) -> None:
         accepted = SubproblemAccepted(
@@ -170,6 +204,10 @@ class ConstitutionGatekeeper:
             ),
             subproblem_id=event.subproblem_id,
             block_index=None,
+        )
+        self._accepted_in_flight[event.subproblem_id] = (
+            event.meta.root_problem_id,
+            event.description,
         )
         await self.bus.publish(topic_for(SubproblemAccepted), accepted)
 
