@@ -282,6 +282,12 @@ def test_action_request_requires_utc_deadline(contract: type) -> None:
         contract.model_validate(payload | {"deadline_at": "2026-08-09T12:00:00"})
 
 
+@pytest.mark.parametrize("contract", (CaptainFactoryActionRequestV1, FactoryActionRequestV1))
+def test_action_request_exposes_authoritative_denied_status(contract: type) -> None:
+    payload = json.loads((FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8"))
+    assert contract.model_validate(payload | {"status": "denied"}).status == "denied"
+
+
 @pytest.mark.parametrize("contract", (CaptainFactoryActionResponseV1, FactoryActionResponseV1))
 def test_action_response_requires_utc_timestamp(contract: type) -> None:
     payload = json.loads((FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8"))

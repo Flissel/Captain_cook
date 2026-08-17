@@ -103,7 +103,7 @@ class TransactionalMemoryActionRepository:
     def resume_rows(self, *, after_request_id=None, limit: int = 100) -> tuple[FactoryActionRow, ...]:
         rows = tuple(
             row for row in self.rows.values()
-            if row.status == "answered"
+            if row.status in {"answered", "denied"}
             and (after_request_id is None or str(row.request.request_id) > str(after_request_id))
         )
         return tuple(sorted(rows, key=lambda row: str(row.request.request_id))[:limit])
@@ -126,7 +126,7 @@ class TransactionalMemoryActionRepository:
         for row in self.rows.values():
             if (
                 row.tenant_id == tenant_id
-                and row.status in {"pending", "answered"}
+                and row.status in {"pending", "answered", "denied"}
                 and row.request.deadline_at <= now
                 and (request_id is None or row.request.request_id == request_id)
             ):
@@ -303,6 +303,22 @@ def test_deterministic_repository_covers_answer_fences_and_blocks_early_consume(
             safe_checkpoint_sha256=request.safe_checkpoint_sha256,
             now=NOW,
         )
+
+
+def test_denial_is_durable_listable_and_recoverable_before_consumption(
+    memory_repository: TransactionalMemoryActionRepository,
+) -> None:
+    request = pending_request()
+    store = FactoryActionStore(repository=memory_repository)
+    store.create(request, tenant_id="tenant-a")
+    denial = action_response(request).model_copy(update={"decision": "deny", "credential_ref": None})
+
+    assert store.answer(denial, tenant_id="tenant-a", now=NOW) == denial
+    assert store.get(request.request_id, tenant_id="tenant-a", now=NOW).status == "denied"
+    assert store.list(tenant_id="tenant-a", status="denied", now=NOW) == (
+        request.model_copy(update={"status": "denied"}),
+    )
+    assert tuple(store.iter_resume_candidates(now=NOW)) == ((request.request_id, "tenant-a"),)
     with pytest.raises(ValueError, match="effects are not acknowledged"):
         store.consume(
             request.request_id,
@@ -643,7 +659,7 @@ def test_db_row_rejects_extraneous_expired_phase_columns(
         _db_row(row)
 
 
-def test_mariadb_expiry_updates_pending_and_answered_rows_only() -> None:
+def test_mariadb_expiry_updates_pending_answered_and_denied_rows_only() -> None:
     calls: list[tuple[str, object]] = []
 
     class Cursor:
@@ -674,7 +690,7 @@ def test_mariadb_expiry_updates_pending_and_answered_rows_only() -> None:
     )
 
     query, parameters = calls[0]
-    assert "status IN ('pending', 'answered')" in query
+    assert "status IN ('pending', 'answered', 'denied')" in query
     assert parameters == (
         request.deadline_at.replace(tzinfo=None),
         "tenant-a",

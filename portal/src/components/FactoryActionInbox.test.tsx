@@ -42,6 +42,36 @@ describe("FactoryActionInbox", () => {
     );
     expect(JSON.stringify(vi.mocked(api.respondToFactoryAction).mock.calls)).not.toContain("secret-value");
     expect(screen.getByLabelText("Credential value")).toHaveValue("");
+    expect(screen.getByRole("status")).toHaveTextContent("Credential stored");
+  });
+
+  it("keeps an overlapping request fenced until its own response settles", async () => {
+    const user = userEvent.setup();
+    const api = apiFixture();
+    let releaseFirst: (() => void) | undefined;
+    let releaseSecond: (() => void) | undefined;
+    vi.mocked(api.respondToFactoryAction)
+      .mockImplementationOnce(async () => new Promise<void>((resolve) => { releaseFirst = resolve; }))
+      .mockImplementationOnce(async () => new Promise<void>((resolve) => { releaseSecond = resolve; }));
+    render(
+      <FactoryActionInbox
+        api={api}
+        actions={[n8nApprovalAction, { ...n8nApprovalAction, requestId: "00000000-0000-0000-0000-000000000604" }]}
+        getAccessToken={async () => "private-user-jwt"}
+        onRefresh={vi.fn(async () => undefined)}
+      />,
+    );
+
+    const buttons = screen.getAllByRole("button", { name: "Approve n8n scope" });
+    await user.click(buttons[0]);
+    await user.click(buttons[1]);
+    expect(api.respondToFactoryAction).toHaveBeenCalledTimes(2);
+
+    releaseFirst?.();
+    await waitFor(() => expect(buttons[1]).toBeDisabled());
+    await user.click(buttons[1]);
+    expect(api.respondToFactoryAction).toHaveBeenCalledTimes(2);
+    releaseSecond?.();
   });
 
   it("renders safe action state and only server-authorized decisions", () => {

@@ -19,7 +19,7 @@ from agenten.agent_factory.action_resume import FactoryActionResumeRecord
 from blockchain.mariadb_storage import MariaDBStorage
 
 
-ActionStatus = Literal["pending", "answered", "expired", "consumed"]
+ActionStatus = Literal["pending", "answered", "denied", "expired", "consumed"]
 ResumePhase = Literal[
     "answered",
     "projection_intent",
@@ -218,12 +218,12 @@ class FactoryActionStore:
                 )
                 or answered_at >= row.request.deadline_at
             ):
-                if row.status in {"pending", "answered"}:
+                if row.status in {"pending", "answered", "denied"}:
                     row.status = "expired"
                 error = TimeoutError("factory action expired")
             elif row.created_at is not None and answered_at < row.created_at:
                 raise ValueError("factory action answered_at is before request created_at")
-            elif row.status in {"answered", "consumed"}:
+            elif row.status in {"answered", "denied", "consumed"}:
                 if row.response is not None and _canonical(row.response) == canonical:
                     outcome = row.response
                 else:
@@ -242,7 +242,7 @@ class FactoryActionStore:
                 if error is None:
                     row.response = response
                     row.response_sha256 = hashlib.sha256(canonical).hexdigest()
-                    row.status = "answered"
+                    row.status = "denied" if response.decision == "deny" else "answered"
                     row.resume_phase = "answered"
                     outcome = response
         if error is not None:
@@ -272,7 +272,7 @@ class FactoryActionStore:
                 "deadline_at": row.request.deadline_at.isoformat(),
                 "credential_alias": credential_alias,
             }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-            if row.status == "answered" and row.response is not None:
+            if row.status in {"answered", "denied"} and row.response is not None:
                 if (
                     row.response.idempotency_key == key
                     and row.response.answer_metadata.get("credential_alias") == credential_alias
@@ -536,7 +536,7 @@ class FactoryActionStore:
             raise LookupError("factory action not found")
         if row.status == "expired":
             raise TimeoutError("factory action expired")
-        if row.status not in {"answered", "consumed"} or row.response is None:
+        if row.status not in {"answered", "denied", "consumed"} or row.response is None:
             raise ValueError("factory action is not answered")
         if row.request.deadline_at <= _aware_utc(now) and row.status != "consumed":
             raise TimeoutError("factory action expired")
@@ -710,7 +710,7 @@ class MariaDBFactoryActionRepository:
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT * FROM factory_action_inbox WHERE status = 'answered' "
+                    "SELECT * FROM factory_action_inbox WHERE status IN ('answered', 'denied') "
                     "AND request_id > %s ORDER BY request_id LIMIT %s",
                     ("" if after_request_id is None else str(after_request_id), limit),
                 )
@@ -795,7 +795,7 @@ class MariaDBFactoryActionRepository:
             "credential_revoke_key = CASE WHEN credential_reservation_key IS NULL THEN credential_revoke_key ELSE credential_reservation_key END, "
             "credential_revoke_attempt = CASE WHEN credential_reservation_key IS NULL THEN credential_revoke_attempt ELSE credential_revoke_attempt + 1 END, "
             "credential_revoke_at = CASE WHEN credential_reservation_key IS NULL THEN credential_revoke_at ELSE %s END WHERE tenant_id = %s "
-            "AND status IN ('pending', 'answered') AND deadline_at <= %s"
+            "AND status IN ('pending', 'answered', 'denied') AND deadline_at <= %s"
         )
         parameters: tuple[object, ...] = (_naive_utc(now), tenant_id, _naive_utc(now))
         if request_id is not None:
@@ -875,7 +875,7 @@ def _normalize_legacy_db_row(
             "response_sha256": response_digest,
         }
     )
-    if status == "answered" and response_digest is not None:
+    if status in {"answered", "denied"} and response_digest is not None:
         normalized["resume_phase"] = "answered"
     elif status == "consumed" and response_digest is not None and consumed_at is not None:
         normalized.update(
@@ -987,8 +987,11 @@ def _db_row(row: dict[str, object]) -> FactoryActionRow:
     response_digest = None if response_canonical is None else hashlib.sha256(response_canonical).hexdigest()
     valid_state = (
         (status == "pending" and response is None and phase is None)
-        or (status == "answered" and response is not None and phase in {
+        or (status == "answered" and response is not None and response.decision == "approve" and phase in {
             "answered", "projection_intent", "projection_acknowledged", "continuation_intent"
+        })
+        or (status == "denied" and response is not None and response.decision == "deny" and phase in {
+            "answered", "projection_intent"
         })
         or (
             status == "consumed"
@@ -1172,7 +1175,7 @@ def _valid_phase_columns(row: FactoryActionRow) -> bool:
         )
     if row.resume_phase == "answered":
         return (
-            row.status in {"answered", "expired"}
+            row.status in {"answered", "denied", "expired"}
             and row.response is not None
             and projection_key is None
             and projection_intent_at is None
@@ -1184,7 +1187,7 @@ def _valid_phase_columns(row: FactoryActionRow) -> bool:
         )
     if row.resume_phase == "projection_intent":
         return (
-            row.status in {"answered", "expired"} and projection_key is not None
+            row.status in {"answered", "denied", "expired"} and projection_key is not None
             and projection_intent_at is not None
             and projection_at is None and continuation_key is None
             and continuation_intent_at is None

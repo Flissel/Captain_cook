@@ -799,7 +799,7 @@ def create_app(
 
     @app.get("/v1/portal/factory-actions")
     async def list_portal_factory_actions(
-        status_filter: Literal["pending", "answered", "expired", "consumed"] = Query(
+        status_filter: Literal["pending", "answered", "denied", "expired", "consumed"] = Query(
             default="pending", alias="status"
         ),
         cursor: UUID | None = Query(default=None),

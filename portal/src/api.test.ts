@@ -115,6 +115,26 @@ describe("portal API", () => {
     expect(() => parseFactoryAction({ ...factoryActionPayload, safe_checkpoint_sha256: "b".repeat(64) })).toThrow();
   });
 
+  it("fails closed on known and high-entropy tokens in every rendered factory field", () => {
+    const longProse = "A display-safe explanation with ordinary words and spaces. ".repeat(5);
+    expect(parseFactoryAction({ ...factoryActionPayload, message: longProse }).message).toBe(longProse);
+    const digest = "0123456789abcdef".repeat(4);
+    expect(parseFactoryAction({
+      ...factoryActionPayload,
+      safe_checkpoint_ref: { ...factoryActionPayload.safe_checkpoint_ref, uri: `artifact://minibook/checkpoint/${digest}`, sha256: digest },
+      safe_checkpoint_sha256: digest,
+    }).safeCheckpointSha256).toBe(digest);
+    for (const patch of [
+      { message: "Y7pL2vQ9xN4mR8sT6uW3aB5cD1eF0gHk" },
+      { required_scope: "ghp_abcdefghijklmnopqrstuvwxyz0123456789" },
+      { message: "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789" },
+      { message: "credential://tenant-a/private-credential" },
+      { safe_checkpoint_ref: { ...factoryActionPayload.safe_checkpoint_ref, uri: "artifact://minibook/checkpoint/Y7pL2vQ9xN4mR8sT6uW3aB5cD1eF0gHk" } },
+    ]) {
+      expect(() => parseFactoryAction({ ...factoryActionPayload, ...patch })).toThrow();
+    }
+  });
+
   it("uses the bearer header without reflecting the credential in errors", async () => {
     const fetcher = vi.fn(async () => response({ detail: accessToken }, 401));
     const api = createPortalApi(fetcher);

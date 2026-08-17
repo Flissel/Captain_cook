@@ -392,6 +392,19 @@ def test_factory_action_routes_are_authenticated_tenant_scoped_and_secret_free()
         assert client.get(f"/v1/portal/factory-actions/{store.factory_action.request_id}", headers=auth()).status_code == 404
 
 
+def test_factory_action_portal_lists_authoritative_denied_status() -> None:
+    store = FakePortalGatewayStore()
+    store.factory_action = store.factory_action.model_copy(update={"status": "denied"})
+    with client_for(
+        PortalPrincipalV1(subject_id="user-a", organization_id="org-a"),
+        store,
+        resume_dispatcher=RecordingResumeDispatcher(),
+    ) as client:
+        listed = client.get("/v1/portal/factory-actions?status=denied", headers=auth())
+    assert listed.status_code == 200
+    assert listed.json()[0]["status"] == "denied"
+
+
 def test_answer_dispatches_durable_resume_without_running_it_in_http_handler() -> None:
     store = FakePortalGatewayStore()
     dispatcher = RecordingResumeDispatcher()

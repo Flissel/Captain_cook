@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, expect, it, vi } from "vitest";
 import { credentialAction } from "./test/fixtures";
 import type { FactoryActionRequest, FactoryActionStatus } from "./types";
+import type { PortalApi } from "./api";
 
 const mocks = vi.hoisted(() => ({
   getSetupSurface: vi.fn(),
@@ -41,7 +42,7 @@ vi.mock("./supabase", () => ({
   }),
 }));
 
-import App from "./App";
+import App, { PortalDashboard } from "./App";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -60,6 +61,39 @@ it("loads authenticated factory actions without replacing Integration Setup", as
   expect(await screen.findByRole("heading", { name: "Factory actions" })).toBeVisible();
   expect(screen.getByText("A CRM credential is required.")).toBeVisible();
   expect(mocks.getFactoryActions).toHaveBeenCalledWith("private-user-jwt", "pending");
+  expect(mocks.getFactoryActions).toHaveBeenCalledWith("private-user-jwt", "denied");
+});
+
+function actionApi(getFactoryActions: PortalApi["getFactoryActions"]): PortalApi {
+  return {
+    getSetupSurface: vi.fn(),
+    discoverCredentials: vi.fn(),
+    selectCredential: vi.fn(),
+    verifyCredential: vi.fn(),
+    requestRotation: vi.fn(),
+    revokeCredential: vi.fn(),
+    getFactoryActions,
+    storeFactoryCredential: vi.fn(),
+    respondToFactoryAction: vi.fn(),
+  };
+}
+
+it("keeps the newest factory-action page when earlier loads finish out of order", async () => {
+  mocks.session = { access_token: "private-user-jwt" };
+  const pendingResolvers: Array<() => void> = [];
+  const firstApi = actionApi(() => new Promise<FactoryActionRequest[]>((resolve) => {
+    pendingResolvers.push(() => resolve([credentialAction]));
+  }));
+  const newerAction = { ...credentialAction, message: "Newer authoritative action." };
+  const secondApi = actionApi(async (_accessToken, status) => status === "pending" ? [newerAction] : []);
+  const view = render(<PortalDashboard api={firstApi} />);
+
+  await waitFor(() => expect(pendingResolvers).toHaveLength(5));
+  view.rerender(<PortalDashboard api={secondApi} />);
+  expect(await screen.findByText("Newer authoritative action.")).toBeVisible();
+  for (const resolve of pendingResolvers) resolve();
+  await waitFor(() => expect(screen.queryByText("A CRM credential is required.")).not.toBeInTheDocument());
+  expect(screen.getByText("Newer authoritative action.")).toBeVisible();
 });
 
 it("does not call Gateway while the real App is unauthenticated", async () => {

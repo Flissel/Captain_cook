@@ -604,7 +604,7 @@ def _reject_secret_like_content(value: object, *, key: str | None = None) -> obj
 
 class FactoryActionRequestV1(_FrozenContract):
     schema_name: Literal["captain.factory-action-request.v1"] = Field(default="captain.factory-action-request.v1", alias="schema", serialization_alias="schema")
-    request_id: UUID; factory_job_id: UUID; creation_job_id: UUID; correlation_id: UUID; expected_subject_version: int = Field(ge=1, strict=True); request_type: Literal["clarification", "credential_required", "external_api_approval", "n8n_approval"]; safe_checkpoint_ref: ArtifactRef; safe_checkpoint_sha256: str = Field(pattern=SHA256_PATTERN); required_scope: str = Field(min_length=1, max_length=200); allowed_decisions: tuple[Literal["approve", "deny"], ...] = Field(min_length=1); message: str = Field(min_length=1, max_length=500); deadline_at: datetime; status: Literal["pending", "answered", "expired", "consumed"]
+    request_id: UUID; factory_job_id: UUID; creation_job_id: UUID; correlation_id: UUID; expected_subject_version: int = Field(ge=1, strict=True); request_type: Literal["clarification", "credential_required", "external_api_approval", "n8n_approval"]; safe_checkpoint_ref: ArtifactRef; safe_checkpoint_sha256: str = Field(pattern=SHA256_PATTERN); required_scope: str = Field(min_length=1, max_length=200); allowed_decisions: tuple[Literal["approve", "deny"], ...] = Field(min_length=1); message: str = Field(min_length=1, max_length=500); deadline_at: datetime; status: Literal["pending", "answered", "denied", "expired", "consumed"]
     @field_validator("required_scope", "message")
     @classmethod
     def safe(cls, value: str) -> str:

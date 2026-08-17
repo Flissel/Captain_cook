@@ -714,7 +714,7 @@ class FactoryActionRequestV1(_FrozenContract):
     allowed_decisions: tuple[Literal["approve", "deny"], ...] = Field(min_length=1)
     message: str = Field(min_length=1, max_length=500)
     deadline_at: datetime
-    status: Literal["pending", "answered", "expired", "consumed"]
+    status: Literal["pending", "answered", "denied", "expired", "consumed"]
 
     @field_validator("required_scope", "message")
     @classmethod

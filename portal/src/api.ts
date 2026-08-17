@@ -25,6 +25,9 @@ const CREDENTIAL_ALIAS_PATTERN = /^[A-Z][A-Z0-9_]*$/;
 const NON_WHITESPACE_PATTERN = /^\S+$/;
 const CREDENTIAL_TYPE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,127}$/;
 const PORTAL_API_PREFIX = "/v1/portal";
+const OPAQUE_TOKEN_PATTERN = /[A-Za-z0-9_+/-]{32,}={0,2}/g;
+const UUID_VALUE_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+const KNOWN_SECRET_PATTERN = /\b(?:sk_(?:live|test)_[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|gh[pours]_[A-Za-z0-9_-]+|xox[a-z]-[A-Za-z0-9-]+|AIza[A-Za-z0-9_-]+|(?:AKIA|ASIA)[A-Z0-9]{16}|[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,})/i;
 
 export class PortalPublicError extends Error {
   readonly status!: number | null;
@@ -122,15 +125,40 @@ function utcTimestamp(value: unknown): string {
 
 function safeFactoryText(value: unknown, maximumLength: number): string {
   const text = stringValue(value, undefined, maximumLength);
-  if (/\b(?:bearer|basic)\s+|(?:api[_ -]?key|password|secret|token|credential)\s*=|\bsk_(?:live|test)_/i.test(text)) {
+  if (/\b(?:bearer|basic)\s+|(?:api[_ -]?key|password|secret|token|credential)\s*=|credential:\/\/|private.?key|system.?prompt|provider.?response|holdout/i.test(text) || knownOrOpaqueSecret(text, false)) {
     throw new Error("unsafe factory display text");
   }
   return text;
 }
 
+function tokenEntropy(token: string): number {
+  return -Array.from(new Set(token), (character) => {
+    const probability = token.split(character).length - 1;
+    const ratio = probability / token.length;
+    return ratio * Math.log2(ratio);
+  }).reduce((total, value) => total + value, 0);
+}
+
+function knownOrOpaqueSecret(value: string, allowDigest: boolean, uriSegments = false): boolean {
+  if (KNOWN_SECRET_PATTERN.test(value)) return true;
+  const tokens = uriSegments
+    ? value.replace("artifact://", "").split("/")
+    : value.match(OPAQUE_TOKEN_PATTERN) ?? [];
+  for (const token of tokens) {
+    if (UUID_VALUE_PATTERN.test(token)) continue;
+    if (/^[0-9a-f]{64}$/i.test(token)) {
+      if (!allowDigest) return true;
+      continue;
+    }
+    if (/^[0-9a-f]{32,}$/i.test(token) || tokenEntropy(token) >= 3.5) return true;
+  }
+  return false;
+}
+
 function parseFactoryArtifactReference(value: unknown) {
   const item = exact(value, ["uri", "sha256", "media_type"]);
   const uri = stringValue(item.uri, /^artifact:\/\/[A-Za-z0-9._:/-]+$/, 512);
+  if (knownOrOpaqueSecret(uri, true, true)) throw new Error("unsafe checkpoint reference");
   const sha256 = stringValue(item.sha256, SHA256_PATTERN);
   if (item.media_type !== "application/json") throw new Error("invalid checkpoint media type");
   return { uri, sha256, mediaType: "application/json" as const };

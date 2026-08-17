@@ -34,6 +34,7 @@ export function FactoryActionCard({ action, busy, onStoreCredential, onRespond }
   const [answer, setAnswer] = useState("");
   const [secretValue, setSecretValue] = useState("");
   const [credentialRef, setCredentialRef] = useState<string | null>(null);
+  const [credentialStatus, setCredentialStatus] = useState<string | null>(null);
   const canRespond = action.status === "pending";
 
   async function storeCredential() {
@@ -41,7 +42,12 @@ export function FactoryActionCard({ action, busy, onStoreCredential, onRespond }
     const submittedSecret = secretValue;
     setSecretValue("");
     const reference = await onStoreCredential(action.requiredScope, submittedSecret);
-    if (reference !== null) setCredentialRef(reference);
+    if (reference !== null) {
+      setCredentialRef(reference);
+      setCredentialStatus("Credential stored. You can continue.");
+    } else {
+      setCredentialStatus("Credential could not be stored. Refresh and try again.");
+    }
   }
 
   async function respond(decision: FactoryActionDecision) {
@@ -83,6 +89,7 @@ export function FactoryActionCard({ action, busy, onStoreCredential, onRespond }
           <label htmlFor={`credential-${action.requestId}`}>Credential value</label>
           <input id={`credential-${action.requestId}`} type="password" autoComplete="off" value={secretValue} onChange={(event) => setSecretValue(event.target.value)} />
           <button disabled={busy || secretValue.length === 0} type="button" onClick={() => void storeCredential()}>Credential verbinden</button>
+          {credentialStatus && <p role="status" className="busy-message">{credentialStatus}</p>}
         </div>
       )}
       {canRespond && (
