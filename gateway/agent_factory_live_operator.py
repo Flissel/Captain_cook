@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -13,7 +14,9 @@ import os
 from pathlib import Path
 import re
 import subprocess
-from typing import Protocol
+import sys
+from typing import Literal, Protocol
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
@@ -281,6 +284,566 @@ def validate_factory_total_cost_envelope(
         )
     ):
         raise ValueError("Factory total cost envelope is invalid")
+
+
+_FACTORY_V3_LIVE_SCHEMA = "captain.factory-v3-live-preflight.v1"
+_FACTORY_V3_LIVE_SUMMARY_SCHEMA = "captain.factory-v3-live-preflight-summary.v1"
+_FACTORY_V3_LIVE_INPUT = Path(
+    "tests/fixtures/agent_factory/sales_pipeline_brief.v3.json"
+)
+_FACTORY_V3_AGENT_IDS = (
+    "account_researcher",
+    "opportunity_qualifier",
+    "deal_strategist",
+    "executive_brief_writer",
+)
+_SAFE_CREDENTIAL_REF = re.compile(
+    r"^credential://[A-Za-z0-9._~-]+/[A-Za-z0-9._~/-]+$"
+)
+_SAFE_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_SAFE_SKILL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+@dataclass(frozen=True)
+class FactoryV3LivePreflightCheck:
+    code: str
+    status: Literal["met", "unmet"]
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[a-z][a-z0-9_]{1,63}", self.code) is None:
+            raise ValueError("Factory V3 live preflight check code is invalid")
+
+    def as_dict(self) -> dict[str, str]:
+        return {"code": self.code, "status": self.status}
+
+
+@dataclass(frozen=True)
+class FactoryV3LiveActionInboxStatus:
+    status: Literal["pending"]
+    url: str
+    request_id: UUID
+    safe_checkpoint_sha256: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "status": self.status,
+            "url": self.url,
+            "request_id": str(self.request_id),
+            "safe_checkpoint_sha256": self.safe_checkpoint_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class FactoryV3LivePreflightReport:
+    run_id: UUID
+    checked_at: datetime
+    status: Literal["ready", "awaiting_user_input", "unmet_preflight"]
+    input_sha256: str
+    checks: tuple[FactoryV3LivePreflightCheck, ...]
+    action_inbox: FactoryV3LiveActionInboxStatus | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self.status == "ready"
+
+    def as_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "schema": _FACTORY_V3_LIVE_SCHEMA,
+            "run_id": str(self.run_id),
+            "checked_at": self.checked_at.isoformat().replace("+00:00", "Z"),
+            "status": self.status,
+            "input_sha256": self.input_sha256,
+            "checks": [check.as_dict() for check in self.checks],
+        }
+        if self.action_inbox is not None:
+            payload["action_inbox"] = self.action_inbox.as_dict()
+        return payload
+
+
+class _FactoryV3LiveReadOnlyProbe(Protocol):
+    def endpoint_ready(self, url: str, *, token: str) -> bool: ...
+
+    def released_skill_active(
+        self,
+        *,
+        skill_name: str,
+        skill_sha256: str,
+    ) -> bool: ...
+
+
+class _DefaultFactoryV3LiveReadOnlyProbe:
+    """Perform bounded health reads and refuse unimplemented authority reads."""
+
+    def endpoint_ready(self, url: str, *, token: str) -> bool:
+        try:
+            with httpx.Client(follow_redirects=False, timeout=5.0) as client:
+                with client.stream(
+                    "GET",
+                    url,
+                    headers={
+                        "Accept": "application/json",
+                        "Authorization": f"Bearer {token}",
+                    },
+                ) as response:
+                    size = 0
+                    for chunk in response.iter_bytes():
+                        size += len(chunk)
+                        if size > 4_096:
+                            return False
+                    return 200 <= response.status_code < 300
+        except httpx.HTTPError:
+            return False
+
+    def released_skill_active(
+        self,
+        *,
+        skill_name: str,
+        skill_sha256: str,
+    ) -> bool:
+        del skill_name, skill_sha256
+        # The current Gateway has no read-only, correlation-bound active-skill
+        # preflight. Local bytes or an environment value are not Captain proof.
+        return False
+
+
+def _factory_v3_check(code: str, condition: bool) -> FactoryV3LivePreflightCheck:
+    return FactoryV3LivePreflightCheck(
+        code=code,
+        status="met" if condition else "unmet",
+    )
+
+
+def _safe_live_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        parsed.port
+    except ValueError:
+        return False
+    loopback = parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+    return bool(
+        parsed.hostname
+        and (parsed.scheme == "https" or (parsed.scheme == "http" and loopback))
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _bounded_endpoint_ready(
+    probe: _FactoryV3LiveReadOnlyProbe,
+    *,
+    url: str,
+    token: str,
+) -> bool:
+    if not url or not token or not _safe_live_url(url):
+        return False
+    try:
+        return probe.endpoint_ready(url, token=token) is True
+    except Exception:
+        return False
+
+
+def _isolated_factory_v3_roots_ready(*roots: Path) -> bool:
+    resolved: list[Path] = []
+    try:
+        for root in roots:
+            if root.is_symlink() or not root.is_dir():
+                return False
+            resolved.append(root.resolve(strict=True))
+    except OSError:
+        return False
+    if len(set(resolved)) != len(resolved):
+        return False
+    return not any(
+        first in second.parents or second in first.parents
+        for index, first in enumerate(resolved)
+        for second in resolved[index + 1 :]
+    )
+
+
+def _factory_v3_skill_digest(directory: Path) -> str | None:
+    try:
+        entries = sorted(
+            directory.rglob("*"),
+            key=lambda item: item.relative_to(directory).as_posix(),
+        )
+        if any(item.is_symlink() for item in entries):
+            return None
+        files = [item for item in entries if item.is_file()]
+        if not files or not (directory / "SKILL.md").is_file():
+            return None
+        manifest = []
+        for path in files:
+            content = path.read_bytes()
+            manifest.append(
+                {
+                    "path": path.relative_to(directory).as_posix(),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "size": len(content),
+                }
+            )
+    except OSError:
+        return None
+    encoded = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _factory_v3_released_skill_ready(
+    environment: Mapping[str, str],
+    probe: _FactoryV3LiveReadOnlyProbe,
+) -> bool:
+    name = environment.get("CAPTAIN_FACTORY_V3_RELEASED_SKILL_NAME", "").strip()
+    digest = environment.get("CAPTAIN_FACTORY_V3_RELEASED_SKILL_SHA256", "").strip()
+    root_value = environment.get("CAPTAIN_FACTORY_V3_RELEASED_SKILL_ROOT", "").strip()
+    if (
+        _SAFE_SKILL_NAME.fullmatch(name) is None
+        or _SAFE_DIGEST.fullmatch(digest) is None
+        or not root_value
+    ):
+        return False
+    try:
+        root = Path(root_value).resolve(strict=True)
+        directory = (root / name).resolve(strict=True)
+        directory.relative_to(root)
+    except (OSError, ValueError):
+        return False
+    if not directory.is_dir() or _factory_v3_skill_digest(directory) != digest:
+        return False
+    try:
+        return probe.released_skill_active(
+            skill_name=name,
+            skill_sha256=digest,
+        ) is True
+    except Exception:
+        return False
+
+
+def _factory_v3_codex_session_ready(
+    environment: Mapping[str, str],
+    repository_root: Path,
+) -> bool:
+    values = tuple(
+        environment.get(name, "").strip()
+        for name in (
+            "CAPTAIN_CODEX_EXECUTABLE",
+            "CAPTAIN_PWSH_EXECUTABLE",
+            "CAPTAIN_CODEX_HOME",
+        )
+    )
+    if not all(values):
+        return False
+    try:
+        codex = Path(values[0]).resolve(strict=True)
+        pwsh = Path(values[1]).resolve(strict=True)
+        codex_home = Path(values[2]).resolve(strict=True)
+        script = (
+            repository_root.resolve(strict=True) / "scripts" / "codex-session.ps1"
+        ).resolve(strict=True)
+    except OSError:
+        return False
+    return codex.is_file() and pwsh.is_file() and codex_home.is_dir() and script.is_file()
+
+
+def _factory_v3_hermes_runtime_ready(environment: Mapping[str, str]) -> bool:
+    executable_value = environment.get(
+        "CAPTAIN_FACTORY_V3_HERMES_PYTHON", ""
+    ).strip()
+    module_value = environment.get(
+        "CAPTAIN_FACTORY_V3_HERMES_MODULE_ROOT", ""
+    ).strip()
+    if not executable_value or not module_value:
+        return False
+    try:
+        executable = Path(executable_value).resolve(strict=True)
+        module_root = Path(module_value).resolve(strict=True)
+    except OSError:
+        return False
+    return bool(
+        executable.is_file()
+        and module_root.is_dir()
+        and (module_root / "hermes_cli" / "__init__.py").is_file()
+        and (module_root / "concurrent_log_handler.py").is_file()
+    )
+
+
+def _factory_v3_execution_bounds_ready(
+    environment: Mapping[str, str],
+    now: datetime,
+) -> bool:
+    try:
+        maximum_runtime = int(
+            environment.get("CAPTAIN_FACTORY_V3_MAX_WALL_CLOCK_SECONDS", "")
+        )
+        maximum_files = int(environment.get("CAPTAIN_FACTORY_V3_MAX_FILES", ""))
+        maximum_cost = Decimal(
+            environment.get("CAPTAIN_FACTORY_V3_MAX_PROVIDER_COST_USD", "")
+        )
+        deadline = datetime.fromisoformat(
+            environment.get("CAPTAIN_FACTORY_V3_DEADLINE_AT", "").replace(
+                "Z", "+00:00"
+            )
+        )
+    except (ArithmeticError, ValueError):
+        return False
+    if deadline.tzinfo is None or deadline.utcoffset() != timezone.utc.utcoffset(deadline):
+        return False
+    remaining_seconds = (deadline - now).total_seconds()
+    return bool(
+        1 <= maximum_runtime <= 900
+        and 1 <= maximum_files <= 4_096
+        and maximum_cost.is_finite()
+        and Decimal("0") < maximum_cost <= Decimal("1.50")
+        and 1 <= remaining_seconds <= maximum_runtime
+        and environment.get("CAPTAIN_FACTORY_V3_NETWORK_ALLOWED", "") == "false"
+    )
+
+
+def _factory_v3_credentials_ready(environment: Mapping[str, str]) -> bool:
+    values = tuple(
+        environment.get(name, "").strip()
+        for name in (
+            "CAPTAIN_FACTORY_V3_CAPTAIN_TOKEN",
+            "CAPTAIN_FACTORY_V3_WORKER_TOKEN",
+            "CAPTAIN_FACTORY_V3_CREATION_API_KEY",
+        )
+    )
+    return all(values) and len(set(values)) == len(values)
+
+
+def _factory_v3_action_inbox_status(
+    environment: Mapping[str, str],
+) -> FactoryV3LiveActionInboxStatus | None:
+    credential_ref = environment.get(
+        "CAPTAIN_FACTORY_V3_CREDENTIAL_REF", ""
+    ).strip()
+    if _SAFE_CREDENTIAL_REF.fullmatch(credential_ref) is not None:
+        return None
+    url = environment.get("CAPTAIN_FACTORY_V3_ACTION_INBOX_URL", "").strip()
+    request_id_value = environment.get(
+        "CAPTAIN_FACTORY_V3_ACTION_REQUEST_ID", ""
+    ).strip()
+    checkpoint = environment.get(
+        "CAPTAIN_FACTORY_V3_SAFE_CHECKPOINT_SHA256", ""
+    ).strip()
+    if not _safe_live_url(url) or _SAFE_DIGEST.fullmatch(checkpoint) is None:
+        return None
+    try:
+        request_id = UUID(request_id_value)
+    except ValueError:
+        return None
+    return FactoryV3LiveActionInboxStatus(
+        status="pending",
+        url=url,
+        request_id=request_id,
+        safe_checkpoint_sha256=checkpoint,
+    )
+
+
+def _factory_v3_portal_ready(
+    environment: Mapping[str, str],
+    action_inbox: FactoryV3LiveActionInboxStatus | None,
+) -> bool:
+    portal_url = environment.get("CAPTAIN_FACTORY_V3_PORTAL_URL", "").strip()
+    credential_ref = environment.get(
+        "CAPTAIN_FACTORY_V3_CREDENTIAL_REF", ""
+    ).strip()
+    return _safe_live_url(portal_url) and (
+        _SAFE_CREDENTIAL_REF.fullmatch(credential_ref) is not None
+        or action_inbox is not None
+    )
+
+
+def _factory_v3_frozen_input_sha256(
+    repository_root: Path,
+    input_path: Path,
+) -> str | None:
+    try:
+        root = repository_root.resolve(strict=True)
+        expected_path = (root / _FACTORY_V3_LIVE_INPUT).resolve(strict=True)
+        actual_path = input_path.resolve(strict=True)
+        if actual_path != expected_path or input_path.is_symlink():
+            return None
+        content = actual_path.read_bytes()
+        payload = json.loads(content)
+        expected = payload.get("expected")
+        if not isinstance(expected, dict) or tuple(
+            expected.get("required_agent_ids", ())
+        ) != _FACTORY_V3_AGENT_IDS:
+            return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return hashlib.sha256(content).hexdigest()
+
+
+def _factory_v3_live_runtime_enforcement_ready() -> bool:
+    # The current live composition returns PowerShellCodexRunner. Its Codex
+    # sandbox and post-run receipts do not enforce exact writable roots, exact
+    # build argv, and the provider-cost cap. Environment claims are not proof.
+    return False
+
+
+def preflight_factory_v3_live(
+    *,
+    environment: Mapping[str, str],
+    repository_root: Path,
+    input_path: Path,
+    workspace_root: Path,
+    cas_root: Path,
+    state_root: Path,
+    run_id: UUID,
+    clock: Callable[[], datetime] | None = None,
+    _probe: _FactoryV3LiveReadOnlyProbe | None = None,
+) -> FactoryV3LivePreflightReport:
+    """Read live prerequisites without starting a worker or mutating services."""
+
+    current_time = (clock or (lambda: datetime.now(timezone.utc)))()
+    if (
+        current_time.tzinfo is None
+        or current_time.utcoffset() != timezone.utc.utcoffset(current_time)
+    ):
+        raise ValueError("Factory V3 live preflight clock must be UTC")
+    probe = _probe or _DefaultFactoryV3LiveReadOnlyProbe()
+    action_inbox = _factory_v3_action_inbox_status(environment)
+    input_sha256 = _factory_v3_frozen_input_sha256(repository_root, input_path)
+    checks = (
+        _factory_v3_check("frozen_input", input_sha256 is not None),
+        _factory_v3_check(
+            "live_opt_in", environment.get("CAPTAIN_FACTORY_V3_LIVE", "") == "1"
+        ),
+        _factory_v3_check(
+            "gateway_reachability",
+            _bounded_endpoint_ready(
+                probe,
+                url=environment.get(
+                    "CAPTAIN_FACTORY_V3_GATEWAY_HEALTH_URL", ""
+                ).strip(),
+                token=environment.get(
+                    "CAPTAIN_FACTORY_V3_CAPTAIN_TOKEN", ""
+                ).strip(),
+            ),
+        ),
+        _factory_v3_check(
+            "minibook_reachability",
+            _bounded_endpoint_ready(
+                probe,
+                url=environment.get(
+                    "CAPTAIN_FACTORY_V3_MINIBOOK_HEALTH_URL", ""
+                ).strip(),
+                token=environment.get(
+                    "CAPTAIN_FACTORY_V3_WORKER_TOKEN", ""
+                ).strip(),
+            ),
+        ),
+        _factory_v3_check(
+            "released_skill_authority",
+            _factory_v3_released_skill_ready(environment, probe),
+        ),
+        _factory_v3_check(
+            "hermes_runtime", _factory_v3_hermes_runtime_ready(environment)
+        ),
+        _factory_v3_check(
+            "codex_session",
+            _factory_v3_codex_session_ready(environment, repository_root),
+        ),
+        _factory_v3_check(
+            "isolated_roots",
+            _isolated_factory_v3_roots_ready(workspace_root, cas_root, state_root),
+        ),
+        _factory_v3_check(
+            "credential_separation", _factory_v3_credentials_ready(environment)
+        ),
+        _factory_v3_check(
+            "execution_bounds",
+            _factory_v3_execution_bounds_ready(environment, current_time),
+        ),
+        _factory_v3_check(
+            "portal_prerequisites",
+            _factory_v3_portal_ready(environment, action_inbox),
+        ),
+        _factory_v3_check(
+            "runtime_enforcement", _factory_v3_live_runtime_enforcement_ready()
+        ),
+    )
+    unmet = tuple(check for check in checks if check.status == "unmet")
+    status: Literal["ready", "awaiting_user_input", "unmet_preflight"]
+    if unmet:
+        status = "unmet_preflight"
+    elif action_inbox is not None:
+        status = "awaiting_user_input"
+    else:
+        status = "ready"
+    return FactoryV3LivePreflightReport(
+        run_id=run_id,
+        checked_at=current_time,
+        status=status,
+        input_sha256=input_sha256 or "0" * 64,
+        checks=checks,
+        action_inbox=action_inbox,
+    )
+
+
+def _factory_v3_live_preflight_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run the read-only Captain Factory V3 live preflight."
+    )
+    parser.add_argument("--repository-root", type=Path, required=True)
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--workspace-root", type=Path, required=True)
+    parser.add_argument("--cas-root", type=Path, required=True)
+    parser.add_argument("--state-root", type=Path, required=True)
+    parser.add_argument("--run-id", type=UUID, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+def factory_v3_live_preflight_main(
+    argv: list[str] | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> int:
+    args = _factory_v3_live_preflight_parser().parse_args(argv)
+    report = preflight_factory_v3_live(
+        environment=os.environ if environment is None else environment,
+        repository_root=args.repository_root,
+        input_path=args.input,
+        workspace_root=args.workspace_root,
+        cas_root=args.cas_root,
+        state_root=args.state_root,
+        run_id=args.run_id,
+        clock=clock,
+    )
+    output = args.output.resolve()
+    run_root = args.state_root.resolve().parent
+    try:
+        output.relative_to(run_root)
+    except ValueError as exc:
+        raise ValueError("Factory V3 preflight report escaped its run root") from exc
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    summary: dict[str, object] = {
+        "schema": _FACTORY_V3_LIVE_SUMMARY_SCHEMA,
+        "run_id": str(report.run_id),
+        "status": report.status,
+        "unmet_checks": [
+            check.code for check in report.checks if check.status == "unmet"
+        ],
+    }
+    if report.action_inbox is not None:
+        summary["action_inbox"] = report.action_inbox.as_dict()
+    print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+    if report.ready:
+        return 0
+    return 4 if report.status == "awaiting_user_input" else 3
 
 
 class _CaptainV3CreationAuthorityBuilder:
@@ -573,6 +1136,8 @@ def compose_business_demo_factory_operator(
 ) -> AgentFactoryLiveComposition:
     """Compose every real port without dispatching Hermes, Forge, n8n, or OpenAI."""
 
+    if settings.factory_v3_enabled and not _factory_v3_live_runtime_enforcement_ready():
+        raise ValueError("Factory V3 live runtime enforcement is unavailable")
     current_time = clock or (lambda: datetime.now(timezone.utc))
     if (settings.factory_v3_enabled and minibook_client is None) or (
         not settings.factory_v3_enabled
@@ -1086,8 +1651,17 @@ def _assert_hermes_python_runtime(
 
 
 __all__ = [
+    "FactoryV3LiveActionInboxStatus",
+    "FactoryV3LivePreflightCheck",
+    "FactoryV3LivePreflightReport",
     "FactoryLiveOperatorSettings",
     "compose_business_demo_factory_operator",
+    "factory_v3_live_preflight_main",
+    "preflight_factory_v3_live",
     "run_business_demo_factory_jobs",
     "validate_factory_total_cost_envelope",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(factory_v3_live_preflight_main(sys.argv[1:]))
