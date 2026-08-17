@@ -56,6 +56,10 @@ class FactoryActionRow:
     credential_alias: str | None = None
     credential_reserved_at: datetime | None = None
     credential_ref: str | None = None
+    credential_revoke_phase: Literal["revoke_pending"] | None = None
+    credential_revoke_key: str | None = None
+    credential_revoke_attempt: int = 0
+    credential_revoke_at: datetime | None = None
 
 
 class FactoryActionRepository(Protocol):
@@ -257,7 +261,8 @@ class FactoryActionStore:
                 raise LookupError("factory action not found")
             if row.status == "expired" or now_utc >= row.request.deadline_at:
                 row.status = "expired"
-                self._clear_credential_reservation(row)
+                if row.credential_reservation_key is not None:
+                    self._mark_credential_revoke_pending(row, now=now_utc)
                 raise TimeoutError("factory action expired")
             if expected_subject_version != row.request.expected_subject_version:
                 raise ValueError("stale subject version")
@@ -291,8 +296,47 @@ class FactoryActionStore:
         with self._repository.locked(request_id, tenant_id=tenant_id) as row:
             if row is None:
                 raise LookupError("factory action not found")
-            if row.credential_reservation_key == reservation_key and row.status == "pending":
+            if (
+                row.credential_reservation_key == reservation_key
+                and row.status == "pending"
+                and row.credential_revoke_phase is None
+            ):
                 self._clear_credential_reservation(row)
+
+    def credential_revoke_pending(
+        self, request_id: UUID, *, tenant_id: str, reservation_key: str
+    ) -> bool:
+        with self._repository.locked(request_id, tenant_id=tenant_id) as row:
+            if row is None:
+                raise LookupError("factory action not found")
+            return (
+                row.credential_revoke_phase == "revoke_pending"
+                and row.credential_revoke_key == reservation_key
+            )
+
+    def mark_credential_revoke_pending(
+        self, request_id: UUID, *, tenant_id: str, reservation_key: str, now: datetime
+    ) -> None:
+        with self._repository.locked(request_id, tenant_id=tenant_id) as row:
+            if row is None:
+                raise LookupError("factory action not found")
+            if row.credential_reservation_key != reservation_key:
+                raise ValueError("factory credential reservation mismatch")
+            self._mark_credential_revoke_pending(row, now=_aware_utc(now))
+
+    def clear_credential_revocation(
+        self, request_id: UUID, *, tenant_id: str, reservation_key: str
+    ) -> None:
+        with self._repository.locked(request_id, tenant_id=tenant_id) as row:
+            if row is None:
+                raise LookupError("factory action not found")
+            if (
+                row.credential_reservation_key != reservation_key
+                or row.credential_revoke_phase != "revoke_pending"
+                or row.credential_revoke_key != reservation_key
+            ):
+                raise ValueError("factory credential revocation mismatch")
+            self._clear_credential_reservation(row)
 
     def credential_reference(
         self, request_id: UUID, *, tenant_id: str
@@ -312,7 +356,8 @@ class FactoryActionStore:
                 raise LookupError("factory action not found")
             if row.status == "expired" or now_utc >= row.request.deadline_at:
                 row.status = "expired"
-                self._clear_credential_reservation(row)
+                if row.credential_reservation_key == reservation_key:
+                    self._mark_credential_revoke_pending(row, now=now_utc)
                 raise TimeoutError("factory action expired")
             if row.credential_ref is not None:
                 if row.credential_ref == credential_ref:
@@ -334,6 +379,19 @@ class FactoryActionStore:
         row.credential_reservation_key = None
         row.credential_alias = None
         row.credential_reserved_at = None
+        row.credential_revoke_phase = None
+        row.credential_revoke_key = None
+        row.credential_revoke_attempt = 0
+        row.credential_revoke_at = None
+
+    @staticmethod
+    def _mark_credential_revoke_pending(row: FactoryActionRow, *, now: datetime) -> None:
+        if row.credential_reservation_key is None:
+            return
+        row.credential_revoke_phase = "revoke_pending"
+        row.credential_revoke_key = row.credential_reservation_key
+        row.credential_revoke_attempt += 1
+        row.credential_revoke_at = now
 
     def consume(
         self,
@@ -524,6 +582,10 @@ class MariaDBFactoryActionRepository:
                         credential_alias VARCHAR(128) NULL,
                         credential_reserved_at DATETIME(6) NULL,
                         credential_ref VARCHAR(512) NULL,
+                        credential_revoke_phase VARCHAR(32) NULL,
+                        credential_revoke_key CHAR(64) NULL,
+                        credential_revoke_attempt BIGINT NOT NULL DEFAULT 0,
+                        credential_revoke_at DATETIME(6) NULL,
                         created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                         updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
                             ON UPDATE CURRENT_TIMESTAMP(6),
@@ -547,6 +609,10 @@ class MariaDBFactoryActionRepository:
                     "credential_alias VARCHAR(128) NULL",
                     "credential_reserved_at DATETIME(6) NULL",
                     "credential_ref VARCHAR(512) NULL",
+                    "credential_revoke_phase VARCHAR(32) NULL",
+                    "credential_revoke_key CHAR(64) NULL",
+                    "credential_revoke_attempt BIGINT NOT NULL DEFAULT 0",
+                    "credential_revoke_at DATETIME(6) NULL",
                 ):
                     cursor.execute(
                         f"ALTER TABLE factory_action_inbox ADD COLUMN IF NOT EXISTS {definition}"
@@ -688,7 +754,9 @@ class MariaDBFactoryActionRepository:
                            continuation_acknowledged_at = %s, consumed_at = %s
                            , credential_reservation_key = %s,
                            credential_alias = %s, credential_reserved_at = %s,
-                           credential_ref = %s
+                           credential_ref = %s, credential_revoke_phase = %s,
+                           credential_revoke_key = %s, credential_revoke_attempt = %s,
+                           credential_revoke_at = %s
                            WHERE request_id = %s AND tenant_id = %s""",
                         (
                             row.status,
@@ -706,6 +774,10 @@ class MariaDBFactoryActionRepository:
                             row.credential_alias,
                             None if row.credential_reserved_at is None else _naive_utc(row.credential_reserved_at),
                             row.credential_ref,
+                            row.credential_revoke_phase,
+                            row.credential_revoke_key,
+                            row.credential_revoke_attempt,
+                            None if row.credential_revoke_at is None else _naive_utc(row.credential_revoke_at),
                             str(request_id), tenant_id,
                         ),
                     )
@@ -718,11 +790,14 @@ class MariaDBFactoryActionRepository:
         request_id: UUID | None = None,
     ) -> None:
         query = (
-            "UPDATE factory_action_inbox SET status = 'expired', credential_reservation_key = NULL, "
-            "credential_alias = NULL, credential_reserved_at = NULL WHERE tenant_id = %s "
+            "UPDATE factory_action_inbox SET status = 'expired', "
+            "credential_revoke_phase = CASE WHEN credential_reservation_key IS NULL THEN credential_revoke_phase ELSE 'revoke_pending' END, "
+            "credential_revoke_key = CASE WHEN credential_reservation_key IS NULL THEN credential_revoke_key ELSE credential_reservation_key END, "
+            "credential_revoke_attempt = CASE WHEN credential_reservation_key IS NULL THEN credential_revoke_attempt ELSE credential_revoke_attempt + 1 END, "
+            "credential_revoke_at = CASE WHEN credential_reservation_key IS NULL THEN credential_revoke_at ELSE %s END WHERE tenant_id = %s "
             "AND status IN ('pending', 'answered') AND deadline_at <= %s"
         )
-        parameters: tuple[object, ...] = (tenant_id, _naive_utc(now))
+        parameters: tuple[object, ...] = (_naive_utc(now), tenant_id, _naive_utc(now))
         if request_id is not None:
             query += " AND request_id = %s"
             parameters += (str(request_id),)
@@ -978,6 +1053,16 @@ def _db_row(row: dict[str, object]) -> FactoryActionRow:
         credential_alias=(None if row.get("credential_alias") is None else str(row["credential_alias"])),
         credential_reserved_at=_optional_aware(row.get("credential_reserved_at")),
         credential_ref=(None if row.get("credential_ref") is None else str(row["credential_ref"])),
+        credential_revoke_phase=(
+            None if row.get("credential_revoke_phase") is None
+            else str(row["credential_revoke_phase"])
+        ),  # type: ignore[arg-type]
+        credential_revoke_key=(
+            None if row.get("credential_revoke_key") is None
+            else str(row["credential_revoke_key"])
+        ),
+        credential_revoke_attempt=int(row.get("credential_revoke_attempt", 0)),
+        credential_revoke_at=_optional_aware(row.get("credential_revoke_at")),
     )
     expected_projection_key = (
         None
@@ -1000,6 +1085,8 @@ def _db_row(row: dict[str, object]) -> FactoryActionRow:
         raise FactoryActionDurabilityError("factory action durable row phase mismatch")
     if not _valid_phase_timestamps(result):
         raise FactoryActionDurabilityError("factory action durable row timestamp mismatch")
+    if not _valid_credential_revocation(result):
+        raise FactoryActionDurabilityError("factory action durable row credential revocation mismatch")
     return result
 
 
@@ -1178,7 +1265,30 @@ def _valid_phase_timestamps(row: FactoryActionRow) -> bool:
             if row.status == "consumed"
             else row.status == "expired" and row.consumed_at is None
         )
+    if row.resume_phase == "denial_acknowledged":
+        return (
+            row.consumed_at == row.projection_acknowledged_at
+            if row.status == "consumed"
+            else row.status == "expired" and row.consumed_at is None
+        )
     return row.consumed_at is None
+
+
+def _valid_credential_revocation(row: FactoryActionRow) -> bool:
+    if row.credential_revoke_phase is None:
+        return (
+            row.credential_revoke_key is None
+            and row.credential_revoke_attempt == 0
+            and row.credential_revoke_at is None
+        )
+    return (
+        row.credential_revoke_phase == "revoke_pending"
+        and row.credential_reservation_key is not None
+        and row.credential_revoke_key == row.credential_reservation_key
+        and row.credential_alias is not None
+        and row.credential_revoke_attempt >= 1
+        and row.credential_revoke_at is not None
+    )
 
 
 def _transition_time(row: FactoryActionRow, now: datetime) -> datetime:

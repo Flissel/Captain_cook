@@ -14,9 +14,30 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Reques
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.types import Receive, Scope, Send
+
+
+class FactoryActionInboxRoute(APIRoute):
+    """Reject disabled inbox traffic before FastAPI validates path, query or body."""
+
+    def get_route_handler(self):  # type: ignore[override]
+        handler = super().get_route_handler()
+
+        async def fenced(request: Request):
+            enabled = request.app.state.factory_action_inbox_enabled
+            if enabled is None:
+                enabled = load_gateway_settings(request.app).factory_action_inbox_enabled
+            if not enabled:
+                return JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={"detail": "factory action resume capability is disabled"},
+                )
+            return await handler(request)
+
+        return fenced
 
 from blockchain.mariadb_storage import MariaDBStorage
 from agenten.agent_runtime.contracts import (
@@ -398,6 +419,9 @@ def create_app(
     )
     app.state.gateway_settings = settings
     app.state.gateway_settings_lock = Lock()
+    app.state.factory_action_inbox_enabled = (
+        None if settings is None else settings.factory_action_inbox_enabled
+    )
     initialize_portal_auth(app)
 
     @app.exception_handler(RequestValidationError)
@@ -770,6 +794,9 @@ def create_app(
             n8n_ui_base_url=configured.captain_n8n_ui_url,
         )
 
+    action_route_class = app.router.route_class
+    app.router.route_class = FactoryActionInboxRoute
+
     @app.get("/v1/portal/factory-actions")
     async def list_portal_factory_actions(
         status_filter: Literal["pending", "answered", "expired", "consumed"] = Query(
@@ -871,6 +898,8 @@ def create_app(
             raise HTTPException(status_code=503, detail="credential store unavailable") from None
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
+
+    app.router.route_class = action_route_class
 
     def _store_factory_credential(
         *,

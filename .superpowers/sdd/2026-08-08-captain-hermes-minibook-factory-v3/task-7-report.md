@@ -88,3 +88,42 @@ MariaDB integration, Minibook sink, scheduler, provider, or deployment run.
 - `python -m pytest --no-cov tests/test_architecture_fitness.py tests/test_import_boundaries.py tests/test_workstream_docs.py -q` -> `18 passed`.
 - `python -m compileall -q agenten blockchain chats config gateway` -> passed.
 - `git diff --check` -> passed; changed-file credential-shaped literal scan -> no findings.
+
+## Terminal-state hardening round 2
+
+### Delivered decisions
+
+- Credential expiry and failed cleanup retain the reservation and persist the
+  `revoke_pending` phase, reservation key, retry count, and last-attempt time.
+  The reaper retries across restart; it clears only after successful revoke or
+  an authoritative absent lookup for an already revoke-pending reservation.
+- MariaDB expiry transitions credential-bearing rows to `revoke_pending`
+  instead of nulling the reservation. Row parsing validates the resulting
+  metadata matrix.
+- A dedicated Action Inbox route wrapper rejects disabled list, read, response,
+  and credential routes before FastAPI validates query/path/body input. Other
+  portal routes retain their existing routing behavior.
+- Consumed `denial_acknowledged` rows now validate only when `consumed_at`
+  exactly equals the projection acknowledgement. Reload preserves the terminal
+  decision state without any continuation key.
+
+### RED to GREEN evidence
+
+- RED: `python -m pytest --no-cov tests/gateway/test_factory_action_store.py tests/gateway/test_portal_api.py tests/agent_factory/test_action_resume.py -q`
+  - Result: `2 failed, 110 passed, 7 skipped`; the prior clearance assertion
+    and SQL-expiry expectation exposed the former lossy reservation semantics.
+- GREEN: same command after the durable phase, route fence, and matrix changes
+  -> `116 passed, 7 skipped`.
+
+### Final verification
+
+- `python -m pytest --no-cov tests/gateway -q` -> `483 passed, 132 skipped`.
+- `python -m pytest --no-cov tests/test_architecture_fitness.py tests/test_import_boundaries.py tests/test_workstream_docs.py -q` -> `18 passed`.
+- `python -m compileall -q agenten blockchain chats config gateway` -> passed.
+- `git diff --check` -> passed; changed-file credential-shaped literal scan -> no findings.
+
+### Non-claims
+
+`TEST_MARIADB_DSN` remained unset; MariaDB-gated tests were skipped. The
+round-trip parser and SQL-shape tests are offline evidence only and do not
+claim a live MariaDB or external credential-adapter run.

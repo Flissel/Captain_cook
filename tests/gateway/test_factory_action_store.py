@@ -131,9 +131,11 @@ class TransactionalMemoryActionRepository:
                 and (request_id is None or row.request.request_id == request_id)
             ):
                 row.status = "expired"
-                row.credential_reservation_key = None
-                row.credential_alias = None
-                row.credential_reserved_at = None
+                if row.credential_reservation_key is not None:
+                    row.credential_revoke_phase = "revoke_pending"
+                    row.credential_revoke_key = row.credential_reservation_key
+                    row.credential_revoke_attempt += 1
+                    row.credential_revoke_at = now
 
 
 def canonical_db_row() -> dict[str, object]:
@@ -200,6 +202,25 @@ def db_row_for_phase(phase: str) -> dict[str, object]:
             {
                 "status": "consumed",
                 "continuation_acknowledged_at": acknowledged_at,
+                "consumed_at": acknowledged_at,
+            }
+        )
+    if phase == "denial_acknowledged":
+        request = pending_request()
+        response = action_response(request).model_copy(
+            update={"decision": "deny", "credential_ref": None}
+        )
+        encoded = _canonical(response).decode()
+        acknowledged_at = (NOW + timedelta(seconds=2)).replace(tzinfo=None)
+        row.update(
+            {
+                "status": "consumed",
+                "response_payload": encoded,
+                "response_sha256": hashlib.sha256(encoded.encode()).hexdigest(),
+                "projection_idempotency_key": expected_effect_key(
+                    request, "projection", hashlib.sha256(encoded.encode()).hexdigest()
+                ),
+                "projection_acknowledged_at": acknowledged_at,
                 "consumed_at": acknowledged_at,
             }
         )
@@ -563,6 +584,43 @@ def test_db_row_accepts_exact_audit_preserving_expired_phase_matrix(
     assert durable.response == action_response(pending_request())
 
 
+def test_db_row_reloads_consumed_denial_with_exact_acknowledgement_time() -> None:
+    durable = _db_row(db_row_for_phase("denial_acknowledged"))
+
+    assert durable.status == "consumed"
+    assert durable.resume_phase == "denial_acknowledged"
+    assert durable.response is not None and durable.response.decision == "deny"
+    assert durable.consumed_at == durable.projection_acknowledged_at
+    assert durable.continuation_idempotency_key is None
+
+
+def test_db_row_roundtrips_revoke_pending_reservation_metadata() -> None:
+    request = pending_request()
+    row = canonical_db_row()
+    row.update(
+        {
+            "status": "expired",
+            "response_payload": None,
+            "response_sha256": None,
+            "resume_phase": None,
+            "credential_reservation_key": "a" * 64,
+            "credential_alias": "n8n-crm-read",
+            "credential_reserved_at": NOW.replace(tzinfo=None),
+            "credential_revoke_phase": "revoke_pending",
+            "credential_revoke_key": "a" * 64,
+            "credential_revoke_attempt": 2,
+            "credential_revoke_at": (NOW + timedelta(seconds=1)).replace(tzinfo=None),
+        }
+    )
+
+    durable = _db_row(row)
+
+    assert durable.request == request
+    assert durable.credential_revoke_phase == "revoke_pending"
+    assert durable.credential_revoke_key == durable.credential_reservation_key
+    assert durable.credential_revoke_attempt == 2
+
+
 @pytest.mark.parametrize(
     ("phase", "column", "value"),
     [
@@ -618,6 +676,7 @@ def test_mariadb_expiry_updates_pending_and_answered_rows_only() -> None:
     query, parameters = calls[0]
     assert "status IN ('pending', 'answered')" in query
     assert parameters == (
+        request.deadline_at.replace(tzinfo=None),
         "tenant-a",
         request.deadline_at.replace(tzinfo=None),
         str(request.request_id),
@@ -1116,7 +1175,70 @@ def test_post_write_deadline_revalidation_expires_without_linking_reference() ->
     durable = repository.rows[str(request.request_id)]
     assert durable.status == "expired"
     assert durable.response is None
+    assert durable.credential_reservation_key == reservation_key
+    assert durable.credential_revoke_phase == "revoke_pending"
+    assert durable.credential_revoke_key == reservation_key
+    assert durable.credential_revoke_attempt == 1
+
+
+def test_credential_revoke_pending_survives_restart_until_revoke_succeeds() -> None:
+    repository = TransactionalMemoryActionRepository()
+    store = FactoryActionStore(repository=repository)
+    request = pending_request()
+    store.create(request, tenant_id="tenant-a")
+    key = store.reserve_credential(
+        request.request_id, tenant_id="tenant-a",
+        expected_subject_version=request.expected_subject_version,
+        credential_alias="n8n-crm-read", now=NOW,
+    )
+    reference = "credential://tenant-a/n8n-crm-read"
+    receipt = FactoryCredentialReceipt(
+        key, "tenant-a", request.request_id, request.expected_subject_version,
+        "n8n-crm-read", reference, hashlib.sha256(reference.encode()).hexdigest(),
+    )
+
+    class FlakyRevokeAdapter:
+        attempts = 0
+
+        def lookup_credential(self, reservation_key):
+            assert reservation_key == key
+            return receipt
+
+        def store_credential(self, **kwargs):
+            raise AssertionError(f"recovery must not write: {kwargs!r}")
+
+        def revoke_credential(self, **kwargs):
+            self.attempts += 1
+            if self.attempts < 3:
+                raise RuntimeError("temporary revoke failure")
+
+    adapter = FlakyRevokeAdapter()
+    # Deadline makes receipt completion fail, which begins durable revocation.
+    coordinator = FactoryCredentialCoordinator(
+        store=store, adapter=adapter, clock=lambda: request.deadline_at
+    )
+    coordinator.recover()
+    durable = repository.rows[str(request.request_id)]
+    assert durable.status == "expired"
+    assert durable.credential_revoke_phase == "revoke_pending"
+    assert durable.credential_reservation_key == key
+    assert adapter.attempts == 1
+
+    FactoryCredentialCoordinator(
+        store=FactoryActionStore(repository=repository), adapter=adapter,
+        clock=lambda: request.deadline_at,
+    ).recover()
+    assert repository.rows[str(request.request_id)].credential_revoke_phase == "revoke_pending"
+    assert adapter.attempts == 2
+
+    FactoryCredentialCoordinator(
+        store=FactoryActionStore(repository=repository), adapter=adapter,
+        clock=lambda: request.deadline_at,
+    ).recover()
+    durable = repository.rows[str(request.request_id)]
+    assert adapter.attempts == 3
     assert durable.credential_reservation_key is None
+    assert durable.credential_revoke_phase is None
 
 
 def test_blocked_credential_write_that_crosses_deadline_is_revoked_and_not_persisted() -> None:

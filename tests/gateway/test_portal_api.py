@@ -470,6 +470,28 @@ def test_disabled_action_inbox_fences_list_read_and_raw_credential_before_store_
     assert store.factory_answer_calls == 0
 
 
+def test_disabled_action_inbox_route_fence_precedes_malformed_path_query_and_body() -> None:
+    store = FakePortalGatewayStore()
+    principal = PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+    with client_for(principal, store, action_resume_enabled=False) as client:
+        malformed_query = client.get(
+            "/v1/portal/factory-actions?status=not-a-status&limit=zero", headers=auth()
+        )
+        malformed_path = client.get(
+            "/v1/portal/factory-actions/not-a-uuid", headers=auth()
+        )
+        malformed_body = client.post(
+            "/v1/portal/factory-actions/not-a-uuid/credentials",
+            headers={**auth(), "Content-Type": "application/json"},
+            content=b"this body must never be parsed",
+        )
+
+    assert [response.status_code for response in (
+        malformed_query, malformed_path, malformed_body
+    )] == [503, 503, 503]
+    assert store.factory_answer_calls == 0
+
+
 def test_enabled_action_inbox_rejects_partial_default_composition() -> None:
     enabled = settings().model_copy(update={"factory_action_inbox_enabled": True})
     with pytest.raises(ValueError, match="action inbox.*incomplete"):
