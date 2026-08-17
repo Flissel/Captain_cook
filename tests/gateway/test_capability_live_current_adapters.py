@@ -78,7 +78,7 @@ from gateway.store import GatewayStore
 
 
 NOW = datetime(2026, 8, 8, 15, 0, tzinfo=timezone.utc)
-JOB_ID = UUID("82000000-0000-0000-0000-000000000071")
+JOB_ID = UUID("82000000-0000-4000-8000-000000000071")
 CORRELATION_ID = UUID("82000000-0000-0000-0000-000000000072")
 RUN_ID = UUID("82000000-0000-0000-0000-000000000073")
 
@@ -546,7 +546,8 @@ def test_store_issued_generic_promotion_executes_with_canonical_subject() -> Non
         adapter.execute(_request(CapabilityLiveStage.EXECUTE), release)
     )
 
-    assert event.subject_id == generic_capability_subject_id(release.job_id)
+    assert event.subject_id == f"subject:{release.job_id}"
+    assert generic_capability_subject_id(release.job_id) == f"subject:{release.job_id}"
     assert authority.execution_result_id == _runs()[2].execution_outcome.result_id
 
     class ExactEffects(_ProjectionEffects):
