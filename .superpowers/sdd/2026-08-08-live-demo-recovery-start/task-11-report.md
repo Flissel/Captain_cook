@@ -345,3 +345,83 @@ Round-6 non-claims:
   `.venv` and its `hermes-agent` submodule is uninitialized. The explicitly
   bounded D1/D4-D12 product neighborhood and corrected broad gate are green as
   recorded above.
+
+## Final Review Fix Round 7
+
+Commits:
+
+1. `141650e` — rejects preloaded closure modules whose imported module,
+   function, class, origin, source, or code bindings differ from the verified
+   repository closure, including relative and package imports.
+2. `ca369ab` — seals each generic benchmark request to the released candidate,
+   team manifest, model, execution policy, and independently built one-agent
+   baseline before an execution effect can begin.
+3. `9919a17` — replaces the conflicting promotion-subject encodings with one
+   canonical deterministic helper used by Store emission and execution
+   readback.
+4. `0f617d4` — adds the digest- and HEAD-attested repository-owned public tool
+   registry with exact schema, operation, endpoint, credential-env-name, and
+   registry bindings.
+5. `2ba0f2b` — ships the productive `AUTOGEN_BENCHMARK` path. Gateway persists
+   the exact WorkBatch, tool call, and single-use lease before the host effect;
+   the released team and sealed one-agent baseline execute through the real
+   Factory HostAutoGen ports; terminal receipts are issued only after exact
+   Runtime result and CAS readback.
+6. `8c013b8` — regenerates the verified Factory dependency closure and shipped
+   descriptor after the production benchmark graph changed.
+7. `c128db0` — proves all public tools declared by the three shipped D11 demo
+   inputs resolve to concrete local read-only or bounded authenticated HTTP
+   adapters; missing operator credentials fail readiness before an effect.
+8. `0c2228d` — retains the exact sealed Factory authority inside production
+   composition so benchmark candidate and baseline execution cannot fall back
+   to a deferred or synthetic graph.
+
+Round-7 RED to GREEN evidence:
+
+- Closure adversarial tests replaced imported module globals and preloaded
+  functions/classes and exercised relative/package imports. All substitutions
+  now fail before Factory materialization.
+- Benchmark REDs showed that a team-kind label and post-effect synthetic tool
+  evidence were insufficient. GREEN binds the actual released candidate/team
+  and separately sealed one-agent baseline to the same public case, model, and
+  policy; agent names, handoffs, messages, and tool calls come from the actual
+  HostAutoGen task result.
+- Zero, extra, wrong, replayed, or foreign job/case/run/tool authority is
+  rejected. Every declared tool has an exact pre-effect persisted call/lease,
+  one counted host effect, typed readback, and only then a terminal receipt.
+  No expected predicates, private case bodies/URIs, outcomes, verdicts, or
+  evaluator internals enter the executor view or durable public summary.
+- The concrete registry covers Sales, Incident, and Claims inputs. Remote
+  adapters use sealed loopback endpoints, exact operation/schema bindings,
+  credential environment names rather than values, fixed timeouts, disabled
+  redirects and environment proxies, bounded responses, sanitized errors, and
+  typed readback. Operator workflow/service provisioning remains required and
+  absent configuration is `incomplete`, never ready.
+- Focused production Gateway/Factory/benchmark/registry/manifest tests: 404
+  passed and 2 skipped after the final three composition repros passed.
+
+Round-7 verification:
+
+- Offline broad product gate with `tests/live` and the two unavailable Hermes
+  contract files explicitly excluded: 3,682 passed, 137 skipped, with five
+  documented warnings and no failures.
+- An earlier unbounded collection attempt confirmed the checkout's
+  `hermes-agent` submodule lacks the referenced Hermes runtime/fixture modules;
+  those external surfaces are recorded as a non-claim, not converted to PASS.
+- Architecture/import/workstream: 18 passed. `compileall`, submission verifier,
+  and full `8342467..HEAD` diff check passed.
+- Added-line credential scan found no credential-shaped assignment. A broad
+  bearer-pattern scan found only the explicit synthetic test fixture
+  `incident-tool-token-123`; no real credential or secret value was added.
+- `TEST_MARIADB_DSN` was absent, so the MariaDB authority gate was not run. No
+  database was contacted.
+
+Round-7 non-claims:
+
+- No live network service, paid provider, Docker/PowerShell process, n8n
+  deployment/volume, or database was contacted or mutated.
+- The HTTP/n8n tool adapters are executable, fail-closed operator contracts;
+  this offline gate does not claim their external workflows are provisioned or
+  reachable.
+- Hermes collection/readiness is not claimed because the required submodule
+  runtime and fixture files are absent from this checkout.
