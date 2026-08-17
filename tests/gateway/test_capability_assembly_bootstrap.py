@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 import pytest
 import asyncio
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.contracts import AgentFactoryJobV3
@@ -759,6 +760,7 @@ def test_shipped_gateway_builds_exact_runtime_and_app_once_after_preflight(
         provider_proxy_code_sha256="5" * 64,
         provider_paid_command_sha256="6" * 64,
         provider_hard_ceiling_enforced=True,
+        provider_token=SecretStr("provider-only-token"),
     )
     factory_plan = SimpleNamespace()
     configured = gateway_app.GatewaySettings.from_env({
@@ -871,6 +873,7 @@ def _factory_runtime_descriptor(*, adapter_sha256: str) -> dict[str, object]:
     return {
         "schema": "captain.capability-factory-runtime-plan.v1",
         "adapter_sha256": adapter_sha256,
+        "adapter_ast_sha256": "0" * 64,
         "constructor_signature": "(configuration, authorities)",
         "clock_signature": "() -> datetime",
         "model_client_signature": "(job, invocation)",
@@ -916,20 +919,21 @@ def test_factory_runtime_plan_rejects_signature_or_nested_authority_drift_purely
     descriptor = _factory_runtime_descriptor(adapter_sha256=digest)
     descriptor[field] = value
     effects: list[str] = []
-    monkeypatch.setattr(
-        bootstrap,
-        "read_verified_repository_bytes",
-        lambda *_args, **_kwargs: (tmp_path / "adapter.py", adapter),
-    )
+    descriptor_bytes = json.dumps(descriptor).encode()
+    def read_verified(relative: str, **_kwargs):
+        if relative == "gateway/capability_factory_runtime_descriptor.json":
+            return tmp_path / "descriptor.json", descriptor_bytes
+        return tmp_path / "adapter.py", adapter
+    monkeypatch.setattr(bootstrap, "read_verified_repository_bytes", read_verified)
     monkeypatch.setattr(
         bootstrap,
         "load_verified_repository_module",
         lambda *_args, **_kwargs: effects.append("module") or SimpleNamespace(),
     )
     environment = {
-        "CAPTAIN_CAPABILITY_FACTORY_ADAPTER": "adapter.py",
+        "CAPTAIN_CAPABILITY_FACTORY_ADAPTER": "gateway/capability_factory_runtime_adapter.py",
         "CAPTAIN_CAPABILITY_FACTORY_ADAPTER_SHA256": digest,
-        "CAPTAIN_CAPABILITY_FACTORY_PLAN_JSON": json.dumps(descriptor),
+        "CAPTAIN_CAPABILITY_FACTORY_DESCRIPTOR": "gateway/capability_factory_runtime_descriptor.json",
         "CAPTAIN_CAPABILITY_FACTORY_PLAN_SHA256": hashlib.sha256(
             json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest(),
@@ -957,6 +961,36 @@ def test_factory_runtime_plan_rejects_signature_or_nested_authority_drift_purely
         )
 
     assert effects == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        b"dangerous()\ndef build_capability_factory(configuration, authorities):\n return None\n",
+        b"def build_capability_factory():\n return None\n",
+        b"from gateway.capability_factory_runtime_internal import build_capability_factory_runtime as _build_capability_factory_runtime\n\ndef build_capability_factory(configuration, authorities):\n print('effect')\n return _build_capability_factory_runtime(configuration, authorities)\n",
+    ),
+)
+def test_factory_adapter_ast_rejects_top_level_calls_or_signature_drift(
+    source: bytes,
+) -> None:
+    import gateway.capability_assembly_bootstrap as bootstrap
+
+    with pytest.raises(ValueError):
+        bootstrap._attest_factory_adapter_ast(source)
+
+
+def test_repository_factory_adapter_matches_committed_descriptor() -> None:
+    import gateway.capability_assembly_bootstrap as bootstrap
+
+    root = Path(__file__).resolve().parents[2]
+    source = (root / "gateway/capability_factory_runtime_adapter.py").read_bytes()
+    descriptor = bootstrap.CapabilityAssemblyFactoryRuntimeDescriptorV1.model_validate_json(
+        (root / "gateway/capability_factory_runtime_descriptor.json").read_bytes()
+    )
+
+    assert hashlib.sha256(source).hexdigest() == descriptor.adapter_sha256
+    assert bootstrap._attest_factory_adapter_ast(source) == descriptor.adapter_ast_sha256
 
 
 def test_factory_constructor_receives_only_allowlisted_config_and_redacts_any_error(

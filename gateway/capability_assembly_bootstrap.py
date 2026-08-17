@@ -8,6 +8,7 @@ owned by ``gateway.app``.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -1379,6 +1380,8 @@ class CapabilityAssemblyFactoryAuthorities:
     private_benchmark_catalog: GatewayPrivateHoldoutStore
     source_artifacts: RepositoryFactoryInputArtifactStore
     clock: Callable[[], datetime]
+    n8n: "GatewayCapabilityN8nWorkBatchAuthority"
+    provider_token: SecretStr
 
 
 class CapabilityAssemblyFactoryRuntimeDescriptorV1(BaseModel):
@@ -1388,6 +1391,7 @@ class CapabilityAssemblyFactoryRuntimeDescriptorV1(BaseModel):
         alias="schema", serialization_alias="schema"
     )
     adapter_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    adapter_ast_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     constructor_signature: str
     clock_signature: str
     model_client_signature: str
@@ -1430,6 +1434,54 @@ _FACTORY_RUNTIME_DESCRIPTOR_BINDINGS = {
     "provider": "openai",
 }
 
+_FACTORY_ADAPTER_PATH = "gateway/capability_factory_runtime_adapter.py"
+_FACTORY_DESCRIPTOR_PATH = "gateway/capability_factory_runtime_descriptor.json"
+
+
+def _attest_factory_adapter_ast(source: bytes) -> str:
+    try:
+        tree = ast.parse(source, filename=_FACTORY_ADAPTER_PATH)
+    except (SyntaxError, ValueError):
+        raise ValueError("adapter syntax") from None
+    nodes = tree.body
+    if (
+        len(nodes) != 3
+        or not isinstance(nodes[0], ast.Expr)
+        or not isinstance(nodes[0].value, ast.Constant)
+        or not isinstance(nodes[0].value.value, str)
+        or not isinstance(nodes[1], ast.ImportFrom)
+        or nodes[1].module != "gateway.capability_factory_runtime_internal"
+        or len(nodes[1].names) != 1
+        or nodes[1].names[0].name != "build_capability_factory_runtime"
+        or nodes[1].names[0].asname != "_build_capability_factory_runtime"
+        or not isinstance(nodes[2], ast.FunctionDef)
+    ):
+        raise ValueError("adapter top level")
+    function = nodes[2]
+    arguments = function.args
+    if (
+        function.name != "build_capability_factory"
+        or function.decorator_list
+        or arguments.posonlyargs
+        or arguments.vararg is not None
+        or arguments.kwonlyargs
+        or arguments.kwarg is not None
+        or arguments.defaults
+        or [item.arg for item in arguments.args] != ["configuration", "authorities"]
+        or len(function.body) != 1
+        or not isinstance(function.body[0], ast.Return)
+        or not isinstance(function.body[0].value, ast.Call)
+        or not isinstance(function.body[0].value.func, ast.Name)
+        or function.body[0].value.func.id != "_build_capability_factory_runtime"
+        or [item.id for item in function.body[0].value.args if isinstance(item, ast.Name)]
+        != ["configuration", "authorities"]
+        or len(function.body[0].value.args) != 2
+        or function.body[0].value.keywords
+    ):
+        raise ValueError("adapter constructor")
+    canonical = ast.dump(tree, annotate_fields=True, include_attributes=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
 
 @dataclass(frozen=True, repr=False)
 class CapabilityAssemblyFactoryRuntimePlan:
@@ -1452,33 +1504,34 @@ def plan_capability_assembly_factory_runtime_from_environment(
     """Attest all Factory constructor metadata without importing or constructing it."""
 
     relative_path = environment.get("CAPTAIN_CAPABILITY_FACTORY_ADAPTER", "").strip()
+    descriptor_path = environment.get(
+        "CAPTAIN_CAPABILITY_FACTORY_DESCRIPTOR", ""
+    ).strip()
     adapter_sha256 = environment.get(
         "CAPTAIN_CAPABILITY_FACTORY_ADAPTER_SHA256", ""
     ).strip()
-    descriptor_raw = environment.get("CAPTAIN_CAPABILITY_FACTORY_PLAN_JSON", "")
     descriptor_sha256 = environment.get(
         "CAPTAIN_CAPABILITY_FACTORY_PLAN_SHA256", ""
     ).strip()
     policy_raw = environment.get("CAPTAIN_CAPABILITY_EXECUTION_POLICY_JSON", "")
     try:
         if (
-            not relative_path
+            relative_path != _FACTORY_ADAPTER_PATH
+            or descriptor_path != _FACTORY_DESCRIPTOR_PATH
             or _SHA256.fullmatch(adapter_sha256) is None
             or _SHA256.fullmatch(descriptor_sha256) is None
-            or not descriptor_raw
             or not policy_raw
         ):
             raise ValueError("incomplete")
-        descriptor_payload = json.loads(descriptor_raw)
-        canonical_descriptor = json.dumps(
-            descriptor_payload, sort_keys=True, separators=(",", ":")
-        ).encode()
-        if not secrets.compare_digest(
-            hashlib.sha256(canonical_descriptor).hexdigest(), descriptor_sha256
-        ):
-            raise ValueError("descriptor digest")
-        descriptor = CapabilityAssemblyFactoryRuntimeDescriptorV1.model_validate(
-            descriptor_payload
+        descriptor_file, descriptor_bytes = read_verified_repository_bytes(
+            descriptor_path,
+            expected_sha256=descriptor_sha256,
+            expected_repository_revision=repository_revision,
+            repository_root=repository_root,
+        )
+        del descriptor_file
+        descriptor = CapabilityAssemblyFactoryRuntimeDescriptorV1.model_validate_json(
+            descriptor_bytes
         )
         if not secrets.compare_digest(descriptor.adapter_sha256, adapter_sha256):
             raise ValueError("adapter binding")
@@ -1503,6 +1556,11 @@ def plan_capability_assembly_factory_runtime_from_environment(
             hashlib.sha256(adapter_bytes).hexdigest(), adapter_sha256
         ):
             raise ValueError("adapter digest")
+        adapter_ast_sha256 = _attest_factory_adapter_ast(adapter_bytes)
+        if not secrets.compare_digest(
+            descriptor.adapter_ast_sha256, adapter_ast_sha256
+        ):
+            raise ValueError("adapter AST digest")
         root = repository_root.resolve(strict=True)
         for relative_root in (descriptor.skill_root, descriptor.replay_root):
             candidate = Path(relative_root)
@@ -1553,6 +1611,7 @@ def build_capability_assembly_factory_runtime_from_environment(
         store=store,
         private_benchmark_catalog=private_benchmark_catalog,
         clock=clock,
+        provider_token=settings.provider_token,
     )
 
 
@@ -1563,17 +1622,21 @@ def materialize_capability_assembly_factory_runtime(
     private_benchmark_catalog: GatewayPrivateHoldoutStore,
     clock: Callable[[], datetime],
     source_artifacts: RepositoryFactoryInputArtifactStore | None = None,
+    provider_token: SecretStr | None = None,
 ) -> CapabilityAssemblyFactoryRuntime:
     """Import and construct only after the complete descriptor is attested."""
 
     selected_source_artifacts = source_artifacts or RepositoryFactoryInputArtifactStore(
         artifacts=ContentAddressedArtifactAdapter(plan.configuration.artifact_root)
     )
+    n8n = GatewayCapabilityN8nWorkBatchAuthority(gateway_store=store)
     authorities = CapabilityAssemblyFactoryAuthorities(
         store=store,
         private_benchmark_catalog=private_benchmark_catalog,
         source_artifacts=selected_source_artifacts,
         clock=clock,
+        n8n=n8n,
+        provider_token=provider_token or SecretStr("unconfigured-provider-token"),
     )
     try:
         module = load_verified_repository_module(
@@ -1593,7 +1656,6 @@ def materialize_capability_assembly_factory_runtime(
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly Factory constructor is invalid"
         )
-    n8n = GatewayCapabilityN8nWorkBatchAuthority(gateway_store=store)
     provisioning = CurrentAuthorityCapabilityFactoryProvisioner(
         repository=factory.repository,
         source_artifacts=selected_source_artifacts,  # type: ignore[arg-type]

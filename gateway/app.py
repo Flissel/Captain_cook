@@ -1685,6 +1685,7 @@ def create_production_app_from_environment(
         private_benchmark_catalog=private_catalog,
         clock=clock,
         source_artifacts=source_artifacts,
+        provider_token=bootstrap.provider_token,
     )
     plan_production_capability_assembly_from_environment(
         repository_root=root,
