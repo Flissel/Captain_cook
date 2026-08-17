@@ -8,10 +8,18 @@ Starting HEAD: `6219663`
 
 D10 integrated HEAD: `69aff22`
 
+Status: **not yet shippable**. The package gates below are green, but the final
+entrypoint audit found that `python -m gateway.app` constructs the module-level
+application without the production environment, runtime, private catalog, or
+repository-root dependencies. Consequently `production_requested` remains
+false for the shipped module entrypoint unless another caller injects those
+dependencies. This does not satisfy Task 11 criterion 1 and must not be treated
+as production-complete.
+
 ## Delivered
 
 - Preserved-history merge of the independently reviewed D10 private benchmark catalog.
-- Shipped Gateway lifespan composition that plans without side effects, then explicitly materializes the exact repository root, environment, private catalog, runtime, stores, and production router once before serving.
+- Gateway lifespan composition that, when given all production dependencies, plans without side effects, then explicitly materializes the exact repository root, environment, private catalog, runtime, stores, and production router once before serving. The shipped module entrypoint does not yet supply those dependencies.
 - One content-addressed source authority shared by the artifact adapter and repository input store; the deep production graph rejects mixed or fake authorities.
 - Explicit D10 catalog interface for open, revalidation, attestation, and materialization; durable n8n lease source injection.
 - Byte-identical Gateway-issued benchmark tool evidence from the process executor through registry persistence and evaluator consumption.
