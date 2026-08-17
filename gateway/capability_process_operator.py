@@ -20,6 +20,33 @@ from uuid import uuid4
 
 _SERVICES = ("gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n")
 _ACTIONS = ("start", "stop", "restart")
+_INHERITED_ENV = ("PATH", "SYSTEMROOT", "COMSPEC", "PATHEXT", "TEMP", "TMP")
+_SERVICE_SECRET_ENV = {
+    "gateway": ("CAPTAIN_GATEWAY_TOKEN", "WORKER_GATEWAY_TOKEN"),
+    "runtime": ("CAPTAIN_RUNTIME_TOKEN",),
+    "provider_proxy": ("CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN", "PROVIDER_RECEIPT_GATEWAY_TOKEN"),
+    "benchmark": ("CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",),
+    "minibook": ("MINIBOOK_API_KEY", "MINIBOOK_PROJECTION_API_KEY"),
+    "n8n": ("CAPTAIN_N8N_API_KEY",),
+}
+_SERVICE_CONFIG_ENV = {
+    "gateway": ("LEDGER_DSN", "GATEWAY_HOST", "GATEWAY_PORT", "GATEWAY_CLAIM_TTL_SECONDS"),
+    "runtime": ("CAPTAIN_RUNTIME_URL",),
+    "provider_proxy": ("CAPTAIN_PROVIDER_PROXY_URL", "CAPTAIN_PROVIDER_PRICE_CARD_PATH", "CAPTAIN_PROVIDER_POLICY_PATH", "CAPTAIN_PROVIDER_STATE_ROOT", "CAPTAIN_GATEWAY_URL"),
+    "benchmark": ("CAPTAIN_CAPABILITY_BENCHMARK_URL",),
+    "minibook": ("MINIBOOK_BACKEND_URL",),
+    "n8n": ("CAPTAIN_N8N_URL",),
+}
+
+
+def _service_environment(service: str, environment: Mapping[str, str]) -> dict[str, str]:
+    allowed = (*_INHERITED_ENV, *_SERVICE_SECRET_ENV[service], *_SERVICE_CONFIG_ENV[service])
+    child = {name: environment[name] for name in allowed if environment.get(name, "").strip()}
+    for name in _SERVICE_SECRET_ENV[service]:
+        if name not in child:
+            raise ValueError(f"required process setting is missing: {name}")
+    child["PYTHONUTF8"] = "1"
+    return child
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -146,14 +173,14 @@ def _observed_n8n_container_identity() -> tuple[str, str] | None:
             "--filter", "label=com.docker.compose.project=captain-n8n-builder",
             "--filter", "label=com.docker.compose.service=n8n",
             "--filter", "status=running",
-        ), capture_output=True, text=True, check=False,
+        ), capture_output=True, text=True, check=False, timeout=10,
     )
     ids = tuple(line.strip() for line in inventory.stdout.splitlines() if line.strip())
     if inventory.returncode != 0 or len(ids) != 1:
         return None
     inspected = subprocess.run(
         ("docker", "inspect", "--format", "{{.Id}}|{{.State.StartedAt}}", ids[0]),
-        capture_output=True, text=True, check=False,
+        capture_output=True, text=True, check=False, timeout=10,
     )
     values = inspected.stdout.strip().split("|", 1)
     if inspected.returncode != 0 or len(values) != 2 or not all(values):
@@ -168,6 +195,26 @@ def _wait_process_gone(state: Mapping[str, object], *, timeout_seconds: float) -
             return True
         time.sleep(0.05)
     return _observed_process_identity(int(state["process_id"])) is None
+
+
+def _terminate_exact_process_tree(state: Mapping[str, object]) -> bool:
+    """Terminate only the still-matching kernel process and confirm its exit."""
+
+    pid = _require_same_process(state)
+    os.kill(pid, signal.SIGTERM)
+    if _wait_process_gone(state, timeout_seconds=5.0):
+        return True
+    pid = _require_same_process(state)
+    if os.name == "nt":
+        subprocess.run(
+            ("taskkill", "/PID", str(pid), "/T", "/F"),
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    else:
+        os.kill(pid, signal.SIGKILL)
+    return _wait_process_gone(state, timeout_seconds=2.0)
 
 
 def _require_same_n8n_container(state: Mapping[str, object]) -> str:
@@ -279,6 +326,7 @@ def operate(
                 ),
                 cwd=repository_root,
                 check=False,
+                timeout=30,
             )
             if completed.returncode != 0:
                 raise RuntimeError("n8n process stop failed")
@@ -288,18 +336,15 @@ def operate(
                     break
                 time.sleep(0.1)
             if container_id is not None and _observed_n8n_container_identity() is not None:
-                subprocess.run(("docker", "kill", container_id), check=False)
+                subprocess.run(("docker", "kill", container_id), check=False, timeout=10)
                 if _observed_n8n_container_identity() is not None:
                     raise RuntimeError("n8n container exit could not be confirmed")
         if prior is not None:
-            pid = int(prior.get("process_id", 0))
+            raw_pid = prior.get("process_id")
+            pid = int(raw_pid) if raw_pid is not None else 0
             if not sentinel and service != "n8n" and _pid_is_live(pid):
-                exact_pid = _require_same_process(prior)
-                os.kill(exact_pid, signal.SIGTERM)
-                if not _wait_process_gone(prior, timeout_seconds=5.0):
-                    os.kill(_require_same_process(prior), signal.SIGKILL)
-                    if not _wait_process_gone(prior, timeout_seconds=2.0):
-                        raise RuntimeError("managed process exit could not be confirmed")
+                if not _terminate_exact_process_tree(prior):
+                    raise RuntimeError("managed process exit could not be confirmed")
     if action in {"stop", "restart"} and prior is not None:
         stopped = {
             **prior,
@@ -314,7 +359,7 @@ def operate(
             "service": service,
             "status": "stopped",
             "operation": "stop",
-            "process_id": 0,
+            "process_id": None,
             "process_identity": "absent",
         }
 
@@ -323,20 +368,25 @@ def operate(
     )
     current = _read_state(state_file)
     if action == "start" and current is not None and current.get("status") == "running":
-        pid = int(current.get("process_id", 0))
-        if sentinel or _pid_is_live(pid):
+        if sentinel:
             return current
+        if service == "n8n":
+            _require_same_n8n_container(current)
+        else:
+            _require_same_process(current)
+        _wait_authenticated_health(service, environment=environment, timeout_seconds=5.0)
+        return current
     identity = str(uuid4())
     if sentinel:
         process_id = int(identity.replace("-", "")[:8], 16) or 1
     elif service == "n8n":
-        completed = subprocess.run(argv, cwd=repository_root, check=False)
+        completed = subprocess.run(argv, cwd=repository_root, check=False, timeout=30)
         if completed.returncode != 0:
             raise RuntimeError("n8n process start failed")
         observed_container = _observed_n8n_container_identity()
         if observed_container is None:
             raise RuntimeError("started n8n container identity is unavailable")
-        process_id = 0
+        process_id = None
     else:
         logs = _state_root(environment, repository_root) / "logs"
         logs.mkdir(parents=True, exist_ok=True)
@@ -344,7 +394,7 @@ def operate(
         process = subprocess.Popen(
             argv,
             cwd=repository_root,
-            env=dict(environment),
+            env=_service_environment(service, environment),
             stdin=subprocess.DEVNULL,
             stdout=output,
             stderr=subprocess.STDOUT,
@@ -378,13 +428,35 @@ def operate(
         state["identity_value"] = f"{observed_container[0]}:{observed_container[1]}"
     else:
         state["identity_value"] = identity
-    _write_state(state_file, state)
     if not sentinel:
-        _wait_authenticated_health(service, environment=environment)
-        if service == "n8n":
-            _require_same_n8n_container(state)
-        else:
-            _require_same_process(state)
+        try:
+            _wait_authenticated_health(service, environment=environment)
+            if service == "n8n":
+                _require_same_n8n_container(state)
+            else:
+                _require_same_process(state)
+        except Exception:
+            gone = False
+            try:
+                if service == "n8n":
+                    container_id = _require_same_n8n_container(state)
+                    subprocess.run(
+                        ("docker", "kill", container_id), check=False, timeout=10
+                    )
+                    gone = _observed_n8n_container_identity() is None
+                else:
+                    gone = _terminate_exact_process_tree(state)
+            except Exception:
+                # The exact authority could not be proven. Preserve the running
+                # record so a later operator cannot adopt or silently forget it.
+                gone = False
+            if gone:
+                state["status"] = "stopped"
+            _write_state(state_file, state)
+            raise RuntimeError(
+                f"authenticated start failed for {service}"
+            ) from None
+    _write_state(state_file, state)
     return state
 
 

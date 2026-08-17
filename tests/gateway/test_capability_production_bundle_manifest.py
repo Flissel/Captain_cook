@@ -178,6 +178,112 @@ def test_operator_refuses_to_stop_a_reused_process_id(
         )
 
 
+def test_each_process_receives_only_its_allowlisted_environment() -> None:
+    environment = {
+        **_environment(),
+        "WORKER_GATEWAY_TOKEN": "worker-token-value",
+        "PROVIDER_RECEIPT_GATEWAY_TOKEN": "receipt-token-value",
+        "LEDGER_DSN": "mysql://captain:redacted@127.0.0.1/captain",
+        "OPENAI_API_KEY": "must-not-cross-process-boundary",
+        "UNRELATED_SECRET": "must-not-cross-process-boundary",
+    }
+
+    for service in ("gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n"):
+        child = process_operator._service_environment(service, environment)
+        assert "OPENAI_API_KEY" not in child
+        assert "UNRELATED_SECRET" not in child
+        for other, names in process_operator._SERVICE_SECRET_ENV.items():
+            if other != service:
+                assert all(name not in child for name in names if name not in process_operator._SERVICE_SECRET_ENV[service])
+
+
+def test_start_reuse_requires_exact_identity_and_authenticated_health(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    state = {
+        "schema": "captain.production-process-state.v1", "service": "gateway",
+        "status": "running", "operation": "start", "process_id": 4242,
+        "process_identity": "opaque", "identity_kind": "os_process",
+        "identity_value": "C:/python.exe:start-1", "executable": "C:/python.exe",
+        "os_start_identity": "start-1", "argv": ["python", "-m", "gateway.app"],
+    }
+    (state_root / "gateway.json").write_text(json.dumps(state), encoding="utf-8")
+    health: list[str] = []
+    monkeypatch.setattr(process_operator, "_observed_process_identity", lambda _pid: ("C:/python.exe", "start-1"))
+    monkeypatch.setattr(process_operator, "_wait_authenticated_health", lambda service, **_kwargs: health.append(service))
+    monkeypatch.setattr(process_operator.subprocess, "Popen", lambda *_args, **_kwargs: pytest.fail("reuse spawned a process"))
+    environment = {
+        "CAPTAIN_PROCESS_STATE_ROOT": str(state_root),
+        "CAPTAIN_GATEWAY_TOKEN": "gateway-token", "WORKER_GATEWAY_TOKEN": "worker-token",
+        "CAPTAIN_GATEWAY_URL": "http://127.0.0.1:8090",
+    }
+
+    reused = operate("gateway", "start", environment=environment, repository_root=tmp_path)
+
+    assert reused == state
+    assert health == ["gateway"]
+
+
+def test_n8n_reuse_uses_container_identity_without_pid_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    state = {
+        "schema": "captain.production-process-state.v1", "service": "n8n",
+        "status": "running", "operation": "start", "process_id": None,
+        "process_identity": "opaque", "identity_kind": "docker_container",
+        "identity_value": "container-id:started-at", "argv": ["pwsh"],
+    }
+    (state_root / "n8n.json").write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(process_operator, "_observed_n8n_container_identity", lambda: ("container-id", "started-at"))
+    monkeypatch.setattr(process_operator, "_wait_authenticated_health", lambda *_args, **_kwargs: None)
+
+    reused = operate("n8n", "start", environment={
+        "CAPTAIN_PROCESS_STATE_ROOT": str(state_root), "CAPTAIN_N8N_API_KEY": "n8n-key",
+        "CAPTAIN_N8N_URL": "http://127.0.0.1:5679",
+    }, repository_root=tmp_path)
+
+    assert reused["process_id"] is None
+    assert reused["identity_kind"] == "docker_container"
+
+
+def test_failed_health_retains_ambiguous_spawn_identity_after_bounded_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        pid = 4343
+
+    monkeypatch.setattr(process_operator.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setattr(process_operator, "_observed_process_identity", lambda _pid: ("C:/python.exe", "start-4343"))
+    monkeypatch.setattr(process_operator, "_wait_authenticated_health", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("not ready")))
+    monkeypatch.setattr(process_operator, "_wait_process_gone", lambda *_args, **_kwargs: False)
+    signals: list[object] = []
+    cleanup_commands: list[tuple[str, ...]] = []
+    monkeypatch.setattr(process_operator.os, "kill", lambda _pid, sent: signals.append(sent))
+    monkeypatch.setattr(
+        process_operator.subprocess,
+        "run",
+        lambda argv, **_kwargs: cleanup_commands.append(tuple(argv)),
+    )
+    environment = {
+        "CAPTAIN_PROCESS_STATE_ROOT": "state",
+        "CAPTAIN_GATEWAY_TOKEN": "gateway-token", "WORKER_GATEWAY_TOKEN": "worker-token",
+        "CAPTAIN_GATEWAY_URL": "http://127.0.0.1:8090", "LEDGER_DSN": "redacted-dsn",
+    }
+
+    with pytest.raises(RuntimeError, match="authenticated start failed"):
+        operate("gateway", "start", environment=environment, repository_root=tmp_path)
+
+    persisted = json.loads((tmp_path / "state/gateway.json").read_text(encoding="utf-8"))
+    assert persisted["status"] == "running"
+    assert persisted["process_id"] == 4343
+    assert signals == [process_operator.signal.SIGTERM]
+    assert cleanup_commands == [("taskkill", "/PID", "4343", "/T", "/F")]
+
+
 def test_operator_manifest_fails_closed_before_probe_on_missing_or_reused_credentials() -> None:
     environment = _environment()
     environment["CAPTAIN_RUNTIME_TOKEN"] = environment["CAPTAIN_GATEWAY_TOKEN"]
