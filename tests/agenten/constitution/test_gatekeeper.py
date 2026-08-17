@@ -321,3 +321,91 @@ async def test_meta_stamps_constitution_version_on_rejection_too():
     await gatekeeper.handle_subproblem_proposed(event)
 
     assert rejected.events[0].meta.constitution_version == "my-special-version"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_sibling_in_same_batch_is_rejected():
+    """Two identical children proposed before the Recorder drains must not both pass.
+
+    The Recorder only enqueues its VALIDATING write, so the ledger cannot see
+    sibling one when sibling two is judged. The Gatekeeper must remember its
+    own verdicts to close that window.
+    """
+    bus, accepted, rejected = wire_bus()
+    gatekeeper = ConstitutionGatekeeper(
+        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery()
+    )
+
+    await gatekeeper.handle_subproblem_proposed(
+        make_proposed(subproblem_id="sp-1", description="Knead the dough for ten minutes.")
+    )
+    await gatekeeper.handle_subproblem_proposed(
+        make_proposed(subproblem_id="sp-2", description="Knead the dough for ten minutes.")
+    )
+
+    assert [event.subproblem_id for event in accepted.events] == ["sp-1"]
+    assert [event.subproblem_id for event in rejected.events] == ["sp-2"]
+    assert rejected.events[0].reason == "duplicate"
+
+
+@pytest.mark.asyncio
+async def test_in_flight_memory_is_released_once_the_ledger_sees_the_subproblem():
+    """The in-process memory must not become a permanent duplicate ban.
+
+    Once the ledger knows the subproblem, the ledger view is authoritative
+    again and an identical description is allowed exactly as before.
+    """
+    bus, accepted, rejected = wire_bus()
+    ledger = FakeLedgerQuery()
+    gatekeeper = ConstitutionGatekeeper(
+        bus=bus, ruleset=make_ruleset(), ledger_query=ledger
+    )
+
+    await gatekeeper.handle_subproblem_proposed(
+        make_proposed(subproblem_id="sp-1", description="Knead the dough for ten minutes.")
+    )
+    ledger.seed(
+        Stage.DONE,
+        FakeBlock(
+            index=2,
+            data={
+                "subproblem_id": "sp-1",
+                "root_problem_id": "root-1",
+                "description": "Knead the dough for ten minutes.",
+            },
+        ),
+    )
+
+    await gatekeeper.handle_subproblem_proposed(
+        make_proposed(subproblem_id="sp-2", description="Knead the dough for ten minutes.")
+    )
+
+    assert [event.subproblem_id for event in accepted.events] == ["sp-1", "sp-2"]
+    assert rejected.events == []
+
+
+@pytest.mark.asyncio
+async def test_identical_descriptions_under_different_roots_are_both_accepted():
+    """The in-flight memory must stay scoped to one root problem."""
+    bus, accepted, rejected = wire_bus()
+    gatekeeper = ConstitutionGatekeeper(
+        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery()
+    )
+
+    await gatekeeper.handle_subproblem_proposed(
+        make_proposed(
+            subproblem_id="sp-1",
+            root_problem_id="root-1",
+            description="Knead the dough for ten minutes.",
+        )
+    )
+    await gatekeeper.handle_subproblem_proposed(
+        make_proposed(
+            subproblem_id="sp-2",
+            root_problem_id="root-2",
+            description="Knead the dough for ten minutes.",
+        )
+    )
+
+    assert [event.subproblem_id for event in accepted.events] == ["sp-1", "sp-2"]
+    assert rejected.events == []
