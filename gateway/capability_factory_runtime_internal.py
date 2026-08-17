@@ -53,7 +53,10 @@ def build_capability_factory_runtime(configuration, authorities) -> AgentFactory
     ports = GatewayTechnicalTeamExecutionPortsProvider(candidate_bindings=candidate_provider, technical_holdout_root=configuration.authority_root / "technical-holdouts", model_client_for=model_client, budget=GatewayFactoryBudgetLedger(store), pricing_authority=pricing, replay_store=FilesystemFactorySkillReplayStore(configuration.repository_root / ".captain-cook/private/business-benchmarks/runtime-state/factory-team-replays"), released_skill_catalog=repository, skill_root=configuration.repository_root / "agenten/agent_factory/skills", provider=configuration.provider, model=configuration.model, max_cost_per_call=maximum, clock=clock)
     team_execution = ProductionFactoryTeamExecutionPort(evidence_store=evidence_store, ports_for=ports, holdout_selector=None)
     candidate_validator = CandidateEvaluationFactory(provider=candidate_provider, evidence_store=evidence_store, team_execution=team_execution, workflow_artifacts=repository)
-    business_benchmark = AssemblyOwnedGenericBenchmark()
+    business_benchmark = AssemblyOwnedGenericBenchmark(
+        gateway_store=store,
+        clock=clock,
+    )
     improvement = _DeferredImprovementAuthority()
     hermes = HermesCliFactory(settings=HermesCliSettings(skill_root=configuration.repository_root / "agenten/agent_factory/skills", evidence_root=configuration.authority_root / "runtime-state/hermes-evidence", working_directory=configuration.repository_root), released_skill_catalog=repository, workflow_artifacts=repository, clock=clock)
     forge = MinibookForgeHttpClient(

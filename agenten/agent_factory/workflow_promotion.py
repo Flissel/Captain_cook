@@ -51,14 +51,18 @@ def build_release_workflow_promotion(
         or job.execution_policy.mode is not FactoryExecutionMode.RELEASE
     ):
         raise ValueError("workflow promotion requires release execution mode")
+    generic = projection.generic_benchmark_summary_ref is not None
     if (
         projection.status is not FactoryLifecycleStatus.RUNNING
         or projection.phase is not FactoryPhase.QUALITY_REVIEWED
-        or projection.feedback_recommendation
-        is not FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
+        or (
+            not generic
+            and projection.feedback_recommendation
+            is not FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
+        )
     ):
         raise ValueError("workflow promotion requires a promotable quality review")
-    if (
+    if not generic and (
         projection.workflow_evaluation_ref is None
         or projection.feedback_ref is None
     ):
@@ -70,8 +74,9 @@ def build_release_workflow_promotion(
         and block.phase is FactoryPhase.QUALITY_REVIEWED
     )
     expected_artifacts = (
-        projection.workflow_evaluation_ref,
-        projection.feedback_ref,
+        (projection.generic_benchmark_summary_ref,)
+        if generic
+        else (projection.workflow_evaluation_ref, projection.feedback_ref)
     )
     event_id = uuid5(
         _PROMOTION_NAMESPACE,

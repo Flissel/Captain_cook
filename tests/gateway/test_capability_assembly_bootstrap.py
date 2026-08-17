@@ -1228,6 +1228,7 @@ def test_shipped_verified_closure_materializes_the_real_factory_graph(
     )
     store = SimpleNamespace(
         _runtime_provider_bundle_bindings=frozenset({provider_bundle}),
+        generic_benchmark_quality_evidence=lambda *_: None,
     )
     private_catalog = bootstrap.GatewayPrivateHoldoutStore(
         gateway_store=store  # type: ignore[arg-type]
@@ -1706,6 +1707,7 @@ def test_generic_benchmark_recorder_is_append_only_and_replay_stable(
             case_id=f"case-{index}",
             category=categories[index // 3],
             case_digest=f"{index + 1:064x}",
+            assertion_ids=("schema_valid", "real_case_green"),
             team_trace_id=uuid4(), team_run_id=uuid4(),
             baseline_trace_id=uuid4(), baseline_run_id=uuid4(),
             team_evaluation_ref=evaluation_ref,
@@ -1720,7 +1722,8 @@ def test_generic_benchmark_recorder_is_append_only_and_replay_stable(
         media_type="text/markdown",
     )
     job = AgentFactoryJobV3.model_construct(
-        job_id=job_id, correlation_id=correlation_id, input_ref=input_ref
+        job_id=job_id, correlation_id=correlation_id, input_ref=input_ref,
+        acceptance_assertion_ids=("schema_valid", "real_case_green"),
     )
     store = SimpleNamespace(
         storage=_BenchmarkStorage(),
@@ -1754,6 +1757,15 @@ def test_generic_benchmark_recorder_is_append_only_and_replay_stable(
     replay = recorder.record_generic_benchmark(request)
 
     assert replay == first
+    stored_payload = store.storage.rows[(str(job_id), request.suite_digest)]["payload"]
+    assert "assertion_ids" in stored_payload
+    assert all(
+        private_name not in stored_payload
+        for private_name in (
+            "expected_predicates", "observable_expected", "private_holdout_uri",
+            "outcome_satisfied", "verdict",
+        )
+    )
     changed = GenericBenchmarkRecordingRequest(
         **{
             **request.__dict__,
@@ -1788,7 +1800,8 @@ def test_generic_benchmark_recorder_rejects_incomplete_suite_before_cas_write(
         ),
         case_receipts=(GenericBenchmarkCaseReceipt(
             case_id="case-a", category=GenericBenchmarkCategory.NORMAL,
-            case_digest="a" * 64, team_trace_id=uuid4(), team_run_id=uuid4(),
+            case_digest="a" * 64, assertion_ids=("schema_valid",),
+            team_trace_id=uuid4(), team_run_id=uuid4(),
             baseline_trace_id=uuid4(), baseline_run_id=uuid4(),
             team_evaluation_ref=evaluation_ref,
             baseline_evaluation_ref=evaluation_ref,

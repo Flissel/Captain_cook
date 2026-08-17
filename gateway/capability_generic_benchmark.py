@@ -202,6 +202,7 @@ class GenericBenchmarkCaseReceipt:
     case_id: str
     category: GenericBenchmarkCategory
     case_digest: str
+    assertion_ids: tuple[str, ...]
     team_trace_id: UUID
     team_run_id: UUID
     baseline_trace_id: UUID
@@ -1303,6 +1304,7 @@ def _require_evaluation(value: IndependentBenchmarkOutcome,
 def _case_receipt(pair: GenericBenchmarkPair) -> GenericBenchmarkCaseReceipt:
     return GenericBenchmarkCaseReceipt(
         pair.case_ref.case_id, pair.case_ref.category, pair.case_ref.case_digest,
+        pair.case_ref.assertion_ids,
         pair.team.trace_id, pair.team.run_id, pair.baseline.trace_id, pair.baseline.run_id,
         pair.team_evaluation.evaluation_ref, pair.baseline_evaluation.evaluation_ref)
 

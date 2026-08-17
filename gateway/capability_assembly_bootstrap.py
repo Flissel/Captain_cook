@@ -1034,6 +1034,18 @@ class GatewayGenericBenchmarkRecorder:
             or job.correlation_id != request.correlation_id
             or job.input_ref.media_type != "text/markdown"
             or not job.input_ref.uri.endswith("/" + job.input_ref.sha256)
+            or set(
+                assertion
+                for case in cases
+                for assertion in case.assertion_ids
+            ) != set(job.acceptance_assertion_ids)
+            or any(
+                not case.assertion_ids
+                or not set(case.assertion_ids).issubset(
+                    job.acceptance_assertion_ids
+                )
+                for case in cases
+            )
         ):
             raise CapabilityLiveAuthorityUnavailable(
                 "generic benchmark Factory binding is invalid"
@@ -1112,6 +1124,7 @@ def _benchmark_payload(request: GenericBenchmarkRecordingRequest) -> dict[str, o
             {
                 **case.__dict__,
                 "category": case.category.value,
+                "assertion_ids": list(case.assertion_ids),
                 "team_trace_id": str(case.team_trace_id),
                 "team_run_id": str(case.team_run_id),
                 "baseline_trace_id": str(case.baseline_trace_id),

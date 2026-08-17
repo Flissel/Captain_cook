@@ -44,6 +44,7 @@ from agenten.agent_factory.contracts import (
     FactoryLease,
     FactoryPhase,
     FactoryRole,
+    GenericBenchmarkQualityEvidenceV1,
     parse_factory_job,
 )
 from agenten.delivery.minibook_events import (
@@ -6548,6 +6549,94 @@ class GatewayStore:
                 )
                 return canonical
 
+    def generic_benchmark_quality_evidence(
+        self, job_id: UUID, attempt: int,
+    ) -> GenericBenchmarkQualityEvidenceV1 | None:
+        """Read one passed 15-case generic suite as public Factory evidence."""
+
+        if not isinstance(job_id, UUID) or not isinstance(attempt, int) or attempt < 1:
+            raise HTTPException(status_code=409, detail="generic quality binding is invalid")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id",
+                    value=str(job_id), for_update=False,
+                )
+                if job_block is None:
+                    return None
+                job = parse_factory_job(job_block["data"])
+                cursor.execute(
+                    "SELECT suite_sha256, correlation_id, summary_sha256, payload "
+                    "FROM capability_generic_benchmarks WHERE job_id = %s",
+                    (str(job_id),),
+                )
+                rows = tuple(cursor.fetchall())
+        if len(rows) != 1 or type(job) is not AgentFactoryJobV3:
+            return None
+        row = rows[0]
+        payload = self._decode_json(row["payload"])
+        cases = payload.get("case_receipts") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema")
+            != "captain.capability-generic-benchmark-summary.v1"
+            or payload.get("job_id") != str(job.job_id)
+            or payload.get("correlation_id") != str(job.correlation_id)
+            or payload.get("suite_digest") != row["suite_sha256"]
+            or payload.get("passed") is not True
+            or not isinstance(cases, list)
+            or len(cases) != 15
+        ):
+            raise HTTPException(status_code=409, detail="generic quality evidence is invalid")
+        try:
+            case_ids = tuple(str(item["case_id"]) for item in cases)
+            case_digests = tuple(str(item["case_digest"]) for item in cases)
+            categories = tuple(str(item["category"]) for item in cases)
+            observed_assertions = tuple(dict.fromkeys(
+                assertion
+                for item in cases
+                for assertion in item["assertion_ids"]
+            ))
+            evaluation_refs = tuple(
+                ArtifactRef.model_validate(item[name])
+                for item in cases
+                for name in ("team_evaluation_ref", "baseline_evaluation_ref")
+            )
+            suite_ref = ArtifactRef.model_validate(payload["suite_ref"])
+            summary_sha256 = str(row["summary_sha256"])
+            summary_ref = ArtifactRef(
+                uri=f"artifact://sha256/{summary_sha256}",
+                sha256=summary_sha256,
+                media_type="application/json",
+            )
+        except (KeyError, TypeError, ValueError, ValidationError):
+            raise HTTPException(status_code=409, detail="generic quality evidence is invalid") from None
+        if set(observed_assertions) != set(job.acceptance_assertion_ids):
+            raise HTTPException(
+                status_code=409,
+                detail="generic quality assertion authority is incomplete",
+            )
+        assertions = job.acceptance_assertion_ids
+        try:
+            return GenericBenchmarkQualityEvidenceV1(
+                schema="captain.generic-benchmark-quality-evidence.v1",
+                authority_id=UUID("fefc0e43-6955-4d50-aae2-b2ef5051e9af"),
+                job_id=job.job_id,
+                correlation_id=job.correlation_id,
+                subject_version=job.subject_version,
+                attempt=attempt,
+                suite_ref=suite_ref,
+                summary_ref=summary_ref,
+                case_ids=case_ids,
+                case_digests=case_digests,
+                categories=categories,
+                acceptance_assertion_ids=assertions,
+                evaluation_refs=evaluation_refs,
+                passed=True,
+            )
+        except ValidationError:
+            raise HTTPException(status_code=409, detail="generic quality evidence is invalid") from None
+
     @staticmethod
     def _generic_minibook_promotion_event(
         *, event_id: UUID, job: AgentFactoryJobV3, occurred_at: datetime,
@@ -6562,6 +6651,13 @@ class GatewayStore:
                 return 10000 if numerator == 0 else 1000000
             return int((numerator * Decimal(10000)) / denominator)
 
+        subject_uuid = UUID(
+            bytes=hashlib.sha256(
+                f"generic-capability-subject:{job.job_id}".encode()
+            ).digest()[:16],
+            version=4,
+        )
+
         return MinibookProjectionEvent.model_validate({
             "schema": "captain.minibook-projection.v2",
             "event_id": event_id,
@@ -6569,7 +6665,7 @@ class GatewayStore:
             "causation_id": job.event_id,
             "occurred_at": occurred_at,
             "producer": "captain-gateway",
-            "subject_id": f"subject:{job.job_id}",
+            "subject_id": f"subject:{subject_uuid}",
             "subject_version": job.subject_version,
             "event_type": "capability.promoted",
             "payload": {
