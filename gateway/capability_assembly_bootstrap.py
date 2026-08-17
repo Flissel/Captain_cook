@@ -59,12 +59,12 @@ from gateway.agent_factory_live_composition import (
     ProductionFactoryTeamExecutionPort,
 )
 from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
+from gateway.capability_factory_benchmark_bridge import AssemblyOwnedGenericBenchmark
 from gateway.factory_repository import GatewayFactoryBudgetLedger, GatewayFactoryRepository
-from agenten.agent_factory.business_benchmark_dispatch import BusinessBenchmarkDispatchService
 from agenten.agent_factory.business_benchmark_production_ports import (
     BusinessBenchmarkPricingAuthority,
     ConfiguredBusinessBenchmarkPricingSource,
-    OpenAIBusinessBenchmarkModelClientBuilder,
+    ProxyBoundResponsesModelClientBuilder,
 )
 from agenten.agent_factory.candidate_evaluation import (
     CandidateEvaluationFactory,
@@ -2185,7 +2185,7 @@ def _native_runtime_is_bound(
         or type(factory.candidate_validator) is not CandidateEvaluationFactory
         or getattr(factory.candidate_validator, "_workflow_artifacts", None)
         is not factory.repository
-        or type(factory.business_benchmark) is not BusinessBenchmarkDispatchService
+        or type(factory.business_benchmark) is not AssemblyOwnedGenericBenchmark
         or type(factory.dispatcher) is not FactoryDispatcher
         or getattr(factory.dispatcher, "_coordinator", None) is not factory.coordinator
         or getattr(factory.dispatcher, "_business_benchmark", None)
@@ -2230,6 +2230,17 @@ def _native_team_execution_ports_are_bound(
     candidate_bindings = getattr(provider, "_candidate_bindings", None)
     maximum = getattr(provider, "_max_cost_per_call", None)
     replay_root = getattr(replay, "_root", None)
+    store = getattr(repository, "_store", None)
+    provider_bundle = (
+        model_client.proxy_url,
+        model_client.policy_sha256,
+        model_client.price_card_sha256,
+        model_client.context_sha256,
+        model_client.executable_sha256,
+        model_client.code_sha256,
+        model_client.paid_command_sha256,
+        model_client.hard_ceiling_enforced,
+    ) if type(model_client) is ProxyBoundResponsesModelClientBuilder else None
     if not isinstance(replay_root, Path):
         return False
     try:
@@ -2244,9 +2255,19 @@ def _native_team_execution_ports_are_bound(
         and bool(getattr(provider, "_model", "").strip())
         and maximum is not None
         and maximum > 0
-        and type(model_client) is OpenAIBusinessBenchmarkModelClientBuilder
+        and type(model_client) is ProxyBoundResponsesModelClientBuilder
         and model_client.provider == "openai"
         and model_client.model == getattr(provider, "_model", None)
+        and provider_bundle in getattr(store, "_runtime_provider_bundle_bindings", ())
+        and all(
+            re.fullmatch(r"[0-9a-f]{64}", value) is not None
+            for value in (
+                model_client.context_sha256, model_client.policy_sha256,
+                model_client.price_card_sha256, model_client.executable_sha256,
+                model_client.code_sha256, model_client.paid_command_sha256,
+            )
+        )
+        and model_client.hard_ceiling_enforced is True
         and type(budget) is GatewayFactoryBudgetLedger
         and getattr(budget, "_store", None) is getattr(repository, "_store", None)
         and type(pricing) is BusinessBenchmarkPricingAuthority

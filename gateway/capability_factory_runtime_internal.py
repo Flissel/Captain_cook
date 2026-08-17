@@ -12,23 +12,13 @@ from agenten.agent_factory.hermes_cli import FilesystemFactorySkillReplayStore, 
 from agenten.agent_factory.orchestration import FactoryDispatcher
 from agenten.agent_factory.production_dispatch_runner import ProductionFactoryDispatchRunner
 from agenten.agent_factory.service import FactoryCoordinator
-from agenten.agent_factory.orchestration import FactoryDispatchError
 from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
 from gateway.agent_factory_live_composition import AgentFactoryLiveComposition, GatewayTechnicalTeamExecutionPortsProvider, ProductionFactoryTeamExecutionPort, _CallableFactoryClock
 from gateway.factory_repository import GatewayFactoryBudgetLedger, GatewayFactoryRepository
 from gateway.minibook_creation_artifacts import GatewayMinibookCreationArtifactStore
 from agenten.agent_factory.minibook_forge import CaptainCreationJobMapper, MinibookForgeHttpClient, MinibookForgeHttpSettings
 from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
-
-
-class AssemblyOwnedGenericBenchmark:
-    """Prevent the generic runtime from entering the incompatible legacy gate."""
-
-    async def dispatch(self, request):
-        del request
-        raise FactoryDispatchError(
-            "generic benchmark dispatch is owned by the capability assembly"
-        )
+from gateway.capability_factory_benchmark_bridge import AssemblyOwnedGenericBenchmark
 
 
 class _DeferredImprovementAuthority:

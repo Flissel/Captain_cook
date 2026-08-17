@@ -1026,7 +1026,7 @@ def test_repository_factory_adapter_matches_committed_descriptor() -> None:
     assert {
         "agenten", "agenten.delivery", "agenten.delivery.minibook_client",
         "agenten.delivery.projection_cursor", "blockchain", "blockchain.storage",
-        "gateway",
+        "gateway", "gateway.capability_factory_benchmark_bridge",
     } <= modules
     assert closure["root_revision_binding"] == "runtime-expected-head"
     assert hashlib.sha256(
@@ -1177,10 +1177,21 @@ def test_shipped_verified_closure_materializes_the_real_factory_graph(
         descriptor=descriptor, configuration=configuration,
     )
 
+    provider_bundle = (
+        "http://127.0.0.1:18091", "1" * 64, "2" * 64, "3" * 64,
+        "4" * 64, "5" * 64, "6" * 64, True,
+    )
+    store = SimpleNamespace(
+        _runtime_provider_bundle_bindings=frozenset({provider_bundle}),
+    )
+    private_catalog = bootstrap.GatewayPrivateHoldoutStore(
+        gateway_store=store  # type: ignore[arg-type]
+    )
+    clock = lambda: datetime.now(timezone.utc)
     runtime = bootstrap.materialize_capability_assembly_factory_runtime(
-        plan, store=SimpleNamespace(),
-        private_benchmark_catalog=SimpleNamespace(),
-        clock=lambda: datetime.now(timezone.utc),
+        plan, store=store,  # type: ignore[arg-type]
+        private_benchmark_catalog=private_catalog,
+        clock=clock,
         provider_token=SecretStr("provider-token"),
         minibook_api_key=SecretStr("minibook-key"),
     )
@@ -1189,6 +1200,30 @@ def test_shipped_verified_closure_materializes_the_real_factory_graph(
     assert type(runtime.factory.business_benchmark).__name__ == (
         "AssemblyOwnedGenericBenchmark"
     )
+    assert bootstrap._native_runtime_is_bound(
+        runtime=runtime, store=store,  # type: ignore[arg-type]
+        private_benchmark_catalog=private_catalog,
+        clock=clock, repository_root=tmp_path,
+    )
+    model_client = runtime.factory.team_execution._ports_for._model_client_for
+    for field, drift in (
+        ("proxy_url", "http://127.0.0.1:18092"),
+        ("policy_sha256", "a" * 64),
+        ("price_card_sha256", "b" * 64),
+        ("context_sha256", "c" * 64),
+        ("executable_sha256", "d" * 64),
+        ("code_sha256", "e" * 64),
+        ("paid_command_sha256", "f" * 64),
+        ("hard_ceiling_enforced", False),
+    ):
+        original = getattr(model_client, field)
+        object.__setattr__(model_client, field, drift)
+        assert not bootstrap._native_runtime_is_bound(
+            runtime=runtime, store=store,  # type: ignore[arg-type]
+            private_benchmark_catalog=private_catalog,
+            clock=clock, repository_root=tmp_path,
+        ), field
+        object.__setattr__(model_client, field, original)
 
 
 def test_factory_constructor_receives_only_allowlisted_config_and_redacts_any_error(
@@ -1400,7 +1435,7 @@ def test_production_plan_rejects_deep_fake_team_ports_before_any_effect(
         bootstrap.CandidateEvaluationFactory,
         _workflow_artifacts=repository,
     )
-    benchmark = bare(bootstrap.BusinessBenchmarkDispatchService)
+    benchmark = bare(bootstrap.AssemblyOwnedGenericBenchmark)
     dispatcher = bare(
         bootstrap.FactoryDispatcher,
         _coordinator=coordinator,
