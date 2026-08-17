@@ -65,15 +65,33 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      # windows-latest does not set core.longpaths. Several offline tests create
-      # git worktrees several directories deep under a pytest tmp_path (e.g.
-      # tests/agent_factory/test_codex_build_execution.py), which crosses the
-      # 260-character Windows MAX_PATH once git creates files beneath that
-      # path. Without this, `git worktree add` fails with exit 128 ("Filename
-      # too long") purely as a runner artifact, not a real code issue.
+      # windows-latest does not set core.longpaths. This does not fix the
+      # tests/agent_factory/test_codex_build_execution.py worktree failures
+      # (measured: the real worktree target path is ~216 chars, well under
+      # Windows' 260-char MAX_PATH, and disabling this setting locally does
+      # not reproduce them either) -- it is kept purely as harmless Windows
+      # CI hygiene for any future deeper paths, not as a fix for anything
+      # currently failing.
       - name: Enable Windows long paths for git
         shell: pwsh
         run: git config --global core.longpaths true
+      - name: DIAGNOSTIC - reproduce git worktree add failure with raw stderr
+        shell: pwsh
+        run: |
+          $repo = Join-Path $env:RUNNER_TEMP "diag-repo"
+          New-Item -ItemType Directory -Force -Path $repo | Out-Null
+          git init -q $repo
+          Set-Content -Path (Join-Path $repo "README.md") -Value "diag"
+          git -C $repo add README.md
+          git -C $repo -c user.name=Diag -c user.email=diag@example.invalid commit -q -m seed
+          $rev = git -C $repo rev-parse HEAD
+          $target = Join-Path $repo ".captain-cook\private\codex-workspaces\00000000-0000-0000-0000-000000000301\attempt-1-0cc32ca8763446cb"
+          Write-Host "target path length: $($target.Length)"
+          Write-Host "target: $target"
+          git -C $repo worktree add --detach $target $rev
+          Write-Host "exit code: $LASTEXITCODE"
+          git -C $repo version
+          [Environment]::OSVersion | Out-String | Write-Host
       - name: Install Captain and Minibook dependencies
         shell: pwsh
         run: >-
