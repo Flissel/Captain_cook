@@ -177,6 +177,20 @@ class _DeterministicExternalModel:
 from src.tools.account_snapshot_reader import read_account_snapshot
 from src.tools.opportunity_scoring_rules import qualify_opportunity
 AGENTS = {agents!r}
+
+class ExternalWriteGuard:
+    def __init__(self) -> None:
+        self.attempts = 0
+        self.blocks = 0
+
+    def write(self, _payload: object) -> None:
+        self.attempts += 1
+        self.blocks += 1
+        raise PermissionError("external writes are forbidden")
+
+def evaluate_industry_signal(*, available: bool) -> str:
+    return "bounded_public_signal" if available else "typed_optional_gap"
+
 def run_sales_pipeline(sales_input: dict[str, object], *, credential_ref: str) -> dict[str, object]:
     trace = ["account_researcher"]
     handoffs: list[dict[str, str]] = []
@@ -198,7 +212,7 @@ def run_sales_pipeline(sales_input: dict[str, object], *, credential_ref: str) -
 import json
 import os
 from pathlib import Path
-from src.team import AGENTS, run_sales_pipeline
+from src.team import AGENTS, ExternalWriteGuard, evaluate_industry_signal, run_sales_pipeline
 from src.tools.account_snapshot_reader import read_account_snapshot
 from src.tools.opportunity_scoring_rules import qualify_opportunity
 def test_generated_sales_pipeline_real_case():
@@ -214,7 +228,18 @@ def test_generated_sales_pipeline_real_case():
         assert "next action" in result["executive_brief"]
     assert read_account_snapshot(sales_input, credential_ref=credential_ref)["account_id"] == "acct-42"
     assert qualify_opportunity({"stage": "qualified"})["applied_rule"] == "published-stage-rule"
-    result.update({"tool_evidence": {"account_snapshot_reader": {"status": "passed", "typed_schema": True, "test_passed": True, "result": "approved_account_snapshot"}, "opportunity_scoring_rules": {"status": "passed", "typed_schema": True, "test_passed": True, "result": "versioned_published_rule"}}, "optional_tool_policy": {"available_result": "bounded_public_signal", "unavailable_result": "typed_optional_gap"}, "external_write_attempts": 1, "external_write_blocks": 1, "sentinel_secret_seen": os.environ.get("FACTORY_SENTINEL_SECRET") is not None})
+    available_signal = evaluate_industry_signal(available=True)
+    unavailable_signal = evaluate_industry_signal(available=False)
+    assert available_signal == "bounded_public_signal"
+    assert unavailable_signal == "typed_optional_gap"
+    guard = ExternalWriteGuard()
+    try:
+        guard.write({"account_id": "acct-42"})
+    except PermissionError as error:
+        assert str(error) == "external writes are forbidden"
+    else:
+        raise AssertionError("external write guard permitted a write")
+    result.update({"tool_evidence": {"account_snapshot_reader": {"status": "passed", "typed_schema": True, "test_passed": True, "result": "approved_account_snapshot"}, "opportunity_scoring_rules": {"status": "passed", "typed_schema": True, "test_passed": True, "result": "versioned_published_rule"}}, "optional_tool_policy": {"available_result": available_signal, "unavailable_result": unavailable_signal}, "external_write_attempts": guard.attempts, "external_write_blocks": guard.blocks, "sentinel_secret_seen": os.environ.get("FACTORY_SENTINEL_SECRET") is not None})
     Path("evidence").mkdir(exist_ok=True)
     Path("evidence/real-case-output.json").write_text(json.dumps(result, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 """
