@@ -507,3 +507,93 @@ Round-8 non-claims:
   remain separate live evidence.
 - Hermes collection/readiness remains unclaimed because this checkout does not
   contain the required initialized submodule runtime and fixture files.
+
+## Final Review Fix Round 9
+
+Commits:
+
+1. `08bfe29` — keeps the real UUIDv5 Factory job identifier as the canonical
+   promotion subject through Store emission, execution, Minibook projection,
+   acknowledgement, and immutable readback.
+2. `140aad2` — makes the authenticated capability tool host the eighth required
+   operator/D12 service, including exact health, start, stop, restart, and paid
+   preflight contracts.
+3. `893f68e` — confines the Hermes/generated subprocess environment to an
+   explicit non-secret allowlist; Factory/Gateway admin, Runtime, provider
+   receipt, Minibook, database, and OpenAI secrets are absent.
+4. `77def75` — adds a Gateway-persisted job/operation-scoped Factory capability
+   receipt and exact full-request replay digest. Foreign Runtime, artifact,
+   WorkBatch, Forge, job, operation, revision, or changed replay fields fail
+   before an external effect.
+5. `8949224` — replaces arbitrary Responses `extra_create_args` with the sole
+   bounded allowlist entry `max_output_tokens` (1..4096). `instructions`,
+   `previous_response_id`, metadata/store/include, and every model, input,
+   reasoning, tool, JSON/schema, context, header, or authority override are
+   rejected before HTTP or cost.
+6. `73a9e61` — removes process-authored benchmark cost from trusted evidence.
+   Completion requires independently persisted provider-role settlements and
+   derives the evidence cost only from their exact readback.
+7. `6052314` — issues a dynamic command-bound D7 ProviderContext and a Factory
+   budget reservation before each benchmark Responses effect. The proxy records
+   each terminal provider call through its distinct provider-receipt role
+   before returning; Gateway binds and aggregates at most 30 calls to the exact
+   job, correlation, case, trace, run, command, result, session, model, and all
+   eight D7 authority fields, then atomically closes the same USD reservation.
+8. `ff0576c` — preserves legacy projection coverage with a valid UUIDv5 fixture
+   and makes benchmark-context lookup ignore non-benchmark rows in narrow Store
+   doubles without weakening production validation.
+
+Round-9 RED to GREEN evidence:
+
+- The shipped process result originally carried locally calculated `cost_usd`.
+  RED proved that a process could complete without an independent provider
+  receipt. GREEN rejects that field, rejects missing settlement, and derives
+  cost from Gateway readback only.
+- Each of URL, policy, price, dynamic context, proxy executable, proxy code,
+  paid-command digest, and `hard_ceiling_enforced=true` was drifted separately;
+  every drift failed before Runtime completion. Missing/duplicate/over-30 call,
+  cross-command/result/session, and reservation-overrun paths fail closed.
+- The real ProviderBudgetProxy service test uses only the injected offline
+  provider effect boundary. It proves exact preflight, reservation, terminal
+  usage readback, and provider-receipt Gateway write occur before the Responses
+  call is returned. No locally invented success receipt is accepted.
+- Factory RPC tests prove the child bearer alone cannot self-assert identifiers:
+  the Gateway-only capability receipt and full canonical request digest must
+  match. Hermes environment tests prove all listed cross-authority secrets are
+  absent.
+- Responses authority-change tests are GREEN: unsafe extras, including
+  `instructions` and `previous_response_id`, are rejected; focused gate was
+  38 passed.
+- Focused Benchmark/Proxy/Assembly gate after the final commits: 166 passed,
+  four known Minibook escape-sequence warnings. Provider/benchmark focused
+  iteration gate: 26 passed.
+
+Round-9 verification:
+
+- The first corrected-scope broad offline run found three regressions after
+  3,715 passes: one narrow fake Cursor did not distinguish the new benchmark
+  authority table, and two legacy projection fixtures used a nil UUID. RED was
+  preserved; the fixes were test-narrow except for the Store row-shape guard.
+- Final offline product gate, explicitly excluding `tests/live` and only the
+  absent Hermes contract files
+  `tests/contracts/test_hermes_runtime_readiness.py` and
+  `tests/contracts/test_work_package_compatibility.py`: 3,718 passed, 137
+  skipped, five documented warnings, zero failures.
+- Minibook offline suite: 132 passed, one live test deselected.
+- Architecture/import/workstream: 18 passed. `compileall`, submission verifier,
+  and full `3851f3d..HEAD` diff check passed.
+- Added-line high-confidence credential assignment scan found zero matches.
+  Two bearer-pattern matches were explicit synthetic test fixtures; neither is
+  a real credential.
+- `TEST_MARIADB_DSN` was absent, so the MariaDB authority gate was not run. No
+  database was contacted.
+
+Round-9 non-claims:
+
+- No live network service, paid provider, Docker/PowerShell managed service,
+  n8n deployment/volume, or database was contacted or mutated.
+- Provider behavior is verified against the actual local proxy service with an
+  injected deterministic provider effect boundary; this is not a claim of a
+  paid OpenAI call or live usage receipt.
+- Hermes collection/readiness remains unclaimed because the initialized
+  submodule runtime and fixture files are absent from this checkout.
