@@ -1039,6 +1039,7 @@ class ProductionCapabilityAssemblyComposition:
         "__controller", "__attestation_digest", "__executor_client",
         "__executor_configuration_digest", "__seal", "__sealed", "__weakref__",
         "__private_catalog", "__private_catalog_configuration_digest",
+        "__private_cases", "__benchmark_tool_authority",
     )
 
     def __init__(self, *, controller: CapabilityAssemblyController,
@@ -1046,7 +1047,9 @@ class ProductionCapabilityAssemblyComposition:
                  executor_client: GatewayIsolatedBenchmarkExecutorClient,
                  executor_configuration_digest: str, _seal: object,
                  private_catalog: VerifiedFilePrivateBenchmarkCatalog | None = None,
-                 private_catalog_configuration_digest: str | None = None) -> None:
+                 private_catalog_configuration_digest: str | None = None,
+                 private_cases: GenericPrivateBenchmarkRepository | None = None,
+                 benchmark_tool_authority: BenchmarkToolEvidenceAuthorityPort | None = None) -> None:
         if (_seal is not _PRODUCTION_COMPOSITION_SEAL
                 or type(controller) is not CapabilityAssemblyController
                 or type(executor_client) is not GatewayIsolatedBenchmarkExecutorClient
@@ -1058,6 +1061,8 @@ class ProductionCapabilityAssemblyComposition:
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__executor_configuration_digest", executor_configuration_digest)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__private_catalog", private_catalog)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__private_catalog_configuration_digest", private_catalog_configuration_digest)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__private_cases", private_cases)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__benchmark_tool_authority", benchmark_tool_authority)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__seal", _seal)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__sealed", True)
 
@@ -1085,6 +1090,12 @@ class ProductionCapabilityAssemblyComposition:
         if self.__private_catalog is None:
             raise AttributeError("production private benchmark authority is absent")
         return self.__private_catalog.suite_identity_sha256
+
+    @property
+    def benchmark_execution_authorities(self) -> tuple[object, object]:
+        if self.__private_cases is None or self.__benchmark_tool_authority is None:
+            raise AttributeError("production benchmark execution authority is absent")
+        return self.__private_cases, self.__benchmark_tool_authority
 
     def is_sealed(self) -> bool:
         try:
@@ -1139,6 +1150,7 @@ def _compose_nonproduction_capability_assembly_controller(
     holdout_store: GenericPrivateHoldoutReader,
     clock: Callable[[], datetime],
     gateway_store: GatewayStore | None = None,
+    private_cases_sink: list[GenericPrivateBenchmarkRepository] | None = None,
 ) -> CapabilityAssemblyController:
     """Test-only low-level composition; it never carries production attestation."""
 
@@ -1199,6 +1211,8 @@ def _compose_nonproduction_capability_assembly_controller(
     projection_delegate: CapabilityAssemblyProjectionPort = (
         GenericGatewayMinibookCapabilityProjectionAdapter(effects=minibook_effects)
     )
+    if private_cases_sink is not None:
+        private_cases_sink.append(private_cases)
     if gateway_store is not None:
         receipt_recorder = cast(_EffectReceiptRecorderPort, reconciliation)
         factory: CapabilityAssemblyFactoryPort = EffectReceiptBoundFactoryAdapter(
@@ -1302,6 +1316,7 @@ def build_capability_assembly_controller(
         require_isolated_executor=True,
     )
     repository = GatewayCapabilityAssemblyRepository(authorities.store)
+    private_cases_sink: list[GenericPrivateBenchmarkRepository] = []
     controller = _compose_nonproduction_capability_assembly_controller(
         repository=repository,
         admission=admission,
@@ -1319,6 +1334,7 @@ def build_capability_assembly_controller(
         holdout_store=cast(GenericPrivateHoldoutReader, holdout_store),
         clock=selected_clock,
         gateway_store=authorities.store,
+        private_cases_sink=private_cases_sink,
     )
     executor_configuration_digest = (
         authorities.benchmark_executor.sealed_configuration_digest()
@@ -1344,6 +1360,8 @@ def build_capability_assembly_controller(
         executor_configuration_digest=executor_configuration_digest,
         private_catalog=private_catalog,
         private_catalog_configuration_digest=private_catalog_configuration_digest,
+        private_cases=private_cases_sink[0],
+        benchmark_tool_authority=authorities.benchmark_tool_authority,
         _seal=_PRODUCTION_COMPOSITION_SEAL,
     )
     _ISSUED_PRODUCTION_COMPOSITIONS.add(composition)

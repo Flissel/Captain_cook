@@ -111,6 +111,7 @@ def test_bootstrap_rejects_each_d7_authority_drift_before_effects(
         "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256": "e" * 64,
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-plan-token",
+        "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-plan-token",
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
         "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": "artifacts",
         "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": "authority",
@@ -153,6 +154,7 @@ def test_bootstrap_settings_reject_non_loopback_http_and_redact_secrets(
     environment = {
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://benchmark.example/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-secret-value",
+        "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-secret-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
         "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": ".captain-cook/artifacts/sha256",
         "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": ".captain-cook/capability-authority",
@@ -303,6 +305,7 @@ def test_gateway_tool_registry_persists_case_bound_entry() -> None:
     job_id, correlation_id, execution_result_id, command_id = (
         uuid4(), uuid4(), uuid4(), uuid4(),
     )
+    trace_id, run_id = uuid4(), uuid4()
 
     class Cursor:
         result: dict[str, str] | None = None
@@ -320,8 +323,13 @@ def test_gateway_tool_registry_persists_case_bound_entry() -> None:
             if normalized.startswith("SELECT payload FROM capability_tool_evidence_registry"):
                 payload = rows.get(str(values[0]))
                 self.result = None if payload is None else {"payload": payload}
-            elif normalized.startswith("SELECT job_id, payload FROM capability_n8n_work_batches"):
-                self.result = {"job_id": str(job_id), "payload": "{}"}
+            elif normalized.startswith("SELECT job_id, correlation_id, case_digest"):
+                self.result = {
+                    "job_id": str(job_id), "correlation_id": str(correlation_id),
+                    "case_digest": "d" * 64, "trace_id": str(trace_id),
+                    "run_id": str(run_id), "command_id": str(command_id),
+                    "declared_tool_keys": '["crm.lookup"]',
+                }
             elif normalized.startswith("INSERT INTO capability_tool_evidence_registry"):
                 rows[str(values[0])] = str(values[1])
                 self.result = None
@@ -379,8 +387,8 @@ def test_gateway_tool_registry_persists_case_bound_entry() -> None:
         case_digest="d" * 64,
         tool_key="crm.lookup",
         operation="codex.run",
-        trace_id=uuid4(),
-        run_id=uuid4(),
+        trace_id=trace_id,
+        run_id=run_id,
         model_policy_digest="e" * 64,
         call_ref=refs[0],
         lease_ref=refs[1],
@@ -1367,6 +1375,7 @@ def test_production_plan_is_pure_and_reuses_the_provisioner_source_authority(
         "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256": "e" * 64,
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-plan-token",
+        "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-plan-token",
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
         "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": "artifacts",
         "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": "authority",
@@ -1531,6 +1540,7 @@ def test_production_plan_rejects_deep_fake_team_ports_before_any_effect(
         "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256": "e" * 64,
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-plan-token",
+        "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-plan-token",
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
         "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": "artifacts",
         "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": "authority",
@@ -1602,6 +1612,7 @@ def test_bootstrap_rejects_raw_factory_runtime_before_schema_or_network() -> Non
         "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256": "e" * 64,
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-secret-value",
+        "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-secret-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
         "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": ".captain-cook/artifacts/sha256",
         "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": ".captain-cook/capability-authority",
@@ -1813,6 +1824,7 @@ def test_bootstrap_rejects_reused_credentials_before_runtime_or_schema(
     environment = {
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "same-secret-value",
+        "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-secret-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
         "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": ".captain-cook/artifacts/sha256",
         "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": ".captain-cook/capability-authority",

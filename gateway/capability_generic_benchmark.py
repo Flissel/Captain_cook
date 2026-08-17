@@ -78,6 +78,8 @@ class GenericExecutionCaseView:
     setup: str
     action: str
     opaque_source_refs: tuple[str, ...]
+    declared_tool_keys: tuple[str, ...]
+    tool_authority_sha256: str
 
 
 @dataclass(frozen=True)
@@ -400,6 +402,9 @@ class GenericPrivateBenchmarkRepository:
         if definition is None or self._reference(definition) != case_ref:
             raise CapabilityLiveAuthorityUnavailable("private case reference is stale")
         if purpose == "execution":
+            tool_authority_sha256 = hashlib.sha256(
+                _canonical(list(definition.declared_tool_keys)).encode()
+            ).hexdigest()
             return GenericExecutionCaseView(
                 case_ref=case_ref,
                 setup=definition.setup,
@@ -408,6 +413,8 @@ class GenericPrivateBenchmarkRepository:
                     hashlib.sha256(item.encode()).hexdigest()
                     for item in definition.assertion_ids
                 ),
+                declared_tool_keys=definition.declared_tool_keys,
+                tool_authority_sha256=tool_authority_sha256,
             )
         return GenericEvaluationCaseView(
             case_ref=case_ref,
@@ -415,6 +422,32 @@ class GenericPrivateBenchmarkRepository:
             declared_tool_keys=definition.declared_tool_keys,
             predicate_source_bindings=definition.predicate_source_bindings,
         )
+
+    def resolve_execution_transport(
+        self, case_ref: GenericPrivateCaseRef, *, authority_id: UUID,
+    ) -> tuple[GenericPrivateCaseRef, GenericExecutionCaseView]:
+        """Restore private assertion identity from the opaque transport key only."""
+
+        self._require_purpose_authority("execution", authority_id)
+        definition = self._definitions.get(case_ref.case_id)
+        if definition is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "private execution case is unavailable"
+            )
+        canonical = self._reference(definition)
+        if (
+            canonical.case_id != case_ref.case_id
+            or canonical.category is not case_ref.category
+            or canonical.case_digest != case_ref.case_digest
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "private execution case identity changed"
+            )
+        view = self.resolve(
+            canonical, purpose="execution", authority_id=authority_id,
+        )
+        assert isinstance(view, GenericExecutionCaseView)
+        return canonical, view
 
     def retire(self, suite: GenericBenchmarkSuite) -> None:
         retired_ids = {case_ref.case_id for case_ref in suite.cases}
@@ -1241,6 +1274,8 @@ def generic_execution_request_digest(
             "setup": execution_case.setup,
             "action": execution_case.action,
             "opaque_source_refs": execution_case.opaque_source_refs,
+            "declared_tool_keys": execution_case.declared_tool_keys,
+            "tool_authority_sha256": execution_case.tool_authority_sha256,
         },
         "request_nonce": str(request_nonce),
     }

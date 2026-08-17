@@ -6708,9 +6708,9 @@ class GatewayStore:
                     ) ENGINE=InnoDB
                     """
                 )
-                batch = self._batch_row(cursor, batch_id, for_update=True)
                 cursor.execute(
-                    "SELECT job_id, payload FROM capability_n8n_work_batches "
+                    "SELECT job_id, correlation_id, case_digest, trace_id, run_id, "
+                    "command_id, declared_tool_keys FROM capability_benchmark_work_batches "
                     "WHERE batch_id = %s FOR UPDATE",
                     (batch_id,),
                 )
@@ -6720,9 +6720,16 @@ class GatewayStore:
                     value=str(job_id), for_update=True,
                 )
                 if (
-                    batch is None or batch_binding is None or job is None
+                    batch_binding is None or job is None
                     or str(batch_binding["job_id"]) != str(job_id)
-                    or f"factory-job-id:{job_id}" not in batch["data"].get("constraints", [])
+                    or str(batch_binding["correlation_id"])
+                    != str(job["data"].get("correlation_id", ""))
+                    or str(batch_binding["case_digest"]) != case_digest
+                    or str(batch_binding["trace_id"]) != str(trace_id)
+                    or str(batch_binding["run_id"]) != str(run_id)
+                    or tool_key not in self._decode_json(
+                        batch_binding["declared_tool_keys"]
+                    )
                 ):
                     raise HTTPException(status_code=409, detail="tool WorkBatch is unavailable")
                 correlation_id = str(job["data"].get("correlation_id", ""))
@@ -6751,6 +6758,8 @@ class GatewayStore:
                     or result_data.get("operation") != operation
                     or command is None
                     or command_data.get("correlation_id") != correlation_id
+                    or str(command_data.get("event_id"))
+                    != str(batch_binding["command_id"])
                     or command_payload.get("batch_id") != batch_id
                     or command_payload.get("operation") != operation
                     or not any(ref.get("sha256") == result_ref_sha256 for ref in result_refs)
@@ -6771,6 +6780,85 @@ class GatewayStore:
                     "INSERT INTO capability_tool_evidence_registry "
                     "(receipt_sha256, payload) VALUES (%s, %s)",
                     (receipt_ref.sha256, json.dumps(payload, sort_keys=True)),
+                )
+
+    def record_capability_benchmark_work_batch(
+        self, *, job_id: UUID, correlation_id: UUID, batch_id: str,
+        case_digest: str, trace_id: UUID, run_id: UUID, command_id: UUID,
+        declared_tool_keys: tuple[str, ...], tool_authority_sha256: str,
+    ) -> None:
+        """Persist the exact execution-only benchmark authority before Runtime."""
+
+        if (
+            not batch_id or len(case_digest) != 64
+            or not declared_tool_keys
+            or len(set(declared_tool_keys)) != len(declared_tool_keys)
+            or hashlib.sha256(json.dumps(
+                list(declared_tool_keys), sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest() != tool_authority_sha256
+        ):
+            raise HTTPException(status_code=409, detail="benchmark WorkBatch is invalid")
+        payload = {
+            "job_id": str(job_id), "correlation_id": str(correlation_id),
+            "batch_id": batch_id, "case_digest": case_digest,
+            "trace_id": str(trace_id), "run_id": str(run_id),
+            "command_id": str(command_id),
+            "declared_tool_keys": list(declared_tool_keys),
+            "tool_authority_sha256": tool_authority_sha256,
+        }
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_benchmark_work_batches (
+                        batch_id VARCHAR(96) NOT NULL PRIMARY KEY,
+                        job_id CHAR(36) NOT NULL,
+                        correlation_id CHAR(36) NOT NULL,
+                        case_digest CHAR(64) NOT NULL,
+                        trace_id CHAR(36) NOT NULL,
+                        run_id CHAR(36) NOT NULL,
+                        command_id CHAR(36) NOT NULL,
+                        declared_tool_keys JSON NOT NULL,
+                        tool_authority_sha256 CHAR(64) NOT NULL,
+                        payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                        UNIQUE KEY capability_benchmark_command (command_id)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                job = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id",
+                    value=str(job_id), for_update=True,
+                )
+                if (
+                    job is None
+                    or str(job["data"].get("correlation_id")) != str(correlation_id)
+                ):
+                    raise HTTPException(
+                        status_code=409, detail="benchmark Factory job is unavailable"
+                    )
+                cursor.execute(
+                    "SELECT payload FROM capability_benchmark_work_batches "
+                    "WHERE batch_id = %s FOR UPDATE", (batch_id,),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) == payload:
+                        return
+                    raise HTTPException(
+                        status_code=409, detail="benchmark WorkBatch conflicts"
+                    )
+                cursor.execute(
+                    "INSERT INTO capability_benchmark_work_batches "
+                    "(batch_id, job_id, correlation_id, case_digest, trace_id, run_id, "
+                    "command_id, declared_tool_keys, tool_authority_sha256, payload) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        batch_id, str(job_id), str(correlation_id), case_digest,
+                        str(trace_id), str(run_id), str(command_id),
+                        json.dumps(list(declared_tool_keys)), tool_authority_sha256,
+                        json.dumps(payload, sort_keys=True),
+                    ),
                 )
 
     def capability_tool_evidence(self, receipt_sha256: str) -> dict[str, Any] | None:

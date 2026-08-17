@@ -107,11 +107,17 @@ def create_capability_benchmark_process_app_from_environment(
     relative = source.get("CAPTAIN_CAPABILITY_BENCHMARK_EXECUTOR", "").strip()
     digest = source.get("CAPTAIN_CAPABILITY_BENCHMARK_EXECUTOR_SHA256", "").strip()
     token = source.get("CAPTAIN_CAPABILITY_BENCHMARK_TOKEN", "").strip()
+    gateway_url = source.get("CAPTAIN_GATEWAY_URL", "").strip()
+    gateway_token = source.get(
+        "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN", ""
+    ).strip()
     authority = source.get("CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID", "").strip()
     if (
         not relative
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
         or len(token) < 16
+        or not gateway_url
+        or len(gateway_token) < 16
         or not authority
     ):
         raise ValueError("benchmark process configuration is incomplete")
@@ -122,7 +128,11 @@ def create_capability_benchmark_process_app_from_environment(
         constructor = getattr(module, "build_capability_benchmark_executor", None)
         if not callable(constructor):
             raise ValueError("constructor")
-        executor = constructor()
+        executor = constructor({
+            "gateway_url": gateway_url,
+            "gateway_token": gateway_token,
+            "executor_authority_id": authority,
+        })
         authority_id = UUID(authority)
     except (RuntimeAdapterManifestError, TypeError, ValueError):
         raise ValueError("benchmark process configuration is invalid") from None
@@ -161,7 +171,10 @@ def _parse_request(payload: dict[str, object]) -> GenericBenchmarkExecutionReque
         not isinstance(case_payload, dict)
         or set(case_payload) != {"case_id", "category", "case_digest"}
         or not isinstance(execution_payload, dict)
-        or set(execution_payload) != {"setup", "action", "opaque_source_refs"}
+        or set(execution_payload) != {
+            "setup", "action", "opaque_source_refs", "declared_tool_keys",
+            "tool_authority_sha256",
+        }
     ):
         raise ValueError("case")
     case_ref = GenericPrivateCaseRef(
@@ -175,6 +188,8 @@ def _parse_request(payload: dict[str, object]) -> GenericBenchmarkExecutionReque
         setup=str(execution_payload["setup"]),
         action=str(execution_payload["action"]),
         opaque_source_refs=tuple(str(item) for item in execution_payload["opaque_source_refs"]),
+        declared_tool_keys=tuple(str(item) for item in execution_payload["declared_tool_keys"]),
+        tool_authority_sha256=str(execution_payload["tool_authority_sha256"]),
     )
     values = {
         "job_id": UUID(str(payload["job_id"])),

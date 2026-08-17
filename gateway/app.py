@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -153,6 +154,12 @@ from gateway.capability_assembly_api import (
     unavailable_capability_assembly_composition,
 )
 from gateway.capability_assembly_production import RepositoryFactoryInputArtifactStore
+from gateway.capability_benchmark_execution_service import (
+    GatewayBenchmarkExecutionService,
+    GatewayRuntimeBenchmarkEffect,
+)
+from gateway.capability_benchmark_process_app import _parse_request as _parse_benchmark_request
+from gateway.capability_benchmark_process_app import _serialize_evidence as _serialize_benchmark_evidence
 from agenten.agent_factory.holdout_store import PrivateHoldoutStore
 from gateway.capability_assembly_bootstrap import (
     CapabilityAssemblyFactoryRuntime,
@@ -381,6 +388,8 @@ def create_app(
     runtime_usage_pricing_snapshots: tuple[
         RuntimeUsagePricingSnapshotV1, ...
     ] = (),
+    capability_benchmark_execution_service: GatewayBenchmarkExecutionService | None = None,
+    capability_benchmark_gateway_token: str | None = None,
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
@@ -455,6 +464,7 @@ def create_app(
     portal_clock = portal_clock or (lambda: datetime.now(timezone.utc))
     selected_capability_assembly_factory = capability_assembly_composition_factory
     production_composition = None
+    benchmark_execution_service = capability_benchmark_execution_service
     production_requested = selected_capability_assembly_factory is None and all(
         value is not None
         for value in (
@@ -479,7 +489,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        nonlocal production_composition
+        nonlocal production_composition, benchmark_execution_service, runtime_http_client
         load_gateway_settings(app)
         if production_requested:
             assert store is not None
@@ -495,6 +505,35 @@ def create_app(
                 private_benchmark_catalog=capability_assembly_private_catalog,
                 clock=portal_clock,
             )
+            if benchmark_execution_service is None and runtime_usage_artifacts is not None:
+                private_cases, tool_issuer = (
+                    production_composition.benchmark_execution_authorities
+                )
+                configured = load_gateway_settings(app)
+                if (
+                    configured.captain_runtime_url is None
+                    or configured.captain_runtime_token is None
+                ):
+                    raise ValueError("benchmark Runtime authority is unavailable")
+                runtime_http_client = httpx.AsyncClient(
+                    verify=configured.tls_ca_bundle_path or True, timeout=300.0,
+                )
+                runtime_executor = AgentRuntimeHttpExecutor(
+                    base_url=configured.captain_runtime_url,
+                    token=configured.captain_runtime_token.get_secret_value(),
+                    client=runtime_http_client,
+                )
+                benchmark_execution_service = GatewayBenchmarkExecutionService(
+                    store=store, artifacts=runtime_usage_artifacts,
+                    private_cases=private_cases,
+                    executor_authority_id=UUID(environment_value(
+                        "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID"
+                    )),
+                    runtime_effect=GatewayRuntimeBenchmarkEffect(
+                        executor=runtime_executor, artifacts=runtime_usage_artifacts,
+                    ),
+                    tool_issuer=tool_issuer, clock=portal_clock,
+                )
         start = getattr(mirror, "start", None)
         if start:
             await start()
@@ -1625,6 +1664,38 @@ def create_app(
         block, created = get_store().import_legacy_record(request)
         return {"created": created, "block": block}
 
+    @app.post("/v1/capability-benchmark/executions")
+    async def execute_capability_benchmark(
+        payload: dict[str, object],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        expected = (
+            capability_benchmark_gateway_token
+            or environment_value("CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN")
+        )
+        if (
+            len(expected) < 16
+            or authorization is None
+            or not secrets.compare_digest(authorization, "Bearer " + expected)
+        ):
+            raise HTTPException(
+                status_code=401, detail="benchmark Gateway authentication failed"
+            )
+        if benchmark_execution_service is None:
+            raise HTTPException(
+                status_code=503, detail="benchmark execution is unavailable"
+            )
+        try:
+            request = _parse_benchmark_request(payload)
+            evidence = await benchmark_execution_service.execute(request)
+            return _serialize_benchmark_evidence(evidence)
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=409, detail="benchmark execution is unavailable"
+            ) from None
+
     return app
 
 
@@ -1642,6 +1713,7 @@ def create_production_app_from_environment(
         environment=environment,
         repository_root=repository_root,
     )
+
     source = plan.environment
     root = plan.repository_root
     configured = plan.settings

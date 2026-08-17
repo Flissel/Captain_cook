@@ -136,6 +136,7 @@ class CapabilityAssemblyBootstrapSettings:
     assembly: CapabilityAssemblyProductionSettings
     benchmark_url: str
     benchmark_token: SecretStr
+    benchmark_gateway_token: SecretStr
     benchmark_authority_id: UUID
     artifact_root: Path
     authority_root: Path
@@ -161,6 +162,7 @@ class CapabilityAssemblyBootstrapSettings:
 _REQUIRED_BOOTSTRAP_NAMES = (
     "CAPTAIN_CAPABILITY_BENCHMARK_URL",
     "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+    "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN",
     "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID",
     "CAPTAIN_CAPABILITY_ARTIFACT_ROOT",
     "CAPTAIN_CAPABILITY_AUTHORITY_ROOT",
@@ -198,6 +200,7 @@ def load_capability_assembly_bootstrap_settings(
         )
     credential_names = (
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+        "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN",
         "CAPTAIN_GATEWAY_TOKEN",
         "MINIBOOK_API_KEY",
         "MINIBOOK_PROJECTION_API_KEY",
@@ -277,6 +280,9 @@ def load_capability_assembly_bootstrap_settings(
         assembly=assembly,
         benchmark_url=benchmark_url,
         benchmark_token=SecretStr(raw["CAPTAIN_CAPABILITY_BENCHMARK_TOKEN"]),
+        benchmark_gateway_token=SecretStr(
+            raw["CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN"]
+        ),
         benchmark_authority_id=benchmark_authority_id,
         artifact_root=artifact_root,
         authority_root=authority_root,

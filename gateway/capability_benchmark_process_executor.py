@@ -213,6 +213,10 @@ class GatewayIsolatedBenchmarkExecutorClient:
                 "setup": request.execution_case.setup,
                 "action": request.execution_case.action,
                 "opaque_source_refs": request.execution_case.opaque_source_refs,
+                "declared_tool_keys": request.execution_case.declared_tool_keys,
+                "tool_authority_sha256": (
+                    request.execution_case.tool_authority_sha256
+                ),
             },
             "request_nonce": str(request.request_nonce),
             "request_digest": request.request_digest,

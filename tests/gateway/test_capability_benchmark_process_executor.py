@@ -54,6 +54,10 @@ def _request(label: str = "request") -> GenericBenchmarkExecutionRequest:
         setup="Redacted customer setup",
         action="Perform the bounded action",
         opaque_source_refs=("b" * 64,),
+        declared_tool_keys=("captain_tool",),
+        tool_authority_sha256=hashlib.sha256(
+            b'["captain_tool"]'
+        ).hexdigest(),
     )
     nonce = _id(label)
     values = dict(
@@ -140,7 +144,11 @@ def test_isolated_executor_sends_only_canonical_execution_dto() -> None:
 
     payload = json.loads(transport.requests[0])
     serialized = transport.requests[0].decode()
-    assert set(payload["execution_case"]) == {"setup", "action", "opaque_source_refs"}
+    assert set(payload["execution_case"]) == {
+        "setup", "action", "opaque_source_refs", "declared_tool_keys",
+        "tool_authority_sha256",
+    }
+    assert payload["execution_case"]["declared_tool_keys"] == ["captain_tool"]
     assert all(item not in serialized for item in (
         "expected_predicates", "private_holdout", "repository", "evaluator",
         "captain-private-assertion", "CAPTAIN-PRIVATE-EXPECTED-SENTINEL",

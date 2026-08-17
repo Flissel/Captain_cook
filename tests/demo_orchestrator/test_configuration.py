@@ -185,6 +185,7 @@ def test_real_d11_manifest_builder_is_compatible_with_d12_loader(tmp_path: Path)
         "CAPTAIN_GATEWAY_TOKEN": "gateway-token",
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:18081/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-token",
+        "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-token",
         "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:18082",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-token",
         "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18083",

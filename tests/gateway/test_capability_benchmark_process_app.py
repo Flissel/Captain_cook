@@ -3,9 +3,14 @@ from __future__ import annotations
 import hashlib
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
 
 from gateway.capability_benchmark_process_app import create_capability_benchmark_process_app
+from gateway.capability_benchmark_executor_adapter import (
+    GatewayOwnedBenchmarkExecutor,
+    build_capability_benchmark_executor,
+)
 from tests.gateway.test_capability_benchmark_process_executor import _request, _response
 
 
@@ -45,6 +50,8 @@ def _payload() -> dict[str, object]:
             "setup": request.execution_case.setup,
             "action": request.execution_case.action,
             "opaque_source_refs": request.execution_case.opaque_source_refs,
+            "declared_tool_keys": request.execution_case.declared_tool_keys,
+            "tool_authority_sha256": request.execution_case.tool_authority_sha256,
         },
         "request_nonce": str(request.request_nonce),
         "request_digest": request.request_digest,
@@ -130,3 +137,20 @@ def test_benchmark_process_module_main_runs_the_isolated_app(
         application,
         {"host": "127.0.0.1", "port": 18092, "workers": 1},
     )
+
+
+def test_shipped_benchmark_constructor_accepts_only_gateway_authority() -> None:
+    executor = build_capability_benchmark_executor({
+        "gateway_url": "http://127.0.0.1:8080",
+        "gateway_token": "benchmark-gateway-token",
+        "executor_authority_id": "166b2b95-b6d5-5737-a2f2-f377b46004b8",
+    })
+
+    assert type(executor) is GatewayOwnedBenchmarkExecutor
+    with pytest.raises(ValueError, match="incomplete"):
+        build_capability_benchmark_executor({
+            "gateway_url": "http://127.0.0.1:8080",
+            "gateway_token": "benchmark-gateway-token",
+            "executor_authority_id": "166b2b95-b6d5-5737-a2f2-f377b46004b8",
+            "OPENAI_API_KEY": "must-not-cross-process-boundary",
+        })

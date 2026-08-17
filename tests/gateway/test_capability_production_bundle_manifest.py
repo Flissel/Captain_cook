@@ -28,6 +28,7 @@ def _environment() -> dict[str, str]:
         "WORKER_GATEWAY_TOKEN": "worker-token-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-token-value",
+        "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-token-value",
         "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-token-value",
         "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
