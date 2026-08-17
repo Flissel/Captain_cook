@@ -240,3 +240,99 @@ Files in the implementation commit:
 - After the implementation commit, `git status --short --branch` showed only
   `## codex/private-demo-benchmarks-d10`. The same clean-status check is required
   after the separate report commit.
+
+## Review Fix Round 2 — open-ended privacy markers and exact predicate sources
+
+### Base and implementation commit
+
+- Review-fix starting commit: `cf26fd57b541a7aef226e0b01b34fe721ac0227f`.
+- Review-fix implementation commit: `4dc4a970ae0e906826e5e3e3431406d6a3511890`
+  (`fix(factory): bind private predicates to exact sources`).
+- Branch: `codex/private-demo-benchmarks-d10`.
+- The report append is the only file in the separate documentation commit; its
+  hash is recorded in the final handoff because a commit cannot self-reference
+  its own hash.
+
+### RED evidence
+
+1. The open-ended privacy-marker matrix produced `1 failed, 4 passed`. A
+   normalized heading containing `Private` still reached parser behavior. The
+   matrix included `Confidential verdicts`, every heading level, all required
+   markers, plural/hyphen/full-width variants, and a parser-effect counter.
+2. The compiler cross-swap group produced `5 failed`. Business, rationale,
+   safety, tool, and handoff predicates accepted another dimension's source and
+   reached the holdout effect.
+3. The Gateway cross-swap group produced `5 failed`. The same five source
+   substitutions were registered because evaluation authority was checked
+   against the case-wide aggregate rather than the exact predicate source.
+
+The final tests strengthen the original RED reproductions into bidirectional
+swaps. They keep the case-wide aggregate source union unchanged and cover both
+unchanged private bindings and bindings rewritten to the swapped source, so a
+set-level aggregate check cannot satisfy the contract.
+
+### Implemented scope
+
+- `agenten/agent_factory/input_document.py`: any normalized heading at levels
+  1–6 containing a private, hidden, secret, confidential, internal, or
+  nonpublic marker now fails closed before parser effects. Singular/plural,
+  punctuation-separated, Unicode-normalized, and `non public` forms are
+  covered. Only the two exact existing level-2 public policy headings retain
+  their explicit exception; unrelated public headings remain valid.
+- `agenten/agent_factory/input_compiler.py`: each private predicate now receives
+  an exact private `predicate_source_bindings` entry containing its predicate
+  key plus source case key, assertion ID, and canonical assertion SHA-256.
+  Expected-value type and value, observed key, predicate kind, source path/kind,
+  and aggregate coverage are validated before the atomic `put_many` effect.
+- `gateway/capability_generic_benchmark.py`: private source bindings are parsed,
+  digest-verified against admitted assertions, retained only in the private
+  evaluation view, and revalidated by the evaluator. Registration occurs only
+  after every case passes binding validation.
+- `tests/agent_factory/test_input_document.py`: adversarial marker matrix,
+  `Confidential verdicts`, zero-parser-effect assertion, and ordinary public
+  heading controls.
+- `tests/agent_factory/test_private_benchmark_catalog.py`: compiler swaps across
+  business, rationale, safety, tool, and handoff sources with zero holdout
+  effects.
+- `tests/gateway/test_capability_assembly_production.py`: exact-binding swaps for
+  all five dimensions, including rewritten private binding records, with zero
+  repository registrations.
+
+The implementation commit changed exactly those six product/test files.
+
+### GREEN and verification evidence
+
+- Final finding-targeted group: `15 passed, 154 deselected in 4.15s`.
+- Complete focused input/catalog/Gateway gate: `169 passed in 13.41s`.
+- Relevant Agent Factory/Gateway/runtime gate: `1611 passed in 61.26s`.
+- Deterministic Hermes/Gateway integration: `7 passed, 1 skipped in 1.92s`.
+  The skip is the separately authorized MariaDB-backed case.
+- Architecture/import/workstream gate: `18 passed in 2.33s`.
+- `python -m compileall -q agenten blockchain chats config gateway`: exit 0.
+- `scripts/verify_submission.py`: `Submission evidence check passed.`, exit 0.
+- `git diff --check`: exit 0 before the implementation commit.
+- Added-line credential-assignment plus bearer/private-key/credential-URL scan:
+  zero hits.
+- One ignored `.coverage` artifact present after development test runs was
+  removed by its exact verified worktree path. No `.coverage` or `.coverage.*`
+  test artifact remained before the report commit.
+
+### Privacy, compatibility, and nonclaims
+
+- All 45 explicit scenarios, exact declared tool authority, atomic compiler
+  writes, canonical holdout digests, and D11-facing digest seams remain covered
+  by the focused and relevant broad gates.
+- Predicate source material exists only in private holdout and evaluation
+  authority. No expected predicate, answer, assertion body, or source binding
+  was added to execution case views, worker bytes, public projections, logs, or
+  public evidence.
+- No live service, database, provider, Docker, n8n, Minibook, browser, or
+  network operation was run. The MariaDB skip is not live evidence.
+- The six-minute full non-live suite was not rerun for this bounded review fix;
+  the focused, relevant broad, deterministic integration, architecture,
+  compilation, and submission gates above are the evidence claimed.
+- No deployment, push, merge, rebase, credential change, or unrelated change
+  was performed.
+- After the implementation commit, `git status --short --branch` showed only
+  `## codex/private-demo-benchmarks-d10`. The final handoff records the same
+  clean status after the separate report commit.
