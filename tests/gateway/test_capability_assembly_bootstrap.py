@@ -1004,6 +1004,11 @@ def test_repository_factory_adapter_matches_committed_descriptor() -> None:
         ).encode("utf-8")
     ).hexdigest() == descriptor.implementation_ast_sha256
     assert b"capability_factory_runtime_internal" not in source
+    assert b"_DeferredForge" not in implementation
+    assert b"_DeferredBenchmarkInputs" not in implementation
+    assert b"InMemoryBusinessBenchmarkRepository" not in implementation
+    assert b"MinibookForgeHttpClient" in implementation
+    assert b"GatewayD10BusinessBenchmarkInputs" in implementation
 
 
 def test_factory_constructor_receives_only_allowlisted_config_and_redacts_any_error(

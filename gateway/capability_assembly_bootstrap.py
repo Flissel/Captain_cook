@@ -1379,6 +1379,7 @@ class CapabilityAssemblyFactoryConfiguration:
     provider_proxy_code_sha256: str = ""
     provider_paid_command_sha256: str = ""
     provider_hard_ceiling_enforced: bool = False
+    minibook_url: str = ""
 
 
 @dataclass(frozen=True, repr=False)
@@ -1391,6 +1392,7 @@ class CapabilityAssemblyFactoryAuthorities:
     clock: Callable[[], datetime]
     n8n: "GatewayCapabilityN8nWorkBatchAuthority"
     provider_token: SecretStr
+    minibook_api_key: SecretStr
 
 
 class CapabilityAssemblyFactoryRuntimeDescriptorV1(BaseModel):
@@ -1634,6 +1636,7 @@ def plan_capability_assembly_factory_runtime_from_environment(
             provider_hard_ceiling_enforced=(
                 environment.get("CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED") == "true"
             ),
+            minibook_url=environment.get("MINIBOOK_BACKEND_URL", "").strip(),
         ),
     )
 
@@ -1662,6 +1665,7 @@ def build_capability_assembly_factory_runtime_from_environment(
         private_benchmark_catalog=private_benchmark_catalog,
         clock=clock,
         provider_token=settings.provider_token,
+        minibook_api_key=settings.minibook_api_key,
     )
 
 
@@ -1673,6 +1677,7 @@ def materialize_capability_assembly_factory_runtime(
     clock: Callable[[], datetime],
     source_artifacts: RepositoryFactoryInputArtifactStore | None = None,
     provider_token: SecretStr | None = None,
+    minibook_api_key: SecretStr | None = None,
 ) -> CapabilityAssemblyFactoryRuntime:
     """Import and construct only after the complete descriptor is attested."""
 
@@ -1687,6 +1692,7 @@ def materialize_capability_assembly_factory_runtime(
         clock=clock,
         n8n=n8n,
         provider_token=provider_token or SecretStr("unconfigured-provider-token"),
+        minibook_api_key=minibook_api_key or SecretStr("unconfigured-minibook-token"),
     )
     try:
         implementation = ModuleType("_captain_verified_factory_implementation")
