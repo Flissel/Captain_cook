@@ -75,9 +75,11 @@ def check_duplicate(
     subproblems currently pending under the same root problem.
 
     `pending_descriptions` is a list of (root_problem_id, description) pairs
-    gathered by the caller from the ledger's VALIDATING-stage blocks — kept
+    gathered by the caller from the ledger's VALIDATING-stage blocks plus any
+    verdicts the gate has issued that the ledger has not persisted yet — kept
     as a plain argument here so this function stays a pure, dependency-free
-    string comparison that's trivial to unit test.
+    string comparison that's trivial to unit test. Duplicate pairs are
+    harmless; the first match wins.
     """
     normalized = _normalize(description)
     for other_root_id, other_description in pending_descriptions:
