@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -11,6 +13,9 @@ from gateway.capability_assembly_bootstrap import (
 )
 from gateway.capability_process_operator import operate, service_argv
 import gateway.capability_process_operator as process_operator
+from gateway.settings import GatewaySettings
+from agenten.agent_runtime.runtime_entrypoint import RuntimeEntrypointSettings
+from agenten.provider_proxy.entrypoint import require_distinct_authority_secrets
 
 
 def _environment() -> dict[str, str]:
@@ -182,19 +187,52 @@ def test_each_process_receives_only_its_allowlisted_environment() -> None:
     environment = {
         **_environment(),
         "WORKER_GATEWAY_TOKEN": "worker-token-value",
-        "PROVIDER_RECEIPT_GATEWAY_TOKEN": "receipt-token-value",
+        "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN": "receipt-token-value",
         "LEDGER_DSN": "mysql://captain:redacted@127.0.0.1/captain",
-        "OPENAI_API_KEY": "must-not-cross-process-boundary",
+        "OPENAI_API_KEY": "provider-only-key-value",
         "UNRELATED_SECRET": "must-not-cross-process-boundary",
     }
 
     for service in ("gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n"):
         child = process_operator._service_environment(service, environment)
-        assert "OPENAI_API_KEY" not in child
         assert "UNRELATED_SECRET" not in child
-        for other, names in process_operator._SERVICE_SECRET_ENV.items():
-            if other != service:
-                assert all(name not in child for name in names if name not in process_operator._SERVICE_SECRET_ENV[service])
+        assert ("OPENAI_API_KEY" in child) is (service == "provider_proxy")
+        assert ("CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN" in child) is (
+            service == "provider_proxy"
+        )
+
+
+def test_filtered_environments_satisfy_real_entrypoint_preflights(tmp_path: Path) -> None:
+    executor = Path("gateway/capability_benchmark_process_executor.py")
+    executor_digest = hashlib.sha256(executor.read_bytes()).hexdigest()
+    environment = {
+        **_environment(),
+        "WORKER_GATEWAY_TOKEN": "worker-token-value",
+        "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN": "receipt-token-value",
+        "LEDGER_DSN": "mysql://captain:redacted@127.0.0.1/captain",
+        "OPENAI_API_KEY": "provider-only-key-value",
+        "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
+        "CAPTAIN_CAPABILITY_BENCHMARK_EXECUTOR": executor.as_posix(),
+        "CAPTAIN_CAPABILITY_BENCHMARK_EXECUTOR_SHA256": executor_digest,
+        "CAPTAIN_PROVIDER_PRICE_CARD_PATH": "contracts/price.json",
+        "CAPTAIN_PROVIDER_POLICY_PATH": "contracts/policy.json",
+        "CAPTAIN_PROVIDER_STATE_ROOT": "state/provider",
+    }
+
+    GatewaySettings.from_env(process_operator._service_environment("gateway", environment))
+    RuntimeEntrypointSettings.from_env(
+        process_operator._service_environment("runtime", environment)
+    )
+    require_distinct_authority_secrets(
+        process_operator._service_environment("provider_proxy", environment)
+    )
+    benchmark = process_operator._service_environment("benchmark", environment)
+    assert {
+        "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+        "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID",
+        "CAPTAIN_CAPABILITY_BENCHMARK_EXECUTOR",
+        "CAPTAIN_CAPABILITY_BENCHMARK_EXECUTOR_SHA256",
+    } <= set(benchmark)
 
 
 def test_start_reuse_requires_exact_identity_and_authenticated_health(
@@ -269,9 +307,10 @@ def test_failed_health_retains_ambiguous_spawn_identity_after_bounded_cleanup(
         lambda argv, **_kwargs: cleanup_commands.append(tuple(argv)),
     )
     environment = {
+        **_environment(),
         "CAPTAIN_PROCESS_STATE_ROOT": "state",
-        "CAPTAIN_GATEWAY_TOKEN": "gateway-token", "WORKER_GATEWAY_TOKEN": "worker-token",
-        "CAPTAIN_GATEWAY_URL": "http://127.0.0.1:8090", "LEDGER_DSN": "redacted-dsn",
+        "WORKER_GATEWAY_TOKEN": "worker-token",
+        "LEDGER_DSN": "redacted-dsn",
     }
 
     with pytest.raises(RuntimeError, match="authenticated start failed"):
