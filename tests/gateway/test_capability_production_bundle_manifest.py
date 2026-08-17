@@ -25,6 +25,11 @@ def _environment() -> dict[str, str]:
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "provider-token-value",
         "CAPTAIN_PROVIDER_POLICY_SHA256": "a" * 64,
         "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "b" * 64,
+        "CAPTAIN_PROVIDER_CONTEXT_SHA256": "c" * 64,
+        "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256": "d" * 64,
+        "CAPTAIN_PROVIDER_PROXY_CODE_SHA256": "e" * 64,
+        "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256": "f" * 64,
+        "CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED": "true",
         "MINIBOOK_BACKEND_URL": "http://127.0.0.1:8080",
         "MINIBOOK_API_KEY": "minibook-token-value",
         "MINIBOOK_PROJECTION_API_KEY": "projection-token-value",
@@ -41,6 +46,15 @@ def test_operator_manifest_is_digest_bound_and_contains_real_process_contracts()
     assert manifest.schema_name == "captain.capability-production-bundle-manifest.v1"
     assert manifest.provider_supervisor_mode == "dynamic_gateway_context_v1"
     assert manifest.provider_context_reference_header == "X-Captain-Provider-Context-Ref"
+    assert (
+        manifest.provider_policy_sha256,
+        manifest.provider_price_card_sha256,
+        manifest.provider_context_sha256,
+        manifest.provider_proxy_executable_sha256,
+        manifest.provider_proxy_code_sha256,
+        manifest.provider_paid_command_sha256,
+        manifest.provider_hard_ceiling_enforced,
+    ) == ("a" * 64, "b" * 64, "c" * 64, "d" * 64, "e" * 64, "f" * 64, True)
     assert manifest.gateway.health_url == (
         "http://127.0.0.1:8090/v1/capability-assemblies/health"
     )

@@ -323,6 +323,10 @@ class CaptainCodexExecutionAdapter:
                     command.payload.provider_policy_sha256,
                     command.payload.provider_price_card_sha256,
                     command.payload.provider_context_sha256,
+                    command.payload.provider_proxy_executable_sha256,
+                    command.payload.provider_proxy_code_sha256,
+                    command.payload.provider_paid_command_sha256,
+                    command.payload.provider_hard_ceiling_enforced,
                 )
             ),
             provider_proxy_url=command.payload.provider_proxy_url,
@@ -464,6 +468,10 @@ class CaptainCodexExecutionAdapter:
                         command.payload.provider_policy_sha256,
                         command.payload.provider_price_card_sha256,
                         command.payload.provider_context_sha256,
+                        command.payload.provider_proxy_executable_sha256,
+                        command.payload.provider_proxy_code_sha256,
+                        command.payload.provider_paid_command_sha256,
+                        command.payload.provider_hard_ceiling_enforced,
                     )
                 )
             )

@@ -687,7 +687,11 @@ async def test_exact_proxy_bound_resume_is_not_downgraded_by_production_adapter(
         "provider_proxy_url": "http://127.0.0.1:18091/v1",
         "provider_policy_sha256": "4" * 64,
         "provider_price_card_sha256": "5" * 64,
-        "provider_context_sha256": "6" * 64,
+            "provider_context_sha256": "6" * 64,
+            "provider_proxy_executable_sha256": "7" * 64,
+            "provider_proxy_code_sha256": "8" * 64,
+            "provider_paid_command_sha256": "9" * 64,
+            "provider_hard_ceiling_enforced": True,
         "provider_session_id": "runtime-thread",
         "provider_result_id": uuid5(resumed.event_id, "captain.runtime-result"),
     })})

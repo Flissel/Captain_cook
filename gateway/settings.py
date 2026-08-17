@@ -43,6 +43,11 @@ class GatewaySettings(BaseModel):
     provider_proxy_url: str | None = None
     provider_policy_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     provider_price_card_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    provider_context_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    provider_proxy_executable_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    provider_proxy_code_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    provider_paid_command_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    provider_hard_ceiling_enforced: bool | None = Field(default=None, strict=True)
     approval_enabled: bool = False
     host: Literal["127.0.0.1"] = "127.0.0.1"
     port: int = Field(default=8090, ge=1, le=65535)
@@ -216,6 +221,11 @@ class GatewaySettings(BaseModel):
             self.provider_proxy_url,
             self.provider_policy_sha256,
             self.provider_price_card_sha256,
+            self.provider_context_sha256,
+            self.provider_proxy_executable_sha256,
+            self.provider_proxy_code_sha256,
+            self.provider_paid_command_sha256,
+            self.provider_hard_ceiling_enforced,
         )
         if any(value is not None for value in proxy_fields) and not all(
             value is not None for value in proxy_fields
@@ -412,6 +422,15 @@ class GatewaySettings(BaseModel):
                 ),
                 provider_policy_sha256=source.get("CAPTAIN_PROVIDER_POLICY_SHA256"),
                 provider_price_card_sha256=source.get("CAPTAIN_PROVIDER_PRICE_CARD_SHA256"),
+                provider_context_sha256=source.get("CAPTAIN_PROVIDER_CONTEXT_SHA256"),
+                provider_proxy_executable_sha256=source.get("CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256"),
+                provider_proxy_code_sha256=source.get("CAPTAIN_PROVIDER_PROXY_CODE_SHA256"),
+                provider_paid_command_sha256=source.get("CAPTAIN_PROVIDER_PAID_COMMAND_SHA256"),
+                provider_hard_ceiling_enforced=(
+                    True
+                    if source.get("CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED") == "true"
+                    else None
+                ),
                 approval_enabled=approval_enabled,
                 port=port,
                 claim_ttl_seconds=claim_ttl_seconds,

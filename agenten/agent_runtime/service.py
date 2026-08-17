@@ -142,6 +142,13 @@ class AgentRuntimeService:
             or authority.provider_policy_sha256 != payload.provider_policy_sha256
             or authority.provider_price_card_sha256 != payload.provider_price_card_sha256
             or authority.provider_context_sha256 != payload.provider_context_sha256
+            or authority.provider_proxy_executable_sha256
+            != payload.provider_proxy_executable_sha256
+            or authority.provider_proxy_code_sha256
+            != payload.provider_proxy_code_sha256
+            or authority.provider_paid_command_sha256
+            != payload.provider_paid_command_sha256
+            or payload.provider_hard_ceiling_enforced is not True
             or authority.provider_session_id != payload.provider_session_id
             or authority.provider_result_id != payload.provider_result_id
         ):

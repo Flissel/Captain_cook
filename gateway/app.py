@@ -421,13 +421,13 @@ def create_app(
             runtime_provider_bundle_bindings=(
                 (
                     configured.provider_proxy_url.removesuffix("/v1"),
-                    environment_value("CAPTAIN_PROVIDER_POLICY_SHA256"),
-                    environment_value("CAPTAIN_PROVIDER_PRICE_CARD_SHA256"),
-                    environment_value("CAPTAIN_PROVIDER_CONTEXT_SHA256"),
-                    environment_value("CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256"),
-                    environment_value("CAPTAIN_PROVIDER_PROXY_CODE_SHA256"),
-                    environment_value("CAPTAIN_PROVIDER_PAID_COMMAND_SHA256"),
-                    os.environ.get("CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED") == "true",
+                    configured.provider_policy_sha256,
+                    configured.provider_price_card_sha256,
+                    configured.provider_context_sha256,
+                    configured.provider_proxy_executable_sha256,
+                    configured.provider_proxy_code_sha256,
+                    configured.provider_paid_command_sha256,
+                    configured.provider_hard_ceiling_enforced,
                 ),
             )
             if configured is not None and configured.provider_proxy_url is not None
@@ -617,6 +617,11 @@ def create_app(
                                 responses_url=configured.provider_proxy_url,
                                 policy_sha256=configured.provider_policy_sha256,
                                 price_card_sha256=configured.provider_price_card_sha256,
+                                context_sha256=configured.provider_context_sha256,
+                                executable_sha256=configured.provider_proxy_executable_sha256,
+                                code_sha256=configured.provider_proxy_code_sha256,
+                                paid_command_sha256=configured.provider_paid_command_sha256,
+                                hard_ceiling_enforced=configured.provider_hard_ceiling_enforced,
                             )
                             if configured.provider_proxy_url is not None
                             else None

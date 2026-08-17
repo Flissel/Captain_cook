@@ -393,6 +393,11 @@ class CapabilityProductionBundleManifestV1(BaseModel):
     provider_context_reference_header: Literal["X-Captain-Provider-Context-Ref"]
     provider_policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     provider_price_card_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_context_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_proxy_executable_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_proxy_code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_paid_command_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_hard_ceiling_enforced: Literal[True]
     gateway: CapabilityProductionProcessBindingV1
     benchmark: CapabilityProductionProcessBindingV1
     runtime: CapabilityProductionProcessBindingV1
@@ -424,6 +429,11 @@ _OPERATOR_REQUIRED_NAMES = (
     "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
     "CAPTAIN_PROVIDER_POLICY_SHA256",
     "CAPTAIN_PROVIDER_PRICE_CARD_SHA256",
+    "CAPTAIN_PROVIDER_CONTEXT_SHA256",
+    "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256",
+    "CAPTAIN_PROVIDER_PROXY_CODE_SHA256",
+    "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256",
+    "CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED",
     "MINIBOOK_BACKEND_URL",
     "MINIBOOK_API_KEY",
     "MINIBOOK_PROJECTION_API_KEY",
@@ -453,7 +463,14 @@ def load_capability_production_bundle_manifest(
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly credentials must be distinct"
         )
-    for name in ("CAPTAIN_PROVIDER_POLICY_SHA256", "CAPTAIN_PROVIDER_PRICE_CARD_SHA256"):
+    for name in (
+        "CAPTAIN_PROVIDER_POLICY_SHA256",
+        "CAPTAIN_PROVIDER_PRICE_CARD_SHA256",
+        "CAPTAIN_PROVIDER_CONTEXT_SHA256",
+        "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256",
+        "CAPTAIN_PROVIDER_PROXY_CODE_SHA256",
+        "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256",
+    ):
         if _SHA256.fullmatch(raw[name]) is None:
             raise CapabilityAssemblyBootstrapConfigurationError(
                 "capability assembly provider authority is invalid"
@@ -480,12 +497,21 @@ def load_capability_production_bundle_manifest(
             "capability assembly operator endpoint contract is invalid"
         )
     provider_root = provider.removesuffix("/v1")
+    if raw["CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED"] != "true":
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "capability assembly provider authority is invalid"
+        )
     material: dict[str, object] = {
         "schema": "captain.capability-production-bundle-manifest.v1",
         "provider_supervisor_mode": "dynamic_gateway_context_v1",
         "provider_context_reference_header": "X-Captain-Provider-Context-Ref",
         "provider_policy_sha256": raw["CAPTAIN_PROVIDER_POLICY_SHA256"],
         "provider_price_card_sha256": raw["CAPTAIN_PROVIDER_PRICE_CARD_SHA256"],
+        "provider_context_sha256": raw["CAPTAIN_PROVIDER_CONTEXT_SHA256"],
+        "provider_proxy_executable_sha256": raw["CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256"],
+        "provider_proxy_code_sha256": raw["CAPTAIN_PROVIDER_PROXY_CODE_SHA256"],
+        "provider_paid_command_sha256": raw["CAPTAIN_PROVIDER_PAID_COMMAND_SHA256"],
+        "provider_hard_ceiling_enforced": True,
         "gateway": _process_binding(
             "gateway", gateway, f"{gateway}/v1/capability-assemblies/health",
             credential_env="CAPTAIN_GATEWAY_TOKEN",

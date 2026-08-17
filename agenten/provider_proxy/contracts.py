@@ -135,6 +135,11 @@ class RuntimeProviderProxyBindingV1(_FrozenContract):
     responses_url: str = Field(pattern=r"^http://127\.0\.0\.1:[0-9]{1,5}/v1$")
     policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     price_card_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    context_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    executable_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    paid_command_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    hard_ceiling_enforced: Literal[True] = True
 
 
 class ProviderBudgetContextV1(_FrozenContract):

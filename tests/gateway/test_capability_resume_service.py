@@ -696,6 +696,7 @@ async def test_runtime_infrastructure_failure_without_provider_settlement_stays_
         FakeCostAuthority,
         FakeHermes,
         FakeState,
+        PROVIDER_BINDING,
         batch_for,
         service_with,
     )
@@ -706,6 +707,17 @@ async def test_runtime_infrastructure_failure_without_provider_settlement_stays_
     authorization = capability_resume.authorize(_request())
     record = repository.authorization(authorization.authorization_receipt_id)
     assert record is not None
+    bound_command = record.resume_command.model_copy(update={
+        "payload": record.resume_command.payload.model_copy(update={
+            **PROVIDER_BINDING,
+            "provider_session_id": "resume-session",
+            "provider_result_id": uuid5(
+                record.resume_command.event_id, "captain.runtime-result"
+            ),
+        })
+    })
+    record = record.model_copy(update={"resume_command": bound_command})
+    repository.records[authorization.authorization_receipt_id] = record
 
     events: list[str] = []
     released_batch = batch_for(record.resume_command).model_copy(

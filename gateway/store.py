@@ -2862,20 +2862,25 @@ class GatewayStore:
                 status_code=409, detail="runtime resume cost reservation is inactive"
             )
         provider_binding = (
-            payload.provider_proxy_url,
+            (
+                payload.provider_proxy_url.removesuffix("/v1")
+                if payload.provider_proxy_url is not None
+                else None
+            ),
             payload.provider_policy_sha256,
             payload.provider_price_card_sha256,
-        )
-        provider_fields = (
-            *provider_binding,
             payload.provider_context_sha256,
-            payload.provider_session_id,
-            payload.provider_result_id,
+            payload.provider_proxy_executable_sha256,
+            payload.provider_proxy_code_sha256,
+            payload.provider_paid_command_sha256,
+            payload.provider_hard_ceiling_enforced,
         )
+        provider_fields = (*provider_binding, payload.provider_session_id, payload.provider_result_id)
         hard_ceiling_enforced = (
             all(value is not None for value in provider_fields)
             and provider_binding
-            in getattr(self, "_runtime_provider_proxy_bindings", frozenset())
+            in getattr(self, "_runtime_provider_bundle_bindings", frozenset())
+            and payload.provider_hard_ceiling_enforced is True
             and payload.provider_result_id
             == uuid5(command.event_id, "captain.runtime-result")
         )
@@ -2899,6 +2904,9 @@ class GatewayStore:
             provider_policy_sha256=(payload.provider_policy_sha256 if hard_ceiling_enforced else None),
             provider_price_card_sha256=(payload.provider_price_card_sha256 if hard_ceiling_enforced else None),
             provider_context_sha256=(payload.provider_context_sha256 if hard_ceiling_enforced else None),
+            provider_proxy_executable_sha256=(payload.provider_proxy_executable_sha256 if hard_ceiling_enforced else None),
+            provider_proxy_code_sha256=(payload.provider_proxy_code_sha256 if hard_ceiling_enforced else None),
+            provider_paid_command_sha256=(payload.provider_paid_command_sha256 if hard_ceiling_enforced else None),
             provider_session_id=(payload.provider_session_id if hard_ceiling_enforced else None),
             provider_result_id=(payload.provider_result_id if hard_ceiling_enforced else None),
         )

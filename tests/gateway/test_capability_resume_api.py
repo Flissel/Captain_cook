@@ -894,6 +894,10 @@ def test_gateway_claims_hard_ceiling_only_for_exact_active_proxy_binding() -> No
         "provider_policy_sha256": policy_sha,
         "provider_price_card_sha256": price_sha,
         "provider_context_sha256": context.sha256,
+        "provider_proxy_executable_sha256": "c" * 64,
+        "provider_proxy_code_sha256": "d" * 64,
+        "provider_paid_command_sha256": "e" * 64,
+        "provider_hard_ceiling_enforced": True,
         "provider_session_id": context.session_id,
         "provider_result_id": context.result_id,
     })})
@@ -924,6 +928,10 @@ def test_gateway_claims_hard_ceiling_only_for_exact_active_proxy_binding() -> No
     store._runtime_provider_proxy_bindings = frozenset({(
         "http://127.0.0.1:18091/v1", policy_sha, price_sha,
     )})
+    store._runtime_provider_bundle_bindings = frozenset({(
+        "http://127.0.0.1:18091", policy_sha, price_sha, context.sha256,
+        "c" * 64, "d" * 64, "e" * 64, True,
+    )})
     store._runtime_block_by_json_value = lambda *_args, **_kwargs: {
         "data": command.model_dump(mode="json", by_alias=True)
     }
@@ -940,6 +948,9 @@ def test_gateway_claims_hard_ceiling_only_for_exact_active_proxy_binding() -> No
 
     assert authority.hard_ceiling_enforced is True
     assert authority.provider_context_sha256 == context.sha256
+    assert authority.provider_proxy_executable_sha256 == "c" * 64
+    assert authority.provider_proxy_code_sha256 == "d" * 64
+    assert authority.provider_paid_command_sha256 == "e" * 64
     assert store.validate_provider_proxy_authority(
         context, now=datetime(2026, 8, 9, tzinfo=timezone.utc)
     ) == context

@@ -108,6 +108,10 @@ class AgentRuntimeCommandPayload(_FrozenContract):
     provider_policy_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     provider_price_card_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     provider_context_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_proxy_executable_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_proxy_code_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_paid_command_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_hard_ceiling_enforced: bool | None = Field(default=None, strict=True)
     provider_session_id: str | None = Field(
         default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
     )
@@ -185,6 +189,10 @@ class AgentRuntimeCommandPayload(_FrozenContract):
             self.provider_policy_sha256,
             self.provider_price_card_sha256,
             self.provider_context_sha256,
+            self.provider_proxy_executable_sha256,
+            self.provider_proxy_code_sha256,
+            self.provider_paid_command_sha256,
+            self.provider_hard_ceiling_enforced,
             self.provider_session_id,
             self.provider_result_id,
         )
@@ -308,6 +316,9 @@ class RuntimeResumeCostAuthorityV1(_FrozenContract):
     provider_policy_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     provider_price_card_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     provider_context_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_proxy_executable_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_proxy_code_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_paid_command_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     provider_session_id: str | None = Field(default=None, min_length=1)
     provider_result_id: UUID | None = None
 
