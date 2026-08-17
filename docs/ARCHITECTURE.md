@@ -419,3 +419,21 @@ example, wrapping `InternetSearcher`.
 - Root dependencies are pinned in `requirements.txt`. The next packaging
   step is moving the root modules under an installable `src/` package without
   changing the domain/event interfaces.
+
+### Ledger integrity boundary
+
+Two ledgers with different guarantees share one `Block` type.
+
+The MariaDB gateway ledger is append-only in the strong sense: `GatewayStore`
+is the sole writer, issues no `UPDATE` or `DELETE` against `blocks`, and
+serializes appends via `SELECT ... FOR UPDATE` on the chain tip. It can be
+checked with `blockchain.Blockchain_modell.verify_chain`.
+
+The in-process pipeline ledger (`LedgerRecorderAgent`) mutates `data`,
+`status`, `metadata` and `children` in place after append and does not
+recompute hashes. Its integrity guarantee is single-writer discipline plus
+validated stage transitions, not hash verification. `verify_chain` is
+expected to fail against it and must not be called there.
+
+`status`, `children` and `metadata` are outside `Block.compute_hash` in both
+cases, so neither ledger detects edits confined to those fields.
