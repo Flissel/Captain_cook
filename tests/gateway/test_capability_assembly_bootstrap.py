@@ -765,6 +765,7 @@ def test_shipped_gateway_builds_exact_runtime_and_app_once_after_preflight(
         provider_paid_command_sha256="6" * 64,
         provider_hard_ceiling_enforced=True,
         provider_token=SecretStr("provider-only-token"),
+        minibook_api_key=SecretStr("exact-minibook-key"),
     )
     factory_plan = SimpleNamespace()
     configured = gateway_app.GatewaySettings.from_env({
@@ -809,6 +810,7 @@ def test_shipped_gateway_builds_exact_runtime_and_app_once_after_preflight(
         calls.append("runtime")
         assert plan is factory_plan
         assert kwargs["store"] is store
+        assert kwargs["minibook_api_key"].get_secret_value() == "exact-minibook-key"
         return runtime
     application = SimpleNamespace(state=SimpleNamespace())
     def app_builder(**kwargs: object) -> object:

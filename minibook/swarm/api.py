@@ -1,10 +1,11 @@
 """Optional HTTP boundary for persisted creation jobs."""
 from __future__ import annotations
 
+import secrets
 from collections.abc import Callable
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -20,9 +21,26 @@ class CancelRequest(BaseModel):
 def create_creation_router(
     store: CreationJobStore | None,
     *,
+    api_key: str | None,
     schedule: Callable[[UUID], None] | None = None,
 ) -> APIRouter:
-    router = APIRouter()
+    expected = (api_key or "").strip()
+
+    def require_creation_bearer(
+        authorization: str | None = Header(default=None),
+    ) -> None:
+        if not expected:
+            raise HTTPException(503, "Creation API authentication is not configured")
+        if authorization is None or not authorization.startswith("Bearer "):
+            raise HTTPException(
+                401, "Creation API bearer credential is required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        supplied = authorization.removeprefix("Bearer ")
+        if not secrets.compare_digest(supplied, expected):
+            raise HTTPException(403, "Creation API bearer credential is invalid")
+
+    router = APIRouter(dependencies=[Depends(require_creation_bearer)])
 
     @router.get("/api/v1/creation-capabilities")
     def capabilities() -> dict[str, object]:

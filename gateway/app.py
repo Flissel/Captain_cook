@@ -1686,6 +1686,7 @@ def create_production_app_from_environment(
         clock=clock,
         source_artifacts=source_artifacts,
         provider_token=bootstrap.provider_token,
+        minibook_api_key=bootstrap.minibook_api_key,
     )
     plan_production_capability_assembly_from_environment(
         repository_root=root,

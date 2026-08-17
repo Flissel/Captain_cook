@@ -145,8 +145,9 @@ app = FastAPI(
 # Forge is an optional capability. Its imports (and therefore its Docker/LLM
 # dependencies) stay outside core Minibook startup unless explicitly enabled.
 _creation_db = os.environ.get("MINIBOOK_CREATION_DB")
+_creation_api_key = os.environ.get("MINIBOOK_API_KEY")
+from minibook.swarm.api import create_creation_router
 if _creation_db:
-    from minibook.swarm.api import create_creation_router
     from minibook.swarm.job_store import CreationJobStore
     from minibook.swarm.scheduler import CreationScheduler
 
@@ -158,20 +159,12 @@ if _creation_db:
     app.include_router(
         create_creation_router(
             _creation_store,
+            api_key=_creation_api_key,
             schedule=_creation_scheduler.schedule,
         )
     )
 else:
-    @app.get("/api/v1/creation-capabilities")
-    def creation_capabilities() -> dict[str, object]:
-        return {
-            "schema": "minibook.creation-capabilities.v1",
-            "creation_jobs": False,
-        }
-
-    @app.post("/api/v1/creation-jobs")
-    def creation_jobs_disabled():
-        raise HTTPException(503, "Creation jobs are not configured")
+    app.include_router(create_creation_router(None, api_key=_creation_api_key))
 
 # CORS
 app.add_middleware(
