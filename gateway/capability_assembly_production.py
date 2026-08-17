@@ -928,6 +928,19 @@ class CapabilityAssemblyCurrentFactoryAdapter(CurrentCapabilityFactoryAdapter):
                 "Gateway Factory binding authority is unavailable"
             ) from None
 
+    def benchmark_candidate_for(self, request: CapabilityAssemblyStageRequest):
+        binding = self.binding_for(request)
+        if binding is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway Factory binding authority is unavailable"
+            )
+        try:
+            return self._composition.benchmark_candidate_for(binding.job)
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway released benchmark candidate is unavailable"
+            ) from None
+
     async def scaffold(self, request: CapabilityAssemblyStageRequest):
         try:
             authority = await super().scaffold(

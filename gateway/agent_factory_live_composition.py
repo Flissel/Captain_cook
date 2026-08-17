@@ -525,6 +525,9 @@ class AgentFactoryLiveComposition:
     def runtime_operation(self, command_id: UUID):
         return self.repository.runtime_operation(command_id)
 
+    def benchmark_candidate_for(self, job: AgentFactoryJobV3) -> ResolvedFactoryCandidate:
+        return self.candidate_validator.candidate_for(job)
+
     async def run(
         self,
         job_id: UUID,

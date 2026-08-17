@@ -23,6 +23,7 @@ from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.capability_generic_benchmark import (
     GenericBenchmarkCategory,
     GenericBenchmarkExecutionEvidence,
+    GenericBenchmarkExecutionPlan,
     GenericBenchmarkExecutionRequest,
     GenericExecutionCaseView,
     GenericPrivateCaseRef,
@@ -160,13 +161,14 @@ def main() -> None:
 def _parse_request(payload: dict[str, object]) -> GenericBenchmarkExecutionRequest:
     required = {
         "schema", "job_id", "capability_id", "input_ref", "case", "team_kind",
-        "model_id", "model_policy_digest", "execution_case", "request_nonce",
+        "model_id", "model_policy_digest", "execution_case", "execution_plan", "request_nonce",
         "request_digest",
     }
     if set(payload) != required or payload["schema"] != "captain.capability-benchmark-execution-request.v1":
         raise ValueError("schema")
     case_payload = payload["case"]
     execution_payload = payload["execution_case"]
+    plan_payload = payload["execution_plan"]
     if (
         not isinstance(case_payload, dict)
         or set(case_payload) != {"case_id", "category", "case_digest"}
@@ -174,6 +176,12 @@ def _parse_request(payload: dict[str, object]) -> GenericBenchmarkExecutionReque
         or set(execution_payload) != {
             "setup", "action", "opaque_source_refs", "declared_tool_keys",
             "tool_authority_sha256",
+        }
+        or not isinstance(plan_payload, dict)
+        or set(plan_payload) != {
+            "candidate_ref", "team_manifest_ref", "baseline_policy_ref",
+            "model_ref", "execution_policy_ref", "team_agent_names",
+            "baseline_agent_name",
         }
     ):
         raise ValueError("case")
@@ -200,6 +208,15 @@ def _parse_request(payload: dict[str, object]) -> GenericBenchmarkExecutionReque
         "model_id": str(payload["model_id"]),
         "model_policy_digest": str(payload["model_policy_digest"]),
         "execution_case": execution_case,
+        "execution_plan": GenericBenchmarkExecutionPlan(
+            candidate_ref=ArtifactRef.model_validate(plan_payload["candidate_ref"]),
+            team_manifest_ref=ArtifactRef.model_validate(plan_payload["team_manifest_ref"]),
+            baseline_policy_ref=ArtifactRef.model_validate(plan_payload["baseline_policy_ref"]),
+            model_ref=ArtifactRef.model_validate(plan_payload["model_ref"]),
+            execution_policy_ref=ArtifactRef.model_validate(plan_payload["execution_policy_ref"]),
+            team_agent_names=tuple(str(item) for item in plan_payload["team_agent_names"]),
+            baseline_agent_name=str(plan_payload["baseline_agent_name"]),
+        ),
         "request_nonce": UUID(str(payload["request_nonce"])),
     }
     digest = generic_execution_request_digest(**values)  # type: ignore[arg-type]

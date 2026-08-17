@@ -19,7 +19,7 @@ from gateway.capability_benchmark_execution_service import (
     GatewayBenchmarkExecutionService,
 )
 from gateway.capability_live_pipeline import CapabilityLiveAuthorityUnavailable
-from tests.gateway.test_capability_benchmark_process_executor import _request
+from tests.gateway.test_capability_benchmark_process_executor import _ref, _request
 from tests.gateway.test_capability_benchmark_process_app import _payload
 
 
@@ -36,6 +36,7 @@ class _Store:
         self.result = None
         self.batch = None
         self.registry = {}
+        self.authorizations = {}
 
     def factory_job(self, _job_id):
         return SimpleNamespace(job=self.job)
@@ -75,6 +76,12 @@ class _Store:
             "result_ref_sha256": payload["result_ref_sha256"],
         }
 
+    def record_capability_tool_authorization(self, **payload):
+        assert self.result is None
+        assert payload["job_id"] == str(self.request.job_id)
+        assert payload["batch_id"] == self.batch["batch_id"]
+        self.authorizations[payload["tool_key"]] = payload
+
     def capability_tool_evidence(self, receipt_sha256):
         return self.registry.get(receipt_sha256)
 
@@ -104,8 +111,10 @@ class _RuntimeEffect:
         self.tools = tools
         self.calls = 0
 
-    async def execute(self, command):
+    async def execute(self, command, *, execution_plan, team_kind, authorized_tools):
         self.calls += 1
+        assert execution_plan == self.artifacts_plan
+        self.authorized_tools = authorized_tools
         refs = {
             tool: self.artifacts.put(
                 ("runtime-result:" + tool).encode(), "application/json"
@@ -127,6 +136,11 @@ class _RuntimeEffect:
             rationale="bounded", messages=(("answer", "bounded"),),
             handoffs=(), tool_result_refs=refs,
             cost_usd=Decimal("0.01"), latency_ms=1,
+            candidate_ref=execution_plan.candidate_ref,
+            execution_ref=(execution_plan.team_manifest_ref if team_kind == "team"
+                           else execution_plan.baseline_policy_ref),
+            agent_names=(execution_plan.team_agent_names if team_kind == "team"
+                         else (execution_plan.baseline_agent_name,)),
         )
 
 
@@ -134,6 +148,7 @@ def _service(tmp_path, request, tools):
     artifacts = ContentAddressedArtifactAdapter(tmp_path / "cas")
     store = _Store(request)
     effect = _RuntimeEffect(artifacts=artifacts, tools=tools)
+    effect.artifacts_plan = request.execution_plan
     issuer = CaptainBenchmarkToolEvidenceAuthority(
         gateway_store=store, artifacts=artifacts,
     )
@@ -164,6 +179,7 @@ def test_gateway_executes_and_issues_every_exact_declared_tool(tmp_path) -> None
         team_kind=request.team_kind, model_id=request.model_id,
         model_policy_digest=request.model_policy_digest,
         execution_case=request.execution_case, request_nonce=request.request_nonce,
+        execution_plan=request.execution_plan,
     ))
     service, store, effect = _service(
         tmp_path, request, ("captain_tool", "second_tool"),
@@ -172,6 +188,7 @@ def test_gateway_executes_and_issues_every_exact_declared_tool(tmp_path) -> None
     evidence = asyncio.run(service.execute(request))
 
     assert effect.calls == 1
+    assert set(store.authorizations) == {"captain_tool", "second_tool"}
     assert tuple(item.tool_key for item in evidence.tool_calls) == (
         "captain_tool", "second_tool",
     )
@@ -203,6 +220,26 @@ def test_gateway_rejects_foreign_case_before_runtime_effect(tmp_path) -> None:
 
     assert effect.calls == 0
     assert store.command is None
+    assert store.registry == {}
+
+
+def test_gateway_rejects_execution_plan_drift_before_authorization_or_effect(tmp_path) -> None:
+    request = _request()
+    service, store, effect = _service(tmp_path, request, ("captain_tool",))
+    drifted = replace(
+        request,
+        execution_plan=replace(
+            request.execution_plan, candidate_ref=_ref("foreign-candidate"),
+        ),
+    )
+
+    with pytest.raises(
+        CapabilityLiveAuthorityUnavailable, match="request authority changed"
+    ):
+        asyncio.run(service.execute(drifted))
+
+    assert effect.calls == 0
+    assert store.authorizations == {}
     assert store.registry == {}
 
 

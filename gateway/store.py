@@ -6741,6 +6741,69 @@ class GatewayStore:
             raise HTTPException(status_code=409, detail="Factory n8n WorkBatch readback mismatch")
         return str(row["batch_id"])
 
+    def record_capability_tool_authorization(
+        self, *, job_id: str, case_digest: str, tool_key: str,
+        operation: str, trace_id: str, run_id: str,
+        model_policy_digest: str, batch_id: str, command_id: str,
+        candidate_sha256: str, execution_sha256: str, call_id: str,
+        lease_id: str, call_ref: ArtifactRef, lease_ref: ArtifactRef,
+    ) -> None:
+        """Persist the exact call and lease before the authorized tool effect."""
+
+        payload = {
+            "job_id": job_id, "case_digest": case_digest,
+            "tool_key": tool_key, "operation": operation,
+            "trace_id": trace_id, "run_id": run_id,
+            "model_policy_digest": model_policy_digest,
+            "batch_id": batch_id, "command_id": command_id,
+            "candidate_sha256": candidate_sha256,
+            "execution_sha256": execution_sha256,
+            "call_id": call_id, "lease_id": lease_id,
+            "call_ref": call_ref.model_dump(mode="json"),
+            "lease_ref": lease_ref.model_dump(mode="json"),
+        }
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_authorizations (
+                        call_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        completed_receipt_sha256 CHAR(64) NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT job_id, correlation_id, case_digest, trace_id, run_id, "
+                    "command_id, declared_tool_keys FROM capability_benchmark_work_batches "
+                    "WHERE batch_id = %s FOR UPDATE", (batch_id,),
+                )
+                binding = cursor.fetchone()
+                if (
+                    binding is None
+                    or str(binding["job_id"]) != job_id
+                    or str(binding["case_digest"]) != case_digest
+                    or str(binding["trace_id"]) != trace_id
+                    or str(binding["run_id"]) != run_id
+                    or str(binding["command_id"]) != command_id
+                    or tool_key not in self._decode_json(binding["declared_tool_keys"])
+                ):
+                    raise HTTPException(status_code=409, detail="tool authorization is unavailable")
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_authorizations "
+                    "WHERE call_sha256 = %s FOR UPDATE", (call_ref.sha256,),
+                )
+                existing = cursor.fetchone()
+                if existing is None:
+                    cursor.execute(
+                        "INSERT INTO capability_tool_authorizations "
+                        "(call_sha256, payload) VALUES (%s, %s)",
+                        (call_ref.sha256, self._encode_json(payload)),
+                    )
+                elif self._decode_json(existing["payload"]) != payload:
+                    raise HTTPException(status_code=409, detail="tool authorization conflicts")
+
     def record_capability_tool_evidence(
         self,
         *,
@@ -6805,12 +6868,47 @@ class GatewayStore:
                     """
                 )
                 cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_authorizations (
+                        call_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        completed_receipt_sha256 CHAR(64) NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
                     "SELECT job_id, correlation_id, case_digest, trace_id, run_id, "
                     "command_id, declared_tool_keys FROM capability_benchmark_work_batches "
                     "WHERE batch_id = %s FOR UPDATE",
                     (batch_id,),
                 )
                 batch_binding = cursor.fetchone()
+                cursor.execute(
+                    "SELECT payload, completed_receipt_sha256 FROM "
+                    "capability_tool_authorizations WHERE call_sha256 = %s FOR UPDATE",
+                    (call_ref.sha256,),
+                )
+                authorization = cursor.fetchone()
+                if authorization is not None and "payload" in authorization:
+                    authorization_payload = self._decode_json(authorization["payload"])
+                    if (
+                        authorization_payload.get("job_id") != str(job_id)
+                        or authorization_payload.get("case_digest") != case_digest
+                        or authorization_payload.get("tool_key") != tool_key
+                        or authorization_payload.get("operation") != operation
+                        or authorization_payload.get("trace_id") != str(trace_id)
+                        or authorization_payload.get("run_id") != str(run_id)
+                        or authorization_payload.get("batch_id") != batch_id
+                        or authorization_payload.get("call_ref")
+                        != call_ref.model_dump(mode="json")
+                        or authorization_payload.get("lease_ref")
+                        != lease_ref.model_dump(mode="json")
+                        or authorization["completed_receipt_sha256"] not in {
+                            None, receipt_ref.sha256,
+                        }
+                    ):
+                        raise HTTPException(status_code=409, detail="tool authorization changed")
                 job = self._runtime_block_by_json_value(
                     cursor, block_type="agent_factory_job", field="job_id",
                     value=str(job_id), for_update=True,
@@ -6877,6 +6975,12 @@ class GatewayStore:
                     "(receipt_sha256, payload) VALUES (%s, %s)",
                     (receipt_ref.sha256, json.dumps(payload, sort_keys=True)),
                 )
+                if authorization is not None and "payload" in authorization:
+                    cursor.execute(
+                        "UPDATE capability_tool_authorizations SET "
+                        "completed_receipt_sha256 = %s WHERE call_sha256 = %s",
+                        (receipt_ref.sha256, call_ref.sha256),
+                    )
 
     def record_capability_benchmark_work_batch(
         self, *, job_id: UUID, correlation_id: UUID, batch_id: str,

@@ -13,6 +13,10 @@ from uuid import UUID
 from uuid import uuid4
 
 from agenten.agent_factory.capability_live_runner import CapabilityLiveStage
+from agenten.agent_factory.candidate_evaluation import (
+    FactoryCandidateEvaluator,
+    ResolvedFactoryCandidate,
+)
 from agenten.agent_factory.input_contracts import (
     BUSINESS_BENCHMARK_PREDICATE_KINDS,
     HANDOFF_BENCHMARK_PREDICATE_KINDS,
@@ -113,6 +117,37 @@ class GenericToolCallEvidence:
 
 
 @dataclass(frozen=True)
+class GenericAuthorizedToolCall:
+    tool_key: str
+    call_id: str
+    lease_id: str
+    call_ref: ArtifactRef
+    lease_ref: ArtifactRef
+
+
+@dataclass(frozen=True)
+class GenericBenchmarkExecutionPlan:
+    """Public, content-addressed authority for one fair team/baseline pair."""
+
+    candidate_ref: ArtifactRef
+    team_manifest_ref: ArtifactRef
+    baseline_policy_ref: ArtifactRef
+    model_ref: ArtifactRef
+    execution_policy_ref: ArtifactRef
+    team_agent_names: tuple[str, ...]
+    baseline_agent_name: str
+
+    def __post_init__(self) -> None:
+        if (
+            len(self.team_agent_names) < 2
+            or len(self.team_agent_names) != len(set(self.team_agent_names))
+            or not self.baseline_agent_name
+            or self.baseline_agent_name in self.team_agent_names
+        ):
+            raise ValueError("benchmark execution plan topology is invalid")
+
+
+@dataclass(frozen=True)
 class BenchmarkToolEvidenceVerificationRequest:
     job_id: UUID
     case_ref: GenericPrivateCaseRef
@@ -157,6 +192,7 @@ class GenericBenchmarkExecutionRequest:
     model_id: str
     model_policy_digest: str
     execution_case: GenericExecutionCaseView
+    execution_plan: GenericBenchmarkExecutionPlan
     request_nonce: UUID
     request_digest: str
 
@@ -791,9 +827,11 @@ class GenericCapabilityBenchmarkAdapter:
                                     job: object, case: GenericPrivateCaseRef,
                                     model_id: str,
                                     policy_digest: str) -> GenericBenchmarkPair:
+        execution_plan = self._execution_plan(request, job, model_id, policy_digest)
         common = dict(job_id=job.job_id, capability_id=job.required_capability,
                       input_ref=request.input.source_ref, case_ref=case,
-                      model_id=model_id, model_policy_digest=policy_digest)
+                      model_id=model_id, model_policy_digest=policy_digest,
+                      execution_plan=execution_plan)
         team_request = self._execution_request(
             authority_id=self._executor.authority_id,
             team_kind="team", **common,
@@ -820,6 +858,63 @@ class GenericCapabilityBenchmarkAdapter:
         _require_evaluation(baseline_eval, baseline)
         return GenericBenchmarkPair(case, team, baseline, team_eval, baseline_eval)
 
+    def _execution_plan(
+        self, request: CapabilityAssemblyStageRequest, job: object,
+        model_id: str, policy_digest: str,
+    ) -> GenericBenchmarkExecutionPlan:
+        direct = getattr(self._bindings, "benchmark_execution_plan", None)
+        if callable(direct):
+            plan = direct(request, model_id, policy_digest)
+            if isinstance(plan, GenericBenchmarkExecutionPlan):
+                return plan
+        resolver = getattr(self._bindings, "benchmark_candidate_for", None)
+        if not callable(resolver):
+            raise CapabilityLiveAuthorityUnavailable(
+                "released benchmark candidate authority is unavailable"
+            )
+        candidate = resolver(request)
+        if not isinstance(candidate, ResolvedFactoryCandidate):
+            raise CapabilityLiveAuthorityUnavailable(
+                "released benchmark candidate authority is invalid"
+            )
+        try:
+            with FactoryCandidateEvaluator().verified_team_workspace(candidate) as (_, manifest):
+                names = tuple(agent.name for agent in manifest.agents)
+                if len(names) < 2:
+                    raise ValueError("team")
+                baseline_name = "captain_baseline"
+                baseline_ref = self._evidence.record_evaluation(_canonical({
+                    "schema": "captain.generic-benchmark-baseline-policy.v1",
+                    "candidate_ref": candidate.candidate.source_archive_ref.model_dump(mode="json"),
+                    "source_agent": names[0],
+                    "agent_name": baseline_name,
+                    "model_id": model_id,
+                    "model_policy_digest": policy_digest,
+                    "conversation_pattern": "single_agent",
+                    "max_handoffs": 0,
+                }).encode())
+                model_ref = self._evidence.record_evaluation(_canonical({
+                    "schema": "captain.generic-benchmark-model.v1",
+                    "model_id": model_id,
+                }).encode())
+                policy_ref = self._evidence.record_evaluation(_canonical({
+                    "schema": "captain.generic-benchmark-execution-policy.v1",
+                    "model_policy_digest": policy_digest,
+                }).encode())
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "released benchmark execution plan is unavailable"
+            ) from None
+        return GenericBenchmarkExecutionPlan(
+            candidate_ref=candidate.candidate.source_archive_ref,
+            team_manifest_ref=candidate.candidate.team_manifest.reference,
+            baseline_policy_ref=baseline_ref,
+            model_ref=model_ref,
+            execution_policy_ref=policy_ref,
+            team_agent_names=names,
+            baseline_agent_name=baseline_name,
+        )
+
     def _execution_request(
         self, *, authority_id: UUID, team_kind: Literal["team", "single_agent"],
         **common: object,
@@ -837,6 +932,7 @@ class GenericCapabilityBenchmarkAdapter:
             team_kind=team_kind, model_id=common["model_id"],
             model_policy_digest=common["model_policy_digest"],
             execution_case=execution_case, request_nonce=nonce,
+            execution_plan=common["execution_plan"],
         )
         execution_case = self._private_cases.issue_execution(
             case_ref, authority_id=authority_id,
@@ -1253,6 +1349,7 @@ def generic_execution_request_digest(
     *, job_id: object, capability_id: object, input_ref: object,
     case_ref: GenericPrivateCaseRef, team_kind: object, model_id: object,
     model_policy_digest: object, execution_case: GenericExecutionCaseView,
+    execution_plan: GenericBenchmarkExecutionPlan,
     request_nonce: UUID,
 ) -> str:
     payload = {
@@ -1277,6 +1374,15 @@ def generic_execution_request_digest(
             "opaque_source_refs": execution_case.opaque_source_refs,
             "declared_tool_keys": execution_case.declared_tool_keys,
             "tool_authority_sha256": execution_case.tool_authority_sha256,
+        },
+        "execution_plan": {
+            "candidate_ref": execution_plan.candidate_ref.model_dump(mode="json"),
+            "team_manifest_ref": execution_plan.team_manifest_ref.model_dump(mode="json"),
+            "baseline_policy_ref": execution_plan.baseline_policy_ref.model_dump(mode="json"),
+            "model_ref": execution_plan.model_ref.model_dump(mode="json"),
+            "execution_policy_ref": execution_plan.execution_policy_ref.model_dump(mode="json"),
+            "team_agent_names": execution_plan.team_agent_names,
+            "baseline_agent_name": execution_plan.baseline_agent_name,
         },
         "request_nonce": str(request_nonce),
     }

@@ -1870,6 +1870,19 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
         def binding_for(self, request: object) -> object:
             return SimpleNamespace(job=job)
 
+        def benchmark_execution_plan(self, request, model_id, policy_digest):
+            del request, model_id, policy_digest
+            from gateway.capability_generic_benchmark import GenericBenchmarkExecutionPlan
+            return GenericBenchmarkExecutionPlan(
+                candidate_ref=_ref("benchmark-candidate"),
+                team_manifest_ref=_ref("benchmark-team-manifest"),
+                baseline_policy_ref=_ref("benchmark-baseline-policy"),
+                model_ref=_ref("benchmark-model"),
+                execution_policy_ref=_ref("benchmark-policy"),
+                team_agent_names=("planner", "worker"),
+                baseline_agent_name="captain_baseline",
+            )
+
     class Evidence:
         class ToolRegistry:
             issued: dict[str, dict[str, object]] = {}

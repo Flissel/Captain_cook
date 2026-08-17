@@ -106,6 +106,7 @@ from gateway.capability_generic_benchmark import (
     GenericBenchmarkRecordingRequest,
     GenericPrivateCaseRef,
     GenericToolCallEvidence,
+    GenericAuthorizedToolCall,
     generic_benchmark_passes,
 )
 from gateway.capability_live_current_adapters import CapabilityProjectionReadback
@@ -618,6 +619,106 @@ class CaptainBenchmarkToolEvidenceAuthority:
     def __init__(self, *, gateway_store: GatewayStore, artifacts: object) -> None:
         self.gateway_store = gateway_store
         self._artifacts = artifacts
+
+    def _put_tool_artifact(self, payload: dict[str, object]) -> ArtifactRef:
+        body = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode()
+        reference = self._artifacts.put(body, "application/json")
+        if (
+            not isinstance(reference, ArtifactRef)
+            or reference.sha256 != hashlib.sha256(body).hexdigest()
+            or self._artifacts.read_bytes(reference) != body
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool evidence artifact readback failed"
+            )
+        return reference
+
+    def authorize(
+        self, *, job_id: UUID, case_ref: GenericPrivateCaseRef,
+        tool_key: str, operation: str, call_id: str, lease_id: str,
+        trace_id: UUID, run_id: UUID, model_policy_digest: str,
+        batch_id: str, command_id: UUID, candidate_ref: ArtifactRef,
+        execution_ref: ArtifactRef,
+    ) -> GenericAuthorizedToolCall:
+        common = {
+            "job_id": str(job_id), "case_digest": case_ref.case_digest,
+            "tool_key": tool_key, "trace_id": str(trace_id),
+            "run_id": str(run_id), "model_policy_digest": model_policy_digest,
+            "batch_id": batch_id, "command_id": str(command_id),
+            "candidate_sha256": candidate_ref.sha256,
+            "execution_sha256": execution_ref.sha256,
+        }
+        if (
+            not tool_key or not operation or not call_id or not lease_id
+            or _SHA256.fullmatch(case_ref.case_digest) is None
+            or _SHA256.fullmatch(model_policy_digest) is None
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool authorization is invalid"
+            )
+        call_ref = self._put_tool_artifact({
+            "schema": "captain.capability-benchmark-tool-call.v2",
+            **common, "operation": operation, "call_id": call_id,
+        })
+        lease_ref = self._put_tool_artifact({
+            "schema": "captain.capability-benchmark-tool-lease.v2",
+            **common, "operation": operation, "call_id": call_id,
+            "call_sha256": call_ref.sha256, "lease_id": lease_id,
+            "status": "authorized",
+        })
+        try:
+            self.gateway_store.record_capability_tool_authorization(
+                **common, operation=operation, call_id=call_id,
+                lease_id=lease_id, call_ref=call_ref, lease_ref=lease_ref,
+            )
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool authorization registration failed"
+            ) from None
+        return GenericAuthorizedToolCall(
+            tool_key=tool_key, call_id=call_id, lease_id=lease_id,
+            call_ref=call_ref, lease_ref=lease_ref,
+        )
+
+    def complete(
+        self, authorization: GenericAuthorizedToolCall, *, job_id: UUID,
+        case_ref: GenericPrivateCaseRef, operation: str, trace_id: UUID,
+        run_id: UUID, model_policy_digest: str, result_ref_sha256: str,
+        batch_id: str, execution_result_id: UUID,
+    ) -> GenericToolCallEvidence:
+        receipt_ref = self._put_tool_artifact({
+            "schema": "captain.capability-benchmark-tool-receipt.v2",
+            "case_digest": case_ref.case_digest,
+            "tool_key": authorization.tool_key,
+            "trace_id": str(trace_id), "run_id": str(run_id),
+            "model_policy_digest": model_policy_digest,
+            "operation": operation, "call_id": authorization.call_id,
+            "call_sha256": authorization.call_ref.sha256,
+            "lease_id": authorization.lease_id,
+            "lease_sha256": authorization.lease_ref.sha256,
+            "status": "succeeded", "result_ref_sha256": result_ref_sha256,
+        })
+        try:
+            self.gateway_store.record_capability_tool_evidence(
+                case_digest=case_ref.case_digest, job_id=job_id,
+                tool_key=authorization.tool_key, operation=operation,
+                trace_id=trace_id, run_id=run_id,
+                model_policy_digest=model_policy_digest,
+                call_ref=authorization.call_ref,
+                lease_ref=authorization.lease_ref, receipt_ref=receipt_ref,
+                batch_id=batch_id, execution_result_id=execution_result_id,
+                result_ref_sha256=result_ref_sha256,
+            )
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool evidence registration failed"
+            ) from None
+        return GenericToolCallEvidence(
+            tool_key=authorization.tool_key, call_ref=authorization.call_ref,
+            lease_ref=authorization.lease_ref, receipt_ref=receipt_ref,
+        )
 
     def issue(
         self,

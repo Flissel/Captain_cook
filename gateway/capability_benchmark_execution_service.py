@@ -25,7 +25,9 @@ from gateway.capability_generic_benchmark import (
     GenericBenchmarkExecutionEvidence,
     GenericBenchmarkExecutionRequest,
     GenericExecutionCaseView,
+    GenericAuthorizedToolCall,
     GenericToolCallEvidence,
+    generic_execution_request_digest,
 )
 from gateway.capability_live_pipeline import CapabilityLiveAuthorityUnavailable
 
@@ -40,11 +42,17 @@ class BenchmarkRuntimeEffectResult:
     tool_result_refs: dict[str, ArtifactRef]
     cost_usd: Decimal
     latency_ms: int
+    candidate_ref: ArtifactRef
+    execution_ref: ArtifactRef
+    agent_names: tuple[str, ...]
 
 
 class BenchmarkRuntimeEffectPort(Protocol):
     async def execute(
-        self, command: AgentRuntimeCommand,
+        self, command: AgentRuntimeCommand, *,
+        execution_plan: object,
+        team_kind: str,
+        authorized_tools: tuple[GenericAuthorizedToolCall, ...],
     ) -> BenchmarkRuntimeEffectResult: ...
 
 
@@ -60,8 +68,15 @@ class GatewayRuntimeBenchmarkEffect:
         self._artifacts = artifacts
 
     async def execute(
-        self, command: AgentRuntimeCommand,
+        self, command: AgentRuntimeCommand, *,
+        execution_plan: object,
+        team_kind: str,
+        authorized_tools: tuple[GenericAuthorizedToolCall, ...],
     ) -> BenchmarkRuntimeEffectResult:
+        if not authorized_tools:
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark tool authorization is unavailable"
+            )
         result = await self._executor.execute(command)
         if not isinstance(result, AgentRuntimeResult):
             raise CapabilityLiveAuthorityUnavailable(
@@ -88,6 +103,7 @@ class GatewayRuntimeBenchmarkEffect:
         required = {
             "schema", "command_id", "observations", "rationale", "messages",
             "handoffs", "tool_result_refs", "cost_usd", "latency_ms",
+            "candidate_ref", "execution_ref", "agent_names",
         }
         try:
             if set(value) != required or value["command_id"] != str(command.event_id):
@@ -106,6 +122,25 @@ class GatewayRuntimeBenchmarkEffect:
             }
             cost = Decimal(str(value["cost_usd"]))
             latency = int(value["latency_ms"])
+            candidate_ref = ArtifactRef.model_validate(value["candidate_ref"])
+            execution_ref = ArtifactRef.model_validate(value["execution_ref"])
+            agent_names = tuple(str(item) for item in value["agent_names"])
+            expected_execution_ref = (
+                execution_plan.team_manifest_ref
+                if team_kind == "team"
+                else execution_plan.baseline_policy_ref
+            )
+            expected_agents = (
+                execution_plan.team_agent_names
+                if team_kind == "team"
+                else (execution_plan.baseline_agent_name,)
+            )
+            if (
+                candidate_ref != execution_plan.candidate_ref
+                or execution_ref != expected_execution_ref
+                or agent_names != expected_agents
+            ):
+                raise ValueError("execution binding")
             if not isinstance(value["observations"], dict) or not isinstance(value["rationale"], str):
                 raise ValueError("shape")
         except (AttributeError, KeyError, TypeError, ValueError):
@@ -116,6 +151,8 @@ class GatewayRuntimeBenchmarkEffect:
             result=result, observations=value["observations"],  # type: ignore[arg-type]
             rationale=value["rationale"], messages=messages, handoffs=handoffs,  # type: ignore[arg-type]
             tool_result_refs=tool_results, cost_usd=cost, latency_ms=latency,
+            candidate_ref=candidate_ref, execution_ref=execution_ref,
+            agent_names=agent_names,
         )
 
 
@@ -127,6 +164,10 @@ class BenchmarkToolIssuerPort(Protocol):
     authority_id: UUID
 
     def issue(self, **kwargs: object) -> GenericToolCallEvidence: ...
+    def authorize(self, **kwargs: object) -> GenericAuthorizedToolCall: ...
+    def complete(
+        self, authorization: GenericAuthorizedToolCall, **kwargs: object,
+    ) -> GenericToolCallEvidence: ...
 
 
 class GatewayBenchmarkExecutionService:
@@ -148,6 +189,18 @@ class GatewayBenchmarkExecutionService:
     async def execute(
         self, request: GenericBenchmarkExecutionRequest,
     ) -> GenericBenchmarkExecutionEvidence:
+        if request.request_digest != generic_execution_request_digest(
+            job_id=request.job_id, capability_id=request.capability_id,
+            input_ref=request.input_ref, case_ref=request.case_ref,
+            team_kind=request.team_kind, model_id=request.model_id,
+            model_policy_digest=request.model_policy_digest,
+            execution_case=request.execution_case,
+            execution_plan=request.execution_plan,
+            request_nonce=request.request_nonce,
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark execution request authority changed"
+            )
         canonical_case_ref, expected_view = (
             self._private_cases.resolve_execution_transport(
                 request.case_ref, authority_id=self._executor_authority_id,
@@ -197,6 +250,14 @@ class GatewayBenchmarkExecutionService:
             "trace_id": str(trace_id),
             "run_id": str(run_id),
             "team_kind": request.team_kind,
+            "candidate_ref": request.execution_plan.candidate_ref.model_dump(mode="json"),
+            "execution_ref": (
+                request.execution_plan.team_manifest_ref.model_dump(mode="json")
+                if request.team_kind == "team"
+                else request.execution_plan.baseline_policy_ref.model_dump(mode="json")
+            ),
+            "model_ref": request.execution_plan.model_ref.model_dump(mode="json"),
+            "execution_policy_ref": request.execution_plan.execution_policy_ref.model_dump(mode="json"),
             "setup": request.execution_case.setup,
             "action": request.execution_case.action,
             "declared_tool_keys": list(tools),
@@ -231,14 +292,50 @@ class GatewayBenchmarkExecutionService:
             tool_authority_sha256=expected_tools_digest,
         )
         self._store.accept_runtime_command(command)
-        effect = await self._runtime_effect.execute(command)
+        authorized_tools = tuple(
+            self._tool_issuer.authorize(
+                job_id=request.job_id, case_ref=canonical_case_ref,
+                tool_key=tool_key, operation=RuntimeOperation.CODEX_RUN.value,
+                call_id=f"call-{command_id}-{tool_key}",
+                lease_id=f"lease-{command_id}-{tool_key}",
+                trace_id=trace_id, run_id=run_id,
+                model_policy_digest=request.model_policy_digest,
+                batch_id=batch_id, command_id=command_id,
+                candidate_ref=request.execution_plan.candidate_ref,
+                execution_ref=(
+                    request.execution_plan.team_manifest_ref
+                    if request.team_kind == "team"
+                    else request.execution_plan.baseline_policy_ref
+                ),
+            )
+            for tool_key in tools
+        )
+        effect = await self._runtime_effect.execute(
+            command,
+            execution_plan=request.execution_plan,
+            team_kind=request.team_kind,
+            authorized_tools=authorized_tools,
+        )
         result = effect.result
+        expected_execution_ref = (
+            request.execution_plan.team_manifest_ref
+            if request.team_kind == "team"
+            else request.execution_plan.baseline_policy_ref
+        )
+        expected_agents = (
+            request.execution_plan.team_agent_names
+            if request.team_kind == "team"
+            else (request.execution_plan.baseline_agent_name,)
+        )
         if (
             result.command_id != command_id
             or result.correlation_id != job.correlation_id
             or result.operation is not RuntimeOperation.CODEX_RUN
             or result.status is not RuntimeStatus.SUCCEEDED
             or result.subject_version != job.subject_version
+            or effect.candidate_ref != request.execution_plan.candidate_ref
+            or effect.execution_ref != expected_execution_ref
+            or effect.agent_names != expected_agents
             or set(effect.tool_result_refs) != set(tools)
             or any(
                 reference not in (*result.artifact_refs, *result.evidence_refs)
@@ -276,21 +373,20 @@ class GatewayBenchmarkExecutionService:
             "from_agent": source, "to_agent": target, "reason_code": reason,
         }) for source, target, reason in effect.handoffs)
         tool_calls = tuple(
-            self._tool_issuer.issue(
+            self._tool_issuer.complete(
+                authorization,
                 job_id=request.job_id, case_ref=canonical_case_ref,
-                tool_key=tool_key, operation=RuntimeOperation.CODEX_RUN.value,
-                call_id=f"call-{command_id}-{tool_key}",
-                lease_id=f"lease-{command_id}-{tool_key}",
+                operation=RuntimeOperation.CODEX_RUN.value,
                 trace_id=trace_id, run_id=run_id,
                 model_policy_digest=request.model_policy_digest,
-                result_ref_sha256=effect.tool_result_refs[tool_key].sha256,
+                result_ref_sha256=effect.tool_result_refs[authorization.tool_key].sha256,
                 batch_id=batch_id, execution_result_id=result.event_id,
             )
-            for tool_key in tools
+            for authorization in authorized_tools
         )
         return GenericBenchmarkExecutionEvidence(
             case_ref=request.case_ref, team_kind=request.team_kind,
-            agent_count=2 if request.team_kind == "team" else 1,
+            agent_count=len(effect.agent_names),
             model_id=request.model_id,
             model_policy_digest=request.model_policy_digest,
             input_ref=request.input_ref, capability_id=request.capability_id,

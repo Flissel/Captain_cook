@@ -19,6 +19,7 @@ from gateway.capability_benchmark_process_executor import (
 )
 from gateway.capability_generic_benchmark import (
     GenericBenchmarkCategory,
+    GenericBenchmarkExecutionPlan,
     GenericBenchmarkExecutionRequest,
     GenericExecutionCaseView,
     GenericPrivateCaseRef,
@@ -64,6 +65,15 @@ def _request(label: str = "request") -> GenericBenchmarkExecutionRequest:
         job_id=_id("job"), capability_id="generic_capability",
         input_ref=_ref("input"), case_ref=case_ref, team_kind="team",
         model_id="fixed-model", model_policy_digest="c" * 64,
+        execution_plan=GenericBenchmarkExecutionPlan(
+            candidate_ref=_ref("candidate"),
+            team_manifest_ref=_ref("team-manifest"),
+            baseline_policy_ref=_ref("baseline-policy"),
+            model_ref=_ref("model"),
+            execution_policy_ref=_ref("execution-policy"),
+            team_agent_names=("planner", "worker"),
+            baseline_agent_name="baseline",
+        ),
         execution_case=execution_case, request_nonce=nonce,
     )
     return GenericBenchmarkExecutionRequest(

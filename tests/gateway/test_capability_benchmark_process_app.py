@@ -53,6 +53,15 @@ def _payload() -> dict[str, object]:
             "declared_tool_keys": request.execution_case.declared_tool_keys,
             "tool_authority_sha256": request.execution_case.tool_authority_sha256,
         },
+        "execution_plan": {
+            "candidate_ref": request.execution_plan.candidate_ref.model_dump(mode="json"),
+            "team_manifest_ref": request.execution_plan.team_manifest_ref.model_dump(mode="json"),
+            "baseline_policy_ref": request.execution_plan.baseline_policy_ref.model_dump(mode="json"),
+            "model_ref": request.execution_plan.model_ref.model_dump(mode="json"),
+            "execution_policy_ref": request.execution_plan.execution_policy_ref.model_dump(mode="json"),
+            "team_agent_names": request.execution_plan.team_agent_names,
+            "baseline_agent_name": request.execution_plan.baseline_agent_name,
+        },
         "request_nonce": str(request.request_nonce),
         "request_digest": request.request_digest,
     }
