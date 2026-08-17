@@ -945,8 +945,8 @@ def _factory_runtime_descriptor(*, adapter_sha256: str) -> dict[str, object]:
         "model_client_signature": "(job, invocation)",
         "factory_type": "gateway.agent_factory_live_composition.AgentFactoryLiveComposition",
         "repository_type": "gateway.factory_repository.GatewayFactoryRepository",
-        "team_execution_type": "gateway.agent_factory_live_composition.ProductionFactoryTeamExecutionPort",
-        "ports_provider_type": "gateway.agent_factory_live_composition.GatewayTechnicalTeamExecutionPortsProvider",
+        "team_execution_type": "gateway.capability_factory_generic_real_case.GatewayD10GenericCandidateValidator",
+        "ports_provider_type": "gateway.capability_factory_generic_real_case.GatewayD10GenericCandidateValidator",
         "model_client_type": "agenten.agent_factory.business_benchmark_production_ports.ProxyBoundResponsesModelClientBuilder",
         "budget_type": "gateway.factory_repository.GatewayFactoryBudgetLedger",
         "pricing_authority_type": "agenten.agent_factory.business_benchmark_production_ports.BusinessBenchmarkPricingAuthority",
@@ -1284,25 +1284,16 @@ def test_shipped_verified_closure_materializes_the_real_factory_graph(
         private_benchmark_catalog=private_catalog,
         clock=clock, repository_root=tmp_path,
     )
-    model_client = runtime.factory.team_execution._ports_for._model_client_for
-    for field, drift in (
-        ("proxy_url", "http://127.0.0.1:18092"),
-        ("policy_sha256", "a" * 64),
-        ("price_card_sha256", "b" * 64),
-        ("context_sha256", "c" * 64),
-        ("executable_sha256", "d" * 64),
-        ("code_sha256", "e" * 64),
-        ("paid_command_sha256", "f" * 64),
-        ("hard_ceiling_enforced", False),
-    ):
-        original = getattr(model_client, field)
-        object.__setattr__(model_client, field, drift)
-        assert not bootstrap._native_runtime_is_bound(
-            runtime=runtime, store=store,  # type: ignore[arg-type]
-            private_benchmark_catalog=private_catalog,
-            clock=clock, repository_root=tmp_path,
-        ), field
-        object.__setattr__(model_client, field, original)
+    generic_real_case = runtime.factory.team_execution
+    assert type(generic_real_case).__name__ == "GatewayD10GenericCandidateValidator"
+    assert generic_real_case is runtime.factory.candidate_validator
+    assert generic_real_case._gateway_store is store
+    generic_real_case._gateway_store = object()
+    assert not bootstrap._native_runtime_is_bound(
+        runtime=runtime, store=store,  # type: ignore[arg-type]
+        private_benchmark_catalog=private_catalog,
+        clock=clock, repository_root=tmp_path,
+    )
 
 
 def test_factory_constructor_receives_only_allowlisted_config_and_redacts_any_error(

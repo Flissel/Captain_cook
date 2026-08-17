@@ -23,6 +23,11 @@ def main() -> int:
         "agenten.agent_factory.business_benchmark_production_ports."
         "ProxyBoundResponsesModelClientBuilder"
     )
+    payload["team_execution_type"] = (
+        "gateway.capability_factory_generic_real_case."
+        "GatewayD10GenericCandidateValidator"
+    )
+    payload["ports_provider_type"] = payload["team_execution_type"]
     payload["adapter_sha256"] = hashlib.sha256(source).hexdigest()
     payload["adapter_ast_sha256"] = hashlib.sha256(
         ast.dump(tree, annotate_fields=True, include_attributes=False).encode("utf-8")

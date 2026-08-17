@@ -62,6 +62,9 @@ from gateway.agent_factory_live_composition import (
 )
 from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
 from gateway.capability_factory_benchmark_bridge import AssemblyOwnedGenericBenchmark
+from gateway.capability_factory_generic_real_case import (
+    GatewayD10GenericCandidateValidator,
+)
 from gateway.factory_repository import GatewayFactoryBudgetLedger, GatewayFactoryRepository
 from agenten.agent_factory.business_benchmark_production_ports import (
     BusinessBenchmarkPricingAuthority,
@@ -1646,8 +1649,8 @@ _FACTORY_RUNTIME_DESCRIPTOR_BINDINGS = {
     "model_client_signature": "(job, invocation)",
     "factory_type": "gateway.agent_factory_live_composition.AgentFactoryLiveComposition",
     "repository_type": "gateway.factory_repository.GatewayFactoryRepository",
-    "team_execution_type": "gateway.agent_factory_live_composition.ProductionFactoryTeamExecutionPort",
-    "ports_provider_type": "gateway.agent_factory_live_composition.GatewayTechnicalTeamExecutionPortsProvider",
+    "team_execution_type": "gateway.capability_factory_generic_real_case.GatewayD10GenericCandidateValidator",
+    "ports_provider_type": "gateway.capability_factory_generic_real_case.GatewayD10GenericCandidateValidator",
     "model_client_type": "agenten.agent_factory.business_benchmark_production_ports.ProxyBoundResponsesModelClientBuilder",
     "budget_type": "gateway.factory_repository.GatewayFactoryBudgetLedger",
     "pricing_authority_type": "agenten.agent_factory.business_benchmark_production_ports.BusinessBenchmarkPricingAuthority",
@@ -2441,16 +2444,25 @@ def _native_runtime_is_bound(
         or getattr(factory.lease_issuer, "_n8n_work_batch_source", None) is not n8n
         or type(factory.hermes) is not HermesCliFactory
         or getattr(factory.hermes, "_workflow_artifacts", None) is not factory.repository
-        or type(factory.team_execution) is not ProductionFactoryTeamExecutionPort
-        or not _native_team_execution_ports_are_bound(
-            factory.team_execution,
-            repository=factory.repository,
-            clock=clock,
-            repository_root=repository_root,
-        )
-        or type(factory.candidate_validator) is not CandidateEvaluationFactory
-        or getattr(factory.candidate_validator, "_workflow_artifacts", None)
-        is not factory.repository
+        or type(factory.team_execution) is not GatewayD10GenericCandidateValidator
+        or factory.candidate_validator is not factory.team_execution
+        or getattr(factory.candidate_validator, "_gateway_store", None) is not store
+        or type(getattr(factory.candidate_validator, "_build_validator", None))
+        is not CandidateEvaluationFactory
+        or getattr(
+            getattr(factory.candidate_validator, "_build_validator", None),
+            "_workflow_artifacts", None,
+        ) is not factory.repository
+        or type(getattr(
+            getattr(factory.candidate_validator, "_build_validator", None),
+            "_provider", None,
+        )) is not GatewayForgeCandidateProvider
+        or getattr(
+            getattr(
+                getattr(factory.candidate_validator, "_build_validator", None),
+                "_provider", None,
+            ), "_repository", None,
+        ) is not factory.repository
         or type(factory.business_benchmark) is not AssemblyOwnedGenericBenchmark
         or type(factory.dispatcher) is not FactoryDispatcher
         or getattr(factory.dispatcher, "_coordinator", None) is not factory.coordinator
