@@ -134,6 +134,8 @@ describe("portal API", () => {
       { message: "Y7pL2vQ9xN4mR8sT6uW3aB5cD1eF0gHk" },
       { message: "V2hhdGV2ZXJTdXBlclNlY3JldENyZWRlbnRpYWw" },
       { message: "Q29uZmlkZW50aWFsVG9rZW5Gb3JUZXN0aW5nLTEyMw" },
+      { message: "GEekimnOsQapQYnwxawDrwCNtDdVqCxsEcQvpJJTuveD" },
+      { message: "aBcDeFgHiJkLmNoPqRsTuVwXyZaBcDeFgHiJkLmNoPqRsTuVwXyZ" },
       { message: "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef" },
       { required_scope: "ghp_abcdefghijklmnopqrstuvwxyz0123456789" },
       { message: "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789" },

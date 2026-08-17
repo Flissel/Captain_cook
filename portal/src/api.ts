@@ -142,7 +142,7 @@ function tokenEntropy(token: string): number {
 }
 
 function humanReadableIdentifier(token: string): boolean {
-  return /^[A-Za-z]+$/.test(token) || HUMAN_READABLE_IDENTIFIER_PATTERN.test(token);
+  return /^[a-z]+$/.test(token) || /^[A-Z][a-z]+$/.test(token) || HUMAN_READABLE_IDENTIFIER_PATTERN.test(token);
 }
 
 function knownOrOpaqueSecret(value: string, allowDigest: boolean, uriSegments = false): boolean {
