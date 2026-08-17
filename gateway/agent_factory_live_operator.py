@@ -128,6 +128,12 @@ from gateway.factory_improvement_authority import (
 from gateway.factory_hermes_retry_authority import (
     FilesystemFactoryHermesRetryAuthority,
 )
+from gateway.factory_v3_live_authority import (
+    FactoryV3LiveAuthorityBinding,
+    FactoryV3ServiceBinding,
+    load_captain_factory_v3_live_authority,
+    verify_factory_v3_local_runtime,
+)
 from gateway.minibook_creation_artifacts import GatewayMinibookCreationArtifactStore
 from gateway.store import GatewayStore
 
@@ -295,10 +301,6 @@ _FACTORY_V3_LIVE_INPUT = Path(
 _FACTORY_V3_FROZEN_INPUT_SHA256 = (
     "81e76f52fdc99f64aeea9e5008c00d6eba25972014ef7563d4fc0851cf85864f"
 )
-_FACTORY_V3_CODEX_SESSION_SHA256 = (
-    "2d7ca8acc7cb6dcdbc9882f3772be1cc8e9dd3ab210d2f87775b92b84023bbf3"
-)
-_FACTORY_V3_HERMES_GIT_SHA = "fcbdeca1ebedf1d1ee7f0199f4df7bf3f39619a0"
 _FACTORY_V3_AGENT_IDS = (
     "account_researcher",
     "opportunity_qualifier",
@@ -357,27 +359,10 @@ _FACTORY_V3_AUTHORITY_MANIFEST: dict[str, object] = {
 _FACTORY_V3_AUTHORITY_MANIFEST_SHA256 = (
     "21fa9a028a9a1b2c53635dcf345d2321f675a7fa2012083c6581dc8ef092a382"
 )
-_FACTORY_V3_HEALTH_CAPABILITIES: dict[str, tuple[str, ...]] = {
-    "captain-gateway": (
-        "factory-v3-live-authority",
-        "action-inbox-read",
-    ),
-    "minibook-creation": ("creation-jobs-v3", "cas-readback-v1"),
-}
-_FACTORY_V3_CODEX_SESSION_MARKERS = (
-    b'ArgumentList.Add("--sandbox")',
-    b'ArgumentList.Add("--ask-for-approval")',
-    b'ArgumentList.Add("never")',
-    b'ArgumentList.Add("sandbox_workspace_write.network_access=false")',
-    b'ArgumentList.Add("--ignore-user-config")',
-    b'ArgumentList.Add("--json")',
-    b"$DeadlineAt",
-)
 _SAFE_CREDENTIAL_REF = re.compile(
     r"^credential://[A-Za-z0-9._~-]+/[A-Za-z0-9._~/-]+$"
 )
 _SAFE_DIGEST = re.compile(r"^[0-9a-f]{64}$")
-_SAFE_SKILL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 @dataclass(frozen=True)
@@ -478,6 +463,8 @@ class FactoryV3LivePreflightReport:
     checked_at: datetime
     status: Literal["ready", "awaiting_user_input", "unmet_preflight"]
     input_sha256: str
+    authority_binding_sha256: str
+    active_released_skill_sha256: str
     checks: tuple[FactoryV3LivePreflightCheck, ...]
     action_inbox: FactoryV3LiveActionInboxStatus | None = None
     resume_metadata: FactoryV3LiveResumeMetadata | None = None
@@ -494,6 +481,8 @@ class FactoryV3LivePreflightReport:
             "status": self.status,
             "input_sha256": self.input_sha256,
             "authority_manifest_sha256": _FACTORY_V3_AUTHORITY_MANIFEST_SHA256,
+            "authority_binding_sha256": self.authority_binding_sha256,
+            "active_released_skill_sha256": self.active_released_skill_sha256,
             "checks": [check.as_dict() for check in self.checks],
         }
         if self.action_inbox is not None:
@@ -517,7 +506,7 @@ class _FactoryV3LiveReadOnlyProbe(Protocol):
         token: str,
         skill_name: str,
         skill_sha256: str,
-    ) -> bool: ...
+    ) -> Mapping[str, object]: ...
 
     def action_resume_metadata(
         self,
@@ -571,11 +560,11 @@ class _DefaultFactoryV3LiveReadOnlyProbe:
         token: str,
         skill_name: str,
         skill_sha256: str,
-    ) -> bool:
+    ) -> Mapping[str, object]:
         del gateway_origin, token, skill_name, skill_sha256
         # The current Gateway has no read-only, correlation-bound active-skill
         # preflight. Local bytes or an environment value are not Captain proof.
-        return False
+        return {}
 
     def action_resume_metadata(
         self,
@@ -627,7 +616,10 @@ def _canonical_service_origin(value: str) -> str | None:
 
 def _factory_v3_authority_origins(
     environment: Mapping[str, str],
+    binding: FactoryV3LiveAuthorityBinding | None,
 ) -> tuple[str, str] | None:
+    if binding is None:
+        return None
     if any(
         environment.get(name, "").strip()
         for name in (
@@ -636,41 +628,40 @@ def _factory_v3_authority_origins(
         )
     ):
         return None
-    gateway = _canonical_service_origin(
-        environment.get("CAPTAIN_FACTORY_V3_GATEWAY_ORIGIN", "").strip()
-    )
-    minibook = _canonical_service_origin(
-        environment.get("CAPTAIN_FACTORY_V3_MINIBOOK_ORIGIN", "").strip()
-    )
-    if gateway is None or minibook is None or gateway == minibook:
+    gateway_claim = environment.get("CAPTAIN_FACTORY_V3_GATEWAY_ORIGIN", "").strip()
+    minibook_claim = environment.get("CAPTAIN_FACTORY_V3_MINIBOOK_ORIGIN", "").strip()
+    if (
+        gateway_claim and gateway_claim != binding.gateway.origin
+    ) or (
+        minibook_claim and minibook_claim != binding.minibook.origin
+    ):
         return None
-    return gateway, minibook
+    return binding.gateway.origin, binding.minibook.origin
 
 
 def _factory_v3_service_health_payload_ready(
     payload: Mapping[str, object],
     *,
-    service: str,
-    origin: str,
+    binding: FactoryV3ServiceBinding,
 ) -> bool:
-    expected_capabilities = _FACTORY_V3_HEALTH_CAPABILITIES.get(service)
     capabilities = payload.get("capabilities")
     return bool(
-        expected_capabilities is not None
-        and set(payload) == {
+        set(payload) == {
             "schema",
             "service",
             "version",
             "origin",
             "capabilities",
+            "credential_audience",
             "ready",
         }
         and payload.get("schema") == "captain.factory-v3-service-health.v1"
-        and payload.get("service") == service
-        and payload.get("version") == "v3"
-        and payload.get("origin") == origin
+        and payload.get("service") == binding.service
+        and payload.get("version") == binding.version
+        and payload.get("origin") == binding.origin
         and isinstance(capabilities, (list, tuple))
-        and tuple(capabilities) == expected_capabilities
+        and tuple(capabilities) == binding.capabilities
+        and payload.get("credential_audience") == binding.credential_audience
         and payload.get("ready") is True
     )
 
@@ -678,20 +669,22 @@ def _factory_v3_service_health_payload_ready(
 def _bounded_service_health_ready(
     probe: _FactoryV3LiveReadOnlyProbe,
     *,
-    service: str,
-    origin: str,
+    binding: FactoryV3ServiceBinding,
     token: str,
 ) -> bool:
-    if not token or _canonical_service_origin(origin) != origin:
+    if not token or _canonical_service_origin(binding.origin) != binding.origin:
         return False
     try:
-        payload = probe.service_health(service=service, origin=origin, token=token)
+        payload = probe.service_health(
+            service=binding.service,
+            origin=binding.origin,
+            token=token,
+        )
     except Exception:
         return False
     return _factory_v3_service_health_payload_ready(
         payload,
-        service=service,
-        origin=origin,
+        binding=binding,
     )
 
 
@@ -713,59 +706,23 @@ def _isolated_factory_v3_roots_ready(*roots: Path) -> bool:
     )
 
 
-def _factory_v3_skill_digest(directory: Path) -> str | None:
-    try:
-        entries = sorted(
-            directory.rglob("*"),
-            key=lambda item: item.relative_to(directory).as_posix(),
-        )
-        if any(item.is_symlink() for item in entries):
-            return None
-        files = [item for item in entries if item.is_file()]
-        if not files or not (directory / "SKILL.md").is_file():
-            return None
-        manifest = []
-        for path in files:
-            content = path.read_bytes()
-            manifest.append(
-                {
-                    "path": path.relative_to(directory).as_posix(),
-                    "sha256": hashlib.sha256(content).hexdigest(),
-                    "size": len(content),
-                }
-            )
-    except OSError:
-        return None
-    encoded = json.dumps(
-        manifest,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def _factory_v3_released_skill_identity(
     environment: Mapping[str, str],
+    binding: FactoryV3LiveAuthorityBinding,
 ) -> tuple[str, str] | None:
-    name = environment.get("CAPTAIN_FACTORY_V3_RELEASED_SKILL_NAME", "").strip()
-    digest = environment.get("CAPTAIN_FACTORY_V3_RELEASED_SKILL_SHA256", "").strip()
-    root_value = environment.get("CAPTAIN_FACTORY_V3_RELEASED_SKILL_ROOT", "").strip()
+    name_claim = environment.get(
+        "CAPTAIN_FACTORY_V3_RELEASED_SKILL_NAME", ""
+    ).strip()
+    digest_claim = environment.get(
+        "CAPTAIN_FACTORY_V3_RELEASED_SKILL_SHA256", ""
+    ).strip()
     if (
-        _SAFE_SKILL_NAME.fullmatch(name) is None
-        or _SAFE_DIGEST.fullmatch(digest) is None
-        or not root_value
+        name_claim and name_claim != binding.released_skill.name
+    ) or (
+        digest_claim and digest_claim != binding.released_skill.sha256
     ):
         return None
-    try:
-        root = Path(root_value).resolve(strict=True)
-        directory = (root / name).resolve(strict=True)
-        directory.relative_to(root)
-    except (OSError, ValueError):
-        return None
-    if not directory.is_dir() or _factory_v3_skill_digest(directory) != digest:
-        return None
-    return name, digest
+    return binding.released_skill.name, binding.released_skill.sha256
 
 
 def _factory_v3_released_skill_ready(
@@ -773,26 +730,47 @@ def _factory_v3_released_skill_ready(
     probe: _FactoryV3LiveReadOnlyProbe,
     *,
     gateway_origin: str,
+    binding: FactoryV3LiveAuthorityBinding,
 ) -> bool:
-    identity = _factory_v3_released_skill_identity(environment)
+    identity = _factory_v3_released_skill_identity(environment, binding)
     token = environment.get("CAPTAIN_FACTORY_V3_CAPTAIN_TOKEN", "").strip()
     if identity is None or not token:
         return False
     name, digest = identity
     try:
-        return probe.released_skill_active(
+        payload = probe.released_skill_active(
             gateway_origin=gateway_origin,
             token=token,
             skill_name=name,
             skill_sha256=digest,
-        ) is True
+        )
     except Exception:
         return False
+    return bool(
+        set(payload) == {
+            "schema",
+            "authority",
+            "gateway_origin",
+            "skill_name",
+            "skill_sha256",
+            "authority_binding_sha256",
+            "status",
+        }
+        and payload.get("schema")
+        == "captain.factory-v3-released-skill-authority.v1"
+        and payload.get("authority") == "captain-gateway"
+        and payload.get("gateway_origin") == binding.gateway.origin
+        and payload.get("skill_name") == binding.released_skill.name
+        and payload.get("skill_sha256") == binding.released_skill.sha256
+        and payload.get("authority_binding_sha256") == binding.sha256
+        and payload.get("status") == "active"
+    )
 
 
-def _factory_v3_codex_session_ready(
+def _factory_v3_local_runtime_ready(
     environment: Mapping[str, str],
     repository_root: Path,
+    binding: FactoryV3LiveAuthorityBinding,
 ) -> bool:
     values = tuple(
         environment.get(name, "").strip()
@@ -800,109 +778,22 @@ def _factory_v3_codex_session_ready(
             "CAPTAIN_CODEX_EXECUTABLE",
             "CAPTAIN_PWSH_EXECUTABLE",
             "CAPTAIN_CODEX_HOME",
+            "CAPTAIN_FACTORY_V3_HERMES_PYTHON",
+            "CAPTAIN_FACTORY_V3_HERMES_MODULE_ROOT",
+            "CAPTAIN_FACTORY_V3_RELEASED_SKILL_ROOT",
         )
     )
     if not all(values):
         return False
-    codex_path, pwsh_path, codex_home_path = (Path(value) for value in values)
-    try:
-        if any(path.is_symlink() for path in (codex_path, pwsh_path, codex_home_path)):
-            return False
-        codex = codex_path.resolve(strict=True)
-        pwsh = pwsh_path.resolve(strict=True)
-        codex_home = codex_home_path.resolve(strict=True)
-        script = (
-            repository_root.resolve(strict=True) / "scripts" / "codex-session.ps1"
-        ).resolve(strict=True)
-        script_content = script.read_bytes()
-    except OSError:
-        return False
-    return bool(
-        codex.is_file()
-        and codex.name.casefold() in {"codex", "codex.exe"}
-        and pwsh.is_file()
-        and pwsh.name.casefold() in {"pwsh", "pwsh.exe"}
-        and codex_home.is_dir()
-        and script.is_file()
-        and hashlib.sha256(script_content).hexdigest()
-        == _FACTORY_V3_CODEX_SESSION_SHA256
-        and all(marker in script_content for marker in _FACTORY_V3_CODEX_SESSION_MARKERS)
-    )
-
-
-def _factory_v3_hermes_runtime_ready(
-    environment: Mapping[str, str],
-    repository_root: Path,
-) -> bool:
-    executable_value = environment.get(
-        "CAPTAIN_FACTORY_V3_HERMES_PYTHON", ""
-    ).strip()
-    module_value = environment.get(
-        "CAPTAIN_FACTORY_V3_HERMES_MODULE_ROOT", ""
-    ).strip()
-    if not executable_value or not module_value:
-        return False
-    executable_path = Path(executable_value)
-    module_path = Path(module_value)
-    try:
-        if executable_path.is_symlink() or module_path.is_symlink():
-            return False
-        executable = executable_path.resolve(strict=True)
-        module_root = module_path.resolve(strict=True)
-        expected_module_root = (
-            repository_root.resolve(strict=True) / "hermes-agent"
-        ).resolve(strict=True)
-        executable.relative_to(module_root)
-    except (OSError, ValueError):
-        return False
-    if not (
-        executable.is_file()
-        and executable.name.casefold() in {"python", "python.exe"}
-        and module_root == expected_module_root
-        and module_root.is_dir()
-        and (module_root / ".git").exists()
-        and (module_root / "hermes_cli" / "__init__.py").is_file()
-        and (module_root / "concurrent_log_handler.py").is_file()
-    ):
-        return False
-    try:
-        gitlink = subprocess.run(
-            ["git", "ls-tree", "HEAD", "--", "hermes-agent"],
-            cwd=repository_root,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        child_head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=module_root,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        child_status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=module_root,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    fields = gitlink.stdout.strip().split()
-    return bool(
-        gitlink.returncode == 0
-        and len(fields) >= 3
-        and fields[0] == "160000"
-        and re.fullmatch(r"[0-9a-f]{40}", fields[2]) is not None
-        and hmac.compare_digest(fields[2], _FACTORY_V3_HERMES_GIT_SHA)
-        and child_head.returncode == 0
-        and hmac.compare_digest(fields[2], child_head.stdout.strip())
-        and child_status.returncode == 0
-        and not child_status.stdout.strip()
+    return verify_factory_v3_local_runtime(
+        binding=binding,
+        repository_root=repository_root,
+        codex_path=Path(values[0]),
+        pwsh_path=Path(values[1]),
+        codex_home=Path(values[2]),
+        hermes_python_path=Path(values[3]),
+        hermes_runtime_root=Path(values[4]),
+        released_skill_root=Path(values[5]),
     )
 
 
@@ -1264,14 +1155,18 @@ def preflight_factory_v3_live(
         raise ValueError("Factory V3 live preflight clock must be UTC")
     probe = _probe or _DefaultFactoryV3LiveReadOnlyProbe()
     input_sha256 = _factory_v3_frozen_input_sha256(repository_root, input_path)
-    origins = _factory_v3_authority_origins(environment)
+    authority_binding = load_captain_factory_v3_live_authority(repository_root)
+    origins = _factory_v3_authority_origins(environment, authority_binding)
     live_opt_in = environment.get("CAPTAIN_FACTORY_V3_LIVE", "") == "1"
     isolated_roots = _isolated_factory_v3_roots_ready(
         workspace_root,
         cas_root,
         state_root,
     )
-    credentials = _factory_v3_credentials_ready(environment)
+    credentials = bool(
+        authority_binding is not None
+        and _factory_v3_credentials_ready(environment)
+    )
     execution_bounds = _factory_v3_execution_bounds_ready(environment, current_time)
     portal_configuration = _factory_v3_portal_configuration_ready(environment)
     runtime_enforcement = _factory_v3_live_runtime_enforcement_ready()
@@ -1282,6 +1177,7 @@ def preflight_factory_v3_live(
     stage_one_ready = all(
         (
             input_sha256 is not None,
+            authority_binding is not None,
             live_opt_in,
             origins is not None,
             isolated_roots,
@@ -1294,14 +1190,20 @@ def preflight_factory_v3_live(
     codex_session = False
     hermes_runtime = False
     released_skill_identity = False
-    if stage_one_ready:
-        codex_session = _factory_v3_codex_session_ready(environment, repository_root)
-        hermes_runtime = _factory_v3_hermes_runtime_ready(
+    if stage_one_ready and authority_binding is not None:
+        local_runtime = _factory_v3_local_runtime_ready(
             environment,
             repository_root,
+            authority_binding,
         )
+        codex_session = local_runtime
+        hermes_runtime = local_runtime
         released_skill_identity = (
-            _factory_v3_released_skill_identity(environment) is not None
+            _factory_v3_released_skill_identity(
+                environment,
+                authority_binding,
+            )
+            is not None
         )
 
     stage_two_ready = bool(
@@ -1326,18 +1228,20 @@ def preflight_factory_v3_live(
 
     # Stage 3 is the only token-bearing stage. Origins are canonical authorities
     # and health paths are derived by the probe; callers cannot inject a URL.
-    if stage_two_ready and origins is not None:
+    if (
+        stage_two_ready
+        and origins is not None
+        and authority_binding is not None
+    ):
         gateway_origin, minibook_origin = origins
         gateway_reachable = _bounded_service_health_ready(
             probe,
-            service="captain-gateway",
-            origin=gateway_origin,
+            binding=authority_binding.gateway,
             token=environment.get("CAPTAIN_FACTORY_V3_CAPTAIN_TOKEN", "").strip(),
         )
         minibook_reachable = _bounded_service_health_ready(
             probe,
-            service="minibook-creation",
-            origin=minibook_origin,
+            binding=authority_binding.minibook,
             token=environment.get("CAPTAIN_FACTORY_V3_WORKER_TOKEN", "").strip(),
         )
         if gateway_reachable and minibook_reachable:
@@ -1345,6 +1249,7 @@ def preflight_factory_v3_live(
                 environment,
                 probe,
                 gateway_origin=gateway_origin,
+                binding=authority_binding,
             )
         if released_skill_authority and (
             resume_metadata_path is not None
@@ -1370,6 +1275,10 @@ def preflight_factory_v3_live(
 
     checks = (
         _factory_v3_check("frozen_input", input_sha256 is not None),
+        _factory_v3_check(
+            "signed_authority_binding",
+            authority_binding is not None,
+        ),
         _factory_v3_check("live_opt_in", live_opt_in),
         _factory_v3_check("authority_origins", origins is not None),
         _factory_v3_check("gateway_reachability", gateway_reachable),
@@ -1396,6 +1305,14 @@ def preflight_factory_v3_live(
         checked_at=current_time,
         status=status,
         input_sha256=input_sha256 or "0" * 64,
+        authority_binding_sha256=(
+            authority_binding.sha256 if authority_binding is not None else "0" * 64
+        ),
+        active_released_skill_sha256=(
+            authority_binding.released_skill.sha256
+            if authority_binding is not None and released_skill_authority
+            else "0" * 64
+        ),
         checks=checks,
         action_inbox=action_inbox,
         resume_metadata=resume_metadata,

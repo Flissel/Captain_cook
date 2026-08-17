@@ -15,6 +15,9 @@ from gateway.factory_v3_live_evidence import (
     assert_factory_v3_live_secret_free,
     verify_factory_v3_live_evidence,
 )
+from gateway.factory_v3_live_authority import (
+    load_captain_factory_v3_live_authority,
+)
 
 
 pytestmark = pytest.mark.live
@@ -75,14 +78,27 @@ def test_real_factory_v3_sales_pipeline_is_independently_captain_accepted(
     assert index["preflight_report_sha256"] == hashlib.sha256(
         preflight_bytes
     ).hexdigest()
+    authority_binding = load_captain_factory_v3_live_authority(ROOT)
+    assert authority_binding is not None
+    assert preflight["authority_binding_sha256"] == authority_binding.sha256
+    assert preflight["active_released_skill_sha256"] == (
+        authority_binding.released_skill.sha256
+    )
+    assert index["authority_binding_sha256"] == authority_binding.sha256
+    assert index["active_released_skill_sha256"] == (
+        authority_binding.released_skill.sha256
+    )
 
     authority = FactoryV3HttpEvidenceAuthority(
-        gateway_origin=os.environ["CAPTAIN_FACTORY_V3_GATEWAY_ORIGIN"],
-        minibook_origin=os.environ["CAPTAIN_FACTORY_V3_MINIBOOK_ORIGIN"],
+        authority_binding=authority_binding,
         captain_token=os.environ["CAPTAIN_FACTORY_V3_CAPTAIN_TOKEN"],
         worker_token=os.environ["CAPTAIN_FACTORY_V3_WORKER_TOKEN"],
     )
-    verified = verify_factory_v3_live_evidence(index, authority=authority)
+    verified = verify_factory_v3_live_evidence(
+        index,
+        authority=authority,
+        authority_binding=authority_binding,
+    )
 
     assert verified.preflight_run_id == run_id
     assert verified.correlation_id == UUID(index["correlation_id"])

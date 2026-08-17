@@ -7,21 +7,30 @@ import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 from math import log2
 import re
-from typing import Protocol
+from typing import Callable, Protocol
 from uuid import UUID
 from urllib.parse import urlsplit
+import zipfile
 
 import httpx
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from agenten.agent_factory.forge_contracts import (
     CodexBuildReceiptV1,
     CreationResultV2,
+    FactoryBuildAssignmentV2,
+    FactoryBuildEffectV2,
     ForgeBuildSkillUsageReceiptV1,
+    PackageBuildEvidenceV1,
+    PackageRealCaseEvidenceV1,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
+from gateway.factory_v3_live_authority import FactoryV3LiveAuthorityBinding
 
 
 _AGENTS = (
@@ -94,9 +103,15 @@ class FactoryV3LiveEvidenceAuthority(Protocol):
         self, correlation_id: UUID
     ) -> tuple[FactoryV3AuthorityRecord, ...]: ...
 
+    def live_attestations(
+        self, correlation_id: UUID
+    ) -> tuple[FactoryV3AuthorityRecord, ...]: ...
+
     def minibook_cas(self, reference: ArtifactRef) -> bytes: ...
 
     def captain_cas(self, reference: ArtifactRef) -> bytes: ...
+
+    def public_cas(self, reference: ArtifactRef) -> bytes: ...
 
 
 class _ArtifactReferenceLike(Protocol):
@@ -141,13 +156,13 @@ class FactoryV3HttpEvidenceAuthority:
     def __init__(
         self,
         *,
-        gateway_origin: str,
-        minibook_origin: str,
+        authority_binding: FactoryV3LiveAuthorityBinding,
         captain_token: str,
         worker_token: str,
     ) -> None:
-        self._gateway_origin = _canonical_origin(gateway_origin)
-        self._minibook_origin = _canonical_origin(minibook_origin)
+        self._authority_binding_sha256 = authority_binding.sha256
+        self._gateway_origin = _canonical_origin(authority_binding.gateway.origin)
+        self._minibook_origin = _canonical_origin(authority_binding.minibook.origin)
         if (
             self._gateway_origin is None
             or self._minibook_origin is None
@@ -227,14 +242,15 @@ class FactoryV3HttpEvidenceAuthority:
         *,
         origin: str,
         path: str,
-        token: str,
+        token: str | None,
         reference: ArtifactRef,
     ) -> bytes:
         try:
+            headers = {} if token is None else {"Authorization": f"Bearer {token}"}
             with httpx.Client(follow_redirects=False, timeout=10.0) as client:
                 response = client.get(
                     f"{origin}{path}",
-                    headers={"Authorization": f"Bearer {token}"},
+                    headers=headers,
                 )
             if (
                 response.status_code != 200
@@ -299,6 +315,16 @@ class FactoryV3HttpEvidenceAuthority:
             authority="captain-prohibited-lifecycle",
         )
 
+    def live_attestations(
+        self, correlation_id: UUID
+    ) -> tuple[FactoryV3AuthorityRecord, ...]:
+        return self._record_set(
+            origin=self._gateway_origin,
+            path=f"/v1/factory/live-evidence/attestations/{correlation_id}",
+            token=self._captain_token,
+            authority="captain-live-runner",
+        )
+
     def minibook_cas(self, reference: ArtifactRef) -> bytes:
         return self._cas_get(
             origin=self._minibook_origin,
@@ -315,6 +341,14 @@ class FactoryV3HttpEvidenceAuthority:
             reference=reference,
         )
 
+    def public_cas(self, reference: ArtifactRef) -> bytes:
+        return self._cas_get(
+            origin=self._gateway_origin,
+            path=f"/v1/factory/live-evidence/public-cas/{reference.sha256}",
+            token=None,
+            reference=reference,
+        )
+
 
 @dataclass(frozen=True)
 class FactoryV3LiveEvidenceIndex:
@@ -323,6 +357,8 @@ class FactoryV3LiveEvidenceIndex:
     factory_job_id: UUID
     creation_job_id: UUID
     preflight_report_sha256: str
+    authority_binding_sha256: str
+    active_released_skill_sha256: str
 
     @classmethod
     def parse(cls, payload: Mapping[str, object]) -> "FactoryV3LiveEvidenceIndex":
@@ -334,11 +370,18 @@ class FactoryV3LiveEvidenceIndex:
             "factory_job_id",
             "creation_job_id",
             "preflight_report_sha256",
+            "authority_binding_sha256",
+            "active_released_skill_sha256",
         } or payload.get("schema") != "captain.factory-v3-live-evidence-index.v1":
             raise FactoryV3LiveEvidenceError("live evidence index is invalid")
         try:
             digest = str(payload["preflight_report_sha256"])
-            if _SHA256.fullmatch(digest) is None:
+            authority_digest = str(payload["authority_binding_sha256"])
+            skill_digest = str(payload["active_released_skill_sha256"])
+            if any(
+                _SHA256.fullmatch(value) is None
+                for value in (digest, authority_digest, skill_digest)
+            ):
                 raise ValueError
             return cls(
                 preflight_run_id=UUID(str(payload["preflight_run_id"])),
@@ -346,6 +389,8 @@ class FactoryV3LiveEvidenceIndex:
                 factory_job_id=UUID(str(payload["factory_job_id"])),
                 creation_job_id=UUID(str(payload["creation_job_id"])),
                 preflight_report_sha256=digest,
+                authority_binding_sha256=authority_digest,
+                active_released_skill_sha256=skill_digest,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise FactoryV3LiveEvidenceError(
@@ -357,6 +402,8 @@ class FactoryV3LiveEvidenceIndex:
 class FactoryV3CaptainAcceptance:
     preflight_run_id: UUID
     preflight_report_sha256: str
+    authority_binding_sha256: str
+    active_released_skill_sha256: str
     correlation_id: UUID
     factory_job_id: UUID
     creation_job_id: UUID
@@ -365,6 +412,7 @@ class FactoryV3CaptainAcceptance:
     team_manifest_ref: ArtifactRef
     source_archive_ref: ArtifactRef
     cas_readback_receipt_ref: ArtifactRef
+    live_attestation_ref: ArtifactRef
     accepted_at: datetime
 
     @classmethod
@@ -376,6 +424,8 @@ class FactoryV3CaptainAcceptance:
             "outcome",
             "preflight_run_id",
             "preflight_report_sha256",
+            "authority_binding_sha256",
+            "active_released_skill_sha256",
             "correlation_id",
             "factory_job_id",
             "creation_job_id",
@@ -384,6 +434,7 @@ class FactoryV3CaptainAcceptance:
             "team_manifest_ref",
             "source_archive_ref",
             "cas_readback_receipt_ref",
+            "live_attestation_ref",
             "accepted_at",
         }
         if (
@@ -402,7 +453,12 @@ class FactoryV3CaptainAcceptance:
             ):
                 raise ValueError
             digest = str(payload["preflight_report_sha256"])
-            if _SHA256.fullmatch(digest) is None:
+            authority_digest = str(payload["authority_binding_sha256"])
+            skill_digest = str(payload["active_released_skill_sha256"])
+            if any(
+                _SHA256.fullmatch(value) is None
+                for value in (digest, authority_digest, skill_digest)
+            ):
                 raise ValueError
             accepted_text = str(payload["accepted_at"])
             if not accepted_text.endswith("Z"):
@@ -419,6 +475,8 @@ class FactoryV3CaptainAcceptance:
             return cls(
                 preflight_run_id=UUID(str(payload["preflight_run_id"])),
                 preflight_report_sha256=digest,
+                authority_binding_sha256=authority_digest,
+                active_released_skill_sha256=skill_digest,
                 correlation_id=UUID(str(payload["correlation_id"])),
                 factory_job_id=UUID(str(payload["factory_job_id"])),
                 creation_job_id=UUID(str(payload["creation_job_id"])),
@@ -435,12 +493,214 @@ class FactoryV3CaptainAcceptance:
                 cas_readback_receipt_ref=ArtifactRef.model_validate(
                     payload["cas_readback_receipt_ref"]
                 ),
+                live_attestation_ref=ArtifactRef.model_validate(
+                    payload["live_attestation_ref"]
+                ),
                 accepted_at=accepted_at,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise FactoryV3LiveEvidenceError(
                 "Captain live acceptance identity is invalid"
             ) from exc
+
+
+_LIVE_ATTESTATION_UNSIGNED_FIELDS = {
+    "schema",
+    "runner_id",
+    "runner_key_id",
+    "mode",
+    "preflight_run_id",
+    "preflight_report_sha256",
+    "authority_binding_sha256",
+    "active_released_skill_name",
+    "active_released_skill_sha256",
+    "correlation_id",
+    "factory_job_id",
+    "creation_job_id",
+    "codex_binary_sha256",
+    "pwsh_binary_sha256",
+    "hermes_python_sha256",
+    "codex_session_script_sha256",
+    "hermes_runtime_sha256",
+    "workspace_policy_ref",
+    "assignment_ref",
+    "effect_ref",
+    "codex_session_ref",
+    "workspace_snapshot_ref",
+    "issued_at",
+}
+
+
+def _canonical_bytes(payload: object) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+@dataclass(frozen=True)
+class FactoryV3LiveRuntimeAttestation:
+    runner_id: str
+    preflight_run_id: UUID
+    preflight_report_sha256: str
+    authority_binding_sha256: str
+    active_released_skill_sha256: str
+    correlation_id: UUID
+    factory_job_id: UUID
+    creation_job_id: UUID
+    workspace_policy_ref: ArtifactRef
+    assignment_ref: ArtifactRef
+    effect_ref: ArtifactRef
+    codex_session_ref: ArtifactRef
+    workspace_snapshot_ref: ArtifactRef
+    issued_at: datetime
+
+    @classmethod
+    def parse(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        binding: FactoryV3LiveAuthorityBinding,
+        index: FactoryV3LiveEvidenceIndex | None,
+    ) -> "FactoryV3LiveRuntimeAttestation":
+        assert_factory_v3_live_secret_free(payload)
+        if set(payload) != {*_LIVE_ATTESTATION_UNSIGNED_FIELDS, "signature_ed25519"}:
+            raise FactoryV3LiveEvidenceError("live attestation is invalid")
+        unsigned = {
+            key: value for key, value in payload.items() if key != "signature_ed25519"
+        }
+        try:
+            encoded_signature = payload["signature_ed25519"]
+            if not isinstance(encoded_signature, str):
+                raise ValueError
+            signature = base64.b64decode(encoded_signature, validate=True)
+            if len(signature) != 64:
+                raise ValueError
+            Ed25519PublicKey.from_public_bytes(
+                binding.runner_attestation.public_key
+            ).verify(signature, _canonical_bytes(unsigned))
+            digests = tuple(
+                str(payload[field])
+                for field in (
+                    "preflight_report_sha256",
+                    "authority_binding_sha256",
+                    "active_released_skill_sha256",
+                    "codex_binary_sha256",
+                    "pwsh_binary_sha256",
+                    "hermes_python_sha256",
+                    "codex_session_script_sha256",
+                    "hermes_runtime_sha256",
+                )
+            )
+            if any(_SHA256.fullmatch(value) is None for value in digests):
+                raise ValueError
+            issued_text = str(payload["issued_at"])
+            if not issued_text.endswith("Z"):
+                raise ValueError
+            issued_at = datetime.fromisoformat(issued_text.replace("Z", "+00:00"))
+            attestation = cls(
+                runner_id=str(payload["runner_id"]),
+                preflight_run_id=UUID(str(payload["preflight_run_id"])),
+                preflight_report_sha256=digests[0],
+                authority_binding_sha256=digests[1],
+                active_released_skill_sha256=digests[2],
+                correlation_id=UUID(str(payload["correlation_id"])),
+                factory_job_id=UUID(str(payload["factory_job_id"])),
+                creation_job_id=UUID(str(payload["creation_job_id"])),
+                workspace_policy_ref=ArtifactRef.model_validate(
+                    payload["workspace_policy_ref"]
+                ),
+                assignment_ref=ArtifactRef.model_validate(payload["assignment_ref"]),
+                effect_ref=ArtifactRef.model_validate(payload["effect_ref"]),
+                codex_session_ref=ArtifactRef.model_validate(
+                    payload["codex_session_ref"]
+                ),
+                workspace_snapshot_ref=ArtifactRef.model_validate(
+                    payload["workspace_snapshot_ref"]
+                ),
+                issued_at=issued_at,
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            InvalidSignature,
+        ) as exc:
+            raise FactoryV3LiveEvidenceError("live attestation is invalid") from exc
+        expected_binding = (
+            payload.get("schema")
+            == "captain.factory-v3-live-runtime-attestation.v1"
+            and payload.get("mode") == "live"
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", attestation.runner_id)
+            is not None
+            and payload.get("runner_key_id") == binding.runner_attestation.key_id
+            and payload.get("authority_binding_sha256") == binding.sha256
+            and payload.get("active_released_skill_name")
+            == binding.released_skill.name
+            and payload.get("active_released_skill_sha256")
+            == binding.released_skill.sha256
+            and payload.get("codex_binary_sha256")
+            == binding.executables.codex.sha256
+            and payload.get("pwsh_binary_sha256") == binding.executables.pwsh.sha256
+            and payload.get("hermes_python_sha256")
+            == binding.executables.hermes_python.sha256
+            and payload.get("codex_session_script_sha256")
+            == binding.codex_session.sha256
+            and payload.get("hermes_runtime_sha256")
+            == binding.hermes_runtime.runtime_sha256
+            and attestation.issued_at.tzinfo is not None
+            and attestation.issued_at.utcoffset()
+            == timezone.utc.utcoffset(attestation.issued_at)
+        )
+        expected_index = bool(
+            index is None
+            or (
+                attestation.preflight_run_id == index.preflight_run_id
+                and attestation.preflight_report_sha256
+                == index.preflight_report_sha256
+                and attestation.authority_binding_sha256
+                == index.authority_binding_sha256
+                and attestation.active_released_skill_sha256
+                == index.active_released_skill_sha256
+                and attestation.correlation_id == index.correlation_id
+                and attestation.factory_job_id == index.factory_job_id
+                and attestation.creation_job_id == index.creation_job_id
+            )
+        )
+        if not expected_binding or not expected_index:
+            raise FactoryV3LiveEvidenceError("live attestation authority differs")
+        return attestation
+
+
+def issue_factory_v3_live_runtime_attestation(
+    payload: Mapping[str, object],
+    *,
+    binding: FactoryV3LiveAuthorityBinding,
+    signer: Callable[[bytes], bytes],
+) -> dict[str, object]:
+    """Production issuer seam for an authorized live runner signing one session."""
+
+    if set(payload) != _LIVE_ATTESTATION_UNSIGNED_FIELDS:
+        raise FactoryV3LiveEvidenceError("live attestation is invalid")
+    unsigned = dict(payload)
+    try:
+        signature = signer(_canonical_bytes(unsigned))
+    except Exception as exc:
+        raise FactoryV3LiveEvidenceError("live attestation signing failed") from exc
+    if not isinstance(signature, bytes) or len(signature) != 64:
+        raise FactoryV3LiveEvidenceError("live attestation signing failed")
+    signed = unsigned | {
+        "signature_ed25519": base64.b64encode(signature).decode("ascii")
+    }
+    FactoryV3LiveRuntimeAttestation.parse(
+        signed,
+        binding=binding,
+        index=None,
+    )
+    return signed
 
 
 @dataclass(frozen=True)
@@ -479,7 +739,13 @@ def _explicit_digest_key(key: str | None) -> bool:
     return bool(
         key
         and (
-            key.casefold() in {"idempotency_key", "seal_idempotency_key", "effect_key"}
+            key.casefold()
+            in {
+                "idempotency_key",
+                "seal_idempotency_key",
+                "effect_key",
+                "signature_ed25519",
+            }
             or re.fullmatch(
                 r"(?:[a-z0-9]+_)*(?:sha256|digest)(?:_[a-z0-9]+)*",
                 key.casefold(),
@@ -490,6 +756,12 @@ def _explicit_digest_key(key: str | None) -> bool:
 
 def _opaque_high_entropy(value: str, key: str | None) -> bool:
     if _UUID.fullmatch(value):
+        return False
+    if (
+        key is not None
+        and (key.casefold() == "id" or key.casefold().endswith("_id"))
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value)
+    ):
         return False
     if _SHA256.fullmatch(value):
         return not _explicit_digest_key(key)
@@ -578,14 +850,90 @@ def _bound_cas_read(
     try:
         minibook = reader.minibook_cas(reference)
         captain = reader.captain_cas(reference)
+        public = reader.public_cas(reference)
     except Exception as exc:
-        raise FactoryV3LiveEvidenceError("independent CAS read failed") from exc
+        raise FactoryV3LiveEvidenceError("independent public CAS read failed") from exc
     if (
         minibook != captain
+        or minibook != public
         or hashlib.sha256(minibook).hexdigest() != reference.sha256
     ):
-        raise FactoryV3LiveEvidenceError("independent CAS readback differs")
+        raise FactoryV3LiveEvidenceError("independent public CAS readback differs")
     return minibook
+
+
+def _public_cas_read(
+    reader: FactoryV3LiveEvidenceAuthority,
+    reference: ArtifactRef,
+) -> bytes:
+    try:
+        content = reader.public_cas(reference)
+    except Exception as exc:
+        raise FactoryV3LiveEvidenceError("independent public CAS read failed") from exc
+    if hashlib.sha256(content).hexdigest() != reference.sha256:
+        raise FactoryV3LiveEvidenceError("independent public CAS readback differs")
+    return content
+
+
+def _public_json(
+    reader: FactoryV3LiveEvidenceAuthority,
+    reference: ArtifactRef,
+) -> Mapping[str, object]:
+    if reference.media_type != "application/json":
+        raise FactoryV3LiveEvidenceError("public CAS JSON reference is invalid")
+    content = _public_cas_read(reader, reference)
+    if len(content) > 2 * 1024 * 1024:
+        raise FactoryV3LiveEvidenceError("public CAS JSON is too large")
+    try:
+        payload = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FactoryV3LiveEvidenceError("public CAS JSON is invalid") from exc
+    if not isinstance(payload, dict):
+        raise FactoryV3LiveEvidenceError("public CAS JSON is invalid")
+    assert_factory_v3_live_secret_free(payload)
+    return payload
+
+
+def _validate_live_zip(content: bytes, *, workspace: bool) -> Mapping[str, object] | None:
+    if len(content) > 32 * 1024 * 1024:
+        raise FactoryV3LiveEvidenceError("live ZIP evidence is invalid")
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            infos = archive.infolist()
+            if not infos or len(infos) > 4096:
+                raise ValueError
+            names: set[str] = set()
+            total = 0
+            for info in infos:
+                name = info.filename
+                parts = name.replace("\\", "/").split("/")
+                if (
+                    name in names
+                    or name.startswith(("/", "\\"))
+                    or "\\" in name
+                    or any(part in {"", ".", ".."} for part in parts)
+                    or any(
+                        fragment in name.casefold()
+                        for fragment in (".env", "secret", "credential", "token", "transcript")
+                    )
+                ):
+                    raise ValueError
+                names.add(name)
+                total += info.file_size
+                if total > 16 * 1024 * 1024:
+                    raise ValueError
+            if not workspace:
+                return None
+            manifest_name = "factory-v3-workspace-manifest.json"
+            if manifest_name not in names:
+                raise ValueError
+            payload = json.loads(archive.read(manifest_name))
+            if not isinstance(payload, dict):
+                raise ValueError
+            assert_factory_v3_live_secret_free(payload)
+            return payload
+    except (OSError, ValueError, KeyError, UnicodeDecodeError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
+        raise FactoryV3LiveEvidenceError("live ZIP evidence is invalid") from exc
 
 
 def _validate_team_manifest(content: bytes) -> None:
@@ -633,14 +981,171 @@ def _validate_team_manifest(content: bytes) -> None:
             raise FactoryV3LiveEvidenceError("required tool evidence is invalid")
 
 
+def _ref_equal(left: _ArtifactReferenceLike, right: _ArtifactReferenceLike) -> bool:
+    return _ref_identity(left) == _ref_identity(right)
+
+
+def _validate_supporting_json(payload: Mapping[str, object]) -> None:
+    schema = payload.get("schema")
+    if (
+        not isinstance(schema, str)
+        or re.fullmatch(
+            r"(?:captain|minibook|hermes)\.[A-Za-z0-9][A-Za-z0-9._-]{2,127}",
+            schema,
+        )
+        is None
+    ):
+        raise FactoryV3LiveEvidenceError("supporting live evidence is untyped")
+
+
+def _validate_codex_session(
+    payload: Mapping[str, object],
+    *,
+    index: FactoryV3LiveEvidenceIndex,
+    binding: FactoryV3LiveAuthorityBinding,
+    attestation: FactoryV3LiveRuntimeAttestation,
+) -> None:
+    fields = {
+        "schema",
+        "mode",
+        "provider",
+        "outcome",
+        "session_id",
+        "preflight_run_id",
+        "correlation_id",
+        "factory_job_id",
+        "creation_job_id",
+        "assignment_ref",
+        "workspace_policy_ref",
+        "workspace_snapshot_ref",
+        "codex_binary_sha256",
+        "codex_script_sha256",
+        "completed_at",
+    }
+    if (
+        set(payload) != fields
+        or payload.get("schema") != "captain.codex-live-session-evidence.v1"
+        or payload.get("mode") != "live"
+        or payload.get("provider") != "codex"
+        or payload.get("outcome") != "completed"
+        or payload.get("codex_binary_sha256") != binding.executables.codex.sha256
+        or payload.get("codex_script_sha256") != binding.codex_session.sha256
+    ):
+        raise FactoryV3LiveEvidenceError("Codex live session evidence is invalid")
+    try:
+        session_id = UUID(str(payload["session_id"]))
+        completed_text = str(payload["completed_at"])
+        if not completed_text.endswith("Z"):
+            raise ValueError
+        completed_at = datetime.fromisoformat(completed_text.replace("Z", "+00:00"))
+        preflight_run_id = UUID(str(payload["preflight_run_id"]))
+        correlation_id = UUID(str(payload["correlation_id"]))
+        factory_job_id = UUID(str(payload["factory_job_id"]))
+        creation_job_id = UUID(str(payload["creation_job_id"]))
+        assignment_ref = ArtifactRef.model_validate(payload["assignment_ref"])
+        policy_ref = ArtifactRef.model_validate(payload["workspace_policy_ref"])
+        snapshot_ref = ArtifactRef.model_validate(payload["workspace_snapshot_ref"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise FactoryV3LiveEvidenceError(
+            "Codex live session evidence is invalid"
+        ) from exc
+    del session_id
+    if (
+        preflight_run_id != index.preflight_run_id
+        or correlation_id != index.correlation_id
+        or factory_job_id != index.factory_job_id
+        or creation_job_id != index.creation_job_id
+        or not _ref_equal(assignment_ref, attestation.assignment_ref)
+        or not _ref_equal(policy_ref, attestation.workspace_policy_ref)
+        or not _ref_equal(snapshot_ref, attestation.workspace_snapshot_ref)
+        or completed_at.tzinfo is None
+        or completed_at.utcoffset() != timezone.utc.utcoffset(completed_at)
+    ):
+        raise FactoryV3LiveEvidenceError("Codex live session identity differs")
+
+
+def _validate_package_children(
+    authority: FactoryV3LiveEvidenceAuthority,
+    result: CreationResultV2,
+) -> tuple[ArtifactRef, ...]:
+    package_ref = result.package_manifest_ref
+    if package_ref is None:
+        raise FactoryV3LiveEvidenceError("Minibook package manifest is missing")
+    payload = _public_json(authority, package_ref)
+    if set(payload) != {"schema", "files"} or payload.get("schema") != (
+        "minibook.team-package-manifest.v1"
+    ):
+        raise FactoryV3LiveEvidenceError("Minibook package manifest is invalid")
+    entries = payload.get("files")
+    if not isinstance(entries, list) or not entries or len(entries) > 4096:
+        raise FactoryV3LiveEvidenceError("Minibook package children are invalid")
+    children: list[ArtifactRef] = []
+    paths: set[str] = set()
+    for item in entries:
+        if not isinstance(item, dict) or set(item) != {
+            "path",
+            "uri",
+            "sha256",
+            "media_type",
+        }:
+            raise FactoryV3LiveEvidenceError("Minibook package child is invalid")
+        path = item["path"]
+        if (
+            not isinstance(path, str)
+            or path in paths
+            or path.startswith(("/", "\\", "."))
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or any(
+                fragment in path.casefold()
+                for fragment in (".env", "secret", "credential", "token", "transcript")
+            )
+        ):
+            raise FactoryV3LiveEvidenceError("Minibook package child path is invalid")
+        paths.add(path)
+        try:
+            reference = ArtifactRef.model_validate(
+                {key: item[key] for key in ("uri", "sha256", "media_type")}
+            )
+        except Exception as exc:
+            raise FactoryV3LiveEvidenceError(
+                "Minibook package child reference is invalid"
+            ) from exc
+        _public_cas_read(authority, reference)
+        children.append(reference)
+    expected = tuple(
+        reference
+        for reference in (
+            result.team_manifest_ref,
+            result.candidate_manifest_ref,
+            result.hermes_usage_receipt_ref,
+            result.codex_build_receipt_ref,
+            *result.build_evidence_refs,
+            *result.real_case_evidence_refs,
+        )
+        if reference is not None
+    )
+    identities = {_ref_identity(reference) for reference in children}
+    if any(_ref_identity(reference) not in identities for reference in expected):
+        raise FactoryV3LiveEvidenceError("Minibook package children are incomplete")
+    return tuple(children)
+
+
 def verify_factory_v3_live_evidence(
     index_payload: Mapping[str, object],
     *,
     authority: FactoryV3LiveEvidenceAuthority,
+    authority_binding: FactoryV3LiveAuthorityBinding,
 ) -> FactoryV3LiveVerifiedEvidence:
-    """Verify four producer records and two-owner CAS reads under one identity."""
+    """Verify signed live execution and independently read every evidence edge."""
 
     index = FactoryV3LiveEvidenceIndex.parse(index_payload)
+    if (
+        index.authority_binding_sha256 != authority_binding.sha256
+        or index.active_released_skill_sha256
+        != authority_binding.released_skill.sha256
+    ):
+        raise FactoryV3LiveEvidenceError("live authority binding differs")
     hermes_record = _exactly_one(
         authority.hermes_receipts(index.correlation_id), authority="Hermes"
     )
@@ -652,6 +1157,10 @@ def verify_factory_v3_live_evidence(
     )
     acceptance_record = _exactly_one(
         authority.captain_acceptances(index.factory_job_id), authority="Captain"
+    )
+    attestation_record = _exactly_one(
+        authority.live_attestations(index.correlation_id),
+        authority="live attestation",
     )
     if authority.prohibited_lifecycle_events(index.correlation_id):
         raise FactoryV3LiveEvidenceError(
@@ -665,6 +1174,11 @@ def verify_factory_v3_live_evidence(
         result = CreationResultV2.model_validate(_record_json(result_record))
         acceptance = FactoryV3CaptainAcceptance.parse(
             _record_json(acceptance_record)
+        )
+        attestation = FactoryV3LiveRuntimeAttestation.parse(
+            _record_json(attestation_record),
+            binding=authority_binding,
+            index=index,
         )
     except FactoryV3LiveEvidenceError:
         raise
@@ -695,6 +1209,13 @@ def verify_factory_v3_live_evidence(
         or result.subject_version != acceptance.subject_version
         or acceptance.preflight_run_id != index.preflight_run_id
         or acceptance.preflight_report_sha256 != index.preflight_report_sha256
+        or acceptance.authority_binding_sha256 != index.authority_binding_sha256
+        or acceptance.active_released_skill_sha256
+        != index.active_released_skill_sha256
+        or attestation.issued_at > acceptance.accepted_at
+        or hermes.released_skill.skill_id != authority_binding.released_skill.name
+        or hermes.released_skill.content_sha256
+        != authority_binding.released_skill.sha256
         or _ref_identity(result.hermes_usage_receipt_ref)
         != _ref_identity(hermes_record.reference)
         or _ref_identity(result.codex_build_receipt_ref)
@@ -707,6 +1228,8 @@ def verify_factory_v3_live_evidence(
         != _ref_identity(result.source_archive_ref)
         or _ref_identity(acceptance.cas_readback_receipt_ref)
         != _ref_identity(result.cas_readback_receipt_ref)
+        or _ref_identity(acceptance.live_attestation_ref)
+        != _ref_identity(attestation_record.reference)
     ):
         raise FactoryV3LiveEvidenceError("live authority identities differ")
 
@@ -717,6 +1240,8 @@ def verify_factory_v3_live_evidence(
         team_manifest_ref is None
         or source_archive_ref is None
         or readback_receipt_ref is None
+        or result.package_manifest_ref is None
+        or result.candidate_manifest_ref is None
     ):
         raise FactoryV3LiveEvidenceError("successful Minibook result is incomplete")
     if (
@@ -726,20 +1251,197 @@ def verify_factory_v3_live_evidence(
         != codex_record.content
         or _bound_cas_read(authority, result_record.reference)
         != result_record.content
+        or _bound_cas_read(authority, acceptance_record.reference)
+        != acceptance_record.content
+        or _bound_cas_read(authority, attestation_record.reference)
+        != attestation_record.content
     ):
         raise FactoryV3LiveEvidenceError("authority receipt CAS readback differs")
+
+    try:
+        assignment = FactoryBuildAssignmentV2.model_validate(
+            _public_json(authority, attestation.assignment_ref)
+        )
+        effect = FactoryBuildEffectV2.model_validate(
+            _public_json(authority, attestation.effect_ref)
+        )
+    except FactoryV3LiveEvidenceError:
+        raise
+    except Exception as exc:
+        raise FactoryV3LiveEvidenceError(
+            "live assignment or effect is invalid"
+        ) from exc
+    assignment_identity = (
+        assignment.creation_job_id,
+        assignment.factory_job_id,
+        assignment.correlation_id,
+    )
+    effect_identity = (
+        effect.creation_job_id,
+        effect.factory_job_id,
+        effect.correlation_id,
+    )
+    if (
+        assignment_identity != identity
+        or effect_identity != identity
+        or assignment.assignment_id != effect.assignment_id
+        or assignment.assignment_id != codex.assignment_id
+        or assignment.effect_key != effect.effect_key
+        or assignment.effect_key != codex.idempotency_key
+        or assignment.workspace_policy_sha256
+        != attestation.workspace_policy_ref.sha256
+        or not _ref_equal(effect.hermes_usage_receipt_ref, hermes_record.reference)
+        or not _ref_equal(effect.codex_build_receipt_ref, codex_record.reference)
+        or not _ref_equal(effect.codex_session_ref, attestation.codex_session_ref)
+        or not _ref_equal(
+            effect.workspace_snapshot_ref,
+            attestation.workspace_snapshot_ref,
+        )
+        or not _ref_equal(effect.source_archive_ref, source_archive_ref)
+        or tuple(_ref_identity(item) for item in effect.build_evidence_refs)
+        != tuple(_ref_identity(item) for item in result.build_evidence_refs)
+        or tuple(_ref_identity(item) for item in effect.test_evidence_refs)
+        != tuple(_ref_identity(item) for item in result.real_case_evidence_refs)
+    ):
+        raise FactoryV3LiveEvidenceError("live assignment or effect identity differs")
+
+    workspace_policy = _public_json(authority, attestation.workspace_policy_ref)
+    if (
+        workspace_policy.get("schema")
+        != "captain.factory-v3-workspace-policy.v1"
+        or workspace_policy.get("network_allowed") is not False
+        or workspace_policy.get("allowed_output_roots")
+        != ["src", "tests", "evidence"]
+    ):
+        raise FactoryV3LiveEvidenceError("live workspace policy is invalid")
+
+    for reference in hermes.evidence_refs:
+        _validate_supporting_json(_public_json(authority, reference))
+    _public_cas_read(authority, hermes.released_skill.content_ref)
+
+    session_payload = _public_json(authority, codex.codex_session_ref)
+    if not _ref_equal(codex.codex_session_ref, attestation.codex_session_ref):
+        raise FactoryV3LiveEvidenceError("Codex live session reference differs")
+    _validate_codex_session(
+        session_payload,
+        index=index,
+        binding=authority_binding,
+        attestation=attestation,
+    )
+    snapshot_bytes = _public_cas_read(authority, codex.workspace_snapshot_ref)
+    if not _ref_equal(
+        codex.workspace_snapshot_ref,
+        attestation.workspace_snapshot_ref,
+    ):
+        raise FactoryV3LiveEvidenceError("Codex workspace snapshot reference differs")
+    snapshot_manifest = _validate_live_zip(snapshot_bytes, workspace=True)
+    if (
+        snapshot_manifest is None
+        or set(snapshot_manifest)
+        != {"schema", "mode", "correlation_id", "assignment_sha256"}
+        or snapshot_manifest.get("schema")
+        != "captain.factory-v3-workspace-snapshot.v1"
+        or snapshot_manifest.get("mode") != "live"
+        or snapshot_manifest.get("correlation_id") != str(index.correlation_id)
+        or snapshot_manifest.get("assignment_sha256")
+        != attestation.assignment_ref.sha256
+    ):
+        raise FactoryV3LiveEvidenceError("Codex workspace snapshot is invalid")
+
+    build_evidence: list[PackageBuildEvidenceV1] = []
+    for reference in result.build_evidence_refs:
+        try:
+            item = PackageBuildEvidenceV1.model_validate(
+                _public_json(authority, reference)
+            )
+        except FactoryV3LiveEvidenceError:
+            raise
+        except Exception as exc:
+            raise FactoryV3LiveEvidenceError(
+                "Minibook build evidence is invalid"
+            ) from exc
+        build_evidence.append(item)
+    real_evidence: list[PackageRealCaseEvidenceV1] = []
+    for reference in result.real_case_evidence_refs:
+        try:
+            item = PackageRealCaseEvidenceV1.model_validate(
+                _public_json(authority, reference)
+            )
+        except FactoryV3LiveEvidenceError:
+            raise
+        except Exception as exc:
+            raise FactoryV3LiveEvidenceError(
+                "Minibook real-case evidence is invalid"
+            ) from exc
+        for evidence_reference in item.evidence_refs:
+            _public_cas_read(authority, evidence_reference)
+        real_evidence.append(item)
+    if (
+        not build_evidence
+        or not real_evidence
+        or tuple(_ref_identity(item) for item in codex.test_evidence_refs)
+        != tuple(_ref_identity(item) for item in result.real_case_evidence_refs)
+        or any(
+            (
+                item.assignment_id != assignment.assignment_id
+                or (item.creation_job_id, item.factory_job_id, item.correlation_id)
+                != identity
+                or item.effect_key != assignment.effect_key
+                or not _ref_equal(item.source_archive_ref, source_archive_ref)
+                or not _ref_equal(item.codex_session_ref, codex.codex_session_ref)
+                or not _ref_equal(
+                    item.workspace_snapshot_ref,
+                    codex.workspace_snapshot_ref,
+                )
+            )
+            for item in build_evidence
+        )
+        or any(
+            (
+                item.assignment_id != assignment.assignment_id
+                or (item.creation_job_id, item.factory_job_id, item.correlation_id)
+                != identity
+                or item.effect_key != assignment.effect_key
+                or not _ref_equal(item.source_archive_ref, source_archive_ref)
+                or not _ref_equal(item.codex_session_ref, codex.codex_session_ref)
+                or tuple(item.assertion_ids) != tuple(codex.acceptance_assertion_ids)
+            )
+            for item in real_evidence
+        )
+    ):
+        raise FactoryV3LiveEvidenceError("Minibook build evidence identity differs")
+
+    package_children = _validate_package_children(authority, result)
     team_bytes = _bound_cas_read(authority, team_manifest_ref)
-    _bound_cas_read(authority, source_archive_ref)
+    candidate_bytes = _bound_cas_read(authority, result.candidate_manifest_ref)
+    source_bytes = _bound_cas_read(authority, source_archive_ref)
+    _bound_cas_read(authority, result.package_manifest_ref)
     readback_bytes = _bound_cas_read(authority, readback_receipt_ref)
     _validate_team_manifest(team_bytes)
+    _validate_live_zip(source_bytes, workspace=False)
+    try:
+        candidate = json.loads(candidate_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FactoryV3LiveEvidenceError("candidate manifest is invalid") from exc
+    if not isinstance(candidate, dict):
+        raise FactoryV3LiveEvidenceError("candidate manifest is invalid")
+    assert_factory_v3_live_secret_free(candidate)
+    if candidate.get("schema") != "captain.factory-candidate.v1":
+        raise FactoryV3LiveEvidenceError("candidate manifest is invalid")
     try:
         readback = json.loads(readback_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise FactoryV3LiveEvidenceError("Minibook readback receipt is invalid") from exc
     assert_factory_v3_live_secret_free(readback)
     expected = {
-        (team_manifest_ref.uri, team_manifest_ref.sha256),
-        (source_archive_ref.uri, source_archive_ref.sha256),
+        (reference.uri, reference.sha256)
+        for reference in (
+            *package_children,
+            result.package_manifest_ref,
+            source_archive_ref,
+            codex.workspace_snapshot_ref,
+            attestation_record.reference,
+        )
     }
     try:
         actual = {
@@ -775,8 +1477,10 @@ __all__ = [
     "FactoryV3LiveEvidenceAuthority",
     "FactoryV3LiveEvidenceError",
     "FactoryV3LiveEvidenceIndex",
+    "FactoryV3LiveRuntimeAttestation",
     "FactoryV3LiveVerifiedEvidence",
     "FactoryV3HttpEvidenceAuthority",
     "assert_factory_v3_live_secret_free",
+    "issue_factory_v3_live_runtime_attestation",
     "verify_factory_v3_live_evidence",
 ]

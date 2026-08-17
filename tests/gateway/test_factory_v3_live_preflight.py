@@ -5,8 +5,6 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
-import shutil
-import sys
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -14,6 +12,17 @@ import pytest
 
 from agenten.agent_factory.forge_contracts import FactoryActionRequestV1
 import gateway.agent_factory_live_operator as live_operator
+from gateway.factory_v3_live_authority import (
+    FactoryV3CodexSessionBinding,
+    FactoryV3CredentialAudiences,
+    FactoryV3ExecutableBinding,
+    FactoryV3ExecutableBindings,
+    FactoryV3HermesRuntimeBinding,
+    FactoryV3LiveAuthorityBinding,
+    FactoryV3ReleasedSkillBinding,
+    FactoryV3RunnerAttestationBinding,
+    FactoryV3ServiceBinding,
+)
 
 
 ROOT = Path(__file__).parents[2]
@@ -69,6 +78,10 @@ class _TypedReadyProbe:
             "version": "v3",
             "origin": origin,
             "capabilities": capabilities,
+            "credential_audience": {
+                "captain-gateway": "captain-gateway-live-v3",
+                "minibook-creation": "minibook-creation-live-v3",
+            }[service],
             "ready": True,
         }
 
@@ -79,12 +92,20 @@ class _TypedReadyProbe:
         token: str,
         skill_name: str,
         skill_sha256: str,
-    ) -> bool:
+    ) -> dict[str, object]:
         assert gateway_origin == "https://gateway.example"
         assert token and skill_name == "captain-factory-brief-codex"
         assert len(skill_sha256) == 64
         self.calls.append(("released_skill_active", skill_sha256))
-        return True
+        return {
+            "schema": "captain.factory-v3-released-skill-authority.v1",
+            "authority": "captain-gateway",
+            "gateway_origin": gateway_origin,
+            "skill_name": skill_name,
+            "skill_sha256": skill_sha256,
+            "authority_binding_sha256": "d" * 64,
+            "status": "active",
+        }
 
     def action_resume_metadata(
         self, *, gateway_origin: str, token: str, run_id: UUID
@@ -119,10 +140,10 @@ def _skill_digest(directory: Path) -> str:
 def _configured_environment(tmp_path: Path) -> dict[str, str]:
     skill_root = tmp_path / "released-skills"
     skill = skill_root / "captain-factory-brief-codex"
-    skill.mkdir(parents=True)
+    skill.mkdir(parents=True, exist_ok=True)
     (skill / "SKILL.md").write_text("# released skill\n", encoding="utf-8")
     codex_home = tmp_path / "codex-home"
-    codex_home.mkdir()
+    codex_home.mkdir(exist_ok=True)
     return {
         "CAPTAIN_FACTORY_V3_LIVE": "1",
         "CAPTAIN_FACTORY_V3_GATEWAY_ORIGIN": "https://gateway.example",
@@ -139,12 +160,67 @@ def _configured_environment(tmp_path: Path) -> dict[str, str]:
         "CAPTAIN_PWSH_EXECUTABLE": str(tmp_path / "pwsh.exe"),
         "CAPTAIN_CODEX_HOME": str(codex_home),
         "CAPTAIN_FACTORY_V3_HERMES_PYTHON": str(tmp_path / "python.exe"),
+        "CAPTAIN_FACTORY_V3_HERMES_MODULE_ROOT": str(ROOT / "hermes-agent"),
         "CAPTAIN_FACTORY_V3_MAX_WALL_CLOCK_SECONDS": "300",
         "CAPTAIN_FACTORY_V3_MAX_FILES": "4096",
         "CAPTAIN_FACTORY_V3_MAX_PROVIDER_COST_USD": "1.50",
         "CAPTAIN_FACTORY_V3_DEADLINE_AT": (NOW + timedelta(minutes=5)).isoformat(),
         "CAPTAIN_FACTORY_V3_NETWORK_ALLOWED": "false",
     }
+
+
+def _authority_binding(tmp_path: Path) -> FactoryV3LiveAuthorityBinding:
+    skill_digest = _configured_environment(tmp_path)[
+        "CAPTAIN_FACTORY_V3_RELEASED_SKILL_SHA256"
+    ]
+    return FactoryV3LiveAuthorityBinding(
+        authority_id="captain-factory-v3-production",
+        binding_version=1,
+        gateway=FactoryV3ServiceBinding(
+            origin="https://gateway.example",
+            health_path="/healthz",
+            service="captain-gateway",
+            version="v3",
+            capabilities=("factory-v3-live-authority", "action-inbox-read"),
+            credential_audience="captain-gateway-live-v3",
+        ),
+        minibook=FactoryV3ServiceBinding(
+            origin="https://minibook.example",
+            health_path="/healthz",
+            service="minibook-creation",
+            version="v3",
+            capabilities=("creation-jobs-v3", "cas-readback-v1"),
+            credential_audience="minibook-creation-live-v3",
+        ),
+        credential_audiences=FactoryV3CredentialAudiences(
+            captain_token="captain-gateway-live-v3",
+            worker_token="minibook-creation-live-v3",
+            creation_api_key="minibook-creation-api-v3",
+        ),
+        executables=FactoryV3ExecutableBindings(
+            codex=FactoryV3ExecutableBinding("1" * 64, "codex-cli 1.2.3"),
+            pwsh=FactoryV3ExecutableBinding("2" * 64, "7.5.2"),
+            hermes_python=FactoryV3ExecutableBinding("3" * 64, "3.11.9"),
+        ),
+        codex_session=FactoryV3CodexSessionBinding(
+            "4" * 64, "captain.codex-session.v1"
+        ),
+        hermes_runtime=FactoryV3HermesRuntimeBinding(
+            runtime_sha256="5" * 64,
+            git_sha="6" * 40,
+            distribution="hermes-agent",
+            version="0.9.0",
+            module_file_sha256="7" * 64,
+            capabilities=("factory-v3-build", "released-skill-execution"),
+        ),
+        released_skill=FactoryV3ReleasedSkillBinding(
+            "captain-factory-brief-codex", skill_digest
+        ),
+        runner_attestation=FactoryV3RunnerAttestationBinding(
+            "captain-factory-v3-runner-2026-01", b"r" * 32
+        ),
+        sha256="d" * 64,
+    )
 
 
 def _roots(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -231,14 +307,98 @@ def test_live_preflight_reports_missing_requirements_without_external_calls_or_s
     assert "secret" not in serialized.casefold()
 
 
+def test_missing_signed_authority_blocks_local_and_token_bearing_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, cas, state = _roots(tmp_path)
+    environment = _configured_environment(tmp_path)
+    probe = _TypedReadyProbe()
+    monkeypatch.setattr(
+        live_operator,
+        "_factory_v3_live_runtime_enforcement_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        live_operator,
+        "_factory_v3_local_runtime_ready",
+        lambda *_: pytest.fail("unsigned authority reached local executable probes"),
+        raising=False,
+    )
+
+    report = live_operator.preflight_factory_v3_live(
+        environment=environment,
+        repository_root=ROOT,
+        input_path=INPUT,
+        workspace_root=workspace,
+        cas_root=cas,
+        state_root=state,
+        run_id=RUN_ID,
+        clock=lambda: NOW,
+        _probe=probe,
+    )
+
+    assert probe.calls == []
+    assert next(
+        check for check in report.checks if check.code == "signed_authority_binding"
+    ).status == "unmet"
+
+
+def test_attacker_origin_with_self_claimed_health_never_receives_a_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, cas, state = _roots(tmp_path)
+    environment = _configured_environment(tmp_path)
+    environment["CAPTAIN_FACTORY_V3_GATEWAY_ORIGIN"] = "https://attacker.example"
+    probe = _TypedReadyProbe()
+    monkeypatch.setattr(
+        live_operator,
+        "load_captain_factory_v3_live_authority",
+        lambda *_: _authority_binding(tmp_path),
+    )
+    monkeypatch.setattr(
+        live_operator,
+        "_factory_v3_live_runtime_enforcement_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        live_operator,
+        "_factory_v3_local_runtime_ready",
+        lambda *_: True,
+        raising=False,
+    )
+
+    report = live_operator.preflight_factory_v3_live(
+        environment=environment,
+        repository_root=ROOT,
+        input_path=INPUT,
+        workspace_root=workspace,
+        cas_root=cas,
+        state_root=state,
+        run_id=RUN_ID,
+        clock=lambda: NOW,
+        _probe=probe,
+    )
+
+    assert probe.calls == []
+    assert next(
+        check for check in report.checks if check.code == "authority_origins"
+    ).status == "unmet"
+
+
 def test_unavailable_runtime_enforcement_suppresses_all_external_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace, cas, state = _roots(tmp_path)
     environment = _configured_environment(tmp_path)
     probe = _NoExternalCallsProbe()
-    monkeypatch.setattr(live_operator, "_factory_v3_codex_session_ready", lambda *_: True)
-    monkeypatch.setattr(live_operator, "_factory_v3_hermes_runtime_ready", lambda *_: True)
+    monkeypatch.setattr(
+        live_operator,
+        "load_captain_factory_v3_live_authority",
+        lambda *_: _authority_binding(tmp_path),
+    )
+    monkeypatch.setattr(live_operator, "_factory_v3_local_runtime_ready", lambda *_: True)
 
     report = live_operator.preflight_factory_v3_live(
         environment=environment, repository_root=ROOT, input_path=INPUT,
@@ -259,8 +419,12 @@ def test_fully_met_local_stage_reads_only_bound_typed_authorities(
     environment = _configured_environment(tmp_path)
     probe = _TypedReadyProbe()
     monkeypatch.setattr(live_operator, "_factory_v3_live_runtime_enforcement_ready", lambda: True)
-    monkeypatch.setattr(live_operator, "_factory_v3_codex_session_ready", lambda *_: True)
-    monkeypatch.setattr(live_operator, "_factory_v3_hermes_runtime_ready", lambda *_: True)
+    monkeypatch.setattr(
+        live_operator,
+        "load_captain_factory_v3_live_authority",
+        lambda *_: _authority_binding(tmp_path),
+    )
+    monkeypatch.setattr(live_operator, "_factory_v3_local_runtime_ready", lambda *_: True)
 
     report = live_operator.preflight_factory_v3_live(
         environment=environment, repository_root=ROOT, input_path=INPUT,
@@ -279,11 +443,17 @@ def test_fully_met_local_stage_reads_only_bound_typed_authorities(
 
 def test_legacy_health_url_override_is_rejected_before_token_can_leave_process(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace, cas, state = _roots(tmp_path)
     environment = _configured_environment(tmp_path)
     environment["CAPTAIN_FACTORY_V3_GATEWAY_HEALTH_URL"] = "https://attacker.example/collect"
     probe = _NoExternalCallsProbe()
+    monkeypatch.setattr(
+        live_operator,
+        "load_captain_factory_v3_live_authority",
+        lambda *_: _authority_binding(tmp_path),
+    )
 
     report = live_operator.preflight_factory_v3_live(
         environment=environment, repository_root=ROOT, input_path=INPUT,
@@ -305,14 +475,19 @@ def test_legacy_health_url_override_is_rejected_before_token_can_leave_process(
         {"schema": "captain.factory-v3-service-health.v1", "service": "wrong-service", "version": "v3", "origin": "https://gateway.example", "capabilities": ["factory-v3-live-authority", "action-inbox-read"], "ready": True},
     ],
 )
-def test_service_health_requires_typed_identity_capability_version_and_readiness(payload: dict[str, object]) -> None:
-    assert not live_operator._factory_v3_service_health_payload_ready(payload, service="captain-gateway", origin="https://gateway.example")
+def test_service_health_requires_typed_identity_capability_version_and_readiness(
+    payload: dict[str, object], tmp_path: Path
+) -> None:
+    assert not live_operator._factory_v3_service_health_payload_ready(
+        payload,
+        binding=_authority_binding(tmp_path).gateway,
+    )
 
 
-def test_service_health_accepts_only_exact_typed_authority_payload() -> None:
+def test_service_health_accepts_only_exact_typed_authority_payload(tmp_path: Path) -> None:
     assert live_operator._factory_v3_service_health_payload_ready(
-        {"schema": "captain.factory-v3-service-health.v1", "service": "captain-gateway", "version": "v3", "origin": "https://gateway.example", "capabilities": ["factory-v3-live-authority", "action-inbox-read"], "ready": True},
-        service="captain-gateway", origin="https://gateway.example",
+        {"schema": "captain.factory-v3-service-health.v1", "service": "captain-gateway", "version": "v3", "origin": "https://gateway.example", "capabilities": ["factory-v3-live-authority", "action-inbox-read"], "credential_audience": "captain-gateway-live-v3", "ready": True},
+        binding=_authority_binding(tmp_path).gateway,
     )
 
 
@@ -383,8 +558,12 @@ def test_answered_authoritative_action_resumes_without_reemitting_pending_url(
         resume_metadata=_signed_resume_metadata(status="answered")
     )
     monkeypatch.setattr(live_operator, "_factory_v3_live_runtime_enforcement_ready", lambda: True)
-    monkeypatch.setattr(live_operator, "_factory_v3_codex_session_ready", lambda *_: True)
-    monkeypatch.setattr(live_operator, "_factory_v3_hermes_runtime_ready", lambda *_: True)
+    monkeypatch.setattr(
+        live_operator,
+        "load_captain_factory_v3_live_authority",
+        lambda *_: _authority_binding(tmp_path),
+    )
+    monkeypatch.setattr(live_operator, "_factory_v3_local_runtime_ready", lambda *_: True)
 
     report = live_operator.preflight_factory_v3_live(
         environment=environment, repository_root=ROOT, input_path=INPUT,
@@ -434,36 +613,6 @@ def test_action_inbox_environment_values_never_become_resume_authority() -> None
         gateway_origin="https://gateway.example", run_id=RUN_ID, now=NOW,
         probe=_TypedReadyProbe(resume_metadata=None), persisted_path=None,
     ) is None
-
-
-def test_codex_session_requires_canonical_executables_and_pinned_launcher(tmp_path: Path) -> None:
-    repository = tmp_path / "repo"
-    scripts = repository / "scripts"
-    scripts.mkdir(parents=True)
-    shutil.copyfile(ROOT / "scripts" / "codex-session.ps1", scripts / "codex-session.ps1")
-    codex = tmp_path / "codex.exe"
-    pwsh = tmp_path / "pwsh.exe"
-    codex.write_bytes(b"codex")
-    pwsh.write_bytes(b"pwsh")
-    codex_home = tmp_path / "codex-home"
-    codex_home.mkdir()
-    environment = {"CAPTAIN_CODEX_EXECUTABLE": str(codex), "CAPTAIN_PWSH_EXECUTABLE": str(pwsh), "CAPTAIN_CODEX_HOME": str(codex_home)}
-
-    assert live_operator._factory_v3_codex_session_ready(environment, repository)
-    (scripts / "codex-session.ps1").write_text("# fabricated launcher\n", encoding="utf-8")
-    assert not live_operator._factory_v3_codex_session_ready(environment, repository)
-    environment["CAPTAIN_CODEX_EXECUTABLE"] = sys.executable
-    assert not live_operator._factory_v3_codex_session_ready(environment, ROOT)
-
-
-def test_hermes_runtime_rejects_arbitrary_python_and_fabricated_module_tree(tmp_path: Path) -> None:
-    fabricated = tmp_path / "hermes-agent"
-    (fabricated / "hermes_cli").mkdir(parents=True)
-    (fabricated / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
-    (fabricated / "concurrent_log_handler.py").write_text("", encoding="utf-8")
-    assert not live_operator._factory_v3_hermes_runtime_ready(
-        {"CAPTAIN_FACTORY_V3_HERMES_PYTHON": sys.executable, "CAPTAIN_FACTORY_V3_HERMES_MODULE_ROOT": str(fabricated)}, ROOT,
-    )
 
 
 def test_frozen_input_is_bound_to_exact_sha_and_full_authority_manifest() -> None:
