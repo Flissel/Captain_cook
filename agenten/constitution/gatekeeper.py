@@ -78,13 +78,22 @@ class ConstitutionGatekeeper:
 
     # The in-flight memory only has to span the window between this gate's
     # verdict and the Recorder draining its queue — one decomposition batch.
-    # A hard cap keeps a Recorder that never persists an acceptance from
-    # turning a remembered verdict into a permanent ban on that description.
-    # 256 is generous headroom over what one batch can actually produce:
-    # DecompositionBudget.max_fanout_per_node defaults to 6 children per
-    # node (agenten/decomposition/budget.py), and even the root-problem
-    # lifetime total (max_total_subproblems, default 200) sits comfortably
-    # under this cap.
+    # Be honest about what this cap does NOT do: it is not a release valve
+    # within a single root problem's lifetime. DecompositionBudget's
+    # root-problem lifetime total (max_total_subproblems, default 200,
+    # agenten/decomposition/budget.py) sits under this 256 cap, so eviction
+    # never fires while one root problem is still being decomposed — an
+    # accepted-but-unpersisted verdict is effectively a permanent duplicate
+    # ban for the rest of that root's lifetime (see check_duplicate's
+    # docstring in validators.py for the resulting scope of the check).
+    #
+    # What the cap does do is bound unbounded growth of `_accepted_in_flight`
+    # across the many root problems one long-lived Gatekeeper process will
+    # see over its lifetime: without it, a Recorder that never drains would
+    # leak memory forever; with it, the oldest entries — by then very likely
+    # from root problems that finished long ago — get evicted once the
+    # process has accumulated more than 256 total accepted-in-flight
+    # subproblems.
     IN_FLIGHT_MEMORY_LIMIT = 256
 
     def __init__(
