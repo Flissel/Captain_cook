@@ -29,6 +29,7 @@ class AuthorityHealthBinding:
     service: str
     health_url: str
     token_name: str
+    header_name: Literal["Authorization", "X-N8N-API-KEY"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,18 +95,24 @@ class DemoConfiguration:
         )
 
     def health_bindings(self) -> tuple[AuthorityHealthBinding, ...]:
-        names = ("gateway", "provider_proxy", "runtime", "benchmark", "minibook")
+        names = ("gateway", "provider_proxy", "runtime", "benchmark", "minibook", "n8n")
         return tuple(
             AuthorityHealthBinding(
                 service=service,
                 health_url=str(
-                    getattr(getattr(self.production_manifest, service), "health_url")
+                    getattr(getattr(self.production_manifest, service), "authenticated_health_url")
                 ),
                 token_name=str(
                     getattr(
-                        getattr(self.production_manifest, service), "credential_env"
+                        getattr(self.production_manifest, service), "authenticated_health_credential_env"
                     )
                 ),
+                header_name=str(
+                    getattr(
+                        getattr(self.production_manifest, service),
+                        "authenticated_health_header",
+                    )
+                ),  # type: ignore[arg-type]
             )
             for service in names
         )
@@ -374,6 +381,25 @@ def _validate_d11_manifest(manifest: object) -> None:
         or getattr(n8n, "authenticated_health_header", None) != "X-N8N-API-KEY"
     ):
         raise DemoConfigurationError("D11 production bundle manifest is invalid")
+    authenticated = {
+        "gateway": ("/v1/capability-assemblies/health", "CAPTAIN_GATEWAY_TOKEN", "Authorization"),
+        "runtime": ("/health", "CAPTAIN_RUNTIME_TOKEN", "Authorization"),
+        "provider_proxy": ("/v1/healthz", "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN", "Authorization"),
+        "benchmark": ("/healthz", "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN", "Authorization"),
+        "minibook": ("/api/v1/projection-health", "MINIBOOK_PROJECTION_API_KEY", "Authorization"),
+        "n8n": ("/api/v1/workflows?limit=1", "CAPTAIN_N8N_API_KEY", "X-N8N-API-KEY"),
+    }
+    for name, (suffix, credential, header) in authenticated.items():
+        binding = getattr(manifest, name, None)
+        base = getattr(binding, "base_url", "")
+        if (
+            getattr(binding, "authenticated_health_url", None)
+            != str(base).rstrip("/") + suffix
+            or getattr(binding, "authenticated_health_credential_env", None)
+            != credential
+            or getattr(binding, "authenticated_health_header", None) != header
+        ):
+            raise DemoConfigurationError("D11 production bundle manifest is invalid")
 
 
 def _resolve_relative_file(repository: Path, relative: str) -> Path:

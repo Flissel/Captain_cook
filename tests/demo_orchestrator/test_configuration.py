@@ -56,8 +56,14 @@ def _manifest(**updates: object) -> object:
             execute_url=(f"{base}/v1/execute" if execute else None),
             authentication=("x-n8n-api-key" if service == "n8n" else "bearer"),
             credential_env=credential_names[service],
-            authenticated_health_url=f"{base}{health_suffix}",
-            authenticated_health_credential_env=credential_names[service],
+            authenticated_health_url=(
+                f"{base}/api/v1/projection-health"
+                if service == "minibook" else f"{base}{health_suffix}"
+            ),
+            authenticated_health_credential_env=(
+                "MINIBOOK_PROJECTION_API_KEY"
+                if service == "minibook" else credential_names[service]
+            ),
             authenticated_health_header=("X-N8N-API-KEY" if service == "n8n" else "Authorization"),
             start_argv=(*prefix, "start"),
             stop_argv=(*prefix, "stop"),

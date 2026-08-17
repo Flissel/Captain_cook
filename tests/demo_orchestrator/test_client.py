@@ -51,6 +51,7 @@ class FakeAssemblyHttp:
         token: str,
         payload: dict[str, Any] | None,
         timeout_seconds: float,
+        auth_header: str = "Authorization",
     ) -> dict[str, Any]:
         assert timeout_seconds > 0
         self.calls.append((method, url, token, payload))
@@ -332,7 +333,8 @@ def test_missing_health_authority_causes_zero_http_and_zero_advances(
                 AuthorityHealthBinding(
                     service="gateway",
                     health_url="http://127.0.0.1:19000/healthz",
-                    token_name="CAPTAIN_GATEWAY_TOKEN",
+                        token_name="CAPTAIN_GATEWAY_TOKEN",
+                        header_name="Authorization",
                 ),
             )
 
@@ -356,4 +358,68 @@ def test_missing_health_authority_causes_zero_http_and_zero_advances(
         )
 
     assert http.calls == []
+    assert http.completed == 0
+
+
+@pytest.mark.parametrize(
+    "failed_service",
+    ("gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n"),
+)
+def test_each_authenticated_health_failure_prevents_paid_effect(
+    tmp_path: Path, failed_service: str,
+) -> None:
+    services = ("gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n")
+    headers = {service: ("X-N8N-API-KEY" if service == "n8n" else "Authorization") for service in services}
+
+    class Configuration:
+        state_root = tmp_path
+        gateway_base_url = "http://127.0.0.1:19000"
+
+        @staticmethod
+        def require_minibook_evidence_readback() -> str:
+            return "http://127.0.0.1:19004/v1/projections/{assembly_id}"
+
+        @staticmethod
+        def require_private_benchmark_catalog() -> object:
+            return object()
+
+        @staticmethod
+        def require_runtime_restart_control() -> object:
+            return object()
+
+        @staticmethod
+        def health_bindings() -> tuple[AuthorityHealthBinding, ...]:
+            return tuple(
+                AuthorityHealthBinding(
+                    service=service,
+                    health_url=f"http://127.0.0.1/{service}/authenticated-health",
+                    token_name=f"{service.upper()}_TOKEN",
+                    header_name=headers[service],
+                )
+                for service in services
+            )
+
+        @staticmethod
+        def authority_token(name: str) -> str:
+            return f"secret-for-{name}"
+
+    class HealthHttp(FakeAssemblyHttp):
+        def request_json(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append((method, url, kwargs["token"], kwargs["payload"]))
+            if url == f"http://127.0.0.1/{failed_service}/authenticated-health":
+                return {"status": "failed"} if failed_service != "n8n" else (_ for _ in ()).throw(TimeoutError("failed"))
+            return {} if url.endswith("n8n/authenticated-health") else {"status": "ready"}
+
+    http = HealthHttp()
+    client = CapabilityDemoClient(
+        Configuration(),  # type: ignore[arg-type]
+        supervisor=FakeSupervisor(),
+        http=http,
+        reporter=lambda _: None,
+    )
+
+    with pytest.raises((DemoClientError, DemoTimeout)):
+        client.run(allow_paid_run=True, maximum_cost_usd="6.00", timeout_seconds=30)
+
+    assert not any(method == "POST" for method, *_ in http.calls)
     assert http.completed == 0

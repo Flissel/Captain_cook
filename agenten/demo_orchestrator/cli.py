@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Protocol
 
-from .client import CapabilityDemoClient, DemoClientError, DemoTimeout
+from .client import CapabilityDemoClient, DemoClientError, DemoTimeout, UrllibJsonHttp
 from .configuration import (
     DemoConfigurationError,
     initialize_private_environment,
@@ -78,6 +78,7 @@ class DefaultDemoActions:
         )
         state_root = root if root.is_absolute() else self._repository_root / root
         states = []
+        health = UrllibJsonHttp()
         for control in controls.services:
             try:
                 state = json.loads(
@@ -93,6 +94,27 @@ class DefaultDemoActions:
             ):
                 raise DemoProcessError("D11 managed process identity is invalid")
             states.append(control.service)
+            token = configuration.authority_token(
+                control.authenticated_health_credential_env
+            )
+            try:
+                response = health.request_json(
+                    "GET", control.authenticated_health_url,
+                    token=token, payload=None,
+                    timeout_seconds=max(0.1, timeout_seconds),
+                    auth_header=control.authenticated_health_header,
+                )
+            except (DemoClientError, TimeoutError):
+                raise DemoProcessError(
+                    f"authenticated health failed for {control.service}"
+                ) from None
+            if (
+                control.service != "n8n"
+                and response.get("status") not in {"ok", "ready"}
+            ):
+                raise DemoProcessError(
+                    f"authenticated health failed for {control.service}"
+                )
         return {
             "schema": "captain.demo-operator-result.v1",
             "status": "ready",

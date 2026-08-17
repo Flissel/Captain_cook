@@ -95,6 +95,58 @@ def test_default_actions_executes_all_six_exact_d11_controls(
     assert all(command[-1] == "start" for command in calls)
 
 
+def test_default_status_revalidates_all_six_authenticated_health_contracts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = ("gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n")
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    controls = tuple(
+        SimpleNamespace(
+            service=service,
+            authenticated_health_url=f"http://127.0.0.1/{service}/authenticated-health",
+            authenticated_health_credential_env=f"{service.upper()}_TOKEN",
+            authenticated_health_header=("X-N8N-API-KEY" if service == "n8n" else "Authorization"),
+        )
+        for service in services
+    )
+    for service in services:
+        (state_root / f"{service}.json").write_text(
+            json.dumps({
+                "service": service, "status": "running",
+                "identity_kind": "docker_container" if service == "n8n" else "os_process",
+                "identity_value": f"verified-{service}",
+            }),
+            encoding="utf-8",
+        )
+    configuration = SimpleNamespace(
+        environment={"CAPTAIN_PROCESS_STATE_ROOT": str(state_root)},
+        require_operator_process_bootstrap=lambda: SimpleNamespace(services=controls),
+        authority_token=lambda name: f"secret-for-{name}",
+    )
+    calls: list[tuple[str, str, str]] = []
+
+    class Health:
+        def request_json(self, _method, url, *, token, auth_header, **_kwargs):
+            calls.append((url, token, auth_header))
+            return {} if "n8n" in url else {"status": "ready"}
+
+    monkeypatch.setattr("agenten.demo_orchestrator.cli.load_demo_configuration", lambda _root: configuration)
+    monkeypatch.setattr("agenten.demo_orchestrator.cli.UrllibJsonHttp", Health)
+
+    result = DefaultDemoActions(tmp_path).status(3)
+
+    assert result["services"] == list(services)
+    assert calls == [
+        (
+            control.authenticated_health_url,
+            f"secret-for-{control.authenticated_health_credential_env}",
+            control.authenticated_health_header,
+        )
+        for control in controls
+    ]
+
+
 @pytest.mark.parametrize("action", ("init", "start", "status", "stop"))
 def test_cli_exposes_non_paid_operator_actions(
     tmp_path: Path, action: str, capsys: pytest.CaptureFixture[str]
