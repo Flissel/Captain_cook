@@ -22,6 +22,7 @@ from agenten.delivery.minibook_events import (
     MinibookProjectionEvent,
 )
 from agenten.delivery.projector import MinibookProjector
+from gateway.capability_identity import generic_capability_subject_id
 from gateway.contracts import DeliveryEventEnvelope
 from gateway.integration_setup_contracts import IntegrationSetupSubmissionV1
 
@@ -253,17 +254,9 @@ def integration_setup_registry_mirror_event(
 
 
 def _factory_subject_reference(job_id: str) -> str:
-    """Keep valid v4 job IDs stable and canonicalize all other UUIDs."""
+    """Return the exact Factory job identity used by every projection path."""
 
-    parsed = UUID(job_id)
-    if parsed.version == 4:
-        return f"subject:{parsed}"
-    subject_digest = bytearray(
-        hashlib.sha256(f"captain-factory-subject:{parsed}".encode("utf-8")).digest()[:16]
-    )
-    subject_digest[6] = (subject_digest[6] & 0x0F) | 0x40
-    subject_digest[8] = (subject_digest[8] & 0x3F) | 0x80
-    return f"subject:{UUID(bytes=bytes(subject_digest))}"
+    return generic_capability_subject_id(UUID(job_id))
 
 
 def runtime_result_projection(

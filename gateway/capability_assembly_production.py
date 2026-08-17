@@ -374,7 +374,7 @@ class GatewayMinibookProjectionEffectsAdapter:
             not isinstance(event, MinibookProjectionEvent)
             or event.event_id != release.release_authority_id
             or event.correlation_id != release.correlation_id
-            or event.subject_id != _factory_subject_reference(release.job_id)
+            or event.subject_id != generic_capability_subject_id(release.job_id)
             or event.subject_version != release.capability_version
             or event.schema_name != "captain.minibook-projection.v2"
             or event.event_type != "capability.promoted"
@@ -487,17 +487,6 @@ class GatewayMinibookProjectionEffectsAdapter:
                 "Gateway projection acknowledgement read-back is unavailable"
             )
         return readback
-
-
-def _factory_subject_reference(job_id: UUID) -> str:
-    if job_id.version == 4:
-        return f"subject:{job_id}"
-    subject_digest = bytearray(
-        hashlib.sha256(f"captain-factory-subject:{job_id}".encode()).digest()[:16]
-    )
-    subject_digest[6] = (subject_digest[6] & 0x0F) | 0x40
-    subject_digest[8] = (subject_digest[8] & 0x3F) | 0x80
-    return f"subject:{UUID(bytes=bytes(subject_digest))}"
 
 
 def _release_projection_digest(release: CapabilityFactoryAuthority) -> str:

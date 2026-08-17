@@ -1766,6 +1766,53 @@ def test_promotion_event_rejects_wrong_release_id_before_minibook() -> None:
     assert minibook.calls == []
 
 
+def test_uuid5_factory_subject_survives_projection_acknowledgement_readback() -> None:
+    job_id = _id("uuid5-factory-job")
+    release = CapabilityFactoryAuthority(
+        stage=CapabilityLiveStage.PROMOTE,
+        input_id="projection-input",
+        source_ref=_ref("source"),
+        job_id=job_id,
+        correlation_id=_id("uuid5-correlation"),
+        subject_version=1,
+        capability_id="generic_capability",
+        capability_version=1,
+        suite_ref=_ref("suite"),
+        hermes_result_ref=_ref("hermes"),
+        evidence_refs=(_ref("release-evidence"),),
+        booked_cost_usd="1.00",
+        normal_trace_ids=(_id("trace-1"), _id("trace-2"), _id("trace-3")),
+        benchmark_authority_id=_id("benchmark-authority"),
+        benchmark_summary_ref=_ref("benchmark-summary"),
+        release_authority_id=_id("uuid5-promotion"),
+    )
+    base = _event()
+    event = base.model_copy(update={
+        "event_id": release.release_authority_id,
+        "correlation_id": release.correlation_id,
+        "subject_id": f"subject:{job_id}",
+        "payload": base.payload.model_copy(update={
+            "artifact_digest": _release_projection_digest(release),
+        }),
+    })
+    acknowledgement = _acknowledgement(event)
+    gateway = _ProjectionGateway(event)
+    minibook = _MinibookProjection(acknowledgement)
+    effects = GatewayMinibookProjectionEffectsAdapter(
+        gateway=gateway,
+        minibook=minibook,
+    )
+
+    selected = asyncio.run(effects.promotion_event(release))
+    readback = asyncio.run(effects.project_and_ack(selected))
+
+    assert selected.subject_id == f"subject:{job_id}"
+    assert readback.event.subject_id == f"subject:{job_id}"
+    assert readback.acknowledgement.subject_id == f"subject:{job_id}"
+    assert gateway.calls == ["feed", "ack", "readback"]
+    assert minibook.calls == ["project", "minibook-readback"]
+
+
 @pytest.mark.parametrize(
     ("relative_path", "bound_batch", "recorded_batch", "message"),
     (
