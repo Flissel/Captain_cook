@@ -1048,10 +1048,22 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             or assignment.workspace_policy_sha256 != authority.workspace_policy_ref.sha256
             or assignment.lease_ref != authority.lease_ref
             or assignment.deadline_at != authority.deadline_at
-            or effect.hermes_usage_receipt_ref != result.hermes_usage_receipt_ref
-            or effect.codex_build_receipt_ref != result.codex_build_receipt_ref
-            or effect.build_evidence_refs != result.build_evidence_refs
-            or effect.test_evidence_refs != result.real_case_evidence_refs
+            or not _same_artifact_content(
+                effect.hermes_usage_receipt_ref,
+                result.hermes_usage_receipt_ref,
+            )
+            or not _same_artifact_content(
+                effect.codex_build_receipt_ref,
+                result.codex_build_receipt_ref,
+            )
+            or not _same_artifact_sequence_content(
+                effect.build_evidence_refs,
+                result.build_evidence_refs,
+            )
+            or not _same_artifact_sequence_content(
+                effect.test_evidence_refs,
+                result.real_case_evidence_refs,
+            )
             or effect.tool_gaps != result.tool_gaps
         ):
             raise FactoryDispatchError(
@@ -1604,7 +1616,13 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
                 for item in (*builds, *cases)
             )
             or any(item.workspace_snapshot_ref != effect.workspace_snapshot_ref for item in builds)
-            or any(item.evidence_refs != result.build_evidence_refs for item in cases)
+            or any(
+                not _same_artifact_sequence_content(
+                    item.evidence_refs,
+                    result.build_evidence_refs,
+                )
+                for item in cases
+            )
             or any(item.declared_test_paths != declared_test_paths for item in cases)
             or hermes.evidence_refs
             != (
@@ -1919,6 +1937,27 @@ def _runtime_ref(reference: object) -> ArtifactRef:
 
 def _artifact_identity(reference: ArtifactRef) -> tuple[str, str, str]:
     return reference.uri, reference.sha256, reference.media_type
+
+
+def _same_artifact_content(left: object, right: object) -> bool:
+    if left is None or right is None:
+        return False
+    left_ref = _runtime_ref(left)
+    right_ref = _runtime_ref(right)
+    return (
+        left_ref.sha256 == right_ref.sha256
+        and left_ref.media_type == right_ref.media_type
+    )
+
+
+def _same_artifact_sequence_content(
+    left: tuple[object, ...],
+    right: tuple[object, ...],
+) -> bool:
+    return len(left) == len(right) and all(
+        _same_artifact_content(left_ref, right_ref)
+        for left_ref, right_ref in zip(left, right, strict=True)
+    )
 
 
 class FactoryTeamExecutionPort(Protocol):

@@ -12,6 +12,7 @@ from agenten.agent_factory.forge_contracts import (
     FactoryBuildAssignmentV1 as CaptainFactoryBuildAssignment,
     ForgeBuildSkillUsageReceiptV1 as CaptainForgeBuildSkillUsageReceipt,
     CreationJobV3 as CaptainCreationJobV3,
+    CreationProgressV1 as CaptainCreationProgressV1,
     CreationResultV2 as CaptainCreationResultV2,
     FactoryActionRequestV1 as CaptainFactoryActionRequestV1,
     FactoryActionResponseV1 as CaptainFactoryActionResponseV1,
@@ -27,6 +28,7 @@ from minibook.swarm.contracts import (
     FactoryBuildAssignmentV1,
     ForgeBuildSkillUsageReceiptV1,
     CreationJobV3,
+    CreationProgressV1,
     CreationResultV2,
     FactoryActionRequestV1,
     FactoryActionResponseV1,
@@ -154,6 +156,36 @@ def test_v3_contract_fixture_is_byte_compatible(
     fixture_name: str, parent_type: type, minibook_type: type
 ) -> None:
     _assert_byte_compatible(fixture_name, parent_type, minibook_type)
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        "planning",
+        "awaiting_build",
+        "building",
+        "validating",
+        "packaging",
+        "readback",
+        "awaiting_user_input",
+    ),
+)
+def test_parent_and_minibook_accept_the_same_v3_progress_status(status: str) -> None:
+    payload = {
+        "schema": "minibook.creation-progress.v1",
+        "creation_job_id": "00000000-0000-0000-0000-000000000401",
+        "subject_version": 1,
+        "attempt": 1,
+        "status": status,
+        "checkpoint": "planning",
+        "version": 3,
+    }
+
+    assert CaptainCreationProgressV1.model_validate(payload).model_dump(
+        mode="json", by_alias=True
+    ) == CreationProgressV1.model_validate(payload).model_dump(
+        mode="json", by_alias=True
+    )
 
 
 @pytest.mark.parametrize("contract", (CaptainCreationResultV2, CreationResultV2))

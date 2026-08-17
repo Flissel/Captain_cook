@@ -399,7 +399,10 @@ class CreationJobStore:
                 job = self._job(assignment.creation_job_id, db)
                 if datetime.now(timezone.utc) >= assignment.deadline_at:
                     raise CreationConflictError("assignment deadline expired")
-                if head["status"] != "awaiting_build" or head["version"] != assignment.checkpoint_version + 1:
+                # A durable user-action pause/resume advances the head version
+                # without replacing the immutable assignment.  The restored
+                # status remains the lifecycle authority for claimability.
+                if head["status"] != "awaiting_build" or head["version"] < assignment.checkpoint_version + 1:
                     raise CreationConflictError("assignment is not available for claim")
                 db.execute("INSERT INTO creation_assignment_claims VALUES (?, ?, ?)", (str(assignment_id), worker_id, _json({"assignment_id": str(assignment_id), "worker_id": worker_id})))
                 self._require_transition(job, head["status"], "building")
@@ -431,7 +434,9 @@ class CreationJobStore:
                 raise CreationConflictError("creation job is already terminal")
             if datetime.now(timezone.utc) >= assignment.deadline_at:
                 raise CreationConflictError("assignment deadline expired")
-            if head["status"] != "building" or head["version"] != assignment.checkpoint_version + 2:
+            # Action Inbox round-trips may advance the version while restoring
+            # the same claimed build state and assignment identity.
+            if head["status"] != "building" or head["version"] < assignment.checkpoint_version + 2:
                 raise CreationConflictError("assignment effect is not valid for the current building state")
             db.execute("INSERT INTO creation_build_effects VALUES (?, ?, ?)", (str(effect.assignment_id), effect.effect_key, encoded))
             self._require_transition(job, head["status"], "validating")
@@ -515,13 +520,13 @@ class CreationJobStore:
             if claimed_worker is None:
                 is_current = (
                     row["head_status"] == "awaiting_build"
-                    and row["head_version"] == assignment.checkpoint_version + 1
+                    and row["head_version"] >= assignment.checkpoint_version + 1
                 )
             else:
                 is_current = (
                     claimed_worker == worker_id
                     and row["head_status"] == "building"
-                    and row["head_version"] == assignment.checkpoint_version + 2
+                    and row["head_version"] >= assignment.checkpoint_version + 2
                 )
             if is_current:
                 return assignment

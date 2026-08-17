@@ -287,6 +287,7 @@ class V3CreationPipeline:
             return StepOutcome(
                 snapshot=outcome.snapshot,
                 effect_receipt=durable_effect.model_dump(mode="json", by_alias=True),
+                completion_status="packaging",
             )
         validate = getattr(self.validator, "validate", None)
         if not callable(validate):
@@ -294,7 +295,13 @@ class V3CreationPipeline:
         outcome = await validate(job, prior_snapshot, self.artifact_store)
         if not isinstance(outcome, StepOutcome):
             raise TypeError("V3 creation validator returned an invalid outcome")
-        return outcome
+        return StepOutcome(
+            snapshot=outcome.snapshot,
+            effect_receipt=outcome.effect_receipt,
+            yield_status=outcome.yield_status,
+            yield_transition_persisted=outcome.yield_transition_persisted,
+            completion_status="readback",
+        )
 
     def assemble_result(
         self, job: CreationJobV3, snapshot: dict[str, Any]

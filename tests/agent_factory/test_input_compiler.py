@@ -7,10 +7,17 @@ from pathlib import Path
 from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
 from agenten.agent_factory.input_compiler import FactoryInputCompiler
 from agenten.agent_factory.input_compiler import CompiledFactorySpecification
+from agenten.agent_factory.input_contracts import FactoryInputDocumentV2
 from agenten.agent_factory.input_document import load_factory_input
 
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "agent_factory" / "TO_BE_BUILT.valid.md"
+SALES_PIPELINE_FIXTURE = (
+    Path(__file__).parents[1]
+    / "fixtures"
+    / "agent_factory"
+    / "sales_pipeline_brief.v3.json"
+)
 
 
 def document(tmp_path: Path):
@@ -68,3 +75,25 @@ def test_public_handoff_fixture_contains_refs_but_no_holdout_body() -> None:
     parsed = CompiledFactorySpecification.model_validate(json.loads(source))
     assert parsed.private_holdout_refs[0].uri.startswith("holdout://")
     assert "controlled recovery" not in source.casefold()
+
+
+def test_sales_pipeline_compiler_freezes_authoritative_v3_team_requirements() -> None:
+    fixture = json.loads(SALES_PIPELINE_FIXTURE.read_text(encoding="utf-8"))
+    source = FactoryInputDocumentV2.model_validate(fixture["document"])
+    compiled, _ = compiler()
+
+    result = compiled.compile(source, subject_version=3)
+
+    expected = fixture["expected"]
+    assert result.required_agent_ids == tuple(expected["required_agent_ids"])
+    assert [item.model_dump(mode="json") for item in result.ordered_handoffs] == expected[
+        "ordered_handoffs"
+    ]
+    assert [item.model_dump(mode="json") for item in result.tool_requirements] == expected[
+        "tool_requirements"
+    ]
+    assert result.allowed_optional_tool_gaps == tuple(
+        expected["allowed_optional_tool_gaps"]
+    )
+    assert result.public_assertion_ids == tuple(expected["public_assertion_ids"])
+    assert result.public_assertion_ids == result.assertion_ids

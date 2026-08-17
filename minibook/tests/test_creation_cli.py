@@ -685,6 +685,10 @@ async def test_production_v3_pipeline_yields_assignment_then_consumes_exact_dura
     assert validator.accepted_effects == []
     assert validator.validation_calls == 0
 
+    waiting = store.progress(job.creation_job_id)
+    assert await runner.run_slice(job.creation_job_id) is None
+    assert store.progress(job.creation_job_id) == waiting
+
     store.claim_build_assignment(assignment.assignment_id, "hermes-factory")
     accepted = store.accept_build_effect(_v3_effect(assignment))
     changed_receipt = accepted.model_copy(

@@ -272,6 +272,24 @@ def test_action_pause_and_response_are_immutable_version_fenced_and_resume_prior
         store.accept_action_response(action_response(request), expected_version=3)
 
 
+def test_resumed_action_keeps_the_same_build_assignment_claimable(tmp_path: Path) -> None:
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    creation_job = job()
+    published = prepare_assignment(store, creation_job)
+    request = action_request(creation_job)
+
+    paused = store.record_action_request(request, expected_version=3)
+    resumed = store.accept_action_response(
+        action_response(request),
+        expected_version=paused.version,
+    )
+
+    assert resumed.status == "awaiting_build"
+    assert store.next_claimable_build_assignment("worker-a") == published
+    assert store.claim_build_assignment(published.assignment_id, "worker-a") == published
+    assert store.accept_build_effect(effect(published)) == effect(published)
+
+
 def test_action_expiry_blocks_the_paused_job(tmp_path: Path) -> None:
     store = CreationJobStore(tmp_path / "creation.sqlite3")
     creation_job = job()

@@ -44,6 +44,7 @@ class ValidatedTeamPackage:
     team_manifest: dict[str, Any]
     files: Mapping[PurePosixPath, bytes]
     tool_gaps: tuple[ToolGapMarkerV1, ...]
+    source_archive_ref: ArtifactRef
 
 
 @dataclass(frozen=True)
@@ -144,7 +145,14 @@ def validate_team_package(
         real_refs=typed_test_evidence_refs,
     )
     files = dict(files) | authority_files
-    return ValidatedTeamPackage(authority_job, compiled, manifest, files, typed_gaps)
+    return ValidatedTeamPackage(
+        authority_job,
+        compiled,
+        manifest,
+        files,
+        typed_gaps,
+        source_archive_ref,
+    )
 
 
 def require_exact_topology(
@@ -194,6 +202,12 @@ def seal_team_package(
         for value in validated.authority_job.tool_requirements
         if not value.required
     ]
+    # The source ZIP contains the pre-seal candidate, so it cannot contain a
+    # digest reference to itself.  Bind that immutable source ref only in the
+    # final candidate published by Minibook.
+    candidate["source_archive_ref"] = validated.source_archive_ref.model_dump(
+        mode="json"
+    )
     candidate["artifacts"] = [
         {
             "path": str(path),

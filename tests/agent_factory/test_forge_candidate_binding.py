@@ -232,7 +232,7 @@ def _durable_v3_result(
         }
     )
     candidate_bytes = json.dumps(
-        candidate.model_dump(mode="json", by_alias=True),
+        preseal_candidate,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -240,6 +240,7 @@ def _durable_v3_result(
     ).encode("utf-8") + b"\n"
     validated = replace(
         validated,
+        source_archive_ref=candidate_source_ref,
         files={
             **changed_files,
             PurePosixPath("factory-candidate.json"): candidate_bytes,
@@ -713,7 +714,7 @@ def test_v3_real_case_paths_must_equal_final_team_manifest_order(
     ("mutation", "message"),
     (
         ("cas", "Captain CAS readback digest mismatch"),
-        ("stale_build", "assignment or effect authority differs"),
+        ("stale_build", "evidence refs differ from the canonical package"),
         ("candidate_substitution", "result refs differ from sealed package"),
     ),
 )

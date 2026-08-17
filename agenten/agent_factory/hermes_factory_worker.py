@@ -20,6 +20,7 @@ import httpx
 from agenten.agent_factory.forge_contracts import (
     ArtifactRef,
     CodexBuildReceiptV1,
+    CreationProgressV1,
     FactoryBuildAssignmentV2,
     FactoryBuildEffectV2,
     ToolGapMarkerV1,
@@ -554,13 +555,24 @@ class AuthenticatedMinibookV3WorkerClient:
             raise ValueError(
                 f"Minibook V3 effect submission failed with status {response.status_code}"
             )
-        try:
-            accepted = FactoryBuildEffectV2.model_validate(response.json())
-        except (ValueError, TypeError) as exc:
-            raise ValueError("Minibook V3 effect response is invalid") from exc
         assignment = self._assignments.get(effect.assignment_id)
         if assignment is None:
             raise ValueError("Minibook V3 effect assignment is not scoped")
+        try:
+            payload = response.json()
+            if payload.get("schema") == "minibook.creation-progress.v1":
+                progress = CreationProgressV1.model_validate(payload)
+                if (
+                    progress.creation_job_id != effect.creation_job_id
+                    or progress.subject_version != effect.subject_version
+                    or progress.attempt != effect.attempt
+                    or progress.status != "validating"
+                ):
+                    raise ValueError("Minibook V3 effect progress binding changed")
+                return effect
+            accepted = FactoryBuildEffectV2.model_validate(payload)
+        except (AttributeError, ValueError, TypeError) as exc:
+            raise ValueError("Minibook V3 effect response is invalid") from exc
         validate_build_effect_binding(assignment, accepted)
         if accepted != effect:
             raise ValueError("Minibook accepted a different build effect")

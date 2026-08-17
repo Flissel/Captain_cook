@@ -35,9 +35,11 @@ FIXTURES = Path(__file__).parents[1] / "fixtures" / "contracts"
 
 
 def _assignment() -> FactoryBuildAssignmentV2:
-    return FactoryBuildAssignmentV2.model_validate(
-        json.loads((FIXTURES / "hermes_factory_assignment.v2.json").read_text())
+    payload = json.loads(
+        (FIXTURES / "hermes_factory_assignment.v2.json").read_text()
     )
+    payload["deadline_at"] = "2099-08-09T12:00:00Z"
+    return FactoryBuildAssignmentV2.model_validate(payload)
 
 
 def _ref(namespace: str, *, media_type: str = "application/json") -> ArtifactRef:
@@ -579,7 +581,7 @@ async def test_worker_rejects_expired_assignment_before_codex(tmp_path: Path) ->
         codex_receipts=CaptainCodexBuildReceiptIssuer(
             CodexBuildArtifactCas(tmp_path / "cas")
         ),
-        clock=lambda: datetime(2026, 8, 9, 12, 0, 1, tzinfo=timezone.utc),
+        clock=lambda: assignment.deadline_at,
     )
 
     with pytest.raises(ValueError, match="deadline expired"):
@@ -796,6 +798,61 @@ async def test_authenticated_minibook_client_uses_typed_v3_worker_routes(
         "/v3/creation/assignments/next",
         f"/v3/creation/assignments/{assignment.assignment_id}/claim",
     ]
+
+
+@pytest.mark.asyncio
+async def test_authenticated_client_accepts_bound_progress_ack_for_effect(
+    tmp_path: Path,
+) -> None:
+    assignment = _assignment()
+    build, issuer = _build(assignment, tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/next") or request.url.path.endswith("/claim"):
+            return httpx.Response(
+                200,
+                json=assignment.model_dump(mode="json", by_alias=True),
+            )
+        return httpx.Response(
+            202,
+            json={
+                "schema": "minibook.creation-progress.v1",
+                "creation_job_id": str(assignment.creation_job_id),
+                "subject_version": assignment.subject_version,
+                "attempt": assignment.attempt,
+                "status": "validating",
+                "checkpoint": "planning",
+                "version": assignment.checkpoint_version + 3,
+            },
+        )
+
+    checkpoint_store = FilesystemHermesFactoryWorkerCheckpointStore(
+        tmp_path / "worker"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://minibook.invalid",
+    ) as session:
+        worker = HermesFactoryWorker(
+            minibook=AuthenticatedMinibookV3WorkerClient(
+                client=session,
+                worker_token="worker-secret",
+                worker_id="hermes-factory-v3",
+                checkpoint_store=checkpoint_store,
+            ),
+            codex=_Codex(build),
+            skill_verifier=_SkillVerifier(),
+            worker_id="hermes-factory-v3",
+            released_skill_name="captain-agent-factory-loop",
+            released_skill_sha256="a" * 64,
+            checkpoint_store=checkpoint_store,
+            codex_receipts=issuer,
+        )
+
+        accepted = await worker.run_once()
+
+    assert accepted is not None
+    assert accepted.assignment_id == assignment.assignment_id
 
 
 @pytest.mark.asyncio

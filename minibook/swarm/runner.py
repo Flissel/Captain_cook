@@ -17,6 +17,7 @@ class StepOutcome:
     effect_receipt: dict[str, Any] | None = None
     yield_status: str | None = None
     yield_transition_persisted: bool = False
+    completion_status: str | None = None
 
 
 class PipelineStepPort(Protocol):
@@ -113,7 +114,8 @@ class CreationRunner:
                     persisted = self.store.progress(job_id)
                     if (
                         persisted.status != outcome.yield_status
-                        or persisted.version != step_expected_version + 1
+                        or persisted.version
+                        not in {step_expected_version, step_expected_version + 1}
                     ):
                         raise ValueError("pipeline persisted an invalid creation yield")
                 else:
@@ -124,6 +126,13 @@ class CreationRunner:
                     job_id, effect_key, outcome.effect_receipt,
                     expected_version=step_expected_version,
                 )
+            if outcome.completion_status is not None:
+                transitioned = self.store.transition(
+                    job_id,
+                    outcome.completion_status,
+                    expected_version=step_expected_version,
+                )
+                step_expected_version = transitioned.version
             self.store.complete_step(
                 job_id, step, effect_key, outcome.snapshot,
                 expected_version=step_expected_version,
