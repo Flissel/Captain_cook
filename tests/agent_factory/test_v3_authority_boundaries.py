@@ -3,11 +3,11 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-import sys
 
 import pytest
 
 import agenten.agent_factory.hermetic_build_authority as hermetic_authority
+import agenten.agent_factory.codex_build_execution as codex_execution
 
 from agenten.agent_factory.codex_build_execution import (
     CaptainStaticFactoryRunnerFactory,
@@ -28,6 +28,7 @@ from agenten.agent_factory.orchestration import FactoryDispatchError
 from agenten.agent_factory.worker_failure_projection import (
     CaptainFactoryWorkerFailureCoordinator,
 )
+from agenten.execution.codex_policy import AuthorizedCodexRun, FrozenEnvironment
 
 
 def test_v3_authority_implementations_are_production_components() -> None:
@@ -53,34 +54,74 @@ def test_v3_authority_implementations_are_production_components() -> None:
     assert not hasattr(hermetic_authority, "CaptainHermeticBuildExecutor")
 
 
-def test_static_factory_runner_rejects_unapproved_source_digest(
+@pytest.mark.asyncio
+async def test_static_factory_runner_rejects_network_source_before_host_execution(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A malicious bundle must never reach a host interpreter or the network."""
+
     workspace = (tmp_path / "workspace").resolve()
+    host_process_calls = 0
+
+    def reject_host_process(*_args: object, **_kwargs: object) -> None:
+        nonlocal host_process_calls
+        host_process_calls += 1
+        raise AssertionError("host process execution crossed the hermetic boundary")
+
+    monkeypatch.setattr(codex_execution.subprocess, "run", reject_host_process)
     authority = FactoryCodexRuntimeAuthority(
         workspace_root=workspace,
-        writable_roots=((workspace / "src").resolve(),),
-        allowed_commands=(("python", "-m", "compileall", "src"),),
+        writable_roots=(
+            (workspace / "src").resolve(),
+            (workspace / "tests").resolve(),
+            (workspace / "evidence").resolve(),
+        ),
+        allowed_commands=(
+            ("python", "-m", "compileall", "src"),
+            ("python", "-m", "pytest"),
+        ),
         network_allowed=False,
         maximum_provider_cost_usd=1.0,
     )
-    factory = CaptainStaticFactoryRunnerFactory(
-        authority=authority,
-        bundle=CaptainStaticFactorySourceBundle(
-            (("src/__init__.py", b'"""bounded"""\n'),)
-        ),
-        expected_bundle_sha256="0" * 64,
-        interpreter_path=Path(sys.executable),
+    bundle = CaptainStaticFactorySourceBundle(
+        (
+            ("src/team.py", b"def safe_team():\n    return 'bounded'\n"),
+            (
+                "tests/test_network.py",
+                b"import socket\n"
+                b"socket.create_connection(('example.com', 443), timeout=1)\n",
+            ),
+        )
     )
 
-    with pytest.raises(FactoryDispatchError, match="digest is not authorized"):
-        factory(
+    with pytest.raises(FactoryDispatchError, match="restricted Python"):
+        runner = CaptainStaticFactoryRunnerFactory(
+            authority=authority,
+            bundle=bundle,
+        )(
             session_id="session",
             state_path=tmp_path / "state.json",
             journal_path=tmp_path / "journal.jsonl",
             maximum_runtime_seconds=10,
             deadline_at=datetime.now(timezone.utc),
         )
+        await runner.run(
+            AuthorizedCodexRun(
+                workspace=workspace,
+                command=("codex", "exec", "--json", "bounded"),
+                environment=FrozenEnvironment(
+                    {
+                        "FACTORY_CREDENTIAL_REF": (
+                            "credential://tenant-a/crm-readonly"
+                        ),
+                        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                    }
+                ),
+            )
+        )
+
+    assert host_process_calls == 0
 
 
 def test_hermetic_subprocess_environment_excludes_unrelated_host_secrets(

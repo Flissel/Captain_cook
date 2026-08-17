@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import json
@@ -605,8 +606,479 @@ class FactoryCodexRuntimeAuthority:
 _CAPTAIN_FACTORY_RUNTIME_SEAL = object()
 
 
+class _RestrictedFactoryPythonError(ValueError):
+    """One redacted rejection from the static restricted Python engine."""
+
+
+class _RestrictedFactoryReturn(Exception):
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+
+@dataclass(frozen=True)
+class _RestrictedFactoryFunction:
+    definition: ast.FunctionDef
+
+
+class _CaptainRestrictedStaticPythonEngine:
+    """Interpret a deliberately tiny Python subset without host capabilities."""
+
+    _MAX_STEPS = 10_000
+    _MAX_CALL_DEPTH = 32
+    _ALLOWED_NODE_TYPES = (
+        ast.Module,
+        ast.FunctionDef,
+        ast.arguments,
+        ast.arg,
+        ast.Assign,
+        ast.Return,
+        ast.If,
+        ast.Expr,
+        ast.Assert,
+        ast.Call,
+        ast.Name,
+        ast.Load,
+        ast.Store,
+        ast.Constant,
+        ast.Dict,
+        ast.List,
+        ast.Tuple,
+        ast.Subscript,
+        ast.BinOp,
+        ast.Add,
+        ast.Compare,
+        ast.Eq,
+        ast.NotEq,
+        ast.keyword,
+    )
+    _PRIMITIVE_NAMES = frozenset(
+        {
+            "blocked_external_write",
+            "credential_ref",
+            "emit_evidence",
+            "len",
+            "sentinel_secret_seen",
+        }
+    )
+
+    def __init__(
+        self,
+        *,
+        workspace_root: Path,
+        writable_roots: tuple[Path, ...],
+        bundle: "CaptainStaticFactorySourceBundle",
+        environment: Mapping[str, str],
+    ) -> None:
+        self._workspace_root = workspace_root.resolve()
+        self._writable_roots = writable_roots
+        self._bundle = bundle
+        self._environment = dict(environment)
+        self._trees: dict[str, ast.Module] = {}
+        self._steps = 0
+        self._call_depth = 0
+        self._external_write_attempts = 0
+        self._external_write_blocks = 0
+        self._evidence_emitted = False
+        self._scope: dict[str, object] = {
+            "blocked_external_write": self._blocked_external_write,
+            "credential_ref": self._credential_ref,
+            "emit_evidence": self._emit_evidence,
+            "len": self._safe_len,
+            "sentinel_secret_seen": self._sentinel_secret_seen,
+        }
+
+    def validate(self) -> None:
+        python_paths = tuple(
+            path for path, _content in self._bundle.files if path.endswith(".py")
+        )
+        if not python_paths or not any(
+            path.startswith("tests/") for path in python_paths
+        ):
+            raise _RestrictedFactoryPythonError(
+                "restricted Python requires source and tests"
+            )
+        for relative in python_paths:
+            path = (self._workspace_root / relative).resolve()
+            try:
+                content = path.read_text(encoding="utf-8")
+                tree = ast.parse(content, filename=relative, mode="exec")
+            except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python source is invalid"
+                ) from exc
+            self._validate_tree(tree)
+            self._trees[relative] = tree
+
+    def run_tests(self) -> None:
+        if not self._trees:
+            raise _RestrictedFactoryPythonError(
+                "restricted Python was not compiled"
+            )
+        source_paths = tuple(
+            path for path in sorted(self._trees) if not path.startswith("tests/")
+        )
+        test_paths = tuple(
+            path for path in sorted(self._trees) if path.startswith("tests/")
+        )
+        if not source_paths or not test_paths:
+            raise _RestrictedFactoryPythonError(
+                "restricted Python requires source and tests"
+            )
+        for path in source_paths:
+            self._execute_block(self._trees[path].body, self._scope)
+        executed_tests = 0
+        for path in test_paths:
+            before = set(self._scope)
+            self._execute_block(self._trees[path].body, self._scope)
+            test_names = tuple(
+                sorted(
+                    name
+                    for name in set(self._scope) - before
+                    if name.startswith("test_")
+                    and isinstance(self._scope[name], _RestrictedFactoryFunction)
+                )
+            )
+            if not test_names:
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python test module has no tests"
+                )
+            for name in test_names:
+                self._call_function(self._scope[name], (), {})
+                executed_tests += 1
+        if executed_tests < 1 or not self._evidence_emitted:
+            raise _RestrictedFactoryPythonError(
+                "restricted Python tests produced no evidence"
+            )
+
+    def _validate_tree(self, tree: ast.Module) -> None:
+        for node in ast.walk(tree):
+            if not isinstance(node, self._ALLOWED_NODE_TYPES):
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python operation is forbidden"
+                )
+            if isinstance(node, ast.Name) and (
+                not node.id.isidentifier() or node.id.startswith("_")
+            ):
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python identifier is forbidden"
+                )
+            if isinstance(node, ast.Constant) and not isinstance(
+                node.value, (str, int, bool, type(None))
+            ):
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python constant is forbidden"
+                )
+            if isinstance(node, ast.Assign) and (
+                len(node.targets) != 1
+                or not isinstance(node.targets[0], ast.Name)
+                or node.targets[0].id in self._PRIMITIVE_NAMES
+            ):
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python assignment is forbidden"
+                )
+            if isinstance(node, ast.FunctionDef):
+                arguments = node.args
+                if (
+                    node.name.startswith("_")
+                    or node.name in self._PRIMITIVE_NAMES
+                    or node.decorator_list
+                    or node.returns is not None
+                    or arguments.posonlyargs
+                    or arguments.kwonlyargs
+                    or arguments.vararg is not None
+                    or arguments.kwarg is not None
+                    or arguments.defaults
+                    or arguments.kw_defaults
+                    or any(argument.annotation is not None for argument in arguments.args)
+                ):
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python function is forbidden"
+                    )
+            if isinstance(node, ast.Call) and (
+                not isinstance(node.func, ast.Name)
+                or any(keyword.arg is None for keyword in node.keywords)
+            ):
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python call is forbidden"
+                )
+            if isinstance(node, ast.BinOp) and not isinstance(node.op, ast.Add):
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python binary operation is forbidden"
+                )
+            if isinstance(node, ast.Compare) and (
+                len(node.ops) != 1 or len(node.comparators) != 1
+            ):
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python comparison is forbidden"
+                )
+
+    def _tick(self) -> None:
+        self._steps += 1
+        if self._steps > self._MAX_STEPS:
+            raise _RestrictedFactoryPythonError(
+                "restricted Python step bound exceeded"
+            )
+
+    def _execute_block(
+        self,
+        statements: Iterable[ast.stmt],
+        scope: dict[str, object],
+    ) -> None:
+        for statement in statements:
+            self._tick()
+            if isinstance(statement, ast.FunctionDef):
+                if statement.name in scope:
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python name was redefined"
+                    )
+                scope[statement.name] = _RestrictedFactoryFunction(statement)
+            elif isinstance(statement, ast.Assign):
+                target = statement.targets[0]
+                assert isinstance(target, ast.Name)
+                scope[target.id] = self._evaluate(statement.value, scope)
+            elif isinstance(statement, ast.Return):
+                raise _RestrictedFactoryReturn(
+                    None
+                    if statement.value is None
+                    else self._evaluate(statement.value, scope)
+                )
+            elif isinstance(statement, ast.If):
+                condition = self._evaluate(statement.test, scope)
+                if not isinstance(condition, bool):
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python condition is not boolean"
+                    )
+                self._execute_block(
+                    statement.body if condition else statement.orelse,
+                    scope,
+                )
+            elif isinstance(statement, ast.Assert):
+                if self._evaluate(statement.test, scope) is not True:
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python assertion failed"
+                    )
+            elif isinstance(statement, ast.Expr):
+                if isinstance(statement.value, ast.Constant) and isinstance(
+                    statement.value.value, str
+                ):
+                    continue
+                self._evaluate(statement.value, scope)
+            else:
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python statement is forbidden"
+                )
+
+    def _evaluate(self, expression: ast.expr, scope: Mapping[str, object]) -> object:
+        self._tick()
+        if isinstance(expression, ast.Constant):
+            return expression.value
+        if isinstance(expression, ast.Name):
+            try:
+                return scope[expression.id]
+            except KeyError as exc:
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python name is unavailable"
+                ) from exc
+        if isinstance(expression, ast.List):
+            return [self._evaluate(item, scope) for item in expression.elts]
+        if isinstance(expression, ast.Tuple):
+            return tuple(self._evaluate(item, scope) for item in expression.elts)
+        if isinstance(expression, ast.Dict):
+            result: dict[str, object] = {}
+            for key_node, value_node in zip(expression.keys, expression.values):
+                if key_node is None:
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python dictionary expansion is forbidden"
+                    )
+                key = self._evaluate(key_node, scope)
+                if not isinstance(key, str) or key in result:
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python dictionary key is invalid"
+                    )
+                result[key] = self._evaluate(value_node, scope)
+            return result
+        if isinstance(expression, ast.Subscript):
+            value = self._evaluate(expression.value, scope)
+            index = self._evaluate(expression.slice, scope)
+            if isinstance(value, dict) and isinstance(index, str):
+                try:
+                    return value[index]
+                except KeyError as exc:
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python dictionary key is missing"
+                    ) from exc
+            if (
+                isinstance(value, (list, tuple))
+                and isinstance(index, int)
+                and not isinstance(index, bool)
+            ):
+                try:
+                    return value[index]
+                except IndexError as exc:
+                    raise _RestrictedFactoryPythonError(
+                        "restricted Python sequence index is invalid"
+                    ) from exc
+            raise _RestrictedFactoryPythonError(
+                "restricted Python subscription is forbidden"
+            )
+        if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
+            left = self._evaluate(expression.left, scope)
+            right = self._evaluate(expression.right, scope)
+            if type(left) is str and type(right) is str:
+                return left + right
+            raise _RestrictedFactoryPythonError(
+                "restricted Python addition is forbidden"
+            )
+        if isinstance(expression, ast.Compare):
+            left = self._evaluate(expression.left, scope)
+            right = self._evaluate(expression.comparators[0], scope)
+            if isinstance(expression.ops[0], ast.Eq):
+                return left == right
+            if isinstance(expression.ops[0], ast.NotEq):
+                return left != right
+            raise _RestrictedFactoryPythonError(
+                "restricted Python comparison is forbidden"
+            )
+        if isinstance(expression, ast.Call):
+            assert isinstance(expression.func, ast.Name)
+            callee = self._evaluate(expression.func, scope)
+            arguments = tuple(self._evaluate(item, scope) for item in expression.args)
+            keywords = {
+                keyword.arg: self._evaluate(keyword.value, scope)
+                for keyword in expression.keywords
+                if keyword.arg is not None
+            }
+            if isinstance(callee, _RestrictedFactoryFunction):
+                return self._call_function(callee, arguments, keywords)
+            if callee not in self._scope.values():
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python callable is forbidden"
+                )
+            try:
+                return callee(*arguments, **keywords)  # type: ignore[operator]
+            except _RestrictedFactoryPythonError:
+                raise
+            except Exception as exc:
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python primitive failed"
+                ) from exc
+        raise _RestrictedFactoryPythonError(
+            "restricted Python expression is forbidden"
+        )
+
+    def _call_function(
+        self,
+        function: _RestrictedFactoryFunction,
+        arguments: tuple[object, ...],
+        keywords: Mapping[str, object],
+    ) -> object:
+        self._tick()
+        self._call_depth += 1
+        if self._call_depth > self._MAX_CALL_DEPTH:
+            self._call_depth -= 1
+            raise _RestrictedFactoryPythonError(
+                "restricted Python call depth exceeded"
+            )
+        definition = function.definition
+        names = tuple(argument.arg for argument in definition.args.args)
+        if len(arguments) > len(names):
+            self._call_depth -= 1
+            raise _RestrictedFactoryPythonError(
+                "restricted Python arguments are invalid"
+            )
+        local = dict(self._scope)
+        bound_names: set[str] = set()
+        for name, value in zip(names, arguments):
+            local[name] = value
+            bound_names.add(name)
+        for name, value in keywords.items():
+            if name not in names or name in bound_names:
+                self._call_depth -= 1
+                raise _RestrictedFactoryPythonError(
+                    "restricted Python arguments are invalid"
+                )
+            local[name] = value
+            bound_names.add(name)
+        if any(name not in bound_names for name in names):
+            self._call_depth -= 1
+            raise _RestrictedFactoryPythonError(
+                "restricted Python arguments are invalid"
+            )
+        try:
+            self._execute_block(definition.body, local)
+        except _RestrictedFactoryReturn as returned:
+            return returned.value
+        finally:
+            self._call_depth -= 1
+        return None
+
+    @staticmethod
+    def _safe_len(value: object) -> int:
+        if not isinstance(value, (str, list, tuple, dict)):
+            raise _RestrictedFactoryPythonError(
+                "restricted Python length input is forbidden"
+            )
+        return len(value)
+
+    def _credential_ref(self) -> str:
+        reference = self._environment.get("FACTORY_CREDENTIAL_REF")
+        if not isinstance(reference, str) or not reference.startswith("credential://"):
+            raise _RestrictedFactoryPythonError(
+                "restricted Python credential reference is unavailable"
+            )
+        return reference
+
+    def _blocked_external_write(self, payload: object) -> str:
+        self._json_bytes(payload)
+        self._external_write_attempts += 1
+        self._external_write_blocks += 1
+        return "blocked"
+
+    def _sentinel_secret_seen(self) -> bool:
+        return "FACTORY_SENTINEL_SECRET" in self._environment
+
+    def _emit_evidence(self, payload: object) -> None:
+        if self._evidence_emitted or not isinstance(payload, dict):
+            raise _RestrictedFactoryPythonError(
+                "restricted Python evidence emission is invalid"
+            )
+        evidence = dict(payload)
+        evidence["external_write_attempts"] = self._external_write_attempts
+        evidence["external_write_blocks"] = self._external_write_blocks
+        evidence["sentinel_secret_seen"] = self._sentinel_secret_seen()
+        content = self._json_bytes(evidence)
+        target = (self._workspace_root / "evidence" / "real-case-output.json").resolve()
+        if not any(target == root or root in target.parents for root in self._writable_roots):
+            raise _RestrictedFactoryPythonError(
+                "restricted Python evidence root is unauthorized"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        self._evidence_emitted = True
+
+    @staticmethod
+    def _json_bytes(value: object) -> bytes:
+        try:
+            content = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise _RestrictedFactoryPythonError(
+                "restricted Python value is not JSON-safe"
+            ) from exc
+        if len(content) > MAX_FACTORY_CODEX_JSON_ARTIFACT_BYTES:
+            raise _RestrictedFactoryPythonError(
+                "restricted Python value exceeds its bound"
+            )
+        return content
+
+
 class _CaptainSealedFactoryCodexRunner:
-    """Captain-owned wrapper for one digest-frozen, network-free static build."""
+    """Captain-owned wrapper for one capability-free restricted static build."""
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         raise TypeError("Captain Factory runtime enforcement is unavailable")
@@ -617,22 +1089,16 @@ class _CaptainSealedFactoryCodexRunner:
         *,
         authority: FactoryCodexRuntimeAuthority,
         bundle: "CaptainStaticFactorySourceBundle",
-        expected_bundle_sha256: str,
-        interpreter_path: Path,
         journal_path: Path,
         maximum_runtime_seconds: int,
         mode: Literal["execute", "null_output", "timeout"],
     ) -> "_CaptainSealedFactoryCodexRunner":
-        actual = captain_static_factory_source_sha256(bundle)
-        if actual != expected_bundle_sha256:
-            raise FactoryDispatchError("static Factory source digest is not authorized")
         if authority.network_allowed:
             raise FactoryDispatchError("static Factory runtime must deny network access")
         runner = object.__new__(cls)
         runner._captain_runtime_seal = _CAPTAIN_FACTORY_RUNTIME_SEAL
         runner.authority = authority
         runner._bundle = bundle
-        runner._interpreter_path = interpreter_path.resolve(strict=True)
         runner._journal_path = journal_path.resolve()
         runner._maximum_runtime_seconds = maximum_runtime_seconds
         runner._mode = mode
@@ -666,32 +1132,32 @@ class _CaptainSealedFactoryCodexRunner:
             raise FactoryDispatchError("static Factory child environment broadened authority")
         executed: list[tuple[str, ...]] = []
         started_at = time.monotonic()
+        engine = _CaptainRestrictedStaticPythonEngine(
+            workspace_root=self.authority.workspace_root,
+            writable_roots=self.authority.writable_roots,
+            bundle=self._bundle,
+            environment=environment,
+        )
         for command in self.authority.allowed_commands:
             if command not in {
                 ("python", "-m", "compileall", "src"),
                 ("python", "-m", "pytest"),
             }:
                 raise FactoryDispatchError("static Factory command is unauthorized")
-            try:
-                remaining_seconds = self._maximum_runtime_seconds - (
-                    time.monotonic() - started_at
-                )
-                if remaining_seconds <= 0:
-                    return self._result(exit_code=124, terminal_status="timed_out")
-                await asyncio.to_thread(
-                    subprocess.run,
-                    command,
-                    executable=str(self._interpreter_path),
-                    cwd=self.authority.workspace_root,
-                    env=environment,
-                    check=True,
-                    capture_output=True,
-                    timeout=remaining_seconds,
-                )
-            except subprocess.TimeoutExpired:
+            remaining_seconds = self._maximum_runtime_seconds - (
+                time.monotonic() - started_at
+            )
+            if remaining_seconds <= 0:
                 return self._result(exit_code=124, terminal_status="timed_out")
-            except (OSError, subprocess.CalledProcessError) as exc:
-                raise FactoryDispatchError("static Factory command failed") from exc
+            try:
+                if command == ("python", "-m", "compileall", "src"):
+                    engine.validate()
+                else:
+                    engine.run_tests()
+            except _RestrictedFactoryPythonError as exc:
+                raise FactoryDispatchError(
+                    "static Factory restricted Python rejected source"
+                ) from exc
             executed.append(command)
         evidence = {
             "schema": "captain.static-factory-command-evidence.v1",
@@ -803,14 +1269,10 @@ class CaptainStaticFactoryRunnerFactory:
         *,
         authority: FactoryCodexRuntimeAuthority,
         bundle: CaptainStaticFactorySourceBundle,
-        expected_bundle_sha256: str,
-        interpreter_path: Path,
         mode: Literal["execute", "null_output", "timeout"] = "execute",
     ) -> None:
         self.authority = authority
         self.bundle = bundle
-        self.expected_bundle_sha256 = expected_bundle_sha256
-        self.interpreter_path = interpreter_path
         self.mode = mode
         self.calls = 0
 
@@ -828,8 +1290,6 @@ class CaptainStaticFactoryRunnerFactory:
         return _CaptainSealedFactoryCodexRunner._create(
             authority=self.authority,
             bundle=self.bundle,
-            expected_bundle_sha256=self.expected_bundle_sha256,
-            interpreter_path=self.interpreter_path,
             journal_path=journal_path,
             maximum_runtime_seconds=maximum_runtime_seconds,
             mode=self.mode,

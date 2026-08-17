@@ -7,7 +7,6 @@ import io
 import json
 import os
 from pathlib import Path
-import sys
 from typing import Literal
 from uuid import UUID
 import zipfile
@@ -52,12 +51,6 @@ from agenten.agent_runtime.contracts import ArtifactRef as RuntimeArtifactRef
 
 _Variant = Literal["happy", "one_agent", "null_output", "timeout", "receipt_only"]
 _EXPECTED_COMMANDS = (("python", "-m", "compileall", "src"), ("python", "-m", "pytest"))
-_AUTHORIZED_SOURCE_DIGESTS = {
-    "four_agent": "2476885d5fa09c1b7f2c27a696ee5299c558a25b5ba57e30627eea7734f90d0a",
-    "one_agent": "a55d9705d08740067e22788fcc93a5f4efc4a2e27576a28bb59c7bcb56e5c257",
-}
-
-
 def _canonical(value: object, *, newline: bool = False) -> bytes:
     content = json.dumps(
         value,
@@ -177,81 +170,49 @@ class _DeterministicExternalModel:
     @staticmethod
     def _workspace_files(agents: tuple[str, ...]) -> dict[str, bytes]:
         team = f"""\
-from src.tools.account_snapshot_reader import read_account_snapshot
-from src.tools.opportunity_scoring_rules import qualify_opportunity
-AGENTS = {agents!r}
+AGENTS = {list(agents)!r}
 
-class ExternalWriteGuard:
-    def __init__(self) -> None:
-        self.attempts = 0
-        self.blocks = 0
+def evaluate_industry_signal(available):
+    if available:
+        return "bounded_public_signal"
+    return "typed_optional_gap"
 
-    def write(self, _payload: object) -> None:
-        self.attempts += 1
-        self.blocks += 1
-        raise PermissionError("external writes are forbidden")
-
-def evaluate_industry_signal(*, available: bool) -> str:
-    return "bounded_public_signal" if available else "typed_optional_gap"
-
-def run_sales_pipeline(sales_input: dict[str, object], *, credential_ref: str) -> dict[str, object]:
+def run_sales_pipeline(sales_input, credential):
     trace = ["account_researcher"]
-    handoffs: list[dict[str, str]] = []
-    account = read_account_snapshot(sales_input, credential_ref=credential_ref)
+    account = read_account_snapshot(sales_input, credential)
     if len(AGENTS) == 1:
-        return {{"executive_brief": "incomplete", "handoff_trace": trace, "handoffs": handoffs, "credential_ref_used": credential_ref, "pipeline_status": "incomplete"}}
-    handoffs.append({{"from": "account_researcher", "to": "opportunity_qualifier"}})
+        return {{"executive_brief": "incomplete", "handoff_trace": trace, "handoffs": [], "credential_ref_used": credential, "pipeline_status": "incomplete", "qualification_preserved": False, "next_action_preserved": False}}
     qualification = qualify_opportunity(account)
-    trace.append("opportunity_qualifier")
-    handoffs.append({{"from": "opportunity_qualifier", "to": "deal_strategist"}})
-    strategy = {{"next_action": "Schedule an evidence review", "qualification": qualification["qualification"]}}
-    trace.append("deal_strategist")
-    handoffs.append({{"from": "deal_strategist", "to": "executive_brief_writer"}})
-    brief = f"{{strategy['qualification']}}; next action: {{strategy['next_action']}}"
-    trace.append("executive_brief_writer")
-    return {{"executive_brief": brief, "handoff_trace": trace, "handoffs": handoffs, "credential_ref_used": credential_ref, "pipeline_status": "passed", "qualification_preserved": qualification["qualification"] in brief, "next_action_preserved": strategy["next_action"] in brief}}
+    brief = qualification["qualification"] + "; next action: Schedule an evidence review"
+    return {{"executive_brief": brief, "handoff_trace": ["account_researcher", "opportunity_qualifier", "deal_strategist", "executive_brief_writer"], "handoffs": [{{"from": "account_researcher", "to": "opportunity_qualifier"}}, {{"from": "opportunity_qualifier", "to": "deal_strategist"}}, {{"from": "deal_strategist", "to": "executive_brief_writer"}}], "credential_ref_used": credential, "pipeline_status": "passed", "qualification_preserved": True, "next_action_preserved": True}}
 """
         test = """\
-import json
-import os
-from pathlib import Path
-from src.team import AGENTS, ExternalWriteGuard, evaluate_industry_signal, run_sales_pipeline
-from src.tools.account_snapshot_reader import read_account_snapshot
-from src.tools.opportunity_scoring_rules import qualify_opportunity
 def test_generated_sales_pipeline_real_case():
-    credential_ref = os.environ["FACTORY_CREDENTIAL_REF"]
+    credential = credential_ref()
     sales_input = {"account_id": "acct-42", "stage": "qualified", "account_name": "Acme"}
-    result = run_sales_pipeline(sales_input, credential_ref=credential_ref)
-    assert tuple(result["handoff_trace"]) == AGENTS
-    assert result["credential_ref_used"] == credential_ref
+    result = run_sales_pipeline(sales_input, credential)
+    assert result["handoff_trace"] == AGENTS
+    assert result["credential_ref_used"] == credential
     if len(AGENTS) == 1:
         assert result["executive_brief"] == "incomplete"
     else:
-        assert "qualified" in result["executive_brief"]
-        assert "next action" in result["executive_brief"]
-    assert read_account_snapshot(sales_input, credential_ref=credential_ref)["account_id"] == "acct-42"
+        assert result["executive_brief"] == "qualified; next action: Schedule an evidence review"
+    assert read_account_snapshot(sales_input, credential)["account_id"] == "acct-42"
     assert qualify_opportunity({"stage": "qualified"})["applied_rule"] == "published-stage-rule"
     available_signal = evaluate_industry_signal(available=True)
     unavailable_signal = evaluate_industry_signal(available=False)
     assert available_signal == "bounded_public_signal"
     assert unavailable_signal == "typed_optional_gap"
-    guard = ExternalWriteGuard()
-    try:
-        guard.write({"account_id": "acct-42"})
-    except PermissionError as error:
-        assert str(error) == "external writes are forbidden"
-    else:
-        raise AssertionError("external write guard permitted a write")
-    result.update({"tool_evidence": {"account_snapshot_reader": {"status": "passed", "typed_schema": True, "test_passed": True, "result": "approved_account_snapshot"}, "opportunity_scoring_rules": {"status": "passed", "typed_schema": True, "test_passed": True, "result": "versioned_published_rule"}}, "optional_tool_policy": {"available_result": available_signal, "unavailable_result": unavailable_signal}, "external_write_attempts": guard.attempts, "external_write_blocks": guard.blocks, "sentinel_secret_seen": os.environ.get("FACTORY_SENTINEL_SECRET") is not None})
-    Path("evidence").mkdir(exist_ok=True)
-    Path("evidence/real-case-output.json").write_text(json.dumps(result, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    blocked = blocked_external_write({"account_id": "acct-42"})
+    assert blocked == "blocked"
+    emit_evidence({"executive_brief": result["executive_brief"], "handoff_trace": result["handoff_trace"], "handoffs": result["handoffs"], "credential_ref_used": result["credential_ref_used"], "pipeline_status": result["pipeline_status"], "qualification_preserved": result["qualification_preserved"], "next_action_preserved": result["next_action_preserved"], "tool_evidence": {"account_snapshot_reader": {"status": "passed", "typed_schema": True, "test_passed": True, "result": "approved_account_snapshot"}, "opportunity_scoring_rules": {"status": "passed", "typed_schema": True, "test_passed": True, "result": "versioned_published_rule"}}, "optional_tool_policy": {"available_result": available_signal, "unavailable_result": unavailable_signal}, "sentinel_secret_seen": sentinel_secret_seen()})
 """
         return {
             "src/__init__.py": b'"""Generated sales pipeline package."""\n',
             "src/team.py": team.encode(),
             "src/tools/__init__.py": b'"""Generated typed sales tools."""\n',
-            "src/tools/account_snapshot_reader.py": b"def read_account_snapshot(value: dict[str, object], *, credential_ref: str) -> dict[str, object]:\n    if not credential_ref.startswith('credential://'):\n        raise ValueError('approved account credential is required')\n    return {key: value[key] for key in sorted(value)}\n",
-            "src/tools/opportunity_scoring_rules.py": b"def qualify_opportunity(value: dict[str, object]) -> dict[str, object]:\n    qualification = 'qualified' if value.get('stage') == 'qualified' else 'not-qualified'\n    return {'qualification': qualification, 'applied_rule': 'published-stage-rule'}\n",
+            "src/tools/account_snapshot_reader.py": b"def read_account_snapshot(value, credential):\n    return {'account_id': value['account_id'], 'account_name': value['account_name'], 'stage': value['stage']}\n",
+            "src/tools/opportunity_scoring_rules.py": b"def qualify_opportunity(value):\n    if value['stage'] == 'qualified':\n        return {'qualification': 'qualified', 'applied_rule': 'published-stage-rule'}\n    return {'qualification': 'not-qualified', 'applied_rule': 'published-stage-rule'}\n",
             "tests/test_team.py": test.encode(),
         }
 
@@ -282,9 +243,6 @@ class CaptainAuthorizedHermeticCodexPort:
         self._model = _DeterministicExternalModel(variant=variant)
         bundle = self._model.generate_bundle(assignment)
         self.source_bundle_sha256 = captain_static_factory_source_sha256(bundle)
-        expected_source_digest = _AUTHORIZED_SOURCE_DIGESTS[
-            "one_agent" if variant == "one_agent" else "four_agent"
-        ]
         workspace = (root / "codex-workspaces" / assignment.assignment_id.hex).resolve()
         credential_session = CaptainStaticFactoryCredentialSession()
         self._credential_session = credential_session
@@ -343,8 +301,6 @@ class CaptainAuthorizedHermeticCodexPort:
             runner_factory=CaptainStaticFactoryRunnerFactory(
                 authority=runtime_authority,
                 bundle=bundle,
-                expected_bundle_sha256=expected_source_digest,
-                interpreter_path=Path(sys.executable),
                 mode=(
                     "null_output"
                     if variant == "null_output"

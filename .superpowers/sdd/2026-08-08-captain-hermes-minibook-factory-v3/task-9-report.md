@@ -149,3 +149,33 @@
 
 - The static runner is not part of default/live composition and does not weaken the Task-5 PowerShell live ruling.
 - No live Hermes/Codex claim, Task 10 evidence, OpenFang action, promotion, deployment, push, merge, or external-service mutation was performed.
+
+## Fix round 4 — technically enforced network isolation
+
+### Review finding closed
+
+- Removed the sealed static runner's normal host-Python subprocess execution. The runner no longer accepts a caller-owned expected digest or interpreter path as execution authority.
+- Added a Captain-owned, step- and call-depth-bounded restricted Python engine. It parses every materialized Python file before execution and permits only an explicit AST subset. Imports, attributes, dynamic call targets, loops, exception machinery, comprehensions, process access, network access, and general filesystem/environment primitives are absent and denied by default.
+- The two canonical command shapes retain real semantics inside the restricted engine: the compile step parses and validates every source/test module, and the test step executes generated functions and assertions. The only writable primitive is a Captain-fixed real-case evidence sink under the authorized evidence root; external-write attempts are represented by a Captain primitive that only increments its blocked counter.
+- Reworked the deterministic external-model bundle to emit generated Python source and a generated test compatible with the restricted subset. The four-agent handoff, required tools, optional-tool policy, opaque credential use, blocked external write, and executive brief are still executed and independently checked by the production observer.
+
+### RED → GREEN evidence
+
+- RED: the adversarial bundle contains a real `socket.create_connection` attempt. A raise-on-call counter on host process launch showed the desired restricted runner API did not exist: construction failed because the old runner still required caller-owned digest and interpreter parameters.
+- GREEN: the same adversarial test is rejected as forbidden restricted Python before any host-process call (`host_process_calls == 0`). The valid generated source/test then passes through the exact Task-9 flow without a subprocess.
+
+### Fix-round verification
+
+- Adversarial network boundary: `1 passed`.
+- Exact Task-9 authority and E2E cases: `9 passed`.
+- Focused Root Task-9 regressions: `77 passed, 3 skipped` (MariaDB-gated skips). The plan's historical `test_forge_contract_compatibility.py` path is absent, so the extant listed Root files plus authority/E2E were run.
+- Full Root Agent Factory/Gateway non-live area: `1863 passed, 132 skipped`.
+- Focused Minibook contracts/state/API/package: `123 passed`; full isolated Minibook non-live suite: `259 passed, 1 deselected`.
+- Portal: `47 passed`; lint and production build passed.
+- Architecture/import/workstream: `18 passed`.
+- Python compileall and `git diff --check`: passed. Ruff/Black remain unavailable in the existing virtual environment; no dependency installation was performed.
+
+### Non-claims
+
+- The restricted static engine remains an injected hermetic Task-9 adapter path, not default/live composition and not a Task-10 runtime.
+- No host firewall mutation, Docker/live service, live Hermes/Codex claim, OpenFang action, promotion, deployment, push, or merge was performed.
