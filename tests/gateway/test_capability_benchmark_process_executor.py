@@ -67,6 +67,7 @@ def _request(label: str = "request") -> GenericBenchmarkExecutionRequest:
         model_id="fixed-model", model_policy_digest="c" * 64,
         execution_plan=GenericBenchmarkExecutionPlan(
             candidate_ref=_ref("candidate"),
+            candidate_manifest_ref=_ref("candidate-manifest"),
             team_manifest_ref=_ref("team-manifest"),
             baseline_policy_ref=_ref("baseline-policy"),
             model_ref=_ref("model"),

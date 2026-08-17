@@ -15,6 +15,7 @@ import uvicorn
 from agenten.agent_runtime.production_bootstrap import (
     RuntimeAdapterManifestError,
     load_verified_repository_module,
+    read_verified_repository_bytes,
 )
 
 from fastapi import FastAPI, Header, HTTPException, status
@@ -113,6 +114,10 @@ def create_capability_benchmark_process_app_from_environment(
         "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN", ""
     ).strip()
     authority = source.get("CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID", "").strip()
+    revision = source.get("CAPTAIN_CAPABILITY_ASSEMBLY_REPOSITORY_REVISION", "").strip()
+    worker_sha256 = source.get("CAPTAIN_CAPABILITY_BENCHMARK_HOST_WORKER_SHA256", "").strip()
+    price_path = source.get("CAPTAIN_PROVIDER_PRICE_CARD_PATH", "").strip()
+    price_sha256 = source.get("CAPTAIN_PROVIDER_PRICE_CARD_SHA256", "").strip()
     if (
         not relative
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
@@ -120,6 +125,10 @@ def create_capability_benchmark_process_app_from_environment(
         or not gateway_url
         or len(gateway_token) < 16
         or not authority
+        or re.fullmatch(r"[0-9a-f]{40}", revision) is None
+        or re.fullmatch(r"[0-9a-f]{64}", worker_sha256) is None
+        or not price_path
+        or re.fullmatch(r"[0-9a-f]{64}", price_sha256) is None
     ):
         raise ValueError("benchmark process configuration is incomplete")
     try:
@@ -129,10 +138,26 @@ def create_capability_benchmark_process_app_from_environment(
         constructor = getattr(module, "build_capability_benchmark_executor", None)
         if not callable(constructor):
             raise ValueError("constructor")
+        _, price_bytes = read_verified_repository_bytes(
+            price_path, expected_sha256=price_sha256,
+            expected_repository_revision=revision, repository_root=root,
+        )
         executor = constructor({
             "gateway_url": gateway_url,
             "gateway_token": gateway_token,
             "executor_authority_id": authority,
+            "repository_root": str(root), "repository_revision": revision,
+            "worker_sha256": worker_sha256,
+            "proxy_url": source.get("CAPTAIN_PROVIDER_PROXY_URL", "").strip(),
+            "proxy_token": source.get("CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN", "").strip(),
+            "context_sha256": source.get("CAPTAIN_PROVIDER_CONTEXT_SHA256", "").strip(),
+            "policy_sha256": source.get("CAPTAIN_PROVIDER_POLICY_SHA256", "").strip(),
+            "price_card_sha256": price_sha256,
+            "proxy_executable_sha256": source.get("CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256", "").strip(),
+            "proxy_code_sha256": source.get("CAPTAIN_PROVIDER_PROXY_CODE_SHA256", "").strip(),
+            "paid_command_sha256": source.get("CAPTAIN_PROVIDER_PAID_COMMAND_SHA256", "").strip(),
+            "hard_ceiling_enforced": source.get("CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED", "").strip(),
+            "pricing_json": price_bytes.decode("utf-8"),
         })
         authority_id = UUID(authority)
     except (RuntimeAdapterManifestError, TypeError, ValueError):
@@ -179,7 +204,7 @@ def _parse_request(payload: dict[str, object]) -> GenericBenchmarkExecutionReque
         }
         or not isinstance(plan_payload, dict)
         or set(plan_payload) != {
-            "candidate_ref", "team_manifest_ref", "baseline_policy_ref",
+            "candidate_ref", "candidate_manifest_ref", "team_manifest_ref", "baseline_policy_ref",
             "model_ref", "execution_policy_ref", "team_agent_names",
             "baseline_agent_name",
         }
@@ -210,6 +235,7 @@ def _parse_request(payload: dict[str, object]) -> GenericBenchmarkExecutionReque
         "execution_case": execution_case,
         "execution_plan": GenericBenchmarkExecutionPlan(
             candidate_ref=ArtifactRef.model_validate(plan_payload["candidate_ref"]),
+            candidate_manifest_ref=ArtifactRef.model_validate(plan_payload["candidate_manifest_ref"]),
             team_manifest_ref=ArtifactRef.model_validate(plan_payload["team_manifest_ref"]),
             baseline_policy_ref=ArtifactRef.model_validate(plan_payload["baseline_policy_ref"]),
             model_ref=ArtifactRef.model_validate(plan_payload["model_ref"]),

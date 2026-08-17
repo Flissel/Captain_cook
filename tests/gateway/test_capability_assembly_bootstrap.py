@@ -112,6 +112,7 @@ def test_bootstrap_rejects_each_d7_authority_drift_before_effects(
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-plan-token",
         "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-plan-token",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN": "tool-host-secret-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
         "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": "artifacts",
         "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": "authority",
@@ -155,6 +156,7 @@ def test_bootstrap_settings_reject_non_loopback_http_and_redact_secrets(
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://benchmark.example/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-secret-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-secret-value",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN": "tool-host-secret-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
         "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": ".captain-cook/artifacts/sha256",
         "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": ".captain-cook/capability-authority",
@@ -274,6 +276,7 @@ def test_tool_evidence_authority_requires_three_gateway_bound_cas_documents() ->
                 for item in (call_payload, lease_payload, receipt_payload)
             }
         ),
+        scoped_token_key=SecretStr("benchmark-tool-test-key"),
     )
     request = BenchmarkToolEvidenceVerificationRequest(
         job_id=job_id,
@@ -434,6 +437,7 @@ def test_gateway_tool_authority_issues_the_exact_registered_artifact_bytes(tmp_p
     artifacts = ContentAddressedArtifactAdapter(tmp_path / "artifacts")
     authority = CaptainBenchmarkToolEvidenceAuthority(
         gateway_store=Store(), artifacts=artifacts,
+        scoped_token_key=SecretStr("benchmark-tool-test-key"),
     )
     case = GenericPrivateCaseRef(
         case_id="case-a", category=GenericBenchmarkCategory.NORMAL,
@@ -1406,6 +1410,7 @@ def test_production_plan_is_pure_and_reuses_the_provisioner_source_authority(
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-plan-token",
         "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-plan-token",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN": "tool-host-secret-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
         "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": "artifacts",
         "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": "authority",
@@ -1571,6 +1576,7 @@ def test_production_plan_rejects_deep_fake_team_ports_before_any_effect(
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-plan-token",
         "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-plan-token",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN": "tool-host-secret-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
         "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": "artifacts",
         "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": "authority",
@@ -1643,6 +1649,7 @@ def test_bootstrap_rejects_raw_factory_runtime_before_schema_or_network() -> Non
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-secret-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-secret-value",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN": "tool-host-secret-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
         "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": ".captain-cook/artifacts/sha256",
         "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": ".captain-cook/capability-authority",
@@ -1867,6 +1874,7 @@ def test_bootstrap_rejects_reused_credentials_before_runtime_or_schema(
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "same-secret-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-secret-value",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN": "tool-host-secret-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
         "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": ".captain-cook/artifacts/sha256",
         "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": ".captain-cook/capability-authority",

@@ -10,6 +10,8 @@ from decimal import Decimal
 from enum import Enum
 from typing import Literal, Protocol
 from uuid import UUID
+
+from pydantic import SecretStr
 from uuid import uuid4
 
 from agenten.agent_factory.capability_live_runner import CapabilityLiveStage
@@ -119,10 +121,12 @@ class GenericToolCallEvidence:
 @dataclass(frozen=True)
 class GenericAuthorizedToolCall:
     tool_key: str
+    operation: str
     call_id: str
     lease_id: str
     call_ref: ArtifactRef
     lease_ref: ArtifactRef
+    scoped_token: SecretStr
 
 
 @dataclass(frozen=True)
@@ -130,6 +134,7 @@ class GenericBenchmarkExecutionPlan:
     """Public, content-addressed authority for one fair team/baseline pair."""
 
     candidate_ref: ArtifactRef
+    candidate_manifest_ref: ArtifactRef
     team_manifest_ref: ArtifactRef
     baseline_policy_ref: ArtifactRef
     model_ref: ArtifactRef
@@ -920,12 +925,16 @@ class GenericCapabilityBenchmarkAdapter:
                     "model_policy_digest": policy_digest,
                     "execution_policy_sha256": execution_policy_sha256,
                 }).encode())
+                candidate_manifest_ref = self._evidence.record_evaluation(
+                    candidate.candidate.model_dump_json(by_alias=True).encode()
+                )
         except Exception:
             raise CapabilityLiveAuthorityUnavailable(
                 "released benchmark execution plan is unavailable"
             ) from None
         return GenericBenchmarkExecutionPlan(
             candidate_ref=candidate.candidate.source_archive_ref,
+            candidate_manifest_ref=candidate_manifest_ref,
             team_manifest_ref=candidate.candidate.team_manifest.reference,
             baseline_policy_ref=baseline_ref,
             model_ref=model_ref,
@@ -1396,6 +1405,7 @@ def generic_execution_request_digest(
         },
         "execution_plan": {
             "candidate_ref": execution_plan.candidate_ref.model_dump(mode="json"),
+            "candidate_manifest_ref": execution_plan.candidate_manifest_ref.model_dump(mode="json"),
             "team_manifest_ref": execution_plan.team_manifest_ref.model_dump(mode="json"),
             "baseline_policy_ref": execution_plan.baseline_policy_ref.model_dump(mode="json"),
             "model_ref": execution_plan.model_ref.model_dump(mode="json"),

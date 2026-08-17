@@ -1875,6 +1875,7 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             from gateway.capability_generic_benchmark import GenericBenchmarkExecutionPlan
             return GenericBenchmarkExecutionPlan(
                 candidate_ref=_ref("benchmark-candidate"),
+                candidate_manifest_ref=_ref("benchmark-candidate-manifest"),
                 team_manifest_ref=_ref("benchmark-team-manifest"),
                 baseline_policy_ref=_ref("benchmark-baseline-policy"),
                 model_ref=_ref("benchmark-model"),
@@ -2067,6 +2068,7 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
     tool_authority = CaptainBenchmarkToolEvidenceAuthority(
         gateway_store=evidence.gateway_store,
         artifacts=evidence,
+        scoped_token_key=SecretStr("benchmark-tool-test-key"),
     )
     private_cases = _private_case_repository(
         holdouts, executor_authority_id=raw_executor.authority_id,

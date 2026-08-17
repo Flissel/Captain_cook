@@ -6741,6 +6741,7 @@ class GatewayStore:
         model_policy_digest: str, batch_id: str, command_id: str,
         candidate_sha256: str, execution_sha256: str, call_id: str,
         lease_id: str, call_ref: ArtifactRef, lease_ref: ArtifactRef,
+        scoped_token_sha256: str,
     ) -> None:
         """Persist the exact call and lease before the authorized tool effect."""
 
@@ -6753,6 +6754,7 @@ class GatewayStore:
             "candidate_sha256": candidate_sha256,
             "execution_sha256": execution_sha256,
             "call_id": call_id, "lease_id": lease_id,
+            "scoped_token_sha256": scoped_token_sha256,
             "call_ref": call_ref.model_dump(mode="json"),
             "lease_ref": lease_ref.model_dump(mode="json"),
         }
@@ -6977,6 +6979,106 @@ class GatewayStore:
                         "completed_receipt_sha256 = %s WHERE call_sha256 = %s",
                         (receipt_ref.sha256, call_ref.sha256),
                     )
+
+    def capability_tool_authorization(self, call_sha256: str) -> dict[str, Any] | None:
+        """Read the exact pre-effect call/lease authority."""
+
+        if len(call_sha256) != 64:
+            return None
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_authorizations (
+                        call_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        completed_receipt_sha256 CHAR(64) NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_authorizations "
+                    "WHERE call_sha256 = %s", (call_sha256,),
+                )
+                row = cursor.fetchone()
+        return None if row is None else dict(self._decode_json(row["payload"]))
+
+    def record_capability_tool_effect(
+        self, *, call_ref: ArtifactRef, lease_ref: ArtifactRef,
+        result_ref: ArtifactRef, receipt_ref: ArtifactRef,
+        arguments_sha256: str, scoped_token_sha256: str,
+    ) -> None:
+        """Persist terminal host readback before it can be returned to AutoGen."""
+
+        payload = {
+            "call_ref": call_ref.model_dump(mode="json"),
+            "lease_ref": lease_ref.model_dump(mode="json"),
+            "result_ref": result_ref.model_dump(mode="json"),
+            "receipt_ref": receipt_ref.model_dump(mode="json"),
+            "arguments_sha256": arguments_sha256,
+            "scoped_token_sha256": scoped_token_sha256,
+        }
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_effects (
+                        call_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_authorizations "
+                    "WHERE call_sha256 = %s FOR UPDATE", (call_ref.sha256,),
+                )
+                row = cursor.fetchone()
+                authority = None if row is None else self._decode_json(row["payload"])
+                if (
+                    not isinstance(authority, dict)
+                    or authority.get("call_ref") != payload["call_ref"]
+                    or authority.get("lease_ref") != payload["lease_ref"]
+                    or authority.get("scoped_token_sha256") != scoped_token_sha256
+                ):
+                    raise HTTPException(status_code=409, detail="tool effect authority changed")
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_effects "
+                    "WHERE call_sha256 = %s FOR UPDATE", (call_ref.sha256,),
+                )
+                existing = cursor.fetchone()
+                if existing is None:
+                    cursor.execute(
+                        "INSERT INTO capability_tool_effects (call_sha256, payload) "
+                        "VALUES (%s, %s)",
+                        (call_ref.sha256, self._encode_json(payload)),
+                    )
+                elif self._decode_json(existing["payload"]) != payload:
+                    raise HTTPException(status_code=409, detail="tool effect conflicts")
+
+    def capability_tool_effect(self, call_sha256: str) -> dict[str, Any] | None:
+        """Read a terminal tool result/receipt for retry reconciliation."""
+
+        if len(call_sha256) != 64:
+            return None
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_effects (
+                        call_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_effects "
+                    "WHERE call_sha256 = %s", (call_sha256,),
+                )
+                row = cursor.fetchone()
+        return None if row is None else dict(self._decode_json(row["payload"]))
 
     def record_capability_benchmark_work_batch(
         self, *, job_id: UUID, correlation_id: UUID, batch_id: str,

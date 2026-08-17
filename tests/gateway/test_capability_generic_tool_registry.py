@@ -70,7 +70,7 @@ def test_shipped_registry_head_attests_all_three_demo_tool_sets() -> None:
         repository_root=root,
         relative_path="config/generic_tool_registry.json",
         expected_sha256=(
-            "5b9751022bcfdce2bb72dee994ab20ac99deebbec7653ea4369a2191d582a528"
+            "1cc99b7ef95ddedebc64f2b1c4ad3b88c5fcbfa748f536e93606af76c1994f5f"
         ),
         environment={
             "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN": "capability-tool-host-token-123",
@@ -103,6 +103,8 @@ def test_remote_registry_executes_exact_authenticated_typed_readback(monkeypatch
 
     def handler(request: httpx.Request) -> httpx.Response:
         observed.append(request)
+        payload = json.loads(request.content)
+        assert payload["effect_id"] == "e" * 64
         return httpx.Response(200, json={
             "schema": "captain.incident-alert-context.v1",
             "tool_key": "alert_context_reader", "operation": "read",
@@ -127,9 +129,10 @@ def test_remote_registry_executes_exact_authenticated_typed_readback(monkeypatch
         ), modules={},
         credentials={"alert_context_reader": "incident-tool-token-123"},
     )
-    value = registry.execute(
+    value = registry.execute_effect(
         tool_key="alert_context_reader", operation="read",
         arguments={"alert_ref": "alert://redacted/1"},
+        effect_id="e" * 64,
     )
     assert value["result"]["alert_refs"] == ["alert://redacted/1"]
     assert len(observed) == 1

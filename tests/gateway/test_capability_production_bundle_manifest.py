@@ -31,7 +31,7 @@ def _environment() -> dict[str, str]:
         "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-token-value",
         "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN": "capability-tool-host-token-value",
         "CAPTAIN_GENERIC_TOOL_REGISTRY": "config/generic_tool_registry.json",
-        "CAPTAIN_GENERIC_TOOL_REGISTRY_SHA256": "5b9751022bcfdce2bb72dee994ab20ac99deebbec7653ea4369a2191d582a528",
+        "CAPTAIN_GENERIC_TOOL_REGISTRY_SHA256": "1cc99b7ef95ddedebc64f2b1c4ad3b88c5fcbfa748f536e93606af76c1994f5f",
         "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-token-value",
         "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",

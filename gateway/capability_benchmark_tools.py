@@ -166,7 +166,7 @@ class VerifiedGenericToolRegistry:
                 "generic tool operation is not authorized"
             )
         if entry.adapter_kind != "local_readonly":
-            return self._execute_remote(entry, arguments)
+            return self._execute_remote(entry, arguments, effect_id=None)
         function = getattr(self._modules[tool_key], "execute_generic_tool", None)
         if not callable(function):
             raise GenericToolRegistryConfigurationError(
@@ -190,9 +190,82 @@ class VerifiedGenericToolRegistry:
             )
         return dict(result)
 
+    def execute_effect(
+        self, *, tool_key: str, operation: str,
+        arguments: Mapping[str, object], effect_id: str,
+    ) -> dict[str, object]:
+        entry = self._entries.get(tool_key)
+        if entry is None or entry.adapter_kind == "local_readonly":
+            raise GenericToolRegistryConfigurationError(
+                "durable generic tool host is unavailable"
+            )
+        if operation != entry.allowed_operation or _SHA256.fullmatch(effect_id) is None:
+            raise GenericToolRegistryConfigurationError(
+                "generic tool effect authority is invalid"
+            )
+        return self._execute_remote(entry, arguments, effect_id=effect_id)
+
+    def effect_request_sha256(
+        self, *, tool_key: str, operation: str,
+        arguments: Mapping[str, object], effect_id: str,
+    ) -> str:
+        entry = self._entries.get(tool_key)
+        if entry is None or operation != entry.allowed_operation:
+            raise GenericToolRegistryConfigurationError(
+                "generic tool effect authority is invalid"
+            )
+        request = self._remote_request(
+            entry, arguments=arguments, effect_id=effect_id,
+        )
+        return hashlib.sha256(json.dumps(
+            request, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode()).hexdigest()
+
+    def read_effect(
+        self, *, tool_key: str, effect_id: str,
+        request_sha256: str,
+    ) -> dict[str, object] | None:
+        entry = self._entries.get(tool_key)
+        if (
+            entry is None or entry.adapter_kind == "local_readonly"
+            or _SHA256.fullmatch(effect_id) is None
+            or _SHA256.fullmatch(request_sha256) is None
+        ):
+            raise GenericToolRegistryConfigurationError(
+                "generic tool effect readback authority is invalid"
+            )
+        assert entry.endpoint is not None
+        token = self._credentials.get(entry.tool_key, "")
+        endpoint = entry.endpoint.split("/v1/", 1)[0] + "/v1/effects/readback"
+        try:
+            with httpx.Client(
+                timeout=httpx.Timeout(10.0), follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                response = client.post(
+                    endpoint,
+                    headers={"Authorization": "Bearer " + token},
+                    json={
+                        "schema": "captain.generic-tool-effect-readback.v1",
+                        "tool_key": tool_key, "effect_id": effect_id,
+                        "request_sha256": request_sha256,
+                    },
+                )
+            if response.status_code == 404:
+                return None
+            if response.status_code != 200 or len(response.content) > 1024 * 1024:
+                raise ValueError("status")
+            value = response.json()
+        except Exception:
+            raise GenericToolRegistryConfigurationError(
+                "remote generic tool effect readback failed"
+            ) from None
+        return self._require_remote_result(entry, value)
+
     def _execute_remote(
         self, entry: GenericToolAdapterDescriptor,
         arguments: Mapping[str, object],
+        *, effect_id: str | None,
     ) -> dict[str, object]:
         assert entry.endpoint is not None
         assert entry.endpoint_sha256 is not None
@@ -201,14 +274,9 @@ class VerifiedGenericToolRegistry:
             raise GenericToolRegistryConfigurationError(
                 "generic tool credential is unavailable"
             )
-        request = {
-            "schema": "captain.generic-tool-execution.v1",
-            "tool_key": entry.tool_key,
-            "operation": entry.allowed_operation,
-            "endpoint_sha256": entry.endpoint_sha256,
-            "registry_sha256": self.digest,
-            "arguments": dict(arguments),
-        }
+        request = self._remote_request(
+            entry, arguments=arguments, effect_id=effect_id,
+        )
         try:
             with httpx.Client(
                 timeout=httpx.Timeout(10.0), follow_redirects=False,
@@ -233,6 +301,29 @@ class VerifiedGenericToolRegistry:
             raise GenericToolRegistryConfigurationError(
                 "remote generic tool execution failed"
             ) from None
+        return self._require_remote_result(entry, result)
+
+    def _remote_request(
+        self, entry: GenericToolAdapterDescriptor, *,
+        arguments: Mapping[str, object], effect_id: str | None,
+    ) -> dict[str, object]:
+        assert entry.endpoint_sha256 is not None
+        request: dict[str, object] = {
+            "schema": "captain.generic-tool-execution.v1",
+            "tool_key": entry.tool_key,
+            "operation": entry.allowed_operation,
+            "endpoint_sha256": entry.endpoint_sha256,
+            "registry_sha256": self.digest,
+            "arguments": dict(arguments),
+        }
+        if effect_id is not None:
+            request["effect_id"] = effect_id
+        return request
+
+    @staticmethod
+    def _require_remote_result(
+        entry: GenericToolAdapterDescriptor, result: object,
+    ) -> dict[str, object]:
         expected_schema = f"{entry.schema_name}.v{entry.schema_version}"
         if (
             not isinstance(result, dict)

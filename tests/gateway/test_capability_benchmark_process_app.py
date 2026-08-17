@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import subprocess
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -55,6 +58,7 @@ def _payload() -> dict[str, object]:
         },
         "execution_plan": {
             "candidate_ref": request.execution_plan.candidate_ref.model_dump(mode="json"),
+            "candidate_manifest_ref": request.execution_plan.candidate_manifest_ref.model_dump(mode="json"),
             "team_manifest_ref": request.execution_plan.team_manifest_ref.model_dump(mode="json"),
             "baseline_policy_ref": request.execution_plan.baseline_policy_ref.model_dump(mode="json"),
             "model_ref": request.execution_plan.model_ref.model_dump(mode="json"),
@@ -148,18 +152,46 @@ def test_benchmark_process_module_main_runs_the_isolated_app(
     )
 
 
-def test_shipped_benchmark_constructor_accepts_only_gateway_authority() -> None:
-    executor = build_capability_benchmark_executor({
+def test_shipped_benchmark_constructor_accepts_only_scoped_gateway_and_proxy_authority(
+    tmp_path,
+) -> None:
+    source_root = Path(__file__).resolve().parents[2]
+    root = tmp_path / "repository"
+    (root / "gateway").mkdir(parents=True)
+    worker = root / "gateway/capability_benchmark_host_worker.py"
+    worker.write_bytes((source_root / "gateway/capability_benchmark_host_worker.py").read_bytes())
+    subprocess.run(("git", "init", "-q"), cwd=root, check=True)
+    subprocess.run(("git", "config", "user.name", "Captain Test"), cwd=root, check=True)
+    subprocess.run(("git", "config", "user.email", "captain@example.invalid"), cwd=root, check=True)
+    subprocess.run(("git", "add", "."), cwd=root, check=True)
+    subprocess.run(("git", "commit", "-q", "-m", "test: worker"), cwd=root, check=True)
+    revision = subprocess.run(
+        ("git", "rev-parse", "HEAD"), cwd=root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    configuration = {
         "gateway_url": "http://127.0.0.1:8080",
         "gateway_token": "benchmark-gateway-token",
         "executor_authority_id": "166b2b95-b6d5-5737-a2f2-f377b46004b8",
-    })
+        "repository_root": str(root), "repository_revision": revision,
+        "worker_sha256": hashlib.sha256(worker.read_bytes()).hexdigest(),
+        "proxy_url": "http://127.0.0.1:8091",
+        "proxy_token": "benchmark-proxy-client-token",
+        "context_sha256": "1" * 64, "policy_sha256": "2" * 64,
+        "price_card_sha256": "3" * 64,
+        "proxy_executable_sha256": "4" * 64,
+        "proxy_code_sha256": "5" * 64,
+        "paid_command_sha256": "6" * 64,
+        "hard_ceiling_enforced": "true",
+        "pricing_json": json.dumps({
+            "input_cost_per_million_usd": "2.00",
+            "output_cost_per_million_usd": "12.00",
+        }),
+    }
+    executor = build_capability_benchmark_executor(configuration)
 
     assert type(executor) is GatewayOwnedBenchmarkExecutor
     with pytest.raises(ValueError, match="incomplete"):
         build_capability_benchmark_executor({
-            "gateway_url": "http://127.0.0.1:8080",
-            "gateway_token": "benchmark-gateway-token",
-            "executor_authority_id": "166b2b95-b6d5-5737-a2f2-f377b46004b8",
-            "OPENAI_API_KEY": "must-not-cross-process-boundary",
+            **configuration, "OPENAI_API_KEY": "must-not-cross-process-boundary",
         })

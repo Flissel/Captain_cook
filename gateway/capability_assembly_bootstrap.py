@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import hmac
 import inspect
 import importlib
 import importlib.abc
@@ -162,7 +163,7 @@ class CapabilityAssemblyBootstrapSettings:
     capability_tool_host_token: SecretStr = SecretStr("")
     generic_tool_registry_path: str = "config/generic_tool_registry.json"
     generic_tool_registry_sha256: str = (
-        "5b9751022bcfdce2bb72dee994ab20ac99deebbec7653ea4369a2191d582a528"
+        "1cc99b7ef95ddedebc64f2b1c4ad3b88c5fcbfa748f536e93606af76c1994f5f"
     )
     allowed_hosts: tuple[str, ...] = ()
 
@@ -247,7 +248,7 @@ def load_capability_assembly_bootstrap_settings(
     ).strip()
     registry_sha256 = environment.get(
         "CAPTAIN_GENERIC_TOOL_REGISTRY_SHA256",
-        "5b9751022bcfdce2bb72dee994ab20ac99deebbec7653ea4369a2191d582a528",
+        "1cc99b7ef95ddedebc64f2b1c4ad3b88c5fcbfa748f536e93606af76c1994f5f",
     ).strip()
     if not registry_path or _SHA256.fullmatch(registry_sha256) is None:
         raise CapabilityAssemblyBootstrapConfigurationError(
@@ -640,9 +641,23 @@ class CaptainBenchmarkToolEvidenceAuthority:
 
     authority_id = _TOOL_AUTHORITY_ID
 
-    def __init__(self, *, gateway_store: GatewayStore, artifacts: object) -> None:
+    def __init__(
+        self, *, gateway_store: GatewayStore, artifacts: object,
+        scoped_token_key: SecretStr,
+    ) -> None:
+        key = scoped_token_key.get_secret_value()
+        if len(key) < 16:
+            raise ValueError("benchmark tool token authority is invalid")
         self.gateway_store = gateway_store
         self._artifacts = artifacts
+        self._scoped_token_key = key.encode()
+
+    def _scoped_token(self, *, call_id: str, lease_id: str) -> SecretStr:
+        value = hmac.new(
+            self._scoped_token_key,
+            (call_id + "\0" + lease_id).encode(), hashlib.sha256,
+        ).hexdigest()
+        return SecretStr(value)
 
     def _put_tool_artifact(self, payload: dict[str, object]) -> ArtifactRef:
         body = json.dumps(
@@ -692,6 +707,10 @@ class CaptainBenchmarkToolEvidenceAuthority:
             "call_sha256": call_ref.sha256, "lease_id": lease_id,
             "status": "authorized",
         })
+        scoped_token = self._scoped_token(call_id=call_id, lease_id=lease_id)
+        common["scoped_token_sha256"] = hashlib.sha256(
+            scoped_token.get_secret_value().encode()
+        ).hexdigest()
         try:
             self.gateway_store.record_capability_tool_authorization(
                 **common, operation=operation, call_id=call_id,
@@ -702,8 +721,8 @@ class CaptainBenchmarkToolEvidenceAuthority:
                 "benchmark tool authorization registration failed"
             ) from None
         return GenericAuthorizedToolCall(
-            tool_key=tool_key, call_id=call_id, lease_id=lease_id,
-            call_ref=call_ref, lease_ref=lease_ref,
+            tool_key=tool_key, operation=operation, call_id=call_id, lease_id=lease_id,
+            call_ref=call_ref, lease_ref=lease_ref, scoped_token=scoped_token,
         )
 
     def complete(
@@ -870,6 +889,38 @@ class CaptainBenchmarkToolEvidenceAuthority:
             call = self._read(request.call_ref)
             lease = self._read(request.lease_ref)
             receipt = self._read(request.receipt_ref)
+            if receipt.get("schema") == "captain.capability-benchmark-tool-effect-receipt.v1":
+                effect = self.gateway_store.capability_tool_effect(
+                    request.call_ref.sha256
+                )
+                authority = self.gateway_store.capability_tool_authorization(
+                    request.call_ref.sha256
+                )
+                return (
+                    isinstance(effect, dict) and isinstance(authority, dict)
+                    and effect.get("call_ref") == request.call_ref.model_dump(mode="json")
+                    and effect.get("lease_ref") == request.lease_ref.model_dump(mode="json")
+                    and effect.get("receipt_ref") == request.receipt_ref.model_dump(mode="json")
+                    and receipt.get("status") == "succeeded"
+                    and receipt.get("job_id") == str(request.job_id)
+                    and receipt.get("case_digest") == request.case_ref.case_digest
+                    and receipt.get("tool_key") == request.tool_key
+                    and receipt.get("trace_id") == str(request.trace_id)
+                    and receipt.get("run_id") == str(request.run_id)
+                    and receipt.get("model_policy_digest")
+                    == request.model_policy_digest
+                    and receipt.get("call_sha256") == request.call_ref.sha256
+                    and receipt.get("lease_sha256") == request.lease_ref.sha256
+                    and receipt.get("result_sha256")
+                    == ArtifactRef.model_validate(effect.get("result_ref")).sha256
+                    and authority.get("job_id") == str(request.job_id)
+                    and authority.get("case_digest") == request.case_ref.case_digest
+                    and authority.get("tool_key") == request.tool_key
+                    and authority.get("trace_id") == str(request.trace_id)
+                    and authority.get("run_id") == str(request.run_id)
+                    and authority.get("model_policy_digest")
+                    == request.model_policy_digest
+                )
             registry = self.gateway_store.capability_tool_evidence(
                 request.receipt_ref.sha256
             )
@@ -2278,7 +2329,8 @@ def materialize_production_capability_assembly(
         gateway_store=store, artifacts=artifacts
     )
     benchmark_tool = CaptainBenchmarkToolEvidenceAuthority(
-        gateway_store=store, artifacts=artifacts
+        gateway_store=store, artifacts=artifacts,
+        scoped_token_key=settings.benchmark_gateway_token,
     )
     benchmark_recorder = GatewayGenericBenchmarkRecorder(
         gateway_store=store, artifacts=artifacts

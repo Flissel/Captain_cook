@@ -155,10 +155,9 @@ from gateway.capability_assembly_api import (
 )
 from gateway.capability_assembly_production import RepositoryFactoryInputArtifactStore
 from gateway.capability_benchmark_execution_service import (
+    GatewayDurableBenchmarkToolBroker,
     GatewayBenchmarkExecutionService,
-    GatewayRuntimeBenchmarkEffect,
 )
-from gateway.capability_host_autogen_benchmark import FactoryHostAutoGenBenchmarkEffect
 from gateway.capability_benchmark_process_app import _parse_request as _parse_benchmark_request
 from gateway.capability_benchmark_process_app import _serialize_evidence as _serialize_benchmark_evidence
 from agenten.agent_factory.holdout_store import PrivateHoldoutStore
@@ -466,6 +465,7 @@ def create_app(
     selected_capability_assembly_factory = capability_assembly_composition_factory
     production_composition = None
     benchmark_execution_service = capability_benchmark_execution_service
+    benchmark_tool_broker: GatewayDurableBenchmarkToolBroker | None = None
     production_requested = selected_capability_assembly_factory is None and all(
         value is not None
         for value in (
@@ -490,7 +490,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        nonlocal production_composition, benchmark_execution_service, runtime_http_client
+        nonlocal production_composition, benchmark_execution_service, benchmark_tool_broker, runtime_http_client
         load_gateway_settings(app)
         if production_requested:
             assert store is not None
@@ -516,13 +516,14 @@ def create_app(
                     executor_authority_id=UUID(environment_value(
                         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID"
                     )),
-                    runtime_effect=FactoryHostAutoGenBenchmarkEffect(
-                        factory=production_composition.benchmark_host_factory,
-                        artifacts=runtime_usage_artifacts, clock=portal_clock,
-                    ),
+                    runtime_effect=None,
                     tool_issuer=tool_issuer,
                     tool_registry=production_composition.benchmark_tool_registry,
                     clock=portal_clock,
+                )
+                benchmark_tool_broker = GatewayDurableBenchmarkToolBroker(
+                    store=store, artifacts=runtime_usage_artifacts,
+                    registry=production_composition.benchmark_tool_registry,
                 )
         start = getattr(mirror, "start", None)
         if start:
@@ -1684,6 +1685,121 @@ def create_app(
         except Exception:
             raise HTTPException(
                 status_code=409, detail="benchmark execution is unavailable"
+            ) from None
+
+    @app.post("/v1/capability-benchmark/sessions/prepare")
+    async def prepare_capability_benchmark(
+        payload: dict[str, object],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        expected = capability_benchmark_gateway_token or environment_value(
+            "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN"
+        )
+        if (
+            len(expected) < 16 or authorization is None
+            or not secrets.compare_digest(authorization, "Bearer " + expected)
+        ):
+            raise HTTPException(status_code=401, detail="benchmark Gateway authentication failed")
+        if benchmark_execution_service is None:
+            raise HTTPException(status_code=503, detail="benchmark execution is unavailable")
+        try:
+            prepared = benchmark_execution_service.prepare(
+                _parse_benchmark_request(payload)
+            )
+            return {
+                "schema": "captain.capability-benchmark-prepared-session.v1",
+                "request_digest": prepared.request.request_digest,
+                "command": prepared.command.model_dump(mode="json", by_alias=True),
+                "trace_id": str(prepared.trace_id), "run_id": str(prepared.run_id),
+                "batch_id": prepared.batch_id,
+                "authorized_tools": [{
+                    "tool_key": item.tool_key, "call_id": item.call_id,
+                    "lease_id": item.lease_id,
+                    "call_ref": item.call_ref.model_dump(mode="json"),
+                    "lease_ref": item.lease_ref.model_dump(mode="json"),
+                    "scoped_token": item.scoped_token.get_secret_value(),
+                    "operation": item.operation,
+                } for item in prepared.authorized_tools],
+                "material": prepared.material,
+            }
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=409, detail="benchmark preparation is unavailable"
+            ) from None
+
+    @app.post("/v1/capability-benchmark/tools/execute")
+    async def execute_capability_benchmark_tool(
+        payload: dict[str, object],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        if benchmark_tool_broker is None or authorization is None or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="benchmark tool authentication failed")
+        try:
+            required = {
+                "schema", "tool_key", "call_id", "lease_id", "call_ref",
+                "lease_ref", "operation", "arguments",
+            }
+            if set(payload) != required or payload.get("schema") != "captain.capability-benchmark-tool-request.v1" or not isinstance(payload.get("arguments"), dict):
+                raise ValueError("shape")
+            from gateway.capability_generic_benchmark import GenericAuthorizedToolCall
+            from pydantic import SecretStr
+            scoped = SecretStr(authorization.removeprefix("Bearer "))
+            authorized = GenericAuthorizedToolCall(
+                tool_key=str(payload["tool_key"]), operation=str(payload["operation"]),
+                call_id=str(payload["call_id"]),
+                lease_id=str(payload["lease_id"]),
+                call_ref=ArtifactRef.model_validate(payload["call_ref"]),
+                lease_ref=ArtifactRef.model_validate(payload["lease_ref"]),
+                scoped_token=scoped,
+            )
+            result = benchmark_tool_broker.execute(
+                authorization=authorized, scoped_token=scoped,
+                operation=str(payload["operation"]),
+                arguments=payload["arguments"],
+            )
+            return {
+                "schema": "captain.capability-benchmark-tool-response.v1",
+                "value": result.value,
+                "result_ref": result.result_ref.model_dump(mode="json"),
+                "receipt_ref": result.receipt_ref.model_dump(mode="json"),
+            }
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=409, detail="benchmark tool execution is unavailable"
+            ) from None
+
+    @app.post("/v1/capability-benchmark/sessions/complete")
+    async def complete_capability_benchmark(
+        payload: dict[str, object],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        expected = capability_benchmark_gateway_token or environment_value(
+            "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN"
+        )
+        if (
+            len(expected) < 16 or authorization is None
+            or not secrets.compare_digest(authorization, "Bearer " + expected)
+        ):
+            raise HTTPException(status_code=401, detail="benchmark Gateway authentication failed")
+        if benchmark_execution_service is None:
+            raise HTTPException(status_code=503, detail="benchmark execution is unavailable")
+        try:
+            if set(payload) != {"schema", "request", "result"} or payload.get("schema") != "captain.capability-benchmark-completion.v1" or not isinstance(payload.get("request"), dict) or not isinstance(payload.get("result"), dict):
+                raise ValueError("shape")
+            request = _parse_benchmark_request(payload["request"])
+            evidence = benchmark_execution_service.complete_process_execution(
+                request, payload["result"],
+            )
+            return _serialize_benchmark_evidence(evidence)
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=409, detail="benchmark completion is unavailable"
             ) from None
 
     return app
