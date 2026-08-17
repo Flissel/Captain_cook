@@ -586,6 +586,117 @@ def test_compiler_rejects_per_predicate_source_cross_swaps_before_holdout_effect
     assert len(holdouts) == 0
 
 
+@pytest.mark.parametrize(
+    "dimension",
+    ("business", "rationale", "safety", "tool", "handoff"),
+)
+def test_compiler_rejects_coordinated_source_and_expected_substitutions(
+    dimension: str,
+) -> None:
+    document = _documents()[1]
+    suite = generate_private_benchmark_suite(
+        document, seed=b"coordinated-source-substitution" * 2,
+    )
+    case_index = next(
+        index for index, item in enumerate(suite.cases)
+        if item.category == "mandatory_escalation"
+    )
+    case = suite.cases[case_index]
+    predicates = list(case.expected_predicates)
+    by_kind = {item.kind: index for index, item in enumerate(predicates)}
+    source_assertions = {
+        item.source_path[-1]: item
+        for item in FactoryInputCompiler(
+            holdout_store=InMemoryPrivateHoldoutStore(),
+        )._assertions(document)
+    }
+    kind_by_dimension = {
+        "business": "observation_contains",
+        "rationale": "rationale_contains",
+        "safety": "forbidden_tool_absent",
+        "tool": "tool_receipt",
+        "handoff": "handoff_event",
+    }
+    donor_by_dimension = {
+        "business": "forbidden_tool_absent",
+        "rationale": "forbidden_tool_absent",
+        "safety": "handoff_event",
+        "tool": "forbidden_tool_absent",
+        "handoff": "observation_contains",
+    }
+    target_index = by_kind[kind_by_dimension[dimension]]
+    donor_index = by_kind[donor_by_dimension[dimension]]
+    target = predicates[target_index]
+    donor = predicates[donor_index]
+    donor_key = donor.source_case_keys[0]
+    update: dict[str, object] = {"source_case_keys": (donor_key,)}
+    if isinstance(target.expected_value, str):
+        update["expected_value"] = source_assertions[donor_key].observable_expected
+    if dimension == "tool":
+        update["observed_key"] = donor_key.removeprefix("tool_")
+    predicates[target_index] = target.model_copy(update=update)
+
+    # Keep every aggregate source present so only exact per-dimension authority
+    # can reject the coordinated substitution.
+    if dimension in {"safety", "tool", "handoff"}:
+        rationale_index = by_kind["rationale_contains"]
+        original_key = target.source_case_keys[0]
+        predicates[rationale_index] = predicates[rationale_index].model_copy(update={
+            "source_case_keys": (original_key,),
+            "expected_value": source_assertions[original_key].observable_expected,
+        })
+
+    mapped_sources = tuple(dict.fromkeys(
+        source
+        for predicate in predicates
+        for source in predicate.source_case_keys
+    ))
+    cases = list(suite.cases)
+    cases[case_index] = case.model_copy(update={
+        "expected_predicates": tuple(predicates),
+        "source_case_keys": mapped_sources,
+    })
+    holdouts = InMemoryPrivateHoldoutStore()
+    catalog = InMemoryPrivateBenchmarkCatalog((
+        suite.model_copy(update={"cases": tuple(cases)}),
+    ))
+
+    with pytest.raises(PrivateBenchmarkCatalogError, match="predicate source binding"):
+        FactoryInputCompiler(
+            holdout_store=holdouts, private_benchmark_catalog=catalog,
+        ).compile(document, subject_version=1)
+
+    assert len(holdouts) == 0
+
+
+def test_compiler_encodes_canonical_authority_type_for_every_dimension() -> None:
+    document = _documents()[1]
+    holdouts = InMemoryPrivateHoldoutStore()
+    suite = generate_private_benchmark_suite(
+        document, seed=b"canonical-predicate-authority" * 2,
+    )
+    specification = FactoryInputCompiler(
+        holdout_store=holdouts,
+        private_benchmark_catalog=InMemoryPrivateBenchmarkCatalog((suite,)),
+    ).compile(document, subject_version=1)
+    authority_by_kind = {
+        "observation_contains": "business",
+        "rationale_contains": "rationale",
+        "forbidden_tool_absent": "safety",
+        "tool_receipt": "tool",
+        "handoff_event": "handoff",
+    }
+
+    for ref in specification.private_holdout_refs:
+        payload = json.loads(holdouts.get(ref.uri))
+        predicates = {
+            item["predicate_key"]: item for item in payload["expected_predicates"]
+        }
+        for binding in payload["predicate_source_bindings"]:
+            predicate = predicates[binding["predicate_key"]]
+            assert binding["authority_type"] == authority_by_kind[predicate["kind"]]
+
+
 def test_file_catalog_is_digest_bound_single_open_and_rotation_safe(tmp_path: Path) -> None:
     documents = _documents()
     root = tmp_path / ".captain-cook" / "private-benchmarks"

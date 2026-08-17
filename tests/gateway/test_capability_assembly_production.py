@@ -1539,6 +1539,95 @@ def test_generic_suite_rejects_per_predicate_source_cross_swaps(
     assert repository._definitions == {}
 
 
+@pytest.mark.parametrize(
+    "dimension",
+    ("business", "rationale", "safety", "tool", "handoff"),
+)
+def test_generic_suite_rejects_coordinated_source_and_expected_substitutions(
+    dimension: str,
+) -> None:
+    holdouts = InMemoryPrivateHoldoutStore()
+    admitted, _ = _admitted_demo(
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts,
+    )
+    canonical = _with_grounded_benchmark_sources(admitted.input, holdouts)
+    refs = canonical.compiled_specification.private_holdout_refs
+    case_index, case_ref, payload = next(
+        (index, ref, json.loads(holdouts.get(ref.uri)))
+        for index, ref in enumerate(refs)
+        if json.loads(holdouts.get(ref.uri))["category"] == "mandatory_escalation"
+    )
+    assertions = {
+        item.source_path[-1]: item
+        for item in canonical.compiled_specification.assertions
+    }
+    kind_by_dimension = {
+        "business": "observation_contains",
+        "rationale": "rationale_contains",
+        "safety": "forbidden_tool_absent",
+        "tool": "tool_receipt",
+        "handoff": "handoff_event",
+    }
+    donor_by_dimension = {
+        "business": "forbidden_tool_absent",
+        "rationale": "forbidden_tool_absent",
+        "safety": "handoff_event",
+        "tool": "forbidden_tool_absent",
+        "handoff": "observation_contains",
+    }
+    predicates = {item["kind"]: item for item in payload["expected_predicates"]}
+    bindings = {
+        item["predicate_key"]: item
+        for item in payload["predicate_source_bindings"]
+    }
+    target = predicates[kind_by_dimension[dimension]]
+    donor = predicates[donor_by_dimension[dimension]]
+    original_key = target["source_case_keys"][0]
+    donor_key = donor["source_case_keys"][0]
+    target_original_sources = list(bindings[target["predicate_key"]]["sources"])
+    target["source_case_keys"] = [donor_key]
+    if isinstance(target["expected_value"], str):
+        target["expected_value"] = assertions[donor_key].observable_expected
+    if dimension == "tool":
+        target["observed_key"] = donor_key.removeprefix("tool_")
+    bindings[target["predicate_key"]]["sources"] = [
+        bindings[donor["predicate_key"]]["sources"][0]
+    ]
+
+    if dimension in {"safety", "tool", "handoff"}:
+        rationale = predicates["rationale_contains"]
+        rationale["source_case_keys"] = [original_key]
+        rationale["expected_value"] = assertions[original_key].observable_expected
+        bindings[rationale["predicate_key"]]["sources"] = [
+            source for source in target_original_sources
+            if source["source_case_key"] == original_key
+        ]
+
+    payload["source_assertion_ids"] = list(dict.fromkeys(
+        source["assertion_id"]
+        for binding in payload["predicate_source_bindings"]
+        for source in binding["sources"]
+    ))
+
+    changed_body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    changed_digest = hashlib.sha256(changed_body.encode()).hexdigest()
+    holdouts._bodies[case_ref.uri] = changed_body
+    changed_refs = list(refs)
+    changed_refs[case_index] = case_ref.model_copy(update={"sha256": changed_digest})
+    drifted = canonical.model_copy(update={
+        "compiled_specification": canonical.compiled_specification.model_copy(update={
+            "private_holdout_refs": tuple(changed_refs),
+        }),
+    })
+
+    repository = _private_case_repository(holdouts)
+    with pytest.raises(
+        CapabilityLiveAuthorityUnavailable, match="predicate source binding",
+    ):
+        build_generic_benchmark_suite(drifted, repository)
+    assert repository._definitions == {}
+
+
 @pytest.mark.parametrize("mutation", ("missing_category", "duplicate_case"))
 def test_explicit_private_categories_fail_closed_when_incomplete_or_ambiguous(
     mutation: str,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -30,6 +31,78 @@ BENCHMARK_RULESET_REFS = (
     "captain.tool-decision.v1",
     "captain.handoff.v1",
 )
+BenchmarkSourceAuthorityType = Literal[
+    "business", "rationale", "safety", "tool", "handoff",
+]
+
+
+def benchmark_predicate_authority_type(
+    predicate_kind: str,
+) -> BenchmarkSourceAuthorityType:
+    if predicate_kind in BUSINESS_BENCHMARK_PREDICATE_KINDS:
+        return "business"
+    if predicate_kind in RATIONALE_BENCHMARK_PREDICATE_KINDS:
+        return "rationale"
+    if predicate_kind in SAFETY_BENCHMARK_PREDICATE_KINDS:
+        return "safety"
+    if predicate_kind in TOOL_BENCHMARK_PREDICATE_KINDS:
+        return "tool"
+    if predicate_kind in HANDOFF_BENCHMARK_PREDICATE_KINDS:
+        return "handoff"
+    raise ValueError("private benchmark predicate authority type is invalid")
+
+
+def benchmark_source_supports_authority(
+    authority_type: BenchmarkSourceAuthorityType,
+    *,
+    assertion_kind: str,
+    source_path: tuple[str, ...],
+    observable_expected: str,
+) -> bool:
+    if not source_path:
+        return False
+    source_section = source_path[0]
+    if authority_type in {"business", "rationale"}:
+        return (
+            assertion_kind == "business"
+            and source_section in {"Acceptance outcomes", "Real cases", "Agents"}
+        ) or (
+            assertion_kind == "recovery"
+            and source_section in {"Integrations", "Stop conditions"}
+        )
+    if authority_type == "safety":
+        return (
+            assertion_kind == "security"
+            and source_section in {
+                "Authority boundaries", "Security requirements", "Tool policy",
+            }
+            and any(
+                marker in observable_expected.casefold()
+                for marker in (
+                    "tool lease", "integration lease", "released team manifest",
+                )
+            )
+        )
+    if authority_type == "tool":
+        return (
+            assertion_kind == "integration"
+            and source_section == "Tool policy"
+            and source_path[-1].startswith("tool_")
+        )
+    return (
+        (
+            assertion_kind == "security"
+            and source_section == "Authority boundaries"
+        )
+        or (
+            assertion_kind == "recovery"
+            and source_section == "Integrations"
+        )
+    ) and re.search(
+        r"\b(?:human|owner|approver|commander|adjuster|reviewer)\b",
+        observable_expected,
+        re.IGNORECASE,
+    ) is not None
 
 
 class _FrozenContract(BaseModel):

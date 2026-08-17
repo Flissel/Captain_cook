@@ -234,9 +234,55 @@ def test_every_normalized_privacy_marker_heading_fails_before_parser_effects(
     assert parser_calls == 0
 
 
+@pytest.mark.parametrize("level", range(1, 7))
 @pytest.mark.parametrize(
     "heading",
-    ("Public verdicts", "Customer results", "Release appendix", "Team decisions"),
+    (
+        "Confidentiality verdicts",
+        "PRIVATELY-maintained notes",
+        "Secretive decisions",
+        "Internally scoped appendix",
+        "Nonpublicly evaluated cases",
+        "hIdDeNs fixtures",
+    ),
+)
+def test_privacy_marker_stem_headings_fail_before_parser_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    level: int,
+    heading: str,
+) -> None:
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    parser_calls = 0
+    original = input_document_module._level_sections
+
+    def counted_parser(text: str):
+        nonlocal parser_calls
+        parser_calls += 1
+        return original(text)
+
+    monkeypatch.setattr(input_document_module, "_level_sections", counted_parser)
+    malformed = source.replace(
+        "## Helpful resources",
+        (
+            "## Helpful resources\n- Public resource\n"
+            f"{'#' * level} {heading}\nSENTINEL"
+        ),
+    )
+
+    with pytest.raises(FactoryInputError, match="private benchmark cases"):
+        parse_factory_input_bytes(
+            malformed.encode(), logical_name="TO_BE_BUILT.md",
+        )
+
+    assert parser_calls == 0
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "Public verdicts", "Customer results", "Release appendix",
+        "Team decisions", "Classification notes", "Secretion controls",
+    ),
 )
 def test_unrelated_public_nested_headings_remain_valid(heading: str) -> None:
     source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")

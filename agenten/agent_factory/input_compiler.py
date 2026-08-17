@@ -16,6 +16,8 @@ from agenten.agent_factory.input_contracts import (
     BenchmarkExpectedPredicate,
     FactoryInputDocumentV2,
     RealCaseRequirement,
+    benchmark_predicate_authority_type,
+    benchmark_source_supports_authority,
 )
 from agenten.agent_factory.private_benchmark_catalog import (
     PrivateBenchmarkCatalogError,
@@ -183,6 +185,9 @@ class FactoryInputCompiler:
                 assertion_ids = tuple(item.assertion_id for item in case_assertions)
                 predicate_bindings = []
                 for predicate in case.expected_predicates:
+                    authority_type = benchmark_predicate_authority_type(
+                        predicate.kind,
+                    )
                     try:
                         source_assertions = tuple(
                             assertions_by_source[key]
@@ -197,6 +202,7 @@ class FactoryInputCompiler:
                     )
                     predicate_bindings.append({
                         "predicate_key": predicate.predicate_key,
+                        "authority_type": authority_type,
                         "sources": [
                             {
                                 "source_case_key": source_case_key,
@@ -319,10 +325,20 @@ def _validate_predicate_source_binding(
     predicate: BenchmarkExpectedPredicate,
     sources: tuple[AcceptanceAssertion, ...],
 ) -> None:
+    authority_type = benchmark_predicate_authority_type(predicate.kind)
     if (
         not sources
         or tuple(item.source_path[-1] for item in sources)
         != predicate.source_case_keys
+        or any(
+            not benchmark_source_supports_authority(
+                authority_type,
+                assertion_kind=item.kind,
+                source_path=item.source_path,
+                observable_expected=item.observable_expected,
+            )
+            for item in sources
+        )
     ):
         raise PrivateBenchmarkCatalogError(
             "private benchmark predicate source binding is invalid"

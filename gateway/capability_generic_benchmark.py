@@ -20,6 +20,9 @@ from agenten.agent_factory.input_contracts import (
     SAFETY_BENCHMARK_PREDICATE_KINDS,
     TOOL_BENCHMARK_PREDICATE_KINDS,
     BenchmarkExpectedPredicate,
+    BenchmarkSourceAuthorityType,
+    benchmark_predicate_authority_type,
+    benchmark_source_supports_authority,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.capability_assembly_contracts import (
@@ -53,6 +56,7 @@ class GenericBoundPredicateSource:
 @dataclass(frozen=True)
 class GenericPredicateSourceBinding:
     predicate_key: str
+    authority_type: BenchmarkSourceAuthorityType
     sources: tuple[GenericBoundPredicateSource, ...]
 
 
@@ -317,6 +321,7 @@ class GenericPrivateBenchmarkRepository:
             "predicate_source_bindings": [
                 {
                     "predicate_key": binding.predicate_key,
+                    "authority_type": binding.authority_type,
                     "sources": [source.__dict__ for source in binding.sources],
                 }
                 for binding in definition.predicate_source_bindings
@@ -934,8 +939,11 @@ def _parse_predicate_source_bindings(
     for raw_binding in value:
         if (
             not isinstance(raw_binding, dict)
-            or set(raw_binding) != {"predicate_key", "sources"}
+            or set(raw_binding) != {
+                "predicate_key", "authority_type", "sources",
+            }
             or not isinstance(raw_binding.get("predicate_key"), str)
+            or not isinstance(raw_binding.get("authority_type"), str)
             or not isinstance(raw_binding.get("sources"), list)
             or not raw_binding["sources"]
         ):
@@ -982,8 +990,21 @@ def _parse_predicate_source_bindings(
                 source_path=assertion.source_path,
                 observable_expected=assertion.observable_expected,
             ))
+        try:
+            expected_authority_type = benchmark_predicate_authority_type(
+                predicates[len(bindings)].kind,
+            )
+        except (IndexError, ValueError):
+            raise CapabilityLiveAuthorityUnavailable(
+                "private benchmark predicate source binding is invalid"
+            ) from None
+        if raw_binding["authority_type"] != expected_authority_type:
+            raise CapabilityLiveAuthorityUnavailable(
+                "private benchmark predicate source binding is invalid"
+            )
         bindings.append(GenericPredicateSourceBinding(
             predicate_key=raw_binding["predicate_key"],
+            authority_type=expected_authority_type,
             sources=tuple(sources),
         ))
     predicate_keys = tuple(item.predicate_key for item in predicates)
@@ -1020,10 +1041,21 @@ def _validate_predicate_source_authority(
         )
     for predicate, binding in zip(predicates, bindings, strict=True):
         sources = binding.sources
+        authority_type = benchmark_predicate_authority_type(predicate.kind)
         if (
             not sources
+            or binding.authority_type != authority_type
             or tuple(item.source_case_key for item in sources)
             != predicate.source_case_keys
+            or any(
+                not benchmark_source_supports_authority(
+                    authority_type,
+                    assertion_kind=item.assertion_kind,
+                    source_path=item.source_path,
+                    observable_expected=item.observable_expected,
+                )
+                for item in sources
+            )
         ):
             raise CapabilityLiveAuthorityUnavailable(
                 "private benchmark predicate source binding is invalid"
