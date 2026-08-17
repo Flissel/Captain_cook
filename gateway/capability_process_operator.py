@@ -9,9 +9,12 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from urllib.parse import urlsplit
+import urllib.error
+import urllib.request
 from uuid import uuid4
 
 
@@ -136,11 +139,80 @@ def _require_same_process(state: Mapping[str, object]) -> int:
     return pid
 
 
+def _observed_n8n_container_identity() -> tuple[str, str] | None:
+    inventory = subprocess.run(
+        (
+            "docker", "ps", "-q",
+            "--filter", "label=com.docker.compose.project=captain-n8n-builder",
+            "--filter", "label=com.docker.compose.service=n8n",
+            "--filter", "status=running",
+        ), capture_output=True, text=True, check=False,
+    )
+    ids = tuple(line.strip() for line in inventory.stdout.splitlines() if line.strip())
+    if inventory.returncode != 0 or len(ids) != 1:
+        return None
+    inspected = subprocess.run(
+        ("docker", "inspect", "--format", "{{.Id}}|{{.State.StartedAt}}", ids[0]),
+        capture_output=True, text=True, check=False,
+    )
+    values = inspected.stdout.strip().split("|", 1)
+    if inspected.returncode != 0 or len(values) != 2 or not all(values):
+        return None
+    return values[0], values[1]
+
+
+def _wait_process_gone(state: Mapping[str, object], *, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _observed_process_identity(int(state["process_id"])) is None:
+            return True
+        time.sleep(0.05)
+    return _observed_process_identity(int(state["process_id"])) is None
+
+
+def _require_same_n8n_container(state: Mapping[str, object]) -> str:
+    observed = _observed_n8n_container_identity()
+    expected = str(state.get("identity_value", ""))
+    if observed is None or f"{observed[0]}:{observed[1]}" != expected:
+        raise RuntimeError("managed n8n container identity changed; refusing to stop")
+    return observed[0]
+
+
 def _required(environment: Mapping[str, str], name: str) -> str:
     value = environment.get(name, "").strip()
     if not value:
         raise ValueError(f"required process setting is missing: {name}")
     return value
+
+
+def _wait_authenticated_health(
+    service: str, *, environment: Mapping[str, str], timeout_seconds: float = 30.0,
+) -> None:
+    definitions = {
+        "gateway": ("CAPTAIN_GATEWAY_URL", "/v1/capability-assemblies/health", "CAPTAIN_GATEWAY_TOKEN", "Authorization"),
+        "runtime": ("CAPTAIN_RUNTIME_URL", "/health", "CAPTAIN_RUNTIME_TOKEN", "Authorization"),
+        "provider_proxy": ("CAPTAIN_PROVIDER_PROXY_URL", "/v1/healthz", "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN", "Authorization"),
+        "benchmark": ("CAPTAIN_CAPABILITY_BENCHMARK_URL", "/healthz", "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN", "Authorization"),
+        "minibook": ("MINIBOOK_BACKEND_URL", "/api/v1/projection-health", "MINIBOOK_PROJECTION_API_KEY", "Authorization"),
+        "n8n": ("CAPTAIN_N8N_URL", "/api/v1/workflows?limit=1", "CAPTAIN_N8N_API_KEY", "X-N8N-API-KEY"),
+    }
+    url_name, suffix, token_name, header = definitions[service]
+    base = _required(environment, url_name)
+    if service == "benchmark":
+        base = base.removesuffix("/v1/execute")
+    token = _required(environment, token_name)
+    value = token if header == "X-N8N-API-KEY" else f"Bearer {token}"
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        request = urllib.request.Request(base.rstrip("/") + suffix, headers={header: value})
+        try:
+            with urllib.request.urlopen(request, timeout=2.0) as response:
+                if response.status == 200:
+                    return
+        except (OSError, urllib.error.URLError):
+            pass
+        time.sleep(0.1)
+    raise RuntimeError(f"authenticated health timed out for {service}")
 
 
 def service_argv(
@@ -196,7 +268,8 @@ def operate(
     sentinel = environment.get("CAPTAIN_PROCESS_OPERATOR_BACKEND") == "sentinel"
 
     if action in {"stop", "restart"}:
-        if not sentinel and service == "n8n":
+        if not sentinel and service == "n8n" and prior is not None:
+            container_id = _require_same_n8n_container(prior)
             completed = subprocess.run(
                 service_argv(
                     service,
@@ -209,10 +282,24 @@ def operate(
             )
             if completed.returncode != 0:
                 raise RuntimeError("n8n process stop failed")
+            deadline = time.monotonic() + 5.0
+            while container_id is not None and time.monotonic() < deadline:
+                if _observed_n8n_container_identity() is None:
+                    break
+                time.sleep(0.1)
+            if container_id is not None and _observed_n8n_container_identity() is not None:
+                subprocess.run(("docker", "kill", container_id), check=False)
+                if _observed_n8n_container_identity() is not None:
+                    raise RuntimeError("n8n container exit could not be confirmed")
         if prior is not None:
             pid = int(prior.get("process_id", 0))
             if not sentinel and service != "n8n" and _pid_is_live(pid):
-                os.kill(_require_same_process(prior), signal.SIGTERM)
+                exact_pid = _require_same_process(prior)
+                os.kill(exact_pid, signal.SIGTERM)
+                if not _wait_process_gone(prior, timeout_seconds=5.0):
+                    os.kill(_require_same_process(prior), signal.SIGKILL)
+                    if not _wait_process_gone(prior, timeout_seconds=2.0):
+                        raise RuntimeError("managed process exit could not be confirmed")
     if action in {"stop", "restart"} and prior is not None:
         stopped = {
             **prior,
@@ -246,6 +333,9 @@ def operate(
         completed = subprocess.run(argv, cwd=repository_root, check=False)
         if completed.returncode != 0:
             raise RuntimeError("n8n process start failed")
+        observed_container = _observed_n8n_container_identity()
+        if observed_container is None:
+            raise RuntimeError("started n8n container identity is unavailable")
         process_id = 0
     else:
         logs = _state_root(environment, repository_root) / "logs"
@@ -276,11 +366,25 @@ def operate(
         "operation": action,
         "process_id": process_id,
         "process_identity": identity,
+        "identity_kind": "sentinel" if sentinel else (
+            "docker_container" if service == "n8n" else "os_process"
+        ),
         "argv": list(argv),
     }
     if not sentinel and service != "n8n":
         state["executable"], state["os_start_identity"] = observed_identity
+        state["identity_value"] = f"{observed_identity[0]}:{observed_identity[1]}"
+    elif not sentinel:
+        state["identity_value"] = f"{observed_container[0]}:{observed_container[1]}"
+    else:
+        state["identity_value"] = identity
     _write_state(state_file, state)
+    if not sentinel:
+        _wait_authenticated_health(service, environment=environment)
+        if service == "n8n":
+            _require_same_n8n_container(state)
+        else:
+            _require_same_process(state)
     return state
 
 

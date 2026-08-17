@@ -153,6 +153,8 @@ def test_operator_executes_all_six_semantic_lifecycles_with_new_restart_identity
             service, "stop", environment=environment, repository_root=tmp_path
         )
         assert replayed["process_identity"] == started["process_identity"]
+        assert started["identity_kind"] == "sentinel"
+        assert started["identity_value"] == started["process_identity"]
         assert restarted["process_identity"] != started["process_identity"]
         assert restarted["operation"] == "restart"
         assert stopped["status"] == "stopped"

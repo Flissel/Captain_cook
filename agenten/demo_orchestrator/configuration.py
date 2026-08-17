@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import Literal, Protocol
 
 from .contracts import CANONICAL_INPUT_PATHS
 
@@ -29,6 +29,31 @@ class AuthorityHealthBinding:
     service: str
     health_url: str
     token_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorServiceControl:
+    service: Literal["gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n"]
+    start_argv: tuple[str, ...]
+    stop_argv: tuple[str, ...]
+    restart_argv: tuple[str, ...]
+    authenticated_health_url: str
+    authenticated_health_credential_env: str
+    authenticated_health_header: Literal["Authorization", "X-N8N-API-KEY"]
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorProcessBootstrap:
+    services: tuple[OperatorServiceControl, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeRestartControl:
+    service: Literal["runtime"]
+    restart_argv: tuple[str, ...]
+    authenticated_health_url: str
+    authenticated_health_credential_env: str
+    authenticated_health_header: Literal["Authorization"]
 
 
 PRIVATE_ENV_RELATIVE = Path(".captain-cook/live-demo/private/demo.env")
@@ -138,14 +163,54 @@ class DemoConfiguration:
             )
         return value
 
-    def require_operator_process_bootstrap(self) -> object:
-        raise DemoConfigurationError(
-            "D11 operator process bootstrap is unavailable"
-        )
+    def require_operator_process_bootstrap(self) -> OperatorProcessBootstrap:
+        expected = ("gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n")
+        controls: list[OperatorServiceControl] = []
+        for service in expected:
+            binding = getattr(self.production_manifest, service, None)
+            try:
+                control = OperatorServiceControl(
+                    service=service,  # type: ignore[arg-type]
+                    start_argv=tuple(binding.start_argv),
+                    stop_argv=tuple(binding.stop_argv),
+                    restart_argv=tuple(binding.restart_argv),
+                    authenticated_health_url=str(binding.authenticated_health_url),
+                    authenticated_health_credential_env=str(
+                        binding.authenticated_health_credential_env
+                    ),
+                    authenticated_health_header=str(binding.authenticated_health_header),  # type: ignore[arg-type]
+                )
+            except (AttributeError, TypeError):
+                raise DemoConfigurationError(
+                    "D11 operator process bootstrap is unavailable"
+                ) from None
+            prefix = ("python", "-m", "gateway.capability_process_operator", "--service", service)
+            if (
+                control.start_argv != (*prefix, "start")
+                or control.stop_argv != (*prefix, "stop")
+                or control.restart_argv != (*prefix, "restart")
+                or not control.authenticated_health_url.startswith(("http://", "https://"))
+                or control.authenticated_health_header not in {"Authorization", "X-N8N-API-KEY"}
+                or not control.authenticated_health_credential_env
+            ):
+                raise DemoConfigurationError(
+                    "D11 operator process bootstrap is invalid"
+                )
+            if service == "n8n" and control.authenticated_health_header != "X-N8N-API-KEY":
+                raise DemoConfigurationError("D11 operator process bootstrap is invalid")
+            if service != "n8n" and control.authenticated_health_header != "Authorization":
+                raise DemoConfigurationError("D11 operator process bootstrap is invalid")
+            controls.append(control)
+        return OperatorProcessBootstrap(services=tuple(controls))
 
-    def require_runtime_restart_control(self) -> object:
-        raise DemoConfigurationError(
-            "D11 operator process bootstrap is unavailable"
+    def require_runtime_restart_control(self) -> RuntimeRestartControl:
+        runtime = self.require_operator_process_bootstrap().services[1]
+        return RuntimeRestartControl(
+            service="runtime",
+            restart_argv=runtime.restart_argv,
+            authenticated_health_url=runtime.authenticated_health_url,
+            authenticated_health_credential_env=runtime.authenticated_health_credential_env,
+            authenticated_health_header="Authorization",
         )
 
 
@@ -245,6 +310,24 @@ def _validate_d11_manifest(manifest: object) -> None:
     digest = getattr(manifest, "manifest_sha256", None)
     if not isinstance(digest, str) or len(digest) != 64:
         raise DemoConfigurationError("D11 production bundle manifest is invalid")
+    provider_digests = tuple(
+        getattr(manifest, name, None)
+        for name in (
+            "provider_policy_sha256", "provider_price_card_sha256",
+            "provider_context_sha256", "provider_proxy_executable_sha256",
+            "provider_proxy_code_sha256", "provider_paid_command_sha256",
+        )
+    )
+    if (
+        any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in provider_digests
+        )
+        or getattr(manifest, "provider_hard_ceiling_enforced", None) is not True
+    ):
+        raise DemoConfigurationError("D11 production bundle manifest is invalid")
     expected = {
         "gateway": ("CAPTAIN_GATEWAY_TOKEN", "/v1/capability-assemblies/health", None),
         "benchmark": (
@@ -281,6 +364,16 @@ def _validate_d11_manifest(manifest: object) -> None:
             )
         ):
             raise DemoConfigurationError("D11 production bundle manifest is invalid")
+    n8n = getattr(manifest, "n8n", None)
+    if (
+        getattr(n8n, "service", None) != "n8n"
+        or getattr(n8n, "authentication", None) != "x-n8n-api-key"
+        or getattr(n8n, "credential_env", None) != "CAPTAIN_N8N_API_KEY"
+        or getattr(n8n, "authenticated_health_credential_env", None)
+        != "CAPTAIN_N8N_API_KEY"
+        or getattr(n8n, "authenticated_health_header", None) != "X-N8N-API-KEY"
+    ):
+        raise DemoConfigurationError("D11 production bundle manifest is invalid")
 
 
 def _resolve_relative_file(repository: Path, relative: str) -> Path:

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Protocol
 
 from .client import CapabilityDemoClient, DemoClientError, DemoTimeout
@@ -58,13 +61,101 @@ class DefaultDemoActions:
 
     def start(self, timeout_seconds: float) -> dict[str, object]:
         configuration = load_demo_configuration(self._repository_root)
-        configuration.require_operator_process_bootstrap()
-        raise DemoConfigurationError("D11 operator process bootstrap is unavailable")
+        services = self._operate(configuration, "start", timeout_seconds)
+        return {
+            "schema": "captain.demo-operator-result.v1",
+            "status": "ready",
+            "services": services,
+        }
 
     def status(self, timeout_seconds: float) -> dict[str, object]:
         configuration = load_demo_configuration(self._repository_root)
-        configuration.require_operator_process_bootstrap()
-        raise DemoConfigurationError("D11 operator process bootstrap is unavailable")
+        controls = configuration.require_operator_process_bootstrap()
+        root = Path(
+            configuration.environment.get(
+                "CAPTAIN_PROCESS_STATE_ROOT", ".captain-cook/processes"
+            )
+        )
+        state_root = root if root.is_absolute() else self._repository_root / root
+        states = []
+        for control in controls.services:
+            try:
+                state = json.loads(
+                    (state_root / f"{control.service}.json").read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                raise DemoProcessError("D11 managed process state is unavailable") from None
+            if (
+                state.get("service") != control.service
+                or state.get("status") != "running"
+                or not state.get("identity_kind")
+                or not state.get("identity_value")
+            ):
+                raise DemoProcessError("D11 managed process identity is invalid")
+            states.append(control.service)
+        return {
+            "schema": "captain.demo-operator-result.v1",
+            "status": "ready",
+            "services": states,
+        }
+
+    def _operate(
+        self, configuration, action: str, timeout_seconds: float,
+    ) -> list[str]:
+        controls = configuration.require_operator_process_bootstrap().services
+        selected = tuple(reversed(controls)) if action == "stop" else controls
+        operated: list[str] = []
+        environment = {**os.environ, **configuration.environment}
+        for control in selected:
+            state = self._invoke_control(
+                control, action=action, environment=environment,
+                timeout_seconds=timeout_seconds,
+            )
+            if (
+                not isinstance(state, dict)
+                or state.get("service") != control.service
+                or state.get("status") != ("stopped" if action == "stop" else "running")
+                or (action != "stop" and not state.get("identity_value"))
+            ):
+                raise DemoProcessError(
+                    f"D11 operator {action} failed for {control.service}"
+                )
+            operated.append(control.service)
+        return operated
+
+    def _invoke_control(
+        self, control, *, action: str, environment: dict[str, str],
+        timeout_seconds: float,
+    ) -> dict[str, object] | None:
+        raw = getattr(control, f"{action}_argv")
+        argv = (sys.executable, *raw[1:])
+        try:
+            result = subprocess.run(
+                argv, cwd=self._repository_root, env=environment,
+                capture_output=True, text=True, check=False,
+                timeout=max(0.1, timeout_seconds),
+            )
+            value = json.loads(result.stdout) if result.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _restart_runtime(self, configuration, *, timeout_seconds: float) -> object:
+        control = configuration.require_operator_process_bootstrap().services[1]
+        state = self._invoke_control(
+            control, action="restart",
+            environment={**os.environ, **configuration.environment},
+            timeout_seconds=timeout_seconds,
+        )
+        if (
+            state is None
+            or state.get("service") != "runtime"
+            or state.get("status") != "running"
+            or state.get("operation") != "restart"
+            or not state.get("identity_value")
+        ):
+            raise DemoProcessError("D11 operator restart failed for runtime")
+        return state
 
     def run(
         self, *, allow_paid_run: bool, maximum_cost_usd: str, timeout_seconds: float
@@ -95,7 +186,11 @@ class DefaultDemoActions:
         timeout_seconds: float,
     ) -> dict[str, object]:
         configuration = load_demo_configuration(self._repository_root)
-        supervisor = ManagedProcessSupervisor(configuration)
+        supervisor = SimpleNamespace(
+            restart_runtime=lambda *, timeout_seconds: self._restart_runtime(
+                configuration, timeout_seconds=timeout_seconds
+            )
+        )
         client = CapabilityDemoClient(
             configuration,
             supervisor=supervisor,
@@ -123,11 +218,16 @@ class DefaultDemoActions:
         }
 
     def stop(self) -> dict[str, object]:
-        stopped = stop_managed_processes(self._repository_root)
+        try:
+            configuration = load_demo_configuration(self._repository_root)
+            stopped = self._operate(configuration, "stop", 30.0)
+        except DemoConfigurationError:
+            legacy = stop_managed_processes(self._repository_root)
+            stopped = [record.service for record in legacy]
         return {
             "schema": "captain.demo-operator-result.v1",
             "status": "stopped",
-            "services": [record.service for record in stopped],
+            "services": stopped,
         }
 
 

@@ -5,10 +5,11 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
-from agenten.demo_orchestrator.cli import main
+from agenten.demo_orchestrator.cli import DefaultDemoActions, main
 from agenten.demo_orchestrator.client import DemoTimeout
 from agenten.demo_orchestrator.processes import DemoProcessError, DemoProcessTimeout
 
@@ -48,6 +49,50 @@ class FakeActions:
     def stop(self) -> dict[str, object]:
         self.calls.append(("stop", None))
         return {"status": "stopped"}
+
+
+def test_default_actions_executes_all_six_exact_d11_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = ("gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n")
+    controls = tuple(
+        SimpleNamespace(
+            service=service,
+            start_argv=("python", "-m", "gateway.capability_process_operator", "--service", service, "start"),
+            stop_argv=("python", "-m", "gateway.capability_process_operator", "--service", service, "stop"),
+            restart_argv=("python", "-m", "gateway.capability_process_operator", "--service", service, "restart"),
+        )
+        for service in services
+    )
+    configuration = SimpleNamespace(
+        environment={"CAPTAIN_PROCESS_OPERATOR_BACKEND": "sentinel"},
+        require_operator_process_bootstrap=lambda: SimpleNamespace(services=controls),
+    )
+    monkeypatch.setattr(
+        "agenten.demo_orchestrator.cli.load_demo_configuration", lambda _root: configuration
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def run(argv, **_kwargs):
+        command = tuple(argv)
+        calls.append(command)
+        service = command[-2]
+        action = command[-1]
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                "service": service, "status": "running", "operation": action,
+                "identity_kind": "sentinel", "identity_value": f"{service}-{action}",
+            }),
+        )
+
+    monkeypatch.setattr("agenten.demo_orchestrator.cli.subprocess.run", run)
+
+    result = DefaultDemoActions(tmp_path).start(3)
+
+    assert result["services"] == list(services)
+    assert tuple(command[-2] for command in calls) == services
+    assert all(command[-1] == "start" for command in calls)
 
 
 @pytest.mark.parametrize("action", ("init", "start", "status", "stop"))
