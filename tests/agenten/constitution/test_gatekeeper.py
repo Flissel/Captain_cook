@@ -473,6 +473,39 @@ async def test_prune_does_not_query_the_ledger():
 
 
 @pytest.mark.asyncio
+async def test_ledger_outage_during_pending_lookup_does_not_break_in_flight_dedup():
+    """`_collect_pending_descriptions` catches ledger failures and falls back to
+    an empty VALIDATING-stage list rather than propagating.
+
+    That fallback is behaviourally meaningful, not just defensive: in-flight
+    dedup must survive a ledger outage instead of collapsing with it. A gate
+    whose duplicate check blew up on every proposal the moment the ledger was
+    unreachable would be strictly worse than one that degrades to
+    in-process-only duplicate detection.
+    """
+    bus, accepted, rejected = wire_bus()
+
+    class RaisingLedgerQuery(FakeLedgerQuery):
+        def blocks_in_stage(self, stage):
+            raise RuntimeError("ledger unavailable")
+
+    gatekeeper = ConstitutionGatekeeper(
+        bus=bus, ruleset=make_ruleset(), ledger_query=RaisingLedgerQuery()
+    )
+
+    await gatekeeper.handle_subproblem_proposed(
+        make_proposed(subproblem_id="sp-1", description="Knead the dough for ten minutes.")
+    )
+    await gatekeeper.handle_subproblem_proposed(
+        make_proposed(subproblem_id="sp-2", description="Knead the dough for ten minutes.")
+    )
+
+    assert [event.subproblem_id for event in accepted.events] == ["sp-1"]
+    assert [event.subproblem_id for event in rejected.events] == ["sp-2"]
+    assert rejected.events[0].reason == "duplicate"
+
+
+@pytest.mark.asyncio
 async def test_redelivery_of_an_already_accepted_subproblem_does_not_shrink_the_map():
     """The event bus is at-least-once, not exactly-once: `handle_subproblem_proposed`
     can run twice for the same `subproblem_id`. Re-accepting an id already present
