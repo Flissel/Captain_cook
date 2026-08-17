@@ -52,17 +52,68 @@ class GatewayOwnedBenchmarkExecutor:
             raise ValueError("benchmark Gateway authority is invalid")
         self.authority_id = authority_id
         root = repository_root.resolve(strict=True)
-        read_verified_repository_bytes(
+        _, worker_bytes = read_verified_repository_bytes(
             "gateway/capability_benchmark_host_worker.py",
             expected_sha256=worker_sha256,
             expected_repository_revision=repository_revision,
             repository_root=root,
+        )
+        self._attest_isolated_runtime(
+            root=root, worker_sha256=worker_sha256,
+            expected_worker_sha256=hashlib.sha256(worker_bytes).hexdigest(),
         )
         self._gateway_url = gateway_url.rstrip("/")
         self._token = gateway_token
         self._client = client or httpx.AsyncClient(timeout=300.0)
         self._repository_root = root
         self._proxy_configuration = dict(proxy_configuration)
+
+    @staticmethod
+    def _attest_isolated_runtime(
+        *, root: Path, worker_sha256: str, expected_worker_sha256: str,
+    ) -> None:
+        worker_path = root / "gateway/capability_benchmark_host_worker.py"
+        script = (
+            "import hashlib,importlib.metadata as m,importlib.util,json,pathlib;"
+            f"p=pathlib.Path({str(worker_path)!r});"
+            "names={'autogen_agentchat':'autogen-agentchat','autogen_core':'autogen-core','httpx':'httpx','pydantic':'pydantic'};"
+            "print(json.dumps({'worker_sha256':hashlib.sha256(p.read_bytes()).hexdigest(),"
+            "'dependencies':{k:{'version':m.version(v),'origin':importlib.util.find_spec(k).origin} for k,v in names.items()}},sort_keys=True))"
+        )
+        environment = {
+            key: value for key in ("SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP")
+            if (value := os.environ.get(key)) is not None
+        }
+        environment["PYTHONUTF8"] = "1"
+        try:
+            completed = subprocess.run(
+                (sys.executable, "-I", "-c", script), text=True,
+                capture_output=True, timeout=30, check=False, env=environment,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise ValueError("isolated benchmark runtime attestation failed") from None
+        try:
+            value = json.loads(completed.stdout)
+            dependencies = value["dependencies"]
+            expected_versions = {
+                "autogen_agentchat": "0.7.5", "autogen_core": "0.7.5",
+                "httpx": "0.28.1", "pydantic": "2.13.4",
+            }
+            if (
+                completed.returncode != 0 or completed.stderr
+                or value["worker_sha256"] != worker_sha256
+                or worker_sha256 != expected_worker_sha256
+                or set(dependencies) != set(expected_versions)
+                or any(
+                    dependencies[name].get("version") != version
+                    or not isinstance(dependencies[name].get("origin"), str)
+                    or not Path(dependencies[name]["origin"]).is_file()
+                    for name, version in expected_versions.items()
+                )
+            ):
+                raise ValueError("binding")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("isolated benchmark runtime attestation failed") from None
 
     async def execute(
         self, request: GenericBenchmarkExecutionRequest,

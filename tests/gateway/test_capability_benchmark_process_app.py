@@ -195,3 +195,31 @@ def test_shipped_benchmark_constructor_accepts_only_scoped_gateway_and_proxy_aut
         build_capability_benchmark_executor({
             **configuration, "OPENAI_API_KEY": "must-not-cross-process-boundary",
         })
+
+
+def test_benchmark_constructor_attests_fresh_runtime_despite_parent_module_poison(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    from types import ModuleType
+
+    root = Path(__file__).resolve().parents[2]
+    worker = root / "gateway/capability_benchmark_host_worker.py"
+    revision = subprocess.run(
+        ("git", "rev-parse", "HEAD"), cwd=root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    poisoned = ModuleType("autogen_agentchat")
+    poisoned.__file__ = "attacker.py"
+    monkeypatch.setitem(sys.modules, "autogen_agentchat", poisoned)
+
+    executor = GatewayOwnedBenchmarkExecutor(
+        gateway_url="http://127.0.0.1:8088",
+        gateway_token="benchmark-gateway-token",
+        authority_id=UUID("166b2b95-b6d5-5737-a2f2-f377b46004b8"),
+        repository_root=root,
+        worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
+        repository_revision=revision, proxy_configuration={},
+    )
+
+    assert type(executor) is GatewayOwnedBenchmarkExecutor
