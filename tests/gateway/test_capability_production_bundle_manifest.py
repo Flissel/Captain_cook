@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from pathlib import Path
 from uuid import uuid4
@@ -22,12 +24,14 @@ def _environment() -> dict[str, str]:
     return {
         "CAPTAIN_GATEWAY_URL": "http://127.0.0.1:8090",
         "CAPTAIN_GATEWAY_TOKEN": "gateway-token-value",
+        "WORKER_GATEWAY_TOKEN": "worker-token-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-token-value",
         "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-token-value",
         "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "provider-token-value",
+        "OPENAI_API_KEY": "provider-only-test-key",
         "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN": "receipt-token-value",
         "CAPTAIN_PROVIDER_POLICY_SHA256": "a" * 64,
         "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "b" * 64,
@@ -39,6 +43,7 @@ def _environment() -> dict[str, str]:
         "MINIBOOK_BACKEND_URL": "http://127.0.0.1:8080",
         "MINIBOOK_API_KEY": "minibook-token-value",
         "MINIBOOK_PROJECTION_API_KEY": "projection-token-value",
+        "MINIBOOK_CREATION_DB": "state/minibook-creation.sqlite3",
         "CAPTAIN_N8N_URL": "http://127.0.0.1:5679",
         "CAPTAIN_N8N_API_KEY": "n8n-token-value",
     }
@@ -282,6 +287,7 @@ def test_start_reuse_requires_exact_identity_and_authenticated_health(
     monkeypatch.setattr(process_operator, "_wait_authenticated_health", lambda service, **_kwargs: health.append(service))
     monkeypatch.setattr(process_operator.subprocess, "Popen", lambda *_args, **_kwargs: pytest.fail("reuse spawned a process"))
     environment = {
+        **_environment(),
         "CAPTAIN_PROCESS_STATE_ROOT": str(state_root),
         "CAPTAIN_GATEWAY_TOKEN": "gateway-token", "WORKER_GATEWAY_TOKEN": "worker-token",
         "CAPTAIN_GATEWAY_URL": "http://127.0.0.1:8090",
@@ -559,6 +565,63 @@ def test_starting_cleanup_retains_claim_when_tree_enumeration_fails(
 
     retained = json.loads((state_root / "gateway.json").read_text())
     assert retained["status"] == "starting"
+
+
+def test_concurrent_first_start_claim_spawns_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    starts: list[int] = []
+    gate = threading.Barrier(2)
+
+    class Process:
+        pid = 7300
+
+    def spawn(*_args, **_kwargs):
+        starts.append(1)
+        return Process()
+
+    monkeypatch.setattr(process_operator.subprocess, "Popen", spawn)
+    monkeypatch.setattr(
+        process_operator, "_observed_process_identity",
+        lambda _pid: ("C:/python.exe", "start-7300"),
+    )
+    monkeypatch.setattr(process_operator, "_wait_authenticated_health", lambda *_a, **_k: None)
+    environment = {
+        **_environment(), "WORKER_GATEWAY_TOKEN": "worker-token",
+        "LEDGER_DSN": "redacted-dsn", "CAPTAIN_PROCESS_STATE_ROOT": "state",
+    }
+
+    def start() -> dict[str, object]:
+        gate.wait()
+        return operate("gateway", "start", environment=environment, repository_root=tmp_path)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: start(), range(2)))
+
+    assert len(starts) == 1
+    assert {result["process_id"] for result in results} == {7300}
+
+
+def test_invalid_health_or_missing_creation_db_rejects_before_any_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    effects: list[str] = []
+    monkeypatch.setattr(process_operator, "_write_state", lambda *_a, **_k: effects.append("state"))
+    monkeypatch.setattr(
+        process_operator.subprocess, "Popen",
+        lambda *_a, **_k: effects.append("spawn") or pytest.fail("spawned"),
+    )
+    gateway = {
+        **_environment(), "WORKER_GATEWAY_TOKEN": "worker-token",
+        "LEDGER_DSN": "redacted-dsn", "CAPTAIN_GATEWAY_URL": "https://attacker.invalid",
+    }
+    with pytest.raises(ValueError, match="health endpoint is invalid"):
+        operate("gateway", "start", environment=gateway, repository_root=tmp_path)
+    minibook = _environment()
+    minibook.pop("MINIBOOK_CREATION_DB", None)
+    with pytest.raises(ValueError, match="MINIBOOK_CREATION_DB"):
+        operate("minibook", "start", environment=minibook, repository_root=tmp_path)
+    assert effects == []
 
 
 def test_operator_manifest_fails_closed_before_probe_on_missing_or_reused_credentials() -> None:

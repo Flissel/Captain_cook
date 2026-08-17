@@ -9,8 +9,10 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 import urllib.error
@@ -20,6 +22,8 @@ from uuid import uuid4
 
 _SERVICES = ("gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n")
 _ACTIONS = ("start", "stop", "restart")
+_LOCAL_LOCKS: dict[str, threading.Lock] = {}
+_LOCAL_LOCKS_GUARD = threading.Lock()
 _INHERITED_ENV = ("PATH", "SYSTEMROOT", "COMSPEC", "PATHEXT", "TEMP", "TMP")
 _SERVICE_SECRET_ENV = {
     "gateway": (
@@ -142,6 +146,38 @@ def _write_state(path: Path, value: dict[str, object]) -> None:
         json.dumps(value, sort_keys=True, separators=(",", ":")), encoding="utf-8"
     )
     os.replace(temporary, path)
+
+
+@contextmanager
+def _exclusive_state_lock(state_file: Path):
+    """Serialize state reconciliation and effects across threads and processes."""
+
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_file.with_suffix(".lock")
+    key = str(lock_path.resolve())
+    with _LOCAL_LOCKS_GUARD:
+        local_lock = _LOCAL_LOCKS.setdefault(key, threading.Lock())
+    with local_lock, lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _pid_is_live(pid: int) -> bool:
@@ -354,6 +390,22 @@ def _required(environment: Mapping[str, str], name: str) -> str:
 def _wait_authenticated_health(
     service: str, *, environment: Mapping[str, str], timeout_seconds: float = 30.0,
 ) -> None:
+    request = _authenticated_health_request(service, environment=environment)
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(request, timeout=2.0) as response:
+                if response.status == 200:
+                    return
+        except (OSError, urllib.error.URLError):
+            pass
+        time.sleep(0.1)
+    raise RuntimeError(f"authenticated health timed out for {service}")
+
+
+def _authenticated_health_request(
+    service: str, *, environment: Mapping[str, str],
+) -> urllib.request.Request:
     definitions = {
         "gateway": ("CAPTAIN_GATEWAY_URL", "/v1/capability-assemblies/health", "CAPTAIN_GATEWAY_TOKEN", "Authorization"),
         "runtime": ("CAPTAIN_RUNTIME_URL", "/health", "CAPTAIN_RUNTIME_TOKEN", "Authorization"),
@@ -378,17 +430,22 @@ def _wait_authenticated_health(
         raise ValueError("authenticated health endpoint is invalid")
     token = _required(environment, token_name)
     value = token if header == "X-N8N-API-KEY" else f"Bearer {token}"
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        request = urllib.request.Request(base.rstrip("/") + suffix, headers={header: value})
-        try:
-            with urllib.request.urlopen(request, timeout=2.0) as response:
-                if response.status == 200:
-                    return
-        except (OSError, urllib.error.URLError):
-            pass
-        time.sleep(0.1)
-    raise RuntimeError(f"authenticated health timed out for {service}")
+    return urllib.request.Request(base.rstrip("/") + suffix, headers={header: value})
+
+
+def _preflight_operation(
+    service: str, action: str, *, environment: Mapping[str, str], repository_root: Path,
+) -> None:
+    if service not in _SERVICES or action not in _ACTIONS:
+        raise ValueError("unsupported process operation")
+    _authenticated_health_request(service, environment=environment)
+    if service == "minibook":
+        _required(environment, "MINIBOOK_CREATION_DB")
+    service_argv(
+        service, environment=environment, repository_root=repository_root,
+        action="start" if action == "restart" else action,
+    )
+    _service_environment(service, environment)
 
 
 def _reconcile_starting(
@@ -481,7 +538,7 @@ def service_argv(
     raise ValueError("unsupported process service")
 
 
-def operate(
+def _operate_locked(
     service: str,
     action: str,
     *,
@@ -667,6 +724,23 @@ def operate(
     state["status"] = "running"
     _write_state(state_file, state)
     return state
+
+
+def operate(
+    service: str,
+    action: str,
+    *,
+    environment: Mapping[str, str],
+    repository_root: Path,
+) -> dict[str, object]:
+    _preflight_operation(
+        service, action, environment=environment, repository_root=repository_root,
+    )
+    state_file = _state_root(environment, repository_root) / f"{service}.json"
+    with _exclusive_state_lock(state_file):
+        return _operate_locked(
+            service, action, environment=environment, repository_root=repository_root,
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
