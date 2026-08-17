@@ -34,7 +34,9 @@ class _Store:
             required_capability=request.capability_id, input_ref=request.input_ref,
             subject_version=1,
             occurred_at=datetime(2026, 8, 17, tzinfo=timezone.utc),
-            execution_policy=SimpleNamespace(allowed_models=(request.model_id,)),
+            execution_policy=SimpleNamespace(
+                allowed_models=(request.model_id,), max_cost_usd=Decimal("6.00"),
+            ),
         )
         self.job.model_dump = lambda **_kwargs: {
             "schema": "captain.agent-factory-job.v3",
@@ -46,6 +48,7 @@ class _Store:
         self.registry = {}
         self.authorizations = {}
         self.effects = {}
+        self.provider_settlements = []
 
     def factory_job(self, _job_id):
         return SimpleNamespace(job=self.job)
@@ -121,6 +124,12 @@ class _Store:
 
     def capability_tool_effect(self, call_sha256):
         return self.effects.get(call_sha256)
+
+    def capability_benchmark_provider_settlements(self, command_id):
+        return tuple(
+            item for item in self.provider_settlements
+            if item["command_id"] == str(command_id)
+        )
 
 
 class _PrivateCases:
@@ -259,6 +268,16 @@ def _service(tmp_path, request, tools, *, artifacts=None):
         private_cases=_PrivateCases(request),
         executor_authority_id=uuid4(), runtime_effect=effect,
         tool_issuer=issuer, tool_registry=registry,
+        provider_binding={
+            "provider_proxy_url": "http://127.0.0.1:8091/v1",
+            "provider_policy_sha256": "1" * 64,
+            "provider_price_card_sha256": "2" * 64,
+            "provider_context_sha256": "3" * 64,
+            "provider_proxy_executable_sha256": "4" * 64,
+            "provider_proxy_code_sha256": "5" * 64,
+            "provider_paid_command_sha256": "6" * 64,
+            "provider_hard_ceiling_enforced": True,
+        },
         clock=lambda: __import__("datetime").datetime.now(
             __import__("datetime").timezone.utc
         ),
@@ -444,7 +463,7 @@ def test_prepare_broker_complete_crosses_process_contract_without_gateway_host_e
         scoped_token=authorization.scoped_token,
         operation="read", arguments={"account_id": "demo-acme"},
     )
-    evidence = service.complete_process_execution(request, {
+    result_payload = {
         "schema": "captain.capability-benchmark-process-result.v1",
         "observations": {"business_outcome": "bounded"},
         "rationale": "bounded process result",
@@ -453,16 +472,49 @@ def test_prepare_broker_complete_crosses_process_contract_without_gateway_host_e
         "tool_result_refs": {
             "captain_tool": tool.result_ref.model_dump(mode="json")
         },
-        "cost_usd": "0.01", "latency_ms": 2,
+        "latency_ms": 2,
         "candidate_ref": plan.candidate_ref.model_dump(mode="json"),
         "execution_ref": plan.team_manifest_ref.model_dump(mode="json"),
         "agent_names": list(plan.team_agent_names),
+    }
+    with pytest.raises(
+        CapabilityLiveAuthorityUnavailable,
+        match="provider settlement is unavailable",
+    ):
+        service.complete_process_execution(request, result_payload)
+
+    command_id = prepared.command.event_id
+    store.provider_settlements.append({
+        "schema": "captain.capability-benchmark-provider-settlement.v1",
+        "settlement_id": str(uuid4()),
+        "provider_call_id": "benchmark-provider-call-1",
+        "job_id": str(request.job_id),
+        "correlation_id": str(store.job.correlation_id),
+        "case_digest": request.case_ref.case_digest,
+        "trace_id": str(prepared.trace_id),
+        "run_id": str(prepared.run_id),
+        "command_id": str(command_id),
+        "provider_result_id": "response-benchmark-1",
+        "provider_session_id": "benchmark-session-1",
+        "provider": "openai", "model": request.model_id,
+        "input_units": 10, "cached_input_units": 0, "output_units": 5,
+        "actual_cost_usd": "0.012345",
+        "provider_proxy_url": "http://127.0.0.1:8091/v1",
+        "provider_policy_sha256": "1" * 64,
+        "provider_price_card_sha256": "2" * 64,
+        "provider_context_sha256": "3" * 64,
+        "provider_proxy_executable_sha256": "4" * 64,
+        "provider_proxy_code_sha256": "5" * 64,
+        "provider_paid_command_sha256": "6" * 64,
+        "provider_hard_ceiling_enforced": True,
     })
+    evidence = service.complete_process_execution(request, result_payload)
 
     assert gateway_effect.calls == 0
     assert store.result.status is RuntimeStatus.SUCCEEDED
     assert evidence.tool_calls[0].receipt_ref == tool.receipt_ref
     assert evidence.request_digest == request.request_digest
+    assert evidence.cost_usd == Decimal("0.012345")
 
 
 @pytest.mark.parametrize("tools", [(), ("captain_tool", "extra"), ("wrong",)])

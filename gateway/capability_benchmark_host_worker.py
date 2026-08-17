@@ -10,7 +10,6 @@ import os
 import sys
 import tempfile
 import time
-from decimal import Decimal
 from pathlib import Path
 from typing import Callable
 
@@ -167,12 +166,6 @@ async def execute(payload: dict[str, object]) -> dict[str, object]:
                 execution_ref = plan["baseline_policy_ref"]
     if set(observed) != set(declared):
         raise ValueError("isolated HostAutoGen did not call every declared tool")
-    usage = client.total_usage()
-    pricing = configuration["pricing"]
-    cost = (
-        Decimal(usage.prompt_tokens) * Decimal(str(pricing["input_cost_per_million_usd"]))
-        + Decimal(usage.completion_tokens) * Decimal(str(pricing["output_cost_per_million_usd"]))
-    ) / Decimal(1_000_000)
     messages = [{
         "message_key": f"message-{index}",
         "content": str(getattr(message, "content", "")),
@@ -193,7 +186,6 @@ async def execute(payload: dict[str, object]) -> dict[str, object]:
         "tool_result_refs": {
             key: value.model_dump(mode="json") for key, value in observed.items()
         },
-        "cost_usd": format(cost, "f"),
         "latency_ms": max(1, (time.monotonic_ns() - started) // 1_000_000),
         "candidate_ref": plan["candidate_ref"], "execution_ref": execution_ref,
         "agent_names": list(agent_names),

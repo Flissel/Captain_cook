@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Callable, Iterator, Protocol, TypeVar
+from typing import Any, Callable, Iterator, Mapping, Protocol, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import HTTPException
@@ -7094,6 +7094,154 @@ class GatewayStore:
                 )
                 row = cursor.fetchone()
         return None if row is None else dict(self._decode_json(row["payload"]))
+
+    def record_capability_benchmark_provider_settlement(
+        self, payload: Mapping[str, object],
+    ) -> None:
+        """Admit one provider-receipt-role benchmark call settlement."""
+
+        required = {
+            "schema", "settlement_id", "provider_call_id", "job_id",
+            "correlation_id", "case_digest", "trace_id", "run_id",
+            "command_id", "provider_result_id", "provider_session_id",
+            "provider", "model", "input_units", "cached_input_units",
+            "output_units", "actual_cost_usd", "provider_proxy_url",
+            "provider_policy_sha256", "provider_price_card_sha256",
+            "provider_context_sha256", "provider_proxy_executable_sha256",
+            "provider_proxy_code_sha256", "provider_paid_command_sha256",
+            "provider_hard_ceiling_enforced",
+        }
+        try:
+            canonical = dict(payload)
+            cost = Decimal(str(canonical["actual_cost_usd"]))
+            if (
+                set(canonical) != required
+                or canonical["schema"]
+                != "captain.capability-benchmark-provider-settlement.v1"
+                or canonical["provider"] != "openai"
+                or canonical["provider_hard_ceiling_enforced"] is not True
+                or not cost.is_finite() or cost < 0
+                or int(canonical["input_units"]) < 0
+                or int(canonical["cached_input_units"]) < 0
+                or int(canonical["output_units"]) < 0
+                or int(canonical["cached_input_units"]) > int(canonical["input_units"])
+            ):
+                raise ValueError("shape")
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(
+                status_code=409, detail="benchmark provider settlement is invalid"
+            ) from None
+        binding = (
+            str(canonical["provider_proxy_url"]).removesuffix("/v1"),
+            canonical["provider_policy_sha256"],
+            canonical["provider_price_card_sha256"],
+            canonical["provider_context_sha256"],
+            canonical["provider_proxy_executable_sha256"],
+            canonical["provider_proxy_code_sha256"],
+            canonical["provider_paid_command_sha256"], True,
+        )
+        if binding not in self._runtime_provider_bundle_bindings:
+            raise HTTPException(
+                status_code=409, detail="benchmark provider authority changed"
+            )
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """CREATE TABLE IF NOT EXISTS capability_benchmark_provider_settlements (
+                    settlement_id CHAR(36) NOT NULL PRIMARY KEY,
+                    provider_call_id VARCHAR(128) NOT NULL UNIQUE,
+                    command_id CHAR(36) NOT NULL,
+                    job_id CHAR(36) NOT NULL,
+                    payload JSON NOT NULL,
+                    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB"""
+                )
+                command = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_runtime_command", field="event_id",
+                    value=str(canonical["command_id"]), for_update=True,
+                )
+                cursor.execute(
+                    "SELECT job_id, correlation_id, case_digest, trace_id, run_id, "
+                    "command_id FROM capability_benchmark_work_batches "
+                    "WHERE command_id = %s FOR UPDATE", (canonical["command_id"],),
+                )
+                batch = cursor.fetchone()
+                job = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id",
+                    value=str(canonical["job_id"]), for_update=True,
+                )
+                command_data = {} if command is None else command["data"]
+                if (
+                    command is None or batch is None or job is None
+                    or command_data.get("payload", {}).get("operation")
+                    != RuntimeOperation.AUTOGEN_BENCHMARK.value
+                    or str(batch["job_id"]) != str(canonical["job_id"])
+                    or str(batch["correlation_id"]) != str(canonical["correlation_id"])
+                    or str(batch["case_digest"]) != str(canonical["case_digest"])
+                    or str(batch["trace_id"]) != str(canonical["trace_id"])
+                    or str(batch["run_id"]) != str(canonical["run_id"])
+                    or command_data.get("correlation_id") != canonical["correlation_id"]
+                    or canonical["model"] not in job["data"]["execution_policy"]["allowed_models"]
+                ):
+                    raise HTTPException(
+                        status_code=409, detail="benchmark provider settlement binding is invalid"
+                    )
+                cursor.execute(
+                    "SELECT payload FROM capability_benchmark_provider_settlements "
+                    "WHERE settlement_id = %s OR provider_call_id = %s FOR UPDATE",
+                    (canonical["settlement_id"], canonical["provider_call_id"]),
+                )
+                existing = cursor.fetchone()
+                encoded = self._encode_json(canonical)
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) == canonical:
+                        return
+                    raise HTTPException(
+                        status_code=409, detail="benchmark provider settlement changed"
+                    )
+                cursor.execute(
+                    "SELECT payload FROM capability_benchmark_provider_settlements "
+                    "WHERE job_id = %s FOR UPDATE", (canonical["job_id"],),
+                )
+                total = sum(
+                    (Decimal(str(self._decode_json(row["payload"])["actual_cost_usd"]))
+                     for row in cursor.fetchall()), start=cost,
+                )
+                maximum = Decimal(str(job["data"]["execution_policy"]["max_cost_usd"]))
+                if total > maximum:
+                    raise HTTPException(
+                        status_code=409, detail="benchmark provider settlement exceeds Factory budget"
+                    )
+                cursor.execute(
+                    "INSERT INTO capability_benchmark_provider_settlements "
+                    "(settlement_id, provider_call_id, command_id, job_id, payload) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (canonical["settlement_id"], canonical["provider_call_id"],
+                     canonical["command_id"], canonical["job_id"], encoded),
+                )
+
+    def capability_benchmark_provider_settlements(
+        self, command_id: UUID,
+    ) -> tuple[dict[str, Any], ...]:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """CREATE TABLE IF NOT EXISTS capability_benchmark_provider_settlements (
+                    settlement_id CHAR(36) NOT NULL PRIMARY KEY,
+                    provider_call_id VARCHAR(128) NOT NULL UNIQUE,
+                    command_id CHAR(36) NOT NULL,
+                    job_id CHAR(36) NOT NULL,
+                    payload JSON NOT NULL,
+                    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB"""
+                )
+                cursor.execute(
+                    "SELECT payload FROM capability_benchmark_provider_settlements "
+                    "WHERE command_id = %s ORDER BY created_at, settlement_id",
+                    (str(command_id),),
+                )
+                rows = cursor.fetchall()
+        return tuple(dict(self._decode_json(row["payload"])) for row in rows)
 
     def record_capability_benchmark_work_batch(
         self, *, job_id: UUID, correlation_id: UUID, batch_id: str,

@@ -538,6 +538,16 @@ def create_app(
                     runtime_effect=None,
                     tool_issuer=tool_issuer,
                     tool_registry=production_composition.benchmark_tool_registry,
+                    provider_binding={
+                        "provider_proxy_url": configured.provider_proxy_url,
+                        "provider_policy_sha256": configured.provider_policy_sha256,
+                        "provider_price_card_sha256": configured.provider_price_card_sha256,
+                        "provider_context_sha256": configured.provider_context_sha256,
+                        "provider_proxy_executable_sha256": configured.provider_proxy_executable_sha256,
+                        "provider_proxy_code_sha256": configured.provider_proxy_code_sha256,
+                        "provider_paid_command_sha256": configured.provider_paid_command_sha256,
+                        "provider_hard_ceiling_enforced": configured.provider_hard_ceiling_enforced,
+                    },
                     clock=portal_clock,
                 )
                 benchmark_tool_broker = GatewayDurableBenchmarkToolBroker(
@@ -1340,6 +1350,23 @@ def create_app(
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
         return receipt
+
+    @app.post(
+        "/v1/capability-benchmark/provider-settlements",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def record_capability_benchmark_provider_settlement(
+        settlement: dict[str, object],
+        _: GatewayRole = Depends(require_provider_receipt_authority),
+    ) -> dict[str, object]:
+        await run_in_threadpool(
+            get_store().record_capability_benchmark_provider_settlement,
+            settlement,
+        )
+        return {
+            "schema": "captain.capability-benchmark-provider-settlement-write.v1",
+            "settlement_id": settlement.get("settlement_id"),
+        }
 
     @app.post("/v1/capability-resumes/provider-authorities/preflight")
     async def preflight_runtime_provider_authority(

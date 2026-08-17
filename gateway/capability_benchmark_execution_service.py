@@ -478,6 +478,7 @@ class GatewayBenchmarkExecutionService:
                  runtime_effect: BenchmarkRuntimeEffectPort | None,
                  tool_issuer: BenchmarkToolIssuerPort,
                  tool_registry: BenchmarkToolRegistryPort,
+                 provider_binding: Mapping[str, object] | None = None,
                  clock=lambda: datetime.now(timezone.utc)) -> None:
         self._store = store
         self._artifacts = artifacts
@@ -486,6 +487,7 @@ class GatewayBenchmarkExecutionService:
         self._runtime_effect = runtime_effect
         self._tool_issuer = tool_issuer
         self._tool_registry = tool_registry
+        self._provider_binding = None if provider_binding is None else dict(provider_binding)
         self._clock = clock
 
     def prepare(
@@ -617,6 +619,7 @@ class GatewayBenchmarkExecutionService:
             "baseline_policy_base64": material(request.execution_plan.baseline_policy_ref),
             "model_binding_base64": material(request.execution_plan.model_ref),
             "execution_policy_base64": material(request.execution_plan.execution_policy_ref),
+            "provider_binding": self._required_provider_binding(),
         }
         return PreparedBenchmarkExecution(
             request=request, canonical_case_ref=canonical_case_ref, job=job,
@@ -644,7 +647,7 @@ class GatewayBenchmarkExecutionService:
         tools = request.execution_case.declared_tool_keys
         expected_keys = {
             "schema", "observations", "rationale", "messages", "handoffs",
-            "tool_result_refs", "cost_usd", "latency_ms", "candidate_ref",
+            "tool_result_refs", "latency_ms", "candidate_ref",
             "execution_ref", "agent_names",
         }
         try:
@@ -685,14 +688,18 @@ class GatewayBenchmarkExecutionService:
                 or set(tool_result_refs) != set(tools)
             ):
                 raise ValueError("binding")
-            cost_usd = Decimal(str(payload["cost_usd"]))
             latency_ms = int(payload["latency_ms"])
-            if cost_usd < 0 or latency_ms < 1:
+            if latency_ms < 1:
                 raise ValueError("metrics")
         except (AttributeError, KeyError, TypeError, ValueError):
             raise CapabilityLiveAuthorityUnavailable(
                 "benchmark process result changed authority"
             ) from None
+
+        cost_usd = self._settled_provider_cost(
+            request=request, job=job, command_id=command_id,
+            trace_id=trace_id, run_id=run_id,
+        )
 
         tool_calls: list[GenericToolCallEvidence] = []
         for tool_key, result_ref in tool_result_refs.items():
@@ -784,6 +791,89 @@ class GatewayBenchmarkExecutionService:
             request_nonce=request.request_nonce,
             request_digest=request.request_digest,
         )
+
+    def _required_provider_binding(self) -> dict[str, object]:
+        required = {
+            "provider_proxy_url", "provider_policy_sha256",
+            "provider_price_card_sha256", "provider_context_sha256",
+            "provider_proxy_executable_sha256", "provider_proxy_code_sha256",
+            "provider_paid_command_sha256", "provider_hard_ceiling_enforced",
+        }
+        binding = self._provider_binding
+        if (
+            binding is None or set(binding) != required
+            or binding.get("provider_hard_ceiling_enforced") is not True
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark provider authority is unavailable"
+            )
+        return dict(binding)
+
+    def _settled_provider_cost(
+        self, *, request: GenericBenchmarkExecutionRequest, job: object,
+        command_id: UUID, trace_id: UUID, run_id: UUID,
+    ) -> Decimal:
+        binding = self._required_provider_binding()
+        settlements = tuple(
+            self._store.capability_benchmark_provider_settlements(command_id)
+        )
+        if not settlements:
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark provider settlement is unavailable"
+            )
+        if len(settlements) > 30:
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark provider settlement authority changed"
+            )
+        expected = {
+            "job_id": str(request.job_id),
+            "correlation_id": str(job.correlation_id),
+            "case_digest": request.case_ref.case_digest,
+            "trace_id": str(trace_id), "run_id": str(run_id),
+            "command_id": str(command_id), "provider": "openai",
+            "model": request.model_id, **binding,
+        }
+        call_ids: set[str] = set()
+        result_ids: set[str] = set()
+        total = Decimal("0")
+        required = {
+            "schema", "settlement_id", "provider_call_id", "job_id",
+            "correlation_id", "case_digest", "trace_id", "run_id",
+            "command_id", "provider_result_id", "provider_session_id",
+            "provider", "model", "input_units", "cached_input_units",
+            "output_units", "actual_cost_usd", *binding,
+        }
+        for value in settlements:
+            try:
+                cost = Decimal(str(value["actual_cost_usd"]))
+                call_id = str(value["provider_call_id"])
+                result_id = str(value["provider_result_id"])
+                if (
+                    set(value) != required
+                    or value.get("schema")
+                    != "captain.capability-benchmark-provider-settlement.v1"
+                    or any(value.get(key) != item for key, item in expected.items())
+                    or not call_id or not result_id
+                    or call_id in call_ids or result_id in result_ids
+                    or int(value["input_units"]) < 0
+                    or int(value["cached_input_units"]) < 0
+                    or int(value["output_units"]) < 0
+                    or int(value["cached_input_units"]) > int(value["input_units"])
+                    or not cost.is_finite() or cost < 0
+                ):
+                    raise ValueError("binding")
+            except (KeyError, TypeError, ValueError):
+                raise CapabilityLiveAuthorityUnavailable(
+                    "benchmark provider settlement authority changed"
+                ) from None
+            call_ids.add(call_id)
+            result_ids.add(result_id)
+            total += cost
+        if total > job.execution_policy.max_cost_usd:
+            raise CapabilityLiveAuthorityUnavailable(
+                "benchmark provider settlement exceeds Factory budget"
+            )
+        return total
 
     async def execute(
         self, request: GenericBenchmarkExecutionRequest,
