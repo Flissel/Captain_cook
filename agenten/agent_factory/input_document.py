@@ -224,17 +224,26 @@ def _is_reserved_private_heading(normalized: str) -> bool:
     authority = bool(tokens & {
         "private", "hidden", "secret", "confidential", "internal", "nonpublic",
     }) or {"non", "public"}.issubset(tokens)
-    domain = bool(tokens & {"benchmark", "benchmarks", "holdout", "evaluation"})
+    semantic = bool(tokens & {
+        "expected", "result", "results", "outcome", "outcomes", "answer",
+        "answers", "predicate", "predicates", "benchmark", "benchmarks",
+        "holdout", "holdouts", "evaluation", "evaluations", "case", "cases",
+        "fixture", "fixtures",
+    })
+    domain = bool(tokens & {
+        "benchmark", "benchmarks", "holdout", "holdouts", "evaluation",
+        "evaluations",
+    })
     payload = bool(tokens & {
         "case", "cases", "fixture", "fixtures", "predicate", "predicates",
-        "answer", "answers", "outcome", "outcomes",
+        "answer", "answers", "result", "results", "outcome", "outcomes",
     }) or {"expected", "outcome"}.issubset(tokens) or {
         "expected", "outcomes",
     }.issubset(tokens)
     direct_answer = bool(tokens & {"answer", "answers", "predicate", "predicates"})
     expected_outcome = "expected" in tokens and bool(tokens & {"outcome", "outcomes"})
     return (
-        (authority and (domain or payload))
+        (authority and semantic)
         or (domain and payload)
         or direct_answer
         or expected_outcome

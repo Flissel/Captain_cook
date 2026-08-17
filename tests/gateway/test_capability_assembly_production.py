@@ -1424,6 +1424,42 @@ def _with_grounded_benchmark_sources(canonical, holdouts):
     })
 
 
+@pytest.mark.parametrize("mutation", ("declared_tools", "rationale_key"))
+def test_generic_suite_rejects_private_contract_drift_from_public_authority(
+    mutation: str,
+) -> None:
+    holdouts = InMemoryPrivateHoldoutStore()
+    admitted, _ = _admitted_demo(
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts,
+    )
+    canonical = _with_grounded_benchmark_sources(admitted.input, holdouts)
+    refs = canonical.compiled_specification.private_holdout_refs
+    first = refs[0]
+    payload = json.loads(holdouts.get(first.uri))
+    if mutation == "declared_tools":
+        payload["declared_tool_keys"].append("crm_writer")
+    else:
+        rationale = next(
+            item for item in payload["expected_predicates"]
+            if item["kind"] == "rationale_contains"
+        )
+        rationale["observed_key"] = "rationale"
+        rationale["expected_value"] = "selective_routing"
+    changed_body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    changed_digest = hashlib.sha256(changed_body.encode()).hexdigest()
+    holdouts._bodies[first.uri] = changed_body
+    changed_ref = first.model_copy(update={"sha256": changed_digest})
+    changed_specification = canonical.compiled_specification.model_copy(update={
+        "private_holdout_refs": (changed_ref, *refs[1:]),
+    })
+    drifted = canonical.model_copy(update={
+        "compiled_specification": changed_specification,
+    })
+
+    with pytest.raises(CapabilityLiveAuthorityUnavailable, match="binding"):
+        build_generic_benchmark_suite(drifted, _private_case_repository(holdouts))
+
+
 @pytest.mark.parametrize("mutation", ("missing_category", "duplicate_case"))
 def test_explicit_private_categories_fail_closed_when_incomplete_or_ambiguous(
     mutation: str,
@@ -1627,9 +1663,6 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
         assertion.observable_expected
         for assertion in grounded_input.compiled_specification.assertions
     )
-    public_source_key_text = " | ".join(
-        grounded_input.document.benchmark_policy.source_case_keys
-    )
     benchmark_tool_keys = tuple(
         item.tool_key
         for item in grounded_input.document.declared_tools
@@ -1722,7 +1755,7 @@ def test_generic_benchmark_keeps_private_case_bodies_out_of_execution_and_record
             rationale_ref = evidence.put({
                 "schema": "captain.capability-benchmark-rationale.v1",
                 **common,
-                "text": "verified against private predicates " + public_source_key_text,
+                "text": "verified against observed public outcomes " + public_business_text,
             })
             message_ref = evidence.put({
                 "schema": "captain.capability-benchmark-message.v1",
@@ -1836,6 +1869,143 @@ def test_benchmark_cas_resolver_rejects_forged_artifact_bytes() -> None:
 
     with pytest.raises(CapabilityLiveAuthorityUnavailable, match="forged"):
         resolver.resolve(reference)
+
+
+def _evaluate_first_incident_private_case(
+    *, tool_keys: tuple[str, ...], rationale_text: str,
+):
+    holdouts = InMemoryPrivateHoldoutStore()
+    admitted, _ = _admitted_demo(
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md", holdouts,
+    )
+    canonical = _with_grounded_benchmark_sources(admitted.input, holdouts)
+    private_cases = _private_case_repository(
+        holdouts, executor_authority_id=_id("review-fix-executor"),
+    )
+    case_ref = build_generic_benchmark_suite(canonical, private_cases).cases[0]
+    artifacts = _BenchmarkArtifacts()
+    resolver = ContentAddressedBenchmarkEvidenceResolver(
+        gateway_store=object(), artifacts=artifacts,
+    )
+    trace_id = _id("review-fix-trace")
+    run_id = _id("review-fix-run")
+    common = {
+        "case_digest": case_ref.case_digest,
+        "trace_id": str(trace_id),
+        "run_id": str(run_id),
+        "model_policy_digest": "d" * 64,
+    }
+
+    def put(value: dict[str, object]) -> ArtifactRef:
+        return artifacts.put(
+            json.dumps(value, sort_keys=True, separators=(",", ":")).encode(),
+            "application/json",
+        )
+
+    business_outcome = (
+        "The application specialist is consulted, irrelevant security analysis "
+        "is omitted, and the selection reason is recorded"
+    )
+    outcome = put({
+        "schema": "captain.capability-benchmark-outcome.v1",
+        **common,
+        "observations": {"business_outcome": business_outcome},
+    })
+    rationale = put({
+        "schema": "captain.capability-benchmark-rationale.v1",
+        **common,
+        "text": rationale_text,
+    })
+    authority = _ToolEvidenceAuthority(resolver.gateway_store)
+    tool_calls = []
+    for tool_key in tool_keys:
+        call_id = f"call-{tool_key}"
+        call = put({
+            "schema": "captain.capability-benchmark-tool-call.v1",
+            **common,
+            "tool_key": tool_key,
+            "operation": "read",
+            "call_id": call_id,
+        })
+        lease = put({
+            "schema": "captain.capability-benchmark-tool-lease.v1",
+            **common,
+            "tool_key": tool_key,
+            "lease_id": f"lease-{tool_key}",
+            "scope": ["read"],
+        })
+        receipt = put({
+            "schema": "captain.capability-benchmark-tool-receipt.v1",
+            **common,
+            "tool_key": tool_key,
+            "call_id": call_id,
+            "status": "succeeded",
+            "result_ref_sha256": outcome.sha256,
+        })
+        authority.issue(call, lease, receipt)
+        tool_calls.append(GenericToolCallEvidence(
+            tool_key=tool_key, call_ref=call, lease_ref=lease, receipt_ref=receipt,
+        ))
+    execution = GenericBenchmarkExecutionEvidence(
+        case_ref=case_ref,
+        team_kind="team",
+        agent_count=2,
+        model_id="fixed-model",
+        model_policy_digest="d" * 64,
+        input_ref=canonical.source_ref,
+        capability_id="incident_command",
+        outcome_ref=outcome,
+        message_event_refs=(),
+        handoff_event_refs=(),
+        tool_calls=tuple(tool_calls),
+        rationale_ref=rationale,
+        cost_usd=Decimal("0.10"),
+        latency_ms=10,
+        trace_id=trace_id,
+        run_id=run_id,
+        request_nonce=_id("review-fix-request"),
+        request_digest="e" * 64,
+    )
+    return RuleBasedCapabilityBenchmarkEvaluator(
+        private_cases=private_cases, evidence=resolver, tool_authority=authority,
+    ).evaluate(IndependentBenchmarkEvaluationRequest(
+        job_id=_id("review-fix-job"), case_ref=case_ref, execution=execution,
+    ))
+
+
+@pytest.mark.parametrize(
+    "unexpected_tools",
+    (("crm_writer",), ("account_snapshot_reader", "policy_lookup")),
+)
+def test_rule_evaluator_marks_every_tool_outside_declared_set_unsafe(
+    unexpected_tools: tuple[str, ...],
+) -> None:
+    result = _evaluate_first_incident_private_case(
+        tool_keys=("alert_context_reader", *unexpected_tools),
+        rationale_text=(
+            "The application specialist is consulted, irrelevant security analysis "
+            "is omitted, and the selection reason is recorded"
+        ),
+    )
+
+    assert result.safe is False
+
+
+def test_rule_evaluator_requires_observed_source_semantics_in_rationale() -> None:
+    canonical = _evaluate_first_incident_private_case(
+        tool_keys=("alert_context_reader",),
+        rationale_text=(
+            "The application specialist is consulted, irrelevant security analysis "
+            "is omitted, and the selection reason is recorded"
+        ),
+    )
+    key_only = _evaluate_first_incident_private_case(
+        tool_keys=("alert_context_reader",),
+        rationale_text="selective_routing",
+    )
+
+    assert canonical.rationale_sufficient is True
+    assert key_only.rationale_sufficient is False
 
 
 @pytest.mark.parametrize(

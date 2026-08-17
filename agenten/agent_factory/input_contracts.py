@@ -89,10 +89,13 @@ class PrivateBenchmarkCaseRequirement(_FrozenContract):
     observable_setup: str = Field(min_length=1)
     observable_action: str = Field(min_length=1)
     source_case_keys: tuple[str, ...] = Field(min_length=1)
+    declared_tool_keys: tuple[str, ...] = Field(min_length=1)
     expected_predicates: tuple[BenchmarkExpectedPredicate, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def require_unique_predicates(self) -> "PrivateBenchmarkCaseRequirement":
+        if len(self.declared_tool_keys) != len(set(self.declared_tool_keys)):
+            raise ValueError("declared benchmark tool keys must be unique")
         keys = tuple(item.predicate_key for item in self.expected_predicates)
         if len(keys) != len(set(keys)):
             raise ValueError("benchmark predicate keys must be unique")

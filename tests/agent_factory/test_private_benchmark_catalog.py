@@ -141,6 +141,20 @@ def test_seeded_generator_is_deterministic_balanced_unique_and_nonvacuous() -> N
 
 
 @pytest.mark.parametrize("relative_path", INPUTS)
+def test_each_private_case_binds_the_exact_public_declared_tool_set(
+    relative_path: str,
+) -> None:
+    document = load_factory_input(ROOT / relative_path)
+    declared_tools = tuple(sorted(item.tool_key for item in document.declared_tools))
+
+    suite = generate_private_benchmark_suite(
+        document, seed=b"declared-tool-safety-binding-seed" * 2,
+    )
+
+    assert all(case.declared_tool_keys == declared_tools for case in suite.cases)
+
+
+@pytest.mark.parametrize("relative_path", INPUTS)
 def test_each_generated_category_is_a_grounded_behavioral_transformation(
     relative_path: str,
 ) -> None:
@@ -235,7 +249,11 @@ def test_each_generated_category_is_a_grounded_behavioral_transformation(
                     for source in predicate.source_case_keys
                 )
             elif predicate.kind == "rationale_contains":
-                assert predicate.expected_value in predicate.source_case_keys
+                assert predicate.observed_key == "business_outcome"
+                assert any(
+                    predicate.expected_value == sources[source][2]
+                    for source in predicate.source_case_keys
+                )
             elif predicate.kind == "tool_receipt":
                 assert predicate.source_case_keys == (
                     f"tool_{predicate.observed_key}",
@@ -607,6 +625,24 @@ def test_catalog_writer_rejects_forbidden_root_before_creating_files(
         )
 
     assert not private_root.exists()
+
+
+def test_catalog_writer_derives_fake_repository_boundary_before_any_creation(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "fake-repository"
+    (repository / ".git").mkdir(parents=True)
+    private_root = repository / ".captain-cook" / "private-benchmarks"
+
+    with pytest.raises(PrivateBenchmarkCatalogError, match="repository|worktree|boundary"):
+        write_private_benchmark_catalog(
+            private_root,
+            _documents(),
+            seed=b"derived-writer-boundary-seed-value" * 2,
+        )
+
+    assert not private_root.exists()
+    assert list(repository.iterdir()) == [repository / ".git"]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction swap contract")

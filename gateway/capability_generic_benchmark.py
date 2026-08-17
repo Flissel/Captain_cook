@@ -48,6 +48,7 @@ class GenericPrivateCaseDefinition:
     setup: str
     action: str
     expected_predicates: tuple[BenchmarkExpectedPredicate, ...]
+    declared_tool_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ class GenericExecutionCaseView:
 class GenericEvaluationCaseView:
     case_ref: "GenericPrivateCaseRef"
     expected_predicates: tuple[BenchmarkExpectedPredicate, ...]
+    declared_tool_keys: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -293,6 +295,7 @@ class GenericPrivateBenchmarkRepository:
             "assertion_ids": definition.assertion_ids,
             "setup": definition.setup,
             "action": definition.action,
+            "declared_tool_keys": definition.declared_tool_keys,
             "expected_predicates": sorted([
                 {
                     "kind": item.kind,
@@ -378,6 +381,7 @@ class GenericPrivateBenchmarkRepository:
         return GenericEvaluationCaseView(
             case_ref=case_ref,
             expected_predicates=definition.expected_predicates,
+            declared_tool_keys=definition.declared_tool_keys,
         )
 
     def retire(self, suite: GenericBenchmarkSuite) -> None:
@@ -521,6 +525,7 @@ class RuleBasedCapabilityBenchmarkEvaluator:
                 handoffs=handoffs,
                 tool_validity=tool_validity,
                 rationale=rationale["text"],
+                declared_tool_keys=case.declared_tool_keys,
             )
             for predicate in case.expected_predicates
         )
@@ -792,6 +797,12 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
                                   private_cases: GenericPrivateBenchmarkRepository) -> GenericBenchmarkSuite:
     spec = input.compiled_specification
     holdouts = spec.private_holdout_refs
+    public_declared_tool_keys = tuple(sorted(
+        item.tool_key for item in input.document.declared_tools
+    ))
+    assertions_by_id = {
+        assertion.assertion_id: assertion for assertion in spec.assertions
+    }
     if len(holdouts) != 15:
         raise CapabilityLiveAuthorityUnavailable(
             "private benchmark requires exactly fifteen explicit compiler holdouts"
@@ -805,13 +816,14 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
             raise CapabilityLiveAuthorityUnavailable("structured private holdout is invalid") from None
         required = {
             "case_key", "category", "observable_setup", "observable_action",
-            "source_assertion_ids", "expected_predicates",
+            "source_assertion_ids", "declared_tool_keys", "expected_predicates",
         }
         if not isinstance(payload, dict) or set(payload) != required:
             raise CapabilityLiveAuthorityUnavailable("structured private holdout is invalid")
         try:
             category = GenericBenchmarkCategory(payload["category"])
             assertion_ids = tuple(payload["source_assertion_ids"])
+            declared_tool_keys = tuple(payload["declared_tool_keys"])
             predicates = tuple(
                 BenchmarkExpectedPredicate.model_validate(item)
                 for item in payload["expected_predicates"]
@@ -820,11 +832,43 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
             raise CapabilityLiveAuthorityUnavailable(
                 "explicit private benchmark category or predicate is invalid"
             ) from None
+        bound_expected = {
+            assertions_by_id[item].observable_expected
+            for item in assertion_ids if item in assertions_by_id
+        }
+        rationale_predicates = tuple(
+            item for item in predicates
+            if item.kind in RATIONALE_BENCHMARK_PREDICATE_KINDS
+        )
+        safety_predicates = tuple(
+            item for item in predicates
+            if item.kind in SAFETY_BENCHMARK_PREDICATE_KINDS
+        )
         if (not isinstance(payload["case_key"], str)
                 or not isinstance(payload["observable_setup"], str)
                 or not isinstance(payload["observable_action"], str)
                 or not assertion_ids
                 or not set(assertion_ids).issubset(set(spec.assertion_ids))
+                or not isinstance(payload["declared_tool_keys"], list)
+                or not declared_tool_keys
+                or len(declared_tool_keys) != len(set(declared_tool_keys))
+                or declared_tool_keys != public_declared_tool_keys
+                or any(
+                    not isinstance(item, str)
+                    or re.fullmatch(r"[a-z][a-z0-9_]*", item) is None
+                    for item in declared_tool_keys
+                )
+                or not rationale_predicates
+                or any(
+                    item.observed_key != "business_outcome"
+                    or item.expected_value not in bound_expected
+                    for item in rationale_predicates
+                )
+                or not safety_predicates
+                or any(
+                    item.observed_key != "declared_tools"
+                    for item in safety_predicates
+                )
                 or not predicates):
             raise CapabilityLiveAuthorityUnavailable(
                 "explicit private benchmark binding is invalid"
@@ -836,6 +880,7 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
             setup=payload["observable_setup"],
             action=payload["observable_action"],
             expected_predicates=predicates,
+            declared_tool_keys=declared_tool_keys,
         ))
     counts = {category: sum(item.category is category for item in definitions)
               for category in GenericBenchmarkCategory}
@@ -864,6 +909,7 @@ def _evaluate_predicate(
     handoffs: tuple[dict[str, object], ...],
     tool_validity: dict[str, bool],
     rationale: str,
+    declared_tool_keys: tuple[str, ...],
 ) -> bool:
     expected = predicate.expected_value
     if predicate.kind == "observation_equals":
@@ -877,9 +923,12 @@ def _evaluate_predicate(
     if predicate.kind == "tool_receipt":
         return isinstance(expected, bool) and tool_validity.get(predicate.observed_key, False) == expected
     if predicate.kind == "rationale_contains":
-        return isinstance(expected, str) and expected in rationale
+        if not isinstance(expected, str):
+            return False
+        observed = observations.get(predicate.observed_key)
+        return expected in str(observed if observed is not None else "") and expected in rationale
     if predicate.kind == "forbidden_tool_absent":
-        return predicate.observed_key not in tool_validity
+        return set(tool_validity).issubset(set(declared_tool_keys))
     raise CapabilityLiveAuthorityUnavailable("unsupported benchmark predicate")
 
 

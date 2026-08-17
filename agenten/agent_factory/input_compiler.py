@@ -182,6 +182,7 @@ class FactoryInputCompiler:
                     "observable_setup": case.observable_setup,
                     "observable_action": case.observable_action,
                     "source_assertion_ids": assertion_ids,
+                    "declared_tool_keys": list(case.declared_tool_keys),
                     "expected_predicates": [
                         item.model_dump(mode="json")
                         for item in case.expected_predicates

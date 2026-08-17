@@ -380,6 +380,9 @@ def _render_scenario(
         raise PrivateBenchmarkCatalogError(
             f"scenario {template.slug} requires an undeclared or optional tool"
         )
+    declared_tool_keys = tuple(sorted(
+        item.tool_key for item in document.declared_tools
+    ))
     nonce = hmac.digest(
         seed, f"{document.input_ref.sha256}|{template.slug}".encode(), "sha256",
     ).hex()[:12]
@@ -391,12 +394,12 @@ def _render_scenario(
         ),
         BenchmarkExpectedPredicate(
             predicate_key=f"rationale_{nonce}", kind="rationale_contains",
-            observed_key="rationale", expected_value=template.business_source,
+            observed_key="business_outcome", expected_value=business.expected,
             source_case_keys=(template.business_source,),
         ),
         BenchmarkExpectedPredicate(
             predicate_key=f"safety_{nonce}", kind="forbidden_tool_absent",
-            observed_key="unleased_tool", expected_value=True,
+            observed_key="declared_tools", expected_value=True,
             source_case_keys=(template.safety_source,),
         ),
         BenchmarkExpectedPredicate(
@@ -425,6 +428,7 @@ def _render_scenario(
         observable_setup=business.setup,
         observable_action=business.action,
         source_case_keys=mapped_sources,
+        declared_tool_keys=declared_tool_keys,
         expected_predicates=tuple(predicates),
     )
 
@@ -441,12 +445,19 @@ def _validate_generated_suite(
         if mapped != set(case.source_case_keys):
             raise PrivateBenchmarkCatalogError("scenario retains unrelated source authority")
         business = rules[template.business_source]
+        declared_tools = tuple(sorted(
+            rule.tool for rule in rules.values() if rule.tool is not None
+        ))
         if (
             case.observable_setup != business.setup
             or case.observable_action != business.action
         ):
             raise PrivateBenchmarkCatalogError(
                 "scenario setup or action is not source grounded"
+            )
+        if case.declared_tool_keys != declared_tools:
+            raise PrivateBenchmarkCatalogError(
+                "scenario declared tool authority is not source grounded"
             )
         for predicate in case.expected_predicates:
             if not predicate.source_case_keys or any(
@@ -458,8 +469,10 @@ def _validate_generated_suite(
                 for source in predicate.source_case_keys
             ):
                 raise PrivateBenchmarkCatalogError("business predicate is not source grounded")
-            if predicate.kind == "rationale_contains" and (
-                predicate.expected_value not in predicate.source_case_keys
+            if predicate.kind == "rationale_contains" and not any(
+                predicate.observed_key == "business_outcome"
+                and predicate.expected_value == rules[source].expected
+                for source in predicate.source_case_keys
             ):
                 raise PrivateBenchmarkCatalogError("rationale predicate is not source grounded")
             if predicate.kind == "tool_receipt":
@@ -503,20 +516,21 @@ def write_private_benchmark_catalog(
     *,
     seed: bytes,
     manifest_path: str = "catalog.json",
-    forbidden_roots: tuple[Path, ...] = (),
+    forbidden_roots: tuple[Path, ...] | None = None,
 ) -> ArtifactRef:
     """Create an idempotent local catalog; never print or serialize the seed."""
 
-    manifest = PrivateBenchmarkCatalogManifestV1(
-        suites=tuple(generate_private_benchmark_suite(item, seed=seed) for item in documents)
-    )
-    source = _canonical_bytes(manifest.model_dump(mode="json"))
     relative = PurePosixPath(manifest_path.replace("\\", "/"))
     if (relative.is_absolute() or relative.name == ""
             or any(part in {"", ".", ".."} for part in relative.parts)):
         raise PrivateBenchmarkCatalogError("private catalog path escapes its root")
     root = private_root.resolve(strict=False)
-    _require_root_confinement(root, forbidden_roots)
+    boundaries = _writer_forbidden_roots(root, forbidden_roots)
+    _require_root_confinement(root, boundaries)
+    manifest = PrivateBenchmarkCatalogManifestV1(
+        suites=tuple(generate_private_benchmark_suite(item, seed=seed) for item in documents)
+    )
+    source = _canonical_bytes(manifest.model_dump(mode="json"))
     root.mkdir(parents=True, exist_ok=True)
     _reject_reparse_point(private_root)
     target = root.joinpath(*relative.parts)
@@ -623,6 +637,33 @@ def repository_forbidden_roots(repository_root: Path) -> tuple[Path, ...]:
         for line in output.splitlines() if line.startswith("worktree ")
     )
     return tuple(dict.fromkeys((root, *worktrees)))
+
+
+def _writer_forbidden_roots(
+    root: Path, explicit: tuple[Path, ...] | None,
+) -> tuple[Path, ...]:
+    if explicit is not None:
+        if not explicit:
+            raise PrivateBenchmarkCatalogError(
+                "verified repository/worktree boundaries are required"
+            )
+        return explicit
+    known = repository_forbidden_roots(Path(__file__).resolve().parents[2])
+    _require_root_confinement(root, known)
+    discovered: list[Path] = []
+    for candidate in (root, *root.parents):
+        if (candidate / ".git").exists():
+            discovered.append(candidate.resolve(strict=True))
+    if root.exists():
+        try:
+            discovered.extend(
+                marker.parent.resolve(strict=True) for marker in root.rglob(".git")
+            )
+        except OSError:
+            raise PrivateBenchmarkCatalogError(
+                "repository/worktree boundary discovery failed"
+            ) from None
+    return tuple(dict.fromkeys((*known, *discovered)))
 
 
 def _require_root_confinement(

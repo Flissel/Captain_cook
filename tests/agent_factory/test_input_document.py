@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+import agenten.agent_factory.input_document as input_document_module
 
 from agenten.agent_factory.input_contracts import CredentialAlias, RequestedAgent
 from agenten.agent_factory.input_document import (
@@ -163,6 +164,37 @@ def test_semantically_hidden_policy_aliases_are_rejected(heading: str) -> None:
 
     with pytest.raises(FactoryInputError, match="private benchmark cases"):
         parse_factory_input_bytes(source.encode(), logical_name="TO_BE_BUILT.md")
+
+
+def test_private_heading_alias_matrix_is_rejected_before_parser_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    parser_calls = 0
+    original = input_document_module._level_sections
+
+    def counted_parser(text: str):
+        nonlocal parser_calls
+        parser_calls += 1
+        return original(text)
+
+    monkeypatch.setattr(input_document_module, "_level_sections", counted_parser)
+    for level in range(2, 7):
+        for authority in ("Private", "Confidential", "Hidden"):
+            for semantic in (
+                "expected", "result", "outcome", "answer", "predicate",
+                "benchmark", "holdout", "evaluation", "case", "fixture",
+            ):
+                malformed = source.replace(
+                    "## Helpful resources",
+                    f"## Helpful resources\n{'#' * level} {authority} {semantic}",
+                )
+                with pytest.raises(FactoryInputError, match="private benchmark cases"):
+                    parse_factory_input_bytes(
+                        malformed.encode(), logical_name="TO_BE_BUILT.md",
+                    )
+
+    assert parser_calls == 0
 
 
 @pytest.mark.parametrize(
