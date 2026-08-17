@@ -37,6 +37,7 @@ from gateway.capability_assembly_bootstrap import GatewayGenericBenchmarkRecorde
 from gateway.capability_live_pipeline import CapabilityLiveAuthorityUnavailable
 from agenten.delivery.minibook_events import MinibookProjectionEvent
 from gateway.store import GatewayStore
+from gateway.capability_assembly_production import RepositoryFactoryInputArtifactStore
 
 
 def _ref(payload: bytes) -> ArtifactRef:
@@ -467,9 +468,33 @@ def test_app_composes_injected_production_bundle_once_at_startup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import gateway.app as gateway_app
+    import gateway.capability_assembly_api as capability_api
 
     calls: list[str] = []
     composition = SimpleNamespace()
+    class Controller:
+        def submit(self, request: object) -> object:
+            raise AssertionError("health must not submit")
+
+        def projection(self, assembly_id: object) -> object:
+            raise AssertionError("health must not read a projection")
+
+        async def advance(self, request: object) -> object:
+            raise AssertionError("health must not advance")
+
+        def final_evidence(self, assembly_id: object) -> object:
+            raise AssertionError("health must not read final evidence")
+
+    controller = Controller()
+    def require_sealed(value: object) -> object:
+        calls.append("attest")
+        if value is not composition:
+            raise RuntimeError("not the lifespan composition")
+        return controller
+
+    monkeypatch.setattr(
+        capability_api, "require_production_capability_assembly", require_sealed,
+    )
     monkeypatch.setattr(
         gateway_app, "build_production_capability_assembly_from_environment",
         lambda **_kwargs: calls.append("build") or composition,
@@ -487,11 +512,101 @@ def test_app_composes_injected_production_bundle_once_at_startup(
         capability_assembly_private_catalog=SimpleNamespace(),
         capability_assembly_repository_root=tmp_path,
     )
+    app.dependency_overrides[gateway_app.require_captain] = lambda: None
 
     assert calls == []
-    with TestClient(app):
-        assert calls == ["build"]
-    assert calls == ["build", "close"]
+    with TestClient(app) as client:
+        response = client.get("/v1/capability-assemblies/health")
+        assert response.status_code == 200
+        assert response.json() == {
+            "schema": "captain.capability-assembly-api-health.v1",
+            "status": "ready",
+            "composition": "injected",
+        }
+        assert calls == ["build", "attest"]
+    assert calls == ["build", "attest", "close"]
+
+
+def test_production_plan_is_pure_and_reuses_the_provisioner_source_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gateway.capability_assembly_bootstrap as bootstrap
+
+    artifact_root = tmp_path / "artifacts"
+    raw_artifacts = ContentAddressedArtifactAdapter(artifact_root)
+    source_artifacts = RepositoryFactoryInputArtifactStore(artifacts=raw_artifacts)
+    store = SimpleNamespace(
+        _runtime_provider_proxy_bindings=frozenset({
+            ("http://127.0.0.1:18091", "c" * 64, "d" * 64),
+        }),
+        storage=SimpleNamespace(
+            transaction=lambda: (_ for _ in ()).throw(
+                AssertionError("plan touched a schema")
+            ),
+        ),
+    )
+    private_catalog = GatewayPrivateHoldoutStore(gateway_store=store)  # type: ignore[arg-type]
+    runtime = SimpleNamespace(
+        provisioning=SimpleNamespace(_source_artifacts=source_artifacts),
+    )
+    inputs = {
+        "demo_inputs/agent_factory/sales_pipeline_brief/TO_BE_BUILT.md": "1" * 64,
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md": "2" * 64,
+        "demo_inputs/agent_factory/claims_resolution/TO_BE_BUILT.md": "3" * 64,
+    }
+    environment = {
+        "CAPTAIN_CAPABILITY_ASSEMBLY_REPOSITORY_REVISION": "a" * 40,
+        "CAPTAIN_CAPABILITY_ASSEMBLY_INPUTS_JSON": json.dumps(inputs),
+        "CAPTAIN_CAPABILITY_ASSEMBLY_TOOL_GAPS_JSON": json.dumps(
+            {digest: [] for digest in inputs.values()}
+        ),
+        "CAPTAIN_CAPABILITY_ASSEMBLY_SUBJECT_VERSION": "1",
+        "CAPTAIN_PRIVATE_BENCHMARK_ROOT": str((tmp_path / "private").resolve()),
+        "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_PATH": "catalog.json",
+        "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256": "e" * 64,
+        "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
+        "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-plan-token",
+        "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
+        "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": "artifacts",
+        "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": "authority",
+        "CAPTAIN_GATEWAY_URL": "http://127.0.0.1:8088",
+        "CAPTAIN_GATEWAY_TOKEN": "gateway-plan-token",
+        "MINIBOOK_BACKEND_URL": "http://127.0.0.1:8080",
+        "MINIBOOK_API_KEY": "minibook-plan-key",
+        "MINIBOOK_PROJECTION_API_KEY": "projection-plan-key",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-plan-token",
+        "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
+        "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "provider-plan-token",
+        "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
+        "CAPTAIN_PROVIDER_POLICY_SHA256": "c" * 64,
+        "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "d" * 64,
+    }
+    monkeypatch.setattr(bootstrap, "_native_runtime_is_bound", lambda **_: True)
+    monkeypatch.setattr(
+        bootstrap.httpx, "AsyncClient",
+        lambda **_: (_ for _ in ()).throw(AssertionError("plan built an async client")),
+    )
+    monkeypatch.setattr(
+        bootstrap.httpx, "Client",
+        lambda **_: (_ for _ in ()).throw(AssertionError("plan built a sync client")),
+    )
+    monkeypatch.setattr(
+        Path, "mkdir",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plan created a directory")
+        ),
+    )
+
+    plan = bootstrap.plan_production_capability_assembly_from_environment(
+        repository_root=tmp_path,
+        environment=environment,
+        store=store,  # type: ignore[arg-type]
+        runtime=runtime,  # type: ignore[arg-type]
+        private_benchmark_catalog=private_catalog,
+    )
+
+    assert plan.source_artifacts is source_artifacts
+    assert not (tmp_path / "authority").exists()
 
 
 def test_bootstrap_rejects_raw_factory_runtime_before_schema_or_network() -> None:
@@ -519,6 +634,9 @@ def test_bootstrap_rejects_raw_factory_runtime_before_schema_or_network() -> Non
             {digest: [] for digest in digests.values()}
         ),
         "CAPTAIN_CAPABILITY_ASSEMBLY_SUBJECT_VERSION": "1",
+        "CAPTAIN_PRIVATE_BENCHMARK_ROOT": "C:/captain-private/private-benchmarks",
+        "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_PATH": "catalog.json",
+        "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256": "e" * 64,
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-secret-value",
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),

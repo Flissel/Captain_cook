@@ -455,7 +455,8 @@ def create_app(
     app.include_router(
         create_production_capability_assembly_router(
             selected_capability_assembly_factory
-            or unavailable_capability_assembly_composition
+            or unavailable_capability_assembly_composition,
+            resolve_lazily=production_requested,
         )
     )
 

@@ -269,15 +269,26 @@ def create_capability_assembly_router(
 
 def create_production_capability_assembly_router(
     composition_factory: CapabilityAssemblyCompositionFactory,
+    *,
+    resolve_lazily: bool = False,
 ) -> APIRouter:
     """Keep and attest the sealed production composition at every boundary."""
 
-    try:
-        composition: object = composition_factory()
-    except Exception:
-        composition = None
+    unresolved = object()
+    composition: object = unresolved if resolve_lazily else None
+    if not resolve_lazily:
+        try:
+            composition = composition_factory()
+        except Exception:
+            composition = None
 
     def resolve_controller() -> CapabilityAssemblyControllerPort | None:
+        nonlocal composition
+        if composition is unresolved:
+            try:
+                composition = composition_factory()
+            except Exception:
+                composition = None
         try:
             controller = require_production_capability_assembly(composition)
             return (

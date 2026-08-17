@@ -1106,7 +1106,20 @@ class CapabilityAssemblyFactoryRuntime:
     n8n: GatewayCapabilityN8nWorkBatchAuthority
 
 
-def build_production_capability_assembly_from_environment(
+@dataclass(frozen=True, repr=False)
+class CapabilityAssemblyProductionPlan:
+    """Pure, validated inputs for the explicit production materialization step."""
+
+    repository_root: Path
+    settings: CapabilityAssemblyBootstrapSettings
+    store: GatewayStore
+    runtime: CapabilityAssemblyFactoryRuntime
+    private_benchmark_catalog: GatewayPrivateHoldoutStore
+    source_artifacts: RepositoryFactoryInputArtifactStore
+    clock: Callable[[], datetime]
+
+
+def plan_production_capability_assembly_from_environment(
     *,
     repository_root: Path,
     environment: Mapping[str, str],
@@ -1114,8 +1127,8 @@ def build_production_capability_assembly_from_environment(
     runtime: CapabilityAssemblyFactoryRuntime,
     private_benchmark_catalog: GatewayPrivateHoldoutStore,
     clock: Callable[[], datetime] | None = None,
-) -> ProductionCapabilityAssemblyComposition:
-    """Compose one sealed D6 graph from one store and native authorities."""
+) -> CapabilityAssemblyProductionPlan:
+    """Validate the complete native graph without materializing any resource."""
 
     settings = load_capability_assembly_bootstrap_settings(
         environment=environment, repository_root=repository_root
@@ -1140,17 +1153,40 @@ def build_production_capability_assembly_from_environment(
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly provider authority is not Gateway-bound"
         )
-    artifacts = ContentAddressedArtifactAdapter(settings.artifact_root)
-    provisioner_artifacts = getattr(runtime.provisioning, "_source_artifacts", None)
+    source_artifacts = getattr(runtime.provisioning, "_source_artifacts", None)
+    artifacts = getattr(source_artifacts, "_artifacts", None)
     if (
-        type(provisioner_artifacts) is not ContentAddressedArtifactAdapter
-        or getattr(getattr(provisioner_artifacts, "_store", None), "root", None)
+        type(source_artifacts) is not RepositoryFactoryInputArtifactStore
+        or type(artifacts) is not ContentAddressedArtifactAdapter
+        or getattr(getattr(artifacts, "_store", None), "root", None)
         != settings.artifact_root
     ):
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly Factory CAS is not canonical"
         )
-    source_artifacts = RepositoryFactoryInputArtifactStore(artifacts=artifacts)
+    return CapabilityAssemblyProductionPlan(
+        repository_root=repository_root,
+        settings=settings,
+        store=store,
+        runtime=runtime,
+        private_benchmark_catalog=private_benchmark_catalog,
+        source_artifacts=source_artifacts,
+        clock=selected_clock,
+    )
+
+
+def materialize_production_capability_assembly(
+    plan: CapabilityAssemblyProductionPlan,
+) -> ProductionCapabilityAssemblyComposition:
+    """Materialize clients, local stores, and the sealed controller explicitly."""
+
+    settings = plan.settings
+    store = plan.store
+    runtime = plan.runtime
+    private_benchmark_catalog = plan.private_benchmark_catalog
+    source_artifacts = plan.source_artifacts
+    selected_clock = plan.clock
+    artifacts = source_artifacts._artifacts
     benchmark_executor = GatewayIsolatedBenchmarkExecutorClient(
         gateway_store=store,
         authority_id=settings.benchmark_authority_id,
@@ -1215,7 +1251,7 @@ def build_production_capability_assembly_from_environment(
         n8n_work_batches=runtime.n8n,
     )
     composition = build_capability_assembly_controller(
-        repository_root=repository_root,
+        repository_root=plan.repository_root,
         settings=settings.assembly,
         authorities=authorities,
         holdout_store=private_benchmark_catalog,
@@ -1223,6 +1259,29 @@ def build_production_capability_assembly_from_environment(
     )
     _BOOTSTRAP_RESOURCES[composition] = (resume_http, minibook_http)
     return composition
+
+
+def build_production_capability_assembly_from_environment(
+    *,
+    repository_root: Path,
+    environment: Mapping[str, str],
+    store: GatewayStore,
+    runtime: CapabilityAssemblyFactoryRuntime,
+    private_benchmark_catalog: GatewayPrivateHoldoutStore,
+    clock: Callable[[], datetime] | None = None,
+) -> ProductionCapabilityAssemblyComposition:
+    """Plan first, then explicitly materialize one sealed production graph."""
+
+    return materialize_production_capability_assembly(
+        plan_production_capability_assembly_from_environment(
+            repository_root=repository_root,
+            environment=environment,
+            store=store,
+            runtime=runtime,
+            private_benchmark_catalog=private_benchmark_catalog,
+            clock=clock,
+        )
+    )
 
 
 def _native_runtime_is_bound(
@@ -1288,6 +1347,7 @@ __all__ = [
     "CapabilityAssemblyBootstrapConfigurationError",
     "CapabilityAssemblyBootstrapSettings",
     "CapabilityAssemblyFactoryRuntime",
+    "CapabilityAssemblyProductionPlan",
     "CapabilityProductionBundleHealthV1",
     "CapabilityProductionBundleManifestV1",
     "CapabilityProductionProcessBindingV1",
@@ -1303,4 +1363,6 @@ __all__ = [
     "close_production_capability_assembly",
     "load_capability_assembly_bootstrap_settings",
     "load_capability_production_bundle_manifest",
+    "materialize_production_capability_assembly",
+    "plan_production_capability_assembly_from_environment",
 ]
