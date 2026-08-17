@@ -453,10 +453,22 @@ async def test_green_business_benchmark_reaches_ready_to_use(profile_id: str) ->
     ).model_dump(mode="json", by_alias=True)
     persisted_summary = _factory_promotion_benchmark_summary(store, promotion_payload)
     assert persisted_summary == result.summary
+    projection_job_id = uuid5(
+        NAMESPACE_URL, f"business-benchmark-projection:{profile_id}"
+    )
+    promotion_payload = {
+        **promotion_payload, "job_id": str(projection_job_id),
+    }
+    projection_job = {
+        **job.model_dump(mode="json", by_alias=True),
+        "job_id": str(projection_job_id),
+    }
     public = factory_promotion_projection(
         promotion_payload,
-        job.model_dump(mode="json", by_alias=True),
-        benchmark_summary=persisted_summary,
+        projection_job,
+        benchmark_summary=persisted_summary.model_copy(
+            update={"job_id": projection_job_id}
+        ),
     )
     rendered = public.model_dump(mode="json", by_alias=True)
     assert rendered["correlation_id"] == str(job.correlation_id)

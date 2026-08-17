@@ -7421,6 +7421,8 @@ class GatewayStore:
         if row is None:
             return None
         payload = self._decode_json(row["payload"])
+        if not isinstance(payload, dict) or "context" not in payload:
+            return None
         context = ProviderBudgetContextV1.model_validate(payload["context"])
         if context.sha256 != digest:
             raise HTTPException(status_code=409, detail="provider authority is unavailable")
