@@ -26,7 +26,11 @@ from gateway.factory_action_store import (
     _normalize_legacy_db_row,
     MariaDBFactoryActionRepository,
 )
-from gateway.portal_store import FactoryCredentialCoordinator, FactoryCredentialReceipt
+from gateway.portal_store import (
+    FactoryCredentialAmbiguousError,
+    FactoryCredentialCoordinator,
+    FactoryCredentialReceipt,
+)
 from tests.support.mariadb import assert_isolated_test_database
 
 
@@ -1170,7 +1174,7 @@ def test_blocked_credential_write_that_crosses_deadline_is_revoked_and_not_persi
     assert "private-fixture-value" not in repr(durable)
 
 
-def test_credential_adapter_exception_releases_reservation_for_retry() -> None:
+def test_credential_lookup_none_preserves_reservation_for_later_authoritative_retry() -> None:
     repository = TransactionalMemoryActionRepository()
     store = FactoryActionStore(repository=repository)
     request = pending_request()
@@ -1199,14 +1203,14 @@ def test_credential_adapter_exception_releases_reservation_for_retry() -> None:
 
     adapter = RetryAdapter()
     coordinator = FactoryCredentialCoordinator(store=store, adapter=adapter, clock=lambda: NOW)
-    with pytest.raises(RuntimeError, match="boundary unavailable"):
+    with pytest.raises(FactoryCredentialAmbiguousError, match="unresolved"):
         coordinator.store_and_answer(
             request_id=request.request_id, tenant_id="tenant-a",
             expected_subject_version=request.expected_subject_version,
             credential_alias="n8n-crm-read", secret_value="private-fixture-value",
             reserved_at=NOW,
         )
-    assert repository.rows[str(request.request_id)].credential_reservation_key is None
+    assert repository.rows[str(request.request_id)].credential_reservation_key is not None
 
     assert coordinator.store_and_answer(
         request_id=request.request_id, tenant_id="tenant-a",
@@ -1214,10 +1218,10 @@ def test_credential_adapter_exception_releases_reservation_for_retry() -> None:
         credential_alias="n8n-crm-read", secret_value="private-fixture-value",
         reserved_at=NOW,
     ) == "credential://tenant-a/n8n-crm-read"
-    assert repository.rows[str(request.request_id)].status == "answered"
+    assert repository.rows[str(request.request_id)].status == "pending"
 
 
-def test_untyped_credential_receipt_releases_reservation_without_an_opaque_reference() -> None:
+def test_untyped_credential_receipt_preserves_reservation_without_an_opaque_reference() -> None:
     repository = TransactionalMemoryActionRepository()
     store = FactoryActionStore(repository=repository)
     request = pending_request()
@@ -1234,7 +1238,7 @@ def test_untyped_credential_receipt_releases_reservation_without_an_opaque_refer
         def revoke_credential(self, *, reservation_key, credential_ref):
             revoked.append((reservation_key, credential_ref))
 
-    with pytest.raises(ValueError, match="credential receipt"):
+    with pytest.raises(FactoryCredentialAmbiguousError, match="unresolved"):
         FactoryCredentialCoordinator(
             store=store, adapter=UntypedReceiptAdapter(), clock=lambda: NOW
         ).store_and_answer(
@@ -1248,12 +1252,12 @@ def test_untyped_credential_receipt_releases_reservation_without_an_opaque_refer
 
     durable = repository.rows[str(request.request_id)]
     assert durable.status == "pending"
-    assert durable.credential_reservation_key is None
+    assert durable.credential_reservation_key is not None
     assert revoked == []
     assert "private-fixture-value" not in repr(durable)
 
 
-def test_credential_reaper_releases_untyped_receipt_without_retaining_a_reservation() -> None:
+def test_credential_reaper_preserves_untyped_receipt_for_authoritative_reconciliation() -> None:
     repository = TransactionalMemoryActionRepository()
     store = FactoryActionStore(repository=repository)
     request = pending_request()
@@ -1283,7 +1287,7 @@ def test_credential_reaper_releases_untyped_receipt_without_retaining_a_reservat
 
     durable = repository.rows[str(request.request_id)]
     assert durable.status == "pending"
-    assert durable.credential_reservation_key is None
+    assert durable.credential_reservation_key is not None
     assert revoked == []
 
 
@@ -1334,7 +1338,8 @@ def test_credential_commit_then_raise_reconciles_exact_receipt_without_duplicate
 
     assert reference == "credential://tenant-a/n8n-crm-read"
     assert adapter.calls == 1
-    assert repository.rows[str(request.request_id)].status == "answered"
+    assert repository.rows[str(request.request_id)].status == "pending"
+    assert repository.rows[str(request.request_id)].credential_ref == reference
     assert "private-fixture-value" not in repr(repository.rows)
 
 
@@ -1380,7 +1385,8 @@ def test_credential_restart_reconciles_valid_receipt_and_revokes_expired_receipt
         adapter=Adapter(), clock=lambda: NOW,
     ).recover()
 
-    assert repository.rows[str(valid.request_id)].status == "answered"
+    assert repository.rows[str(valid.request_id)].status == "pending"
+    assert repository.rows[str(valid.request_id)].credential_ref == f"credential://tenant-a/{valid.request_id}"
     assert repository.rows[str(expired.request_id)].status == "expired"
     assert revoked == [f"credential://tenant-a/{expired.request_id}"]
     assert all(row.credential_reservation_key is None for row in repository.rows.values())
@@ -1451,7 +1457,8 @@ def test_concurrent_duplicate_credential_submissions_create_one_sink_effect() ->
     assert errors == []
     assert results == ["credential://tenant-a/n8n-crm-read"] * 2
     assert len(adapter.effects) == 1
-    assert repository.rows[str(request.request_id)].status == "answered"
+    assert repository.rows[str(request.request_id)].status == "pending"
+    assert repository.rows[str(request.request_id)].credential_ref == "credential://tenant-a/n8n-crm-read"
 
 
 def _capture_error(errors: list[Exception], operation) -> None:

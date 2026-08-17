@@ -78,6 +78,7 @@ from gateway.portal_control_auth import (
     require_restart_control,
 )
 from gateway.portal_n8n_composition import build_portal_n8n_adapter_bundle
+from gateway.portal_store import FactoryCredentialCoordinator
 from gateway.portal_contracts import (
     PortalFactoryCredentialReferenceV1,
     PortalFactoryCredentialWriteV1,
@@ -377,7 +378,7 @@ def create_app(
                     get_store(), "recover_factory_credentials", None
                 )
                 if recover_credentials is not None:
-                    recover_credentials(now=portal_clock())
+                    recover_credentials(clock=portal_clock)
                 resume_dispatcher.recover()
             yield
         finally:
@@ -460,6 +461,15 @@ def create_app(
                     ),
                 )
         return owned_resume_service
+
+    def require_factory_action_inbox_dispatcher() -> FactoryActionResumeDispatcher:
+        dispatcher = get_factory_action_resume_dispatcher()
+        if dispatcher is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="factory action resume capability is disabled",
+            )
+        return dispatcher
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -769,9 +779,14 @@ def create_app(
         limit: int = Query(default=100, ge=1, le=100),
         principal: PortalPrincipalV1 = Depends(require_portal_principal),
     ) -> tuple[FactoryActionRequestV1, ...]:
-        return get_store().portal_factory_actions(
-            principal=principal, status=status_filter, now=portal_clock(),
-            after_request_id=cursor, limit=limit,
+        require_factory_action_inbox_dispatcher()
+        return await run_in_threadpool(
+            get_store().portal_factory_actions,
+            principal=principal,
+            status=status_filter,
+            now=portal_clock(),
+            after_request_id=cursor,
+            limit=limit,
         )
 
     @app.get("/v1/portal/factory-actions/{request_id}")
@@ -780,8 +795,12 @@ def create_app(
         principal: PortalPrincipalV1 = Depends(require_portal_principal),
     ) -> FactoryActionRequestV1:
         try:
-            return get_store().portal_factory_action(
-                request_id=request_id, principal=principal, now=portal_clock()
+            require_factory_action_inbox_dispatcher()
+            return await run_in_threadpool(
+                get_store().portal_factory_action,
+                request_id=request_id,
+                principal=principal,
+                now=portal_clock(),
             )
         except LookupError:
             raise HTTPException(status_code=404, detail="factory action not found") from None
@@ -793,12 +812,7 @@ def create_app(
         principal: PortalPrincipalV1 = Depends(require_portal_principal),
     ) -> FactoryActionResponseV1:
         try:
-            resume_dispatcher = get_factory_action_resume_dispatcher()
-            if resume_dispatcher is None:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="factory action resume capability is disabled",
-                )
+            resume_dispatcher = require_factory_action_inbox_dispatcher()
             try:
                 response = FactoryActionResponseV1.model_validate(await request.json())
             except (TypeError, ValueError):
@@ -806,7 +820,8 @@ def create_app(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail="invalid portal request",
                 ) from None
-            answered = get_store().answer_portal_factory_action(
+            answered = await run_in_threadpool(
+                get_store().answer_portal_factory_action,
                 request_id=request_id,
                 principal=principal,
                 response=response,
@@ -828,26 +843,26 @@ def create_app(
     )
     async def store_portal_factory_credential(
         request_id: UUID,
-        request: PortalFactoryCredentialWriteV1,
+        request: Request,
         principal: PortalPrincipalV1 = Depends(require_portal_principal),
     ) -> PortalFactoryCredentialReferenceV1:
         try:
-            resume_dispatcher = get_factory_action_resume_dispatcher()
-            if resume_dispatcher is None:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="factory action resume capability is disabled",
+            require_factory_action_inbox_dispatcher()
+            try:
+                credential = PortalFactoryCredentialWriteV1.model_validate(
+                    await request.json()
                 )
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="invalid portal request",
+                ) from None
             reference = await run_in_threadpool(
-                get_store().store_portal_factory_credential,
+                _store_factory_credential,
                 request_id=request_id,
                 principal=principal,
-                request=request,
-                now=portal_clock(),
-            )
-            resume_dispatcher.enqueue(
-                request_id=request_id,
-                tenant_id=principal.organization_id,
+                credential=credential,
+                reserved_at=portal_clock(),
             )
             return PortalFactoryCredentialReferenceV1(credential_ref=reference)
         except LookupError:
@@ -856,6 +871,31 @@ def create_app(
             raise HTTPException(status_code=503, detail="credential store unavailable") from None
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from None
+
+    def _store_factory_credential(
+        *,
+        request_id: UUID,
+        principal: PortalPrincipalV1,
+        credential: PortalFactoryCredentialWriteV1,
+        reserved_at: datetime,
+    ) -> str:
+        if factory_credential_adapter is None:
+            raise RuntimeError("factory credential store unavailable")
+        action = get_store().portal_factory_action(
+            request_id=request_id, principal=principal, now=reserved_at
+        )
+        return FactoryCredentialCoordinator(
+            store=get_store().factory_action_resume_consumer(),
+            adapter=factory_credential_adapter,
+            clock=portal_clock,
+        ).store_and_link(
+            request_id=request_id,
+            tenant_id=principal.organization_id,
+            expected_subject_version=action.expected_subject_version,
+            credential_alias=credential.credential_alias,
+            secret_value=credential.secret_value.get_secret_value(),
+            reserved_at=reserved_at,
+        )
 
     @app.post("/v1/factory/budget/reservations", status_code=status.HTTP_201_CREATED)
     async def reserve_factory_budget(

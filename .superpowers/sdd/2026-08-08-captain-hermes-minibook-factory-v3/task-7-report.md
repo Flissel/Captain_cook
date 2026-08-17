@@ -50,3 +50,41 @@ scoped commit.
 `TEST_MARIADB_DSN` was not configured, so the 132 MariaDB-gated Gateway tests
 were skipped. These offline checks do not claim a live credential adapter,
 MariaDB integration, Minibook sink, scheduler, provider, or deployment run.
+
+## Authority hardening round 1
+
+### Delivered decisions
+
+- A `deny` response projects the typed decision with redacted `status=denied`,
+  then reaches the durable `denial_acknowledged` terminal state. It never
+  schedules a continuation, including on replay.
+- Credential upload is a dedicated, fenced, thread-pooled secret boundary. It
+  links only an opaque credential reference and does not answer or enqueue.
+  Only the explicit typed response route answers and enqueues.
+- `GatewayStore` no longer accepts a raw credential request or secret value.
+  The app-level dedicated coordinator sends the secret only to the credential
+  adapter; Gateway persistence receives reservation metadata and opaque refs.
+- Every Action Inbox route checks the enabled dispatcher before store access;
+  the credential route parses its raw body only after that fence. List, read,
+  answer, and credential store calls use worker threads for blocking work.
+- Credential lookup `None` or untyped results preserve the durable reservation
+  for authoritative later reconciliation. Reaping receives a live clock
+  callable, and a durable linked-reference read is checked before revocation.
+
+### RED to GREEN evidence
+
+- RED: `python -m pytest --no-cov tests/agent_factory/test_action_resume.py -q -k denied_action`
+  - Result: `1 failed`; deny projected as answered and scheduled a continuation.
+- GREEN: same command -> `1 passed, 17 deselected`.
+- RED: `python -m pytest --no-cov tests/gateway/test_portal_api.py -q -k "factory_action_routes_are_authenticated or disabled_action_inbox_fences_list"`
+  - Result: `2 failed`; credential upload enqueued, and disabled list/read/raw
+    credential calls reached parsing or normal handling.
+- GREEN: same command -> `2 passed, 17 deselected`.
+
+### Final verification
+
+- `python -m pytest --no-cov tests/gateway/test_factory_action_store.py tests/gateway/test_portal_api.py tests/agent_factory/test_action_resume.py -q` -> `112 passed, 7 skipped`.
+- `python -m pytest --no-cov tests/gateway -q` -> `479 passed, 132 skipped`.
+- `python -m pytest --no-cov tests/test_architecture_fitness.py tests/test_import_boundaries.py tests/test_workstream_docs.py -q` -> `18 passed`.
+- `python -m compileall -q agenten blockchain chats config gateway` -> passed.
+- `git diff --check` -> passed; changed-file credential-shaped literal scan -> no findings.

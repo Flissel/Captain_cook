@@ -22,6 +22,10 @@ from gateway.portal_contracts import (
 _INVALID_TICKET: Final = "invalid portal setup ticket"
 
 
+class FactoryCredentialAmbiguousError(RuntimeError):
+    """The credential boundary cannot yet authoritatively settle a reservation."""
+
+
 @runtime_checkable
 class FactoryCredentialAdapter(Protocol):
     """Dedicated idempotent and reversible credential boundary."""
@@ -42,7 +46,7 @@ class FactoryCredentialAdapter(Protocol):
     ) -> "FactoryCredentialReceipt | None": ...
 
     def revoke_credential(
-        self, *, reservation_key: str, credential_ref: str
+        self, *, reservation_key: str, credential_ref: str | None = None
     ) -> None: ...
 
 
@@ -79,7 +83,11 @@ class FactoryCredentialReservationStore(Protocol):
     def complete_credential_reservation(
         self, request_id: UUID, *, tenant_id: str, reservation_key: str,
         credential_ref: str, now: datetime,
-    ) -> object: ...
+    ) -> str: ...
+
+    def credential_reference(
+        self, request_id: UUID, *, tenant_id: str
+    ) -> str | None: ...
 
     def release_credential_reservation(
         self, request_id: UUID, *, tenant_id: str, reservation_key: str
@@ -97,7 +105,7 @@ class FactoryCredentialCoordinator:
         self._adapter = adapter
         self._clock = clock
 
-    def store_and_answer(
+    def store_and_link(
         self, *, request_id: UUID, tenant_id: str, expected_subject_version: int,
         credential_alias: str, secret_value: str, reserved_at: datetime,
     ) -> str:
@@ -121,7 +129,11 @@ class FactoryCredentialCoordinator:
                 except Exception:
                     receipt = self._adapter.lookup_credential(reservation_key)
                     if receipt is None:
-                        raise
+                        raise FactoryCredentialAmbiguousError(
+                            "credential receipt is unresolved"
+                        ) from None
+            if not isinstance(receipt, FactoryCredentialReceipt):
+                raise FactoryCredentialAmbiguousError("credential receipt is unresolved")
             self._validate_receipt(
                 receipt,
                 reservation_key=reservation_key, tenant_id=tenant_id,
@@ -133,8 +145,20 @@ class FactoryCredentialCoordinator:
                 credential_ref=receipt.opaque_reference, now=self._clock(),
             )
             return receipt.opaque_reference
+        except FactoryCredentialAmbiguousError:
+            # A timeout or malformed read is not proof the external write did not commit.
+            # Keep the durable key for an authoritative later lookup/reconciliation.
+            raise
         except Exception:
             try:
+                linked_reference = self._store.credential_reference(
+                    request_id, tenant_id=tenant_id
+                )
+                if (
+                    isinstance(receipt, FactoryCredentialReceipt)
+                    and linked_reference == receipt.opaque_reference
+                ):
+                    return linked_reference
                 if isinstance(receipt, FactoryCredentialReceipt):
                     self._adapter.revoke_credential(
                         reservation_key=reservation_key,
@@ -146,6 +170,27 @@ class FactoryCredentialCoordinator:
                 )
             raise
 
+    def store_and_answer(
+        self,
+        *,
+        request_id: UUID,
+        tenant_id: str,
+        expected_subject_version: int,
+        credential_alias: str,
+        secret_value: str,
+        reserved_at: datetime,
+    ) -> str:
+        """Compatibility name; this only links a credential and never answers."""
+
+        return self.store_and_link(
+            request_id=request_id,
+            tenant_id=tenant_id,
+            expected_subject_version=expected_subject_version,
+            credential_alias=credential_alias,
+            secret_value=secret_value,
+            reserved_at=reserved_at,
+        )
+
     def recover(self) -> None:
         """Reconcile secret-free durable reservations after process restart."""
 
@@ -153,10 +198,9 @@ class FactoryCredentialCoordinator:
             self._store.iter_credential_reservations()
         ):
             receipt = self._adapter.lookup_credential(reservation_key)
-            if receipt is None:
-                self._store.release_credential_reservation(
-                    request_id, tenant_id=tenant_id, reservation_key=reservation_key
-                )
+            if not isinstance(receipt, FactoryCredentialReceipt):
+                # Preserve ambiguous reservations until the adapter can make an
+                # authoritative lookup; deleting the key could duplicate a write.
                 continue
             try:
                 self._validate_receipt(

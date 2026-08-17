@@ -300,13 +300,13 @@ class GatewayStore:
         """Expose the durable Action Inbox state machine to the resume worker."""
         return self._factory_actions
 
-    def recover_factory_credentials(self, *, now: datetime) -> None:
+    def recover_factory_credentials(self, *, clock: Callable[[], datetime]) -> None:
         if self._factory_credential_adapter is None:
             return
         FactoryCredentialCoordinator(
             store=self._factory_actions,
             adapter=self._factory_credential_adapter,
-            clock=lambda: now,
+            clock=clock,
         ).recover()
 
     def portal_factory_actions(
@@ -346,36 +346,6 @@ class GatewayStore:
             raise ValueError("factory action request_id must match route")
         return self._factory_actions.answer(
             response, tenant_id=principal.organization_id, now=now
-        )
-
-    def store_portal_factory_credential(
-        self,
-        *,
-        request_id: UUID,
-        principal: PortalPrincipalV1,
-        request: PortalFactoryCredentialWriteV1,
-        now: datetime,
-    ) -> str:
-        action = self._factory_actions.get(
-            request_id,
-            tenant_id=principal.organization_id,
-            now=now,
-        )
-        if action.status != "pending" or action.request_type != "credential_required":
-            raise ValueError("factory action does not accept a credential")
-        if self._factory_credential_adapter is None:
-            raise RuntimeError("factory credential store unavailable")
-        return FactoryCredentialCoordinator(
-            store=self._factory_actions,
-            adapter=self._factory_credential_adapter,
-            clock=_utcnow,
-        ).store_and_answer(
-            tenant_id=principal.organization_id,
-            request_id=request_id,
-            expected_subject_version=action.expected_subject_version,
-            credential_alias=request.credential_alias,
-            secret_value=request.secret_value.get_secret_value(),
-            reserved_at=now,
         )
 
     def configure_portal_sources(

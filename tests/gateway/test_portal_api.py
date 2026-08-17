@@ -22,6 +22,7 @@ from gateway.portal_contracts import (
     PortalTenantBindingV1,
 )
 from agenten.agent_factory.forge_contracts import FactoryActionRequestV1, FactoryActionResponseV1
+from gateway.portal_store import FactoryCredentialReceipt
 from gateway.settings import GatewaySettings
 from tests.gateway.test_integration_setup_api import ready_setup_payload, setup_payload
 from tests.agent_factory.test_state_machine import job
@@ -224,10 +225,40 @@ class FakePortalGatewayStore:
         self.factory_answer = response
         return response
 
-    def store_portal_factory_credential(self, *, request_id, principal, request, now):
-        self.portal_factory_action(request_id=request_id, principal=principal, now=NOW)
-        assert request.secret_value.get_secret_value() == "secret-value"
-        return "credential://org-a/n8n-crm-read"
+    def factory_action_resume_consumer(self):
+        return self
+
+    def reserve_credential(self, request_id, *, tenant_id, expected_subject_version, credential_alias, now):
+        del request_id, tenant_id, expected_subject_version, credential_alias, now
+        return "a" * 64
+
+    def complete_credential_reservation(self, request_id, *, tenant_id, reservation_key, credential_ref, now):
+        del request_id, tenant_id, reservation_key, now
+        return credential_ref
+
+    def release_credential_reservation(self, request_id, *, tenant_id, reservation_key):
+        del request_id, tenant_id, reservation_key
+
+    def credential_reference(self, request_id, *, tenant_id):
+        del request_id, tenant_id
+        return None
+
+
+class TestFactoryCredentialAdapter:
+    def lookup_credential(self, reservation_key):
+        del reservation_key
+        return None
+
+    def store_credential(self, *, reservation_key, tenant_id, request_id, expected_subject_version, purpose, secret_value):
+        assert secret_value == "secret-value"
+        reference = "credential://org-a/n8n-crm-read"
+        return FactoryCredentialReceipt(
+            reservation_key, tenant_id, request_id, expected_subject_version, purpose,
+            reference, "d4862ebc87fb0c834eea1ea429df7d9bfaed6922e920dce6e610c3581dc4a746",
+        )
+
+    def revoke_credential(self, *, reservation_key, credential_ref=None):
+        del reservation_key, credential_ref
 
 
 class RecordingResumeDispatcher:
@@ -309,6 +340,7 @@ def client_for(
         ),
         portal_clock=lambda: NOW,
         factory_action_resume_dispatcher=configured_dispatcher,
+        factory_credential_adapter=TestFactoryCredentialAdapter(),
     )
     application.state.portal_token_verifier = StaticVerifier(principal)
     return TestClient(application)
@@ -320,7 +352,12 @@ def auth() -> dict[str, str]:
 
 def test_factory_action_routes_are_authenticated_tenant_scoped_and_secret_free() -> None:
     store = FakePortalGatewayStore()
-    with client_for(PortalPrincipalV1(subject_id="user-a", organization_id="org-a"), store) as client:
+    dispatcher = RecordingResumeDispatcher()
+    with client_for(
+        PortalPrincipalV1(subject_id="user-a", organization_id="org-a"),
+        store,
+        resume_dispatcher=dispatcher,
+    ) as client:
         listed = client.get("/v1/portal/factory-actions?status=pending", headers=auth())
         assert listed.status_code == 200
         request = listed.json()[0]
@@ -335,6 +372,8 @@ def test_factory_action_routes_are_authenticated_tenant_scoped_and_secret_free()
         assert credential.status_code == 201
         assert credential.json() == {"credential_ref": "credential://org-a/n8n-crm-read"}
         assert "secret-value" not in credential.text
+        assert store.factory_answer is None
+        assert dispatcher.enqueued == []
 
         response_payload = FactoryActionResponseV1.model_validate_json(
             (Path(__file__).parents[1] / "fixtures" / "contracts" / "factory_action_response.v1.json").read_text(encoding="utf-8")
@@ -346,6 +385,7 @@ def test_factory_action_routes_are_authenticated_tenant_scoped_and_secret_free()
         )
         assert answered.status_code == 200
         assert answered.json()["credential_ref"] == "credential://org-a/n8n-crm-read"
+        assert dispatcher.enqueued == [(store.factory_action.request_id, "org-a")]
 
     with client_for(PortalPrincipalV1(subject_id="user-b", organization_id="org-b"), store) as client:
         assert client.get("/v1/portal/factory-actions?status=pending", headers=auth()).json() == []
@@ -410,6 +450,24 @@ def test_disabled_action_inbox_fences_injected_dispatcher_before_body_admission(
     assert store.factory_answer is None
     assert store.factory_answer_calls == 0
     assert dispatcher.enqueued == []
+
+
+def test_disabled_action_inbox_fences_list_read_and_raw_credential_before_store_or_body() -> None:
+    store = FakePortalGatewayStore()
+    principal = PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+    with client_for(principal, store, action_resume_enabled=False) as client:
+        listed = client.get("/v1/portal/factory-actions?status=pending", headers=auth())
+        read = client.get(
+            f"/v1/portal/factory-actions/{store.factory_action.request_id}", headers=auth()
+        )
+        credential = client.post(
+            f"/v1/portal/factory-actions/{store.factory_action.request_id}/credentials",
+            headers={**auth(), "Content-Type": "application/json"},
+            content=b"this body must never be parsed",
+        )
+
+    assert listed.status_code == read.status_code == credential.status_code == 503
+    assert store.factory_answer_calls == 0
 
 
 def test_enabled_action_inbox_rejects_partial_default_composition() -> None:

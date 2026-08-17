@@ -165,6 +165,34 @@ def test_resume_does_not_schedule_when_action_is_not_answered() -> None:
     assert scheduler.values == []
 
 
+def test_denied_action_is_durably_projected_without_scheduling_a_continuation() -> None:
+    request = FactoryActionRequestV1.model_validate_json(
+        (FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8")
+    )
+    response = FactoryActionResponseV1.model_validate_json(
+        (FIXTURES / "factory_action_response.v1.json").read_text(encoding="utf-8")
+    ).model_copy(update={"decision": "deny", "credential_ref": None})
+    repository = TransactionalMemoryActionRepository()
+    store = FactoryActionStore(repository=repository)
+    store.create(request, tenant_id="tenant-a")
+    store.answer(response, tenant_id="tenant-a", now=NOW)
+    projection = RecordingProjection()
+    scheduler = RecordingScheduler()
+    coordinator = FactoryActionResumeCoordinator(
+        store=store, projection=projection, scheduler=scheduler, clock=lambda: NOW
+    )
+
+    assert coordinator.resume(request_id=request.request_id, tenant_id="tenant-a") == response
+    assert projection.values[0]["status"] == "denied"
+    assert scheduler.values == []
+    durable = repository.rows[str(request.request_id)]
+    assert durable.status == "consumed"
+    assert durable.resume_phase == "denial_acknowledged"
+
+    assert coordinator.resume(request_id=request.request_id, tenant_id="tenant-a") == response
+    assert scheduler.values == []
+
+
 def test_resume_at_deadline_writes_no_projection_or_continuation_intent() -> None:
     request = FactoryActionRequestV1.model_validate_json(
         (FIXTURES / "factory_action_request.v1.json").read_text(encoding="utf-8")

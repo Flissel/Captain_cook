@@ -24,6 +24,7 @@ ResumePhase = Literal[
     "answered",
     "projection_intent",
     "projection_acknowledged",
+    "denial_acknowledged",
     "continuation_intent",
     "continuation_acknowledged",
 ]
@@ -54,6 +55,7 @@ class FactoryActionRow:
     credential_reservation_key: str | None = None
     credential_alias: str | None = None
     credential_reserved_at: datetime | None = None
+    credential_ref: str | None = None
 
 
 class FactoryActionRepository(Protocol):
@@ -292,10 +294,18 @@ class FactoryActionStore:
             if row.credential_reservation_key == reservation_key and row.status == "pending":
                 self._clear_credential_reservation(row)
 
+    def credential_reference(
+        self, request_id: UUID, *, tenant_id: str
+    ) -> str | None:
+        with self._repository.locked(request_id, tenant_id=tenant_id) as row:
+            if row is None:
+                raise LookupError("factory action not found")
+            return row.credential_ref
+
     def complete_credential_reservation(
         self, request_id: UUID, *, tenant_id: str, reservation_key: str,
         credential_ref: str, now: datetime,
-    ) -> FactoryActionResponseV1:
+    ) -> str:
         now_utc = _exact_utc(now, field="answered_at")
         with self._repository.locked(request_id, tenant_id=tenant_id) as row:
             if row is None:
@@ -304,9 +314,9 @@ class FactoryActionStore:
                 row.status = "expired"
                 self._clear_credential_reservation(row)
                 raise TimeoutError("factory action expired")
-            if row.status == "answered" and row.response is not None:
-                if row.response.idempotency_key == reservation_key and row.response.credential_ref == credential_ref:
-                    return row.response
+            if row.credential_ref is not None:
+                if row.credential_ref == credential_ref:
+                    return credential_ref
                 raise ValueError("factory credential reservation conflict")
             if row.status != "pending" or row.credential_reservation_key != reservation_key:
                 raise ValueError("factory credential reservation mismatch")
@@ -315,22 +325,9 @@ class FactoryActionStore:
             alias = row.credential_alias
             if alias is None:
                 raise FactoryActionDurabilityError("factory credential reservation is incomplete")
-            response = FactoryActionResponseV1(
-                request_id=request_id,
-                expected_subject_version=row.request.expected_subject_version,
-                decision="approve", approved_scope=row.request.required_scope,
-                credential_ref=credential_ref,
-                answer_metadata={"credential_alias": alias},
-                answered_at=now_utc, idempotency_key=reservation_key,
-            )
-            validate_action_response_binding(row.request, response)
-            canonical = _canonical(response)
-            row.response = response
-            row.response_sha256 = hashlib.sha256(canonical).hexdigest()
-            row.status = "answered"
-            row.resume_phase = "answered"
+            row.credential_ref = credential_ref
             self._clear_credential_reservation(row)
-            return response
+            return credential_ref
 
     @staticmethod
     def _clear_credential_reservation(row: FactoryActionRow) -> None:
@@ -413,10 +410,17 @@ class FactoryActionStore:
             if row.projection_idempotency_key != idempotency_key:
                 raise ValueError("factory action projection acknowledgement mismatch")
             if row.resume_phase == "projection_intent":
-                row.projection_acknowledged_at = _transition_time(row, now)
-                row.resume_phase = "projection_acknowledged"
+                acknowledged_at = _transition_time(row, now)
+                row.projection_acknowledged_at = acknowledged_at
+                if row.response is not None and row.response.decision == "deny":
+                    row.resume_phase = "denial_acknowledged"
+                    row.status = "consumed"
+                    row.consumed_at = acknowledged_at
+                else:
+                    row.resume_phase = "projection_acknowledged"
             elif row.resume_phase not in {
                 "projection_acknowledged",
+                "denial_acknowledged",
                 "continuation_intent",
                 "continuation_acknowledged",
             }:
@@ -519,6 +523,7 @@ class MariaDBFactoryActionRepository:
                         credential_reservation_key CHAR(64) NULL,
                         credential_alias VARCHAR(128) NULL,
                         credential_reserved_at DATETIME(6) NULL,
+                        credential_ref VARCHAR(512) NULL,
                         created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                         updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
                             ON UPDATE CURRENT_TIMESTAMP(6),
@@ -541,6 +546,7 @@ class MariaDBFactoryActionRepository:
                     "credential_reservation_key CHAR(64) NULL",
                     "credential_alias VARCHAR(128) NULL",
                     "credential_reserved_at DATETIME(6) NULL",
+                    "credential_ref VARCHAR(512) NULL",
                 ):
                     cursor.execute(
                         f"ALTER TABLE factory_action_inbox ADD COLUMN IF NOT EXISTS {definition}"
@@ -681,7 +687,8 @@ class MariaDBFactoryActionRepository:
                            continuation_intent_at = %s,
                            continuation_acknowledged_at = %s, consumed_at = %s
                            , credential_reservation_key = %s,
-                           credential_alias = %s, credential_reserved_at = %s
+                           credential_alias = %s, credential_reserved_at = %s,
+                           credential_ref = %s
                            WHERE request_id = %s AND tenant_id = %s""",
                         (
                             row.status,
@@ -698,6 +705,7 @@ class MariaDBFactoryActionRepository:
                             row.credential_reservation_key,
                             row.credential_alias,
                             None if row.credential_reserved_at is None else _naive_utc(row.credential_reserved_at),
+                            row.credential_ref,
                             str(request_id), tenant_id,
                         ),
                     )
@@ -907,7 +915,11 @@ def _db_row(row: dict[str, object]) -> FactoryActionRow:
         or (status == "answered" and response is not None and phase in {
             "answered", "projection_intent", "projection_acknowledged", "continuation_intent"
         })
-        or (status == "consumed" and response is not None and phase == "continuation_acknowledged")
+        or (
+            status == "consumed"
+            and response is not None
+            and phase in {"denial_acknowledged", "continuation_acknowledged"}
+        )
         or (
             status == "expired"
             and (
@@ -918,6 +930,7 @@ def _db_row(row: dict[str, object]) -> FactoryActionRow:
                         "answered",
                         "projection_intent",
                         "projection_acknowledged",
+                        "denial_acknowledged",
                         "continuation_intent",
                         "continuation_acknowledged",
                     }
@@ -964,6 +977,7 @@ def _db_row(row: dict[str, object]) -> FactoryActionRow:
         credential_reservation_key=(None if row.get("credential_reservation_key") is None else str(row["credential_reservation_key"])),
         credential_alias=(None if row.get("credential_alias") is None else str(row["credential_alias"])),
         credential_reserved_at=_optional_aware(row.get("credential_reserved_at")),
+        credential_ref=(None if row.get("credential_ref") is None else str(row["credential_ref"])),
     )
     expected_projection_key = (
         None
@@ -1028,8 +1042,12 @@ def _resume_record(row: FactoryActionRow) -> FactoryActionResumeRecord:
         or row.projection_idempotency_key is None
     ):
         raise FactoryActionDurabilityError("factory action durable row resume state incomplete")
-    continuation_key = row.continuation_idempotency_key or _effect_key(
-        row.request, "continuation", row.response_sha256
+    continuation_key = (
+        None
+        if row.response.decision == "deny"
+        else row.continuation_idempotency_key or _effect_key(
+            row.request, "continuation", row.response_sha256
+        )
     )
     return FactoryActionResumeRecord(
         request=row.request,
@@ -1093,12 +1111,34 @@ def _valid_phase_columns(row: FactoryActionRow) -> bool:
             and continuation_intent_at is None
             and continuation_at is None and consumed_at is None
         )
+    if row.resume_phase == "denial_acknowledged":
+        return (
+            row.status in {"consumed", "expired"}
+            and row.response is not None
+            and row.response.decision == "deny"
+            and projection_key is not None
+            and projection_intent_at is not None
+            and projection_at is not None
+            and continuation_key is None
+            and continuation_intent_at is None
+            and continuation_at is None
+            and (
+                (row.status == "consumed" and consumed_at == projection_at)
+                or (row.status == "expired" and consumed_at is None)
+            )
+        )
     if row.resume_phase == "continuation_intent":
         return (
             row.status in {"answered", "expired"} and projection_key is not None
             and projection_at is not None and continuation_key is not None
             and projection_intent_at is not None and continuation_intent_at is not None
             and continuation_at is None and consumed_at is None
+        )
+    if row.resume_phase == "denial_acknowledged":
+        return (
+            row.consumed_at == row.projection_acknowledged_at
+            if row.status == "consumed"
+            else row.status == "expired" and row.consumed_at is None
         )
     if row.resume_phase == "continuation_acknowledged":
         return (

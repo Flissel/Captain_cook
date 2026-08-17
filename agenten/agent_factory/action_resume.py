@@ -46,11 +46,12 @@ class FactoryActionResumeRecord:
         "answered",
         "projection_intent",
         "projection_acknowledged",
+        "denial_acknowledged",
         "continuation_intent",
         "continuation_acknowledged",
     ]
     projection_idempotency_key: str
-    continuation_idempotency_key: str
+    continuation_idempotency_key: str | None
 
 
 class FactoryActionConsumer(Protocol):
@@ -129,7 +130,8 @@ class FactoryActionResumeCoordinator:
                     "creation_job_id": str(request.creation_job_id),
                     "correlation_id": str(request.correlation_id),
                     "request_type": request.request_type,
-                    "status": "answered",
+                    "status": "answered" if state.response.decision == "approve" else "denied",
+                    "decision": state.response.decision,
                     "safe_checkpoint_sha256": request.safe_checkpoint_sha256,
                 }
             self._reconcile_effect(
@@ -144,6 +146,10 @@ class FactoryActionResumeCoordinator:
                 idempotency_key=state.projection_idempotency_key,
                 now=self._clock(),
             )
+        if state.response.decision == "deny":
+            if state.phase != "denial_acknowledged":
+                raise FactoryActionEffectConflict("denied action did not reach a terminal state")
+            return state.response
         if state.phase in {"projection_acknowledged", "continuation_intent"}:
             state = self._store.prepare_continuation(
                 request_id, tenant_id=tenant_id, now=self._clock()
@@ -156,6 +162,7 @@ class FactoryActionResumeCoordinator:
                 "correlation_id": request.correlation_id,
                 "expected_subject_version": request.expected_subject_version,
                 "safe_checkpoint_ref": request.safe_checkpoint_ref,
+                "decision": response.decision,
                 "approved_scope": response.approved_scope,
                 "credential_ref": response.credential_ref,
                 "answer_metadata": response.answer_metadata,
@@ -163,13 +170,13 @@ class FactoryActionResumeCoordinator:
             self._reconcile_effect(
                 sink=self._scheduler,
                 method=self._scheduler.schedule_factory_continuation,
-                effect_key=state.continuation_idempotency_key,
+                effect_key=_require_continuation_key(state),
                 payload=continuation_payload,
             )
             state = self._store.acknowledge_continuation(
                 request_id,
                 tenant_id=tenant_id,
-                idempotency_key=state.continuation_idempotency_key,
+                idempotency_key=_require_continuation_key(state),
                 now=self._clock(),
             )
         return state.response
@@ -196,6 +203,12 @@ class FactoryActionResumeCoordinator:
             raise FactoryActionEffectConflict(
                 "factory action effect receipt conflicts with canonical payload"
             )
+
+
+def _require_continuation_key(state: FactoryActionResumeRecord) -> str:
+    if state.continuation_idempotency_key is None:
+        raise FactoryActionEffectConflict("approved action continuation key is missing")
+    return state.continuation_idempotency_key
 
 
 class FactoryActionResumeService:
