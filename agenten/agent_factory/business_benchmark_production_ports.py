@@ -379,8 +379,12 @@ class ProxyResponsesChatCompletionClient(ChatCompletionClient):
                 raise ValueError("proxy Responses tool schema is invalid")
             tool_payload.append({"type": "function", **dict(schema)})
         extra = dict(extra_create_args)
-        if "reasoning" in extra:
-            raise ValueError("proxy Responses reasoning authority cannot be overridden")
+        forbidden = {
+            "model", "input", "reasoning", "tools", "tool_choice", "text",
+            "response_format", "json_schema", "context", "headers",
+        }
+        if forbidden.intersection(extra):
+            raise ValueError("proxy Responses request authority cannot be overridden")
         payload = {
             "model": self._model, "input": inputs,
             "reasoning": {"effort": "high"}, **extra,

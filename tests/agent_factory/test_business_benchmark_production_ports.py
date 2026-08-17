@@ -451,6 +451,42 @@ async def test_proxy_responses_client_serializes_autogen_and_parses_nested_outpu
     await client.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    (
+        "model", "input", "reasoning", "tools", "tool_choice", "text",
+        "response_format", "json_schema", "context", "headers",
+    ),
+)
+async def test_proxy_responses_extra_args_cannot_change_request_authority(
+    field: str,
+) -> None:
+    from agenten.agent_factory.business_benchmark_production_ports import (
+        ProxyResponsesChatCompletionClient,
+    )
+
+    requests: list[httpx.Request] = []
+    http = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: requests.append(request) or httpx.Response(500)
+    ))
+    client = ProxyResponsesChatCompletionClient(
+        endpoint="http://127.0.0.1:18091/v1/responses",
+        token="proxy-token", model="authorized-model",
+        context_reference="gateway://provider-budget-contexts/" + "c" * 64,
+        client=http,
+    )
+
+    with pytest.raises(ValueError, match="request authority cannot be overridden"):
+        await client.create(
+            [UserMessage(content="authorized-input", source="captain")],
+            extra_create_args={field: "attacker-value"},
+        )
+
+    assert requests == []
+    await client.close()
+
+
 def test_production_module_does_not_import_global_llm_environment_config() -> None:
     import agenten.agent_factory.business_benchmark_production_ports as ports
 
