@@ -1053,7 +1053,7 @@ class ProductionCapabilityAssemblyComposition:
         "__controller", "__attestation_digest", "__executor_client",
         "__executor_configuration_digest", "__seal", "__sealed", "__weakref__",
         "__private_catalog", "__private_catalog_configuration_digest",
-        "__private_cases", "__benchmark_tool_authority",
+        "__private_cases", "__benchmark_tool_authority", "__factory",
     )
 
     def __init__(self, *, controller: CapabilityAssemblyController,
