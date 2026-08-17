@@ -49,6 +49,14 @@ class GenericToolAdapterDescriptor(BaseModel):
     implementation_sha256: str | None = Field(
         default=None, pattern=r"^[0-9a-f]{64}$"
     )
+    host_implementation_path: str | None = None
+    host_implementation_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    dataset_path: str | None = None
+    dataset_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
 
     @model_validator(mode="after")
     def require_kind_contract(self) -> "GenericToolAdapterDescriptor":
@@ -60,6 +68,10 @@ class GenericToolAdapterDescriptor(BaseModel):
                 or self.endpoint_sha256 is not None
                 or self.implementation_path is None
                 or self.implementation_sha256 is None
+                or self.host_implementation_path is not None
+                or self.host_implementation_sha256 is not None
+                or self.dataset_path is not None
+                or self.dataset_sha256 is not None
             ):
                 raise ValueError("local readonly tool binding is invalid")
         else:
@@ -69,6 +81,10 @@ class GenericToolAdapterDescriptor(BaseModel):
                 or self.endpoint_sha256 is None
                 or self.implementation_path is not None
                 or self.implementation_sha256 is not None
+                or self.host_implementation_path is None
+                or self.host_implementation_sha256 is None
+                or self.dataset_path is None
+                or self.dataset_sha256 is None
             ):
                 raise ValueError("remote tool binding is invalid")
             parsed = urlsplit(self.endpoint)
@@ -228,6 +244,10 @@ class VerifiedGenericToolRegistry:
             or result.get("operation") != entry.allowed_operation
             or result.get("endpoint_sha256") != entry.endpoint_sha256
             or not isinstance(result.get("result"), dict)
+            or result["result"].get("implementation_sha256")
+            != entry.host_implementation_sha256
+            or result["result"].get("dataset_sha256") != entry.dataset_sha256
+            or result["result"].get("truth_scope") != "demo_fixture_evidence"
         ):
             raise GenericToolRegistryConfigurationError(
                 "remote generic tool returned the wrong typed readback"
@@ -267,6 +287,22 @@ def load_verified_generic_tool_registry(
                 )
             else:
                 assert entry.credential_env_name is not None
+                assert entry.host_implementation_path is not None
+                assert entry.host_implementation_sha256 is not None
+                assert entry.dataset_path is not None
+                assert entry.dataset_sha256 is not None
+                read_verified_repository_bytes(
+                    entry.host_implementation_path,
+                    expected_sha256=entry.host_implementation_sha256,
+                    expected_repository_revision=revision,
+                    repository_root=root,
+                )
+                read_verified_repository_bytes(
+                    entry.dataset_path,
+                    expected_sha256=entry.dataset_sha256,
+                    expected_repository_revision=revision,
+                    repository_root=root,
+                )
                 value = environment.get(entry.credential_env_name, "")
                 if len(value) < 16:
                     raise ValueError("credential")

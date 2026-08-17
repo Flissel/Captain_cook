@@ -159,11 +159,10 @@ class CapabilityAssemblyBootstrapSettings:
     provider_proxy_code_sha256: str
     provider_paid_command_sha256: str
     provider_hard_ceiling_enforced: bool
-    incident_tool_gateway_token: SecretStr = SecretStr("")
-    claims_tool_gateway_token: SecretStr = SecretStr("")
+    capability_tool_host_token: SecretStr = SecretStr("")
     generic_tool_registry_path: str = "config/generic_tool_registry.json"
     generic_tool_registry_sha256: str = (
-        "9a911de3261a96591e8eea2fabfb0aa2956c10b7b80d818982959fd7c3448ba8"
+        "5b9751022bcfdce2bb72dee994ab20ac99deebbec7653ea4369a2191d582a528"
     )
     allowed_hosts: tuple[str, ...] = ()
 
@@ -191,6 +190,7 @@ _REQUIRED_BOOTSTRAP_NAMES = (
     "CAPTAIN_PROVIDER_PROXY_CODE_SHA256",
     "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256",
     "CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED",
+    "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN",
 )
 
 
@@ -215,6 +215,7 @@ def load_capability_assembly_bootstrap_settings(
         "MINIBOOK_PROJECTION_API_KEY",
         "CAPTAIN_RUNTIME_TOKEN",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN",
     )
     credentials = tuple(raw[name] for name in credential_names)
     if any(
@@ -246,7 +247,7 @@ def load_capability_assembly_bootstrap_settings(
     ).strip()
     registry_sha256 = environment.get(
         "CAPTAIN_GENERIC_TOOL_REGISTRY_SHA256",
-        "9a911de3261a96591e8eea2fabfb0aa2956c10b7b80d818982959fd7c3448ba8",
+        "5b9751022bcfdce2bb72dee994ab20ac99deebbec7653ea4369a2191d582a528",
     ).strip()
     if not registry_path or _SHA256.fullmatch(registry_sha256) is None:
         raise CapabilityAssemblyBootstrapConfigurationError(
@@ -330,11 +331,8 @@ def load_capability_assembly_bootstrap_settings(
         provider_proxy_code_sha256=raw["CAPTAIN_PROVIDER_PROXY_CODE_SHA256"],
         provider_paid_command_sha256=raw["CAPTAIN_PROVIDER_PAID_COMMAND_SHA256"],
         provider_hard_ceiling_enforced=True,
-        incident_tool_gateway_token=SecretStr(
-            environment.get("CAPTAIN_INCIDENT_TOOL_GATEWAY_TOKEN", "").strip()
-        ),
-        claims_tool_gateway_token=SecretStr(
-            environment.get("CAPTAIN_CLAIMS_TOOL_GATEWAY_TOKEN", "").strip()
+        capability_tool_host_token=SecretStr(
+            raw["CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN"]
         ),
         generic_tool_registry_path=registry_path,
         generic_tool_registry_sha256=registry_sha256,
@@ -2261,11 +2259,8 @@ def materialize_production_capability_assembly(
         relative_path=settings.generic_tool_registry_path,
         expected_sha256=settings.generic_tool_registry_sha256,
         environment={
-            "CAPTAIN_INCIDENT_TOOL_GATEWAY_TOKEN": (
-                settings.incident_tool_gateway_token.get_secret_value()
-            ),
-            "CAPTAIN_CLAIMS_TOOL_GATEWAY_TOKEN": (
-                settings.claims_tool_gateway_token.get_secret_value()
+            "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN": (
+                settings.capability_tool_host_token.get_secret_value()
             ),
         },
     )

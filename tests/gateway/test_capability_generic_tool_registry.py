@@ -70,11 +70,10 @@ def test_shipped_registry_head_attests_all_three_demo_tool_sets() -> None:
         repository_root=root,
         relative_path="config/generic_tool_registry.json",
         expected_sha256=(
-            "9a911de3261a96591e8eea2fabfb0aa2956c10b7b80d818982959fd7c3448ba8"
+            "5b9751022bcfdce2bb72dee994ab20ac99deebbec7653ea4369a2191d582a528"
         ),
         environment={
-            "CAPTAIN_INCIDENT_TOOL_GATEWAY_TOKEN": "incident-tool-token-123",
-            "CAPTAIN_CLAIMS_TOOL_GATEWAY_TOKEN": "claims-tool-token-1234",
+            "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN": "capability-tool-host-token-123",
         },
     )
     assert registry.tool_keys == (
@@ -92,9 +91,13 @@ def test_remote_registry_executes_exact_authenticated_typed_readback(monkeypatch
         tool_key="alert_context_reader", adapter_kind="http_readonly",
         schema_name="captain.incident-alert-context", schema_version=1,
         allowed_operation="read",
-        credential_env_name="CAPTAIN_INCIDENT_TOOL_GATEWAY_TOKEN",
+        credential_env_name="CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN",
         endpoint=endpoint, endpoint_sha256=endpoint_sha256,
         implementation_path=None, implementation_sha256=None,
+        host_implementation_path="gateway/capability_tool_host_app.py",
+        host_implementation_sha256="c" * 64,
+        dataset_path="config/demo_tool_data/incident.json",
+        dataset_sha256="d" * 64,
     )
     observed: list[httpx.Request] = []
 
@@ -104,7 +107,12 @@ def test_remote_registry_executes_exact_authenticated_typed_readback(monkeypatch
             "schema": "captain.incident-alert-context.v1",
             "tool_key": "alert_context_reader", "operation": "read",
             "endpoint_sha256": endpoint_sha256,
-            "result": {"alert_refs": ["alert://redacted/1"]},
+            "result": {
+                "alert_refs": ["alert://redacted/1"],
+                "implementation_sha256": "c" * 64,
+                "dataset_sha256": "d" * 64,
+                "truth_scope": "demo_fixture_evidence",
+            },
         })
 
     real_client = httpx.Client
@@ -123,7 +131,7 @@ def test_remote_registry_executes_exact_authenticated_typed_readback(monkeypatch
         tool_key="alert_context_reader", operation="read",
         arguments={"alert_ref": "alert://redacted/1"},
     )
-    assert value["result"] == {"alert_refs": ["alert://redacted/1"]}
+    assert value["result"]["alert_refs"] == ["alert://redacted/1"]
     assert len(observed) == 1
     assert observed[0].headers["Authorization"] == "Bearer incident-tool-token-123"
     assert observed[0].url == endpoint

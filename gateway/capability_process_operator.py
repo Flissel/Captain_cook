@@ -20,7 +20,10 @@ import urllib.request
 from uuid import uuid4
 
 
-_SERVICES = ("gateway", "runtime", "provider_proxy", "benchmark", "minibook", "n8n")
+_SERVICES = (
+    "gateway", "runtime", "provider_proxy", "benchmark", "tool_host",
+    "minibook", "n8n",
+)
 _ACTIONS = ("start", "stop", "restart")
 _LOCAL_LOCKS: dict[str, threading.Lock] = {}
 _LOCAL_LOCKS_GUARD = threading.Lock()
@@ -32,7 +35,7 @@ _SERVICE_SECRET_ENV = {
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN", "MINIBOOK_API_KEY",
         "MINIBOOK_PROJECTION_API_KEY", "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN",
         "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN",
-        "CAPTAIN_INCIDENT_TOOL_GATEWAY_TOKEN", "CAPTAIN_CLAIMS_TOOL_GATEWAY_TOKEN",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN",
     ),
     "runtime": (
         "CAPTAIN_RUNTIME_TOKEN", "CAPTAIN_GATEWAY_TOKEN",
@@ -46,6 +49,7 @@ _SERVICE_SECRET_ENV = {
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
         "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN",
     ),
+    "tool_host": ("CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN",),
     "minibook": ("MINIBOOK_API_KEY", "MINIBOOK_PROJECTION_API_KEY"),
     "n8n": ("CAPTAIN_N8N_API_KEY",),
 }
@@ -86,6 +90,18 @@ _SERVICE_CONFIG_ENV = {
         "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID", "CAPTAIN_CAPABILITY_BENCHMARK_EXECUTOR",
         "CAPTAIN_CAPABILITY_BENCHMARK_EXECUTOR_SHA256",
         "CAPTAIN_GATEWAY_URL",
+    ),
+    "tool_host": (
+        "CAPTAIN_CAPABILITY_TOOL_HOST_URL",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_PORT",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_CODE_SHA256",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_SALES_DATASET",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_SALES_DATASET_SHA256",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_INCIDENT_DATASET",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_INCIDENT_DATASET_SHA256",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_CLAIMS_DATASET",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_CLAIMS_DATASET_SHA256",
+        "CAPTAIN_CAPABILITY_ASSEMBLY_REPOSITORY_REVISION",
     ),
     "minibook": (
         "MINIBOOK_BACKEND_URL", "MINIBOOK_CREATION_DB",
@@ -419,6 +435,7 @@ def _authenticated_health_request(
         "runtime": ("CAPTAIN_RUNTIME_URL", "/health", "CAPTAIN_RUNTIME_TOKEN", "Authorization"),
         "provider_proxy": ("CAPTAIN_PROVIDER_PROXY_URL", "/v1/healthz", "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN", "Authorization"),
         "benchmark": ("CAPTAIN_CAPABILITY_BENCHMARK_URL", "/healthz", "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN", "Authorization"),
+        "tool_host": ("CAPTAIN_CAPABILITY_TOOL_HOST_URL", "/healthz", "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN", "Authorization"),
         "minibook": ("MINIBOOK_BACKEND_URL", "/api/v1/projection-health", "MINIBOOK_PROJECTION_API_KEY", "Authorization"),
         "n8n": ("CAPTAIN_N8N_URL", "/api/v1/workflows?limit=1", "CAPTAIN_N8N_API_KEY", "X-N8N-API-KEY"),
     }
@@ -520,6 +537,8 @@ def service_argv(
         return (python, "-m", "agenten.agent_runtime.runtime_entrypoint")
     if service == "benchmark":
         return (python, "-m", "gateway.capability_benchmark_process_app")
+    if service == "tool_host":
+        return (python, "-m", "gateway.capability_tool_host_app")
     if service == "provider_proxy":
         provider_url = _required(environment, "CAPTAIN_PROVIDER_PROXY_URL")
         parsed = urlsplit(provider_url)
