@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 
@@ -15,7 +16,19 @@ OUTPUT = ROOT / "gateway/capability_factory_runtime_closure.json"
 
 def _path_for(module: str) -> Path | None:
     candidate = ROOT.joinpath(*module.split(".")).with_suffix(".py")
-    return candidate if candidate.is_file() else None
+    if candidate.is_file():
+        return candidate
+    package = ROOT.joinpath(*module.split("."), "__init__.py")
+    return package if package.is_file() else None
+
+
+def _package_modules(module: str) -> set[str]:
+    parts = module.split(".")
+    return {
+        ".".join(parts[:index])
+        for index in range(1, len(parts))
+        if _path_for(".".join(parts[:index])) is not None
+    }
 
 
 def _imports(module: str, source: bytes) -> set[str]:
@@ -23,13 +36,27 @@ def _imports(module: str, source: bytes) -> set[str]:
     for node in ast.walk(ast.parse(source, filename=module)):
         if isinstance(node, ast.Import):
             result.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            result.add(node.module)
-    return {name for name in result if _path_for(name) is not None}
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                package = module.rpartition(".")[0]
+                relative = "." * node.level + (node.module or "")
+                try:
+                    base = importlib.util.resolve_name(relative, package)
+                except (ImportError, ValueError):
+                    continue
+            else:
+                base = node.module or ""
+            if base:
+                result.add(base)
+                result.update(f"{base}.{alias.name}" for alias in node.names)
+    local = {name for name in result if _path_for(name) is not None}
+    for name in tuple(local):
+        local.update(_package_modules(name))
+    return local
 
 
 def main() -> int:
-    pending, seen = [ENTRY], set()
+    pending, seen = [ENTRY, *_package_modules(ENTRY)], set()
     entries = []
     while pending:
         module = pending.pop()

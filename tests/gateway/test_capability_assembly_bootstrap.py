@@ -1021,7 +1021,13 @@ def test_repository_factory_adapter_matches_committed_descriptor() -> None:
     closure = json.loads(
         (root / descriptor.closure_path).read_text(encoding="utf-8")
     )
-    assert len(closure["entries"]) >= 100
+    modules = {entry["module"] for entry in closure["entries"]}
+    assert len(modules) >= 119
+    assert {
+        "agenten", "agenten.delivery", "agenten.delivery.minibook_client",
+        "agenten.delivery.projection_cursor", "blockchain", "blockchain.storage",
+        "gateway",
+    } <= modules
     assert closure["root_revision_binding"] == "runtime-expected-head"
     assert hashlib.sha256(
         json.dumps(closure["entries"], sort_keys=True, separators=(",", ":")).encode()
@@ -1084,6 +1090,33 @@ def test_verified_closure_rejects_same_origin_code_substitution(
 
     with pytest.raises(ValueError, match="preloaded Factory closure module"):
         finder.require_preloaded_origins()
+
+
+def test_shipped_closure_accepts_real_preloaded_modules_and_covers_packages() -> None:
+    import sys
+    import gateway.capability_assembly_bootstrap as bootstrap
+
+    root = Path(__file__).parents[2]
+    payload = json.loads(
+        (root / "gateway/capability_factory_runtime_closure.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    modules = {
+        entry["module"]: (
+            (root / entry["path"]).resolve(),
+            (root / entry["path"]).read_bytes(),
+        )
+        for entry in payload["entries"]
+    }
+    assert {
+        "agenten", "agenten.delivery", "agenten.delivery.minibook_client",
+        "agenten.delivery.projection_cursor", "blockchain", "blockchain.storage",
+        "gateway",
+    } <= modules.keys()
+    assert sum(name in sys.modules for name in modules) >= 70
+
+    bootstrap._VerifiedFactoryClosureFinder(modules).require_preloaded_origins()
 
 
 def test_factory_constructor_receives_only_allowlisted_config_and_redacts_any_error(

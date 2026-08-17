@@ -14,7 +14,6 @@ import inspect
 import importlib.abc
 import importlib.util
 import json
-import marshal
 import re
 import secrets
 import sys
@@ -1623,6 +1622,8 @@ def _preloaded_module_matches_verified_code(
         try:
             for component in qualname.split("."):
                 value = getattr(value, component)
+            if isinstance(value, property):
+                value = value.fget
             value = inspect.unwrap(value)
             if inspect.ismethod(value):
                 value = value.__func__
@@ -1631,9 +1632,40 @@ def _preloaded_module_matches_verified_code(
             return False
         if not isinstance(actual_code, CodeType):
             return False
-        if marshal.dumps(actual_code) != marshal.dumps(expected_code):
+        if _stable_code_fingerprint(actual_code) != _stable_code_fingerprint(expected_code):
             return False
     return True
+
+
+def _stable_code_fingerprint(code: CodeType) -> str:
+    """Hash executable semantics without loader-specific filenames/line tables."""
+
+    constants: list[object] = []
+    for value in code.co_consts:
+        if isinstance(value, CodeType):
+            constants.append(("code", _stable_code_fingerprint(value)))
+        else:
+            constants.append(_stable_code_constant(value))
+    payload = repr((
+        code.co_argcount, code.co_posonlyargcount, code.co_kwonlyargcount,
+        code.co_nlocals, code.co_flags, code.co_code, tuple(constants),
+        code.co_names, code.co_varnames, code.co_freevars, code.co_cellvars,
+    )).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _stable_code_constant(value: object) -> object:
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_stable_code_constant(item) for item in value))
+    if isinstance(value, frozenset):
+        return ("frozenset", tuple(sorted(
+            (_stable_code_constant(item) for item in value), key=repr,
+        )))
+    if isinstance(value, (str, bytes, int, float, complex, bool, type(None))):
+        return (type(value).__name__, repr(value))
+    if value is Ellipsis:
+        return ("ellipsis",)
+    return (type(value).__name__, repr(value))
 
 
 def plan_capability_assembly_factory_runtime_from_environment(
