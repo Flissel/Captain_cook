@@ -62,8 +62,10 @@ from gateway.capability_live_current_adapters import (
     RecordedFactoryCapabilityExecutionAdapter,
 )
 from gateway.capability_assembly_production import (
+    GenericGatewayMinibookCapabilityProjectionAdapter,
     GatewayGenericCapabilityExecutionAdapter,
 )
+from gateway.capability_identity import generic_capability_subject_id
 from gateway.capability_live_pipeline import CapabilityFactoryAuthority
 from gateway.capability_live_pipeline import (
     CapabilityExecutionAuthority,
@@ -72,6 +74,7 @@ from gateway.capability_live_pipeline import (
 )
 from gateway.contracts import FactoryJobProjection, RuntimeOperationProjection
 from gateway.registry_feed import factory_promotion_projection
+from gateway.store import GatewayStore
 
 
 NOW = datetime(2026, 8, 8, 15, 0, tzinfo=timezone.utc)
@@ -484,7 +487,7 @@ def test_generic_execution_accepts_only_exact_gateway_promotion_event() -> None:
     event = {
         "event_id": str(release.release_authority_id),
         "correlation_id": str(release.correlation_id),
-        "subject_id": f"subject:{release.job_id}",
+        "subject_id": generic_capability_subject_id(release.job_id),
         "subject_version": release.capability_version,
         "payload": {
             "status_id": "ready_to_use",
@@ -511,13 +514,66 @@ def test_generic_execution_accepts_only_exact_gateway_promotion_event() -> None:
     assert authority.execution_authority_id == _runs()[2].invocation_id
 
 
+def test_store_issued_generic_promotion_executes_with_canonical_subject() -> None:
+    release = _release()
+    job = AgentFactoryJobV3.model_construct(
+        job_id=release.job_id, event_id=_uuid("job-event"),
+        correlation_id=release.correlation_id,
+        subject_version=release.capability_version,
+    )
+    event = GatewayStore._generic_minibook_promotion_event(
+        event_id=release.release_authority_id, job=job,
+        occurred_at=datetime(2026, 8, 17, tzinfo=timezone.utc),
+        summary_sha256=release.benchmark_summary_ref.sha256,
+        aggregate={
+            "team_quality_count": 15, "baseline_quality_count": 10,
+            "team_cost_usd": "0.5", "baseline_cost_usd": "1.0",
+            "team_latency_ms": 50, "baseline_latency_ms": 100,
+            "unsafe_team_count": 0, "mandatory_handoff_misses": 0,
+        },
+    )
+    stored = event.model_dump(mode="json", by_alias=True)
+    adapter = GatewayGenericCapabilityExecutionAdapter(
+        gateway_store=SimpleNamespace(
+            generic_capability_promotion=lambda event_id: (
+                stored if event_id == event.event_id else None
+            )
+        ),
+        composition=_Composition(promoted=False),
+    )
+
+    authority = asyncio.run(
+        adapter.execute(_request(CapabilityLiveStage.EXECUTE), release)
+    )
+
+    assert event.subject_id == generic_capability_subject_id(release.job_id)
+    assert authority.execution_result_id == _runs()[2].execution_outcome.result_id
+
+    class ExactEffects(_ProjectionEffects):
+        async def promotion_event(self, selected_release):
+            assert selected_release == release
+            return event
+
+    effects = ExactEffects()
+    projection = asyncio.run(
+        GenericGatewayMinibookCapabilityProjectionAdapter(
+            effects=effects  # type: ignore[arg-type]
+        ).project_and_readback(
+            _request(CapabilityLiveStage.PROJECT), release, authority,
+        )
+    )
+    assert effects.current is not None
+    assert effects.current.event is event
+    assert projection.projection_event_id == event.event_id
+
+
 def test_generic_execution_rejects_changed_benchmark_summary_binding() -> None:
     release = _release()
     store = SimpleNamespace(
         generic_capability_promotion=lambda _event_id: {
             "event_id": str(release.release_authority_id),
             "correlation_id": str(release.correlation_id),
-            "subject_id": f"subject:{release.job_id}",
+            "subject_id": generic_capability_subject_id(release.job_id),
             "subject_version": release.capability_version,
             "payload": {
                 "status_id": "ready_to_use",

@@ -18,6 +18,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ValidationError
 from pymysql.err import IntegrityError, OperationalError
 
+from gateway.capability_identity import generic_capability_subject_id
 from agenten.validation.contracts import HoldoutSuite, WorkBatch
 from agenten.agent_runtime.capabilities import CapabilityDenied, validate_grant
 from agenten.agent_runtime.contracts import (
@@ -6651,13 +6652,6 @@ class GatewayStore:
                 return 10000 if numerator == 0 else 1000000
             return int((numerator * Decimal(10000)) / denominator)
 
-        subject_uuid = UUID(
-            bytes=hashlib.sha256(
-                f"generic-capability-subject:{job.job_id}".encode()
-            ).digest()[:16],
-            version=4,
-        )
-
         return MinibookProjectionEvent.model_validate({
             "schema": "captain.minibook-projection.v2",
             "event_id": event_id,
@@ -6665,7 +6659,7 @@ class GatewayStore:
             "causation_id": job.event_id,
             "occurred_at": occurred_at,
             "producer": "captain-gateway",
-            "subject_id": f"subject:{subject_uuid}",
+            "subject_id": generic_capability_subject_id(job.job_id),
             "subject_version": job.subject_version,
             "event_type": "capability.promoted",
             "payload": {

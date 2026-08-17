@@ -87,6 +87,7 @@ from gateway.capability_live_pipeline import (
     CapabilityLiveAuthorityUnavailable,
     CapabilityProjectionAuthority,
 )
+from gateway.capability_identity import generic_capability_subject_id
 from gateway.capability_live_runtime_resume import (
     CapabilityResumeGatewayPort,
     GatewayCapabilityResumeExecutionAdapter,
@@ -620,7 +621,7 @@ class GatewayGenericCapabilityExecutionAdapter(
             not isinstance(event, dict)
             or event.get("event_id") != str(event_id)
             or event.get("correlation_id") != str(release.correlation_id)
-            or event.get("subject_id") != f"subject:{release.job_id}"
+            or event.get("subject_id") != generic_capability_subject_id(release.job_id)
             or event.get("subject_version") != release.capability_version
             or not isinstance(payload, dict)
             or payload.get("benchmark_summary_digest")
