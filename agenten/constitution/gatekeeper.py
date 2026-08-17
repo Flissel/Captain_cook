@@ -20,7 +20,7 @@ module still imports cleanly when `autogen_core` is absent.
 """
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from agenten.constitution.ruleset import ConstitutionRuleset
 from agenten.constitution.validators import run_deterministic_checks
@@ -75,6 +75,17 @@ class ConstitutionGatekeeper:
     the same code path as a judge that times out or raises, both of which
     reject.
     """
+
+    # The in-flight memory only has to span the window between this gate's
+    # verdict and the Recorder draining its queue — one decomposition batch.
+    # A hard cap keeps a Recorder that never persists an acceptance from
+    # turning a remembered verdict into a permanent ban on that description.
+    # 256 is generous headroom over what one batch can actually produce:
+    # DecompositionBudget.max_fanout_per_node defaults to 6 children per
+    # node (agenten/decomposition/budget.py), and even the root-problem
+    # lifetime total (max_total_subproblems, default 200) sits comfortably
+    # under this cap.
+    IN_FLIGHT_MEMORY_LIMIT = 256
 
     def __init__(
         self,
@@ -162,37 +173,11 @@ class ConstitutionGatekeeper:
             if isinstance(block_root_id, str) and isinstance(block_description, str):
                 pending.append((block_root_id, block_description))
 
-        self._forget_persisted_acceptances()
         for subproblem_id, entry in self._accepted_in_flight.items():
             if subproblem_id == exclude_subproblem_id:
                 continue
             pending.append(entry)
         return pending
-
-    def _forget_persisted_acceptances(self) -> None:
-        """Drop remembered verdicts the ledger has caught up on.
-
-        The Recorder enqueues its VALIDATING write rather than performing it,
-        so a sibling proposed in the same batch is invisible in that stage.
-        This gate therefore remembers what it accepted until the ledger can
-        see it, then hands authority back to the ledger view — otherwise the
-        memory would become a permanent, unbounded duplicate ban.
-        """
-        if not self._accepted_in_flight:
-            return
-        persisted: Set[str] = set()
-        for stage in Stage:
-            try:
-                blocks = self.ledger_query.blocks_in_stage(stage)
-            except Exception:
-                continue
-            for block in blocks:
-                subproblem_id = _field_from_block(block, "subproblem_id")
-                if isinstance(subproblem_id, str):
-                    persisted.add(subproblem_id)
-        for subproblem_id in list(self._accepted_in_flight):
-            if subproblem_id in persisted:
-                del self._accepted_in_flight[subproblem_id]
 
     async def _accept(self, event: SubproblemProposed) -> None:
         accepted = SubproblemAccepted(
@@ -205,6 +190,11 @@ class ConstitutionGatekeeper:
             subproblem_id=event.subproblem_id,
             block_index=None,
         )
+        if (
+            event.subproblem_id not in self._accepted_in_flight
+            and len(self._accepted_in_flight) >= self.IN_FLIGHT_MEMORY_LIMIT
+        ):
+            self._accepted_in_flight.pop(next(iter(self._accepted_in_flight)))
         self._accepted_in_flight[event.subproblem_id] = (
             event.meta.root_problem_id,
             event.description,

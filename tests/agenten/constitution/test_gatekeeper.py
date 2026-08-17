@@ -349,38 +349,42 @@ async def test_duplicate_sibling_in_same_batch_is_rejected():
 
 
 @pytest.mark.asyncio
-async def test_in_flight_memory_is_released_once_the_ledger_sees_the_subproblem():
+async def test_in_flight_memory_ban_is_released_by_eviction_not_the_ledger():
     """The in-process memory must not become a permanent duplicate ban.
 
-    Once the ledger knows the subproblem, the ledger view is authoritative
-    again and an identical description is allowed exactly as before.
+    This used to be ledger-driven: seeding the subproblem into a DONE block
+    released the ban (see git history / test_prune_does_not_query_the_ledger
+    for why that scan is gone). Release is now purely capacity-driven: once
+    enough later acceptances evict the oldest entry from the bounded map, an
+    identical description is accepted again — even though the ledger here
+    never learns about sp-1 at all.
     """
     bus, accepted, rejected = wire_bus()
-    ledger = FakeLedgerQuery()
     gatekeeper = ConstitutionGatekeeper(
-        bus=bus, ruleset=make_ruleset(), ledger_query=ledger
+        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery()
     )
 
     await gatekeeper.handle_subproblem_proposed(
         make_proposed(subproblem_id="sp-1", description="Knead the dough for ten minutes.")
     )
-    ledger.seed(
-        Stage.DONE,
-        FakeBlock(
-            index=2,
-            data={
-                "subproblem_id": "sp-1",
-                "root_problem_id": "root-1",
-                "description": "Knead the dough for ten minutes.",
-            },
-        ),
-    )
+
+    # Fill the bounded map past its limit so sp-1 is evicted as the oldest
+    # entry. The ledger is never seeded with anything here — if release
+    # were still ledger-driven, sp-1 would remain a permanent ban.
+    for index in range(gatekeeper.IN_FLIGHT_MEMORY_LIMIT):
+        await gatekeeper.handle_subproblem_proposed(
+            make_proposed(
+                subproblem_id=f"filler-{index}",
+                description=f"Prepare baking step number {index}.",
+            )
+        )
+    assert "sp-1" not in gatekeeper._accepted_in_flight
 
     await gatekeeper.handle_subproblem_proposed(
         make_proposed(subproblem_id="sp-2", description="Knead the dough for ten minutes.")
     )
 
-    assert [event.subproblem_id for event in accepted.events] == ["sp-1", "sp-2"]
+    assert accepted.events[-1].subproblem_id == "sp-2"
     assert rejected.events == []
 
 
@@ -408,4 +412,94 @@ async def test_identical_descriptions_under_different_roots_are_both_accepted():
     )
 
     assert [event.subproblem_id for event in accepted.events] == ["sp-1", "sp-2"]
+    assert rejected.events == []
+
+
+@pytest.mark.asyncio
+async def test_in_flight_memory_is_bounded_and_evicts_oldest_first():
+    """The memory must not grow without bound when the ledger never catches up.
+
+    A Recorder that fails to persist an acceptance would otherwise leave an
+    entry in place for the life of the process, permanently banning that
+    description under that root.
+    """
+    bus, accepted, rejected = wire_bus()
+    gatekeeper = ConstitutionGatekeeper(
+        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery()
+    )
+
+    for index in range(gatekeeper.IN_FLIGHT_MEMORY_LIMIT + 1):
+        await gatekeeper.handle_subproblem_proposed(
+            make_proposed(
+                subproblem_id=f"sp-{index}",
+                description=f"Prepare baking step number {index}.",
+            )
+        )
+
+    assert len(gatekeeper._accepted_in_flight) == gatekeeper.IN_FLIGHT_MEMORY_LIMIT
+    assert "sp-0" not in gatekeeper._accepted_in_flight
+    assert rejected.events == []
+
+
+@pytest.mark.asyncio
+async def test_prune_does_not_query_the_ledger():
+    """Pruning must not scan the ledger: it ran on every proposal during a batch."""
+    bus, accepted, rejected = wire_bus()
+
+    class CountingLedgerQuery(FakeLedgerQuery):
+        def __init__(self):
+            super().__init__()
+            self.stage_queries = 0
+
+        def blocks_in_stage(self, stage):
+            self.stage_queries += 1
+            return super().blocks_in_stage(stage)
+
+    ledger = CountingLedgerQuery()
+    gatekeeper = ConstitutionGatekeeper(
+        bus=bus, ruleset=make_ruleset(), ledger_query=ledger
+    )
+
+    await gatekeeper.handle_subproblem_proposed(
+        make_proposed(subproblem_id="sp-1", description="Knead the dough for ten minutes.")
+    )
+    first = ledger.stage_queries
+    await gatekeeper.handle_subproblem_proposed(
+        make_proposed(subproblem_id="sp-2", description="Shape the loaf and score it.")
+    )
+
+    # Only the single VALIDATING lookup per proposal, never a sweep of all stages.
+    assert ledger.stage_queries - first == 1
+
+
+@pytest.mark.asyncio
+async def test_redelivery_of_an_already_accepted_subproblem_does_not_shrink_the_map():
+    """The event bus is at-least-once, not exactly-once: `handle_subproblem_proposed`
+    can run twice for the same `subproblem_id`. Re-accepting an id already present
+    in `_accepted_in_flight` must not count as growth — it is a same-size overwrite,
+    not an insert — so it must not trigger an eviction. Evicting anyway would drop
+    an unrelated, still-relevant entry and silently shrink the map below its limit.
+    """
+    bus, accepted, rejected = wire_bus()
+    gatekeeper = ConstitutionGatekeeper(
+        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery()
+    )
+
+    for index in range(gatekeeper.IN_FLIGHT_MEMORY_LIMIT):
+        await gatekeeper.handle_subproblem_proposed(
+            make_proposed(
+                subproblem_id=f"sp-{index}",
+                description=f"Prepare baking step number {index}.",
+            )
+        )
+    assert len(gatekeeper._accepted_in_flight) == gatekeeper.IN_FLIGHT_MEMORY_LIMIT
+    assert "sp-0" in gatekeeper._accepted_in_flight
+
+    # Redeliver an already-accepted, non-oldest subproblem — same id, same event.
+    await gatekeeper.handle_subproblem_proposed(
+        make_proposed(subproblem_id="sp-5", description="Prepare baking step number 5.")
+    )
+
+    assert len(gatekeeper._accepted_in_flight) == gatekeeper.IN_FLIGHT_MEMORY_LIMIT
+    assert "sp-0" in gatekeeper._accepted_in_flight
     assert rejected.events == []
