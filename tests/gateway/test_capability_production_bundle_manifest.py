@@ -297,7 +297,11 @@ def test_failed_health_retains_ambiguous_spawn_identity_after_bounded_cleanup(
     monkeypatch.setattr(process_operator.subprocess, "Popen", lambda *_args, **_kwargs: Process())
     monkeypatch.setattr(process_operator, "_observed_process_identity", lambda _pid: ("C:/python.exe", "start-4343"))
     monkeypatch.setattr(process_operator, "_wait_authenticated_health", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("not ready")))
-    monkeypatch.setattr(process_operator, "_wait_process_gone", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(process_operator, "_wait_tracked_tree_gone", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        process_operator, "_collect_exact_process_tree",
+        lambda _state: ((4343, "C:/python.exe", "start-4343"),),
+    )
     signals: list[object] = []
     cleanup_commands: list[tuple[str, ...]] = []
     monkeypatch.setattr(process_operator.os, "kill", lambda _pid, sent: signals.append(sent))
@@ -317,10 +321,115 @@ def test_failed_health_retains_ambiguous_spawn_identity_after_bounded_cleanup(
         operate("gateway", "start", environment=environment, repository_root=tmp_path)
 
     persisted = json.loads((tmp_path / "state/gateway.json").read_text(encoding="utf-8"))
-    assert persisted["status"] == "running"
+    assert persisted["status"] == "starting"
     assert persisted["process_id"] == 4343
     assert signals == [process_operator.signal.SIGTERM]
     assert cleanup_commands == [("taskkill", "/PID", "4343", "/T", "/F")]
+
+
+def test_starting_state_is_durable_before_process_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[dict[str, object]] = []
+
+    class Process:
+        pid = 5151
+
+    def spawn(*_args, **_kwargs):
+        observed.append(json.loads((tmp_path / "state/gateway.json").read_text()))
+        raise RuntimeError("controlled spawn stop")
+
+    monkeypatch.setattr(process_operator.subprocess, "Popen", spawn)
+    environment = {
+        **_environment(), "WORKER_GATEWAY_TOKEN": "worker-token",
+        "LEDGER_DSN": "redacted-dsn", "CAPTAIN_PROCESS_STATE_ROOT": "state",
+    }
+
+    with pytest.raises(RuntimeError, match="controlled spawn stop"):
+        operate("gateway", "start", environment=environment, repository_root=tmp_path)
+
+    assert observed[0]["status"] == "starting"
+    assert observed[0]["process_id"] is None
+
+
+def test_missing_spawn_identity_retains_exact_starting_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        pid = 5252
+        def terminate(self): pass
+        def wait(self, *, timeout): return None
+
+    monkeypatch.setattr(process_operator.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setattr(process_operator, "_observed_process_identity", lambda _pid: None)
+    environment = {
+        **_environment(), "WORKER_GATEWAY_TOKEN": "worker-token",
+        "LEDGER_DSN": "redacted-dsn", "CAPTAIN_PROCESS_STATE_ROOT": "state",
+    }
+
+    with pytest.raises(RuntimeError, match="identity is unavailable"):
+        operate("gateway", "start", environment=environment, repository_root=tmp_path)
+
+    state = json.loads((tmp_path / "state/gateway.json").read_text())
+    assert state["status"] == "starting"
+    assert state["process_id"] == 5252
+
+
+def test_cleanup_tracks_and_kills_an_exact_orphan_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identities = {
+        6000: ("C:/python.exe", "parent-start"),
+        6001: ("C:/worker.exe", "child-start"),
+    }
+    commands: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        process_operator, "_collect_exact_process_tree",
+        lambda _state: (
+            (6000, "C:/python.exe", "parent-start"),
+            (6001, "C:/worker.exe", "child-start"),
+        ),
+    )
+    monkeypatch.setattr(process_operator, "_observed_process_identity", identities.get)
+    monkeypatch.setattr(process_operator.os, "kill", lambda *_args: None)
+    monkeypatch.setattr(process_operator, "_wait_tracked_tree_gone", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        process_operator.subprocess, "run",
+        lambda argv, **_kwargs: commands.append(tuple(argv)),
+    )
+
+    assert process_operator._terminate_exact_process_tree({
+        "process_id": 6000, "executable": "C:/python.exe",
+        "os_start_identity": "parent-start",
+    }) is False
+    assert commands == [
+        ("taskkill", "/PID", "6001", "/T", "/F"),
+        ("taskkill", "/PID", "6000", "/T", "/F"),
+    ]
+
+
+def test_n8n_start_timeout_retains_starting_without_pid_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        process_operator.subprocess, "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            process_operator.subprocess.TimeoutExpired("pwsh", 30)
+        ),
+    )
+    environment = {
+        "CAPTAIN_PROCESS_STATE_ROOT": "state",
+        "CAPTAIN_N8N_API_KEY": "n8n-token-value",
+        "CAPTAIN_N8N_URL": "http://127.0.0.1:5679",
+    }
+
+    with pytest.raises(process_operator.subprocess.TimeoutExpired):
+        operate("n8n", "start", environment=environment, repository_root=tmp_path)
+
+    state = json.loads((tmp_path / "state/n8n.json").read_text())
+    assert state["status"] == "starting"
+    assert state["process_id"] is None
+    assert state["identity_kind"] == "docker_container"
 
 
 def test_operator_manifest_fails_closed_before_probe_on_missing_or_reused_credentials() -> None:

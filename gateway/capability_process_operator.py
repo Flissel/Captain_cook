@@ -239,24 +239,73 @@ def _wait_process_gone(state: Mapping[str, object], *, timeout_seconds: float) -
     return _observed_process_identity(int(state["process_id"])) is None
 
 
+def _collect_exact_process_tree(
+    state: Mapping[str, object],
+) -> tuple[tuple[int, str, str], ...]:
+    root = _require_same_process(state)
+    identities = [(root, str(state["executable"]), str(state["os_start_identity"]))]
+    if os.name != "nt":
+        return tuple(identities)
+    command = (
+        "$r=" + str(root) + ";$p=Get-CimInstance Win32_Process;"
+        "$ids=@($r);do{$n=@($p|Where-Object{$ids-contains $_.ParentProcessId}"
+        "|ForEach-Object ProcessId|Where-Object{$ids-notcontains $_});$ids+=$n}"
+        "while($n.Count);$ids|ConvertTo-Json -Compress"
+    )
+    try:
+        result = subprocess.run(
+            ("pwsh", "-NoProfile", "-Command", command),
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        values = json.loads(result.stdout) if result.returncode == 0 else []
+        pids = values if isinstance(values, list) else [values]
+        for raw in pids:
+            pid = int(raw)
+            if pid == root:
+                continue
+            observed = _observed_process_identity(pid)
+            if observed is not None:
+                identities.append((pid, observed[0], observed[1]))
+    except Exception:
+        pass
+    return tuple(identities)
+
+
+def _tracked_tree_is_gone(tree: tuple[tuple[int, str, str], ...]) -> bool:
+    return all(_observed_process_identity(pid) != (executable, started)
+               for pid, executable, started in tree)
+
+
+def _wait_tracked_tree_gone(
+    tree: tuple[tuple[int, str, str], ...], *, timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _tracked_tree_is_gone(tree):
+            return True
+        time.sleep(0.05)
+    return _tracked_tree_is_gone(tree)
+
+
 def _terminate_exact_process_tree(state: Mapping[str, object]) -> bool:
     """Terminate only the still-matching kernel process and confirm its exit."""
 
-    pid = _require_same_process(state)
+    tree = _collect_exact_process_tree(state)
+    pid = tree[0][0]
     os.kill(pid, signal.SIGTERM)
-    if _wait_process_gone(state, timeout_seconds=5.0):
+    if _wait_tracked_tree_gone(tree, timeout_seconds=5.0):
         return True
-    pid = _require_same_process(state)
-    if os.name == "nt":
-        subprocess.run(
-            ("taskkill", "/PID", str(pid), "/T", "/F"),
-            capture_output=True,
-            check=False,
-            timeout=10,
-        )
-    else:
-        os.kill(pid, signal.SIGKILL)
-    return _wait_process_gone(state, timeout_seconds=2.0)
+    for tracked_pid, executable, started in reversed(tree):
+        if _observed_process_identity(tracked_pid) != (executable, started):
+            continue
+        if os.name == "nt":
+            subprocess.run(
+                ("taskkill", "/PID", str(tracked_pid), "/T", "/F"),
+                capture_output=True, check=False, timeout=10,
+            )
+        else:
+            os.kill(tracked_pid, signal.SIGKILL)
+    return _wait_tracked_tree_gone(tree, timeout_seconds=2.0)
 
 
 def _require_same_n8n_container(state: Mapping[str, object]) -> str:
@@ -419,6 +468,20 @@ def operate(
         _wait_authenticated_health(service, environment=environment, timeout_seconds=5.0)
         return current
     identity = str(uuid4())
+    state = {
+        "schema": "captain.production-process-state.v1",
+        "service": service,
+        "status": "starting",
+        "operation": action,
+        "process_id": None,
+        "process_identity": identity,
+        "identity_kind": "sentinel" if sentinel else (
+            "docker_container" if service == "n8n" else "os_process"
+        ),
+        "identity_value": identity if sentinel else None,
+        "argv": list(argv),
+    }
+    _write_state(state_file, state)
     if sentinel:
         process_id = int(identity.replace("-", "")[:8], 16) or 1
     elif service == "n8n":
@@ -447,22 +510,21 @@ def operate(
         )
         process_id = process.pid
         output.close()
+        state["process_id"] = process_id
+        _write_state(state_file, state)
         observed_identity = _observed_process_identity(process_id)
         if observed_identity is None:
-            process.terminate()
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except Exception:
+                try:
+                    process.kill()
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
             raise RuntimeError("started process identity is unavailable")
-    state = {
-        "schema": "captain.production-process-state.v1",
-        "service": service,
-        "status": "running",
-        "operation": action,
-        "process_id": process_id,
-        "process_identity": identity,
-        "identity_kind": "sentinel" if sentinel else (
-            "docker_container" if service == "n8n" else "os_process"
-        ),
-        "argv": list(argv),
-    }
+    state["process_id"] = process_id
     if not sentinel and service != "n8n":
         state["executable"], state["os_start_identity"] = observed_identity
         state["identity_value"] = f"{observed_identity[0]}:{observed_identity[1]}"
@@ -470,6 +532,8 @@ def operate(
         state["identity_value"] = f"{observed_container[0]}:{observed_container[1]}"
     else:
         state["identity_value"] = identity
+    state["status"] = "running" if sentinel else "starting"
+    _write_state(state_file, state)
     if not sentinel:
         try:
             _wait_authenticated_health(service, environment=environment)
@@ -498,6 +562,8 @@ def operate(
             raise RuntimeError(
                 f"authenticated start failed for {service}"
             ) from None
+    _write_state(state_file, state)
+    state["status"] = "running"
     _write_state(state_file, state)
     return state
 
