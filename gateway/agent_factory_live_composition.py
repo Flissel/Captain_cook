@@ -542,6 +542,7 @@ class AgentFactoryLiveComposition:
 def compose_agent_factory_live(
     *,
     store: GatewayStore,
+    gateway_repository: GatewayFactoryRepository | None = None,
     forge: MinibookForgePort,
     candidate_bindings: ForgeCandidateBindingPort | None,
     team_execution_ports_for: FactoryLiveTeamExecutionPortsProvider,
@@ -574,7 +575,17 @@ def compose_agent_factory_live(
     if not callable(clock):
         raise ValueError("Factory live clock is required")
 
-    repository = GatewayFactoryRepository(
+    if gateway_repository is not None and (
+        type(gateway_repository) is not GatewayFactoryRepository
+        or getattr(gateway_repository, "_store", None) is not store
+        or (
+            runtime_retries is not None
+            and getattr(gateway_repository, "_runtime_retries", None)
+            is not runtime_retries
+        )
+    ):
+        raise ValueError("Factory Gateway repository authority is mismatched")
+    repository = gateway_repository or GatewayFactoryRepository(
         store,
         runtime_retries=runtime_retries,
     )

@@ -73,6 +73,74 @@ def test_bootstrap_settings_fail_before_path_or_network_use(tmp_path: Path) -> N
     assert touched == []
 
 
+@pytest.mark.parametrize(
+    "name,value",
+    (
+        ("CAPTAIN_PROVIDER_CONTEXT_SHA256", "x" * 64),
+        ("CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256", "x" * 64),
+        ("CAPTAIN_PROVIDER_PROXY_CODE_SHA256", "x" * 64),
+        ("CAPTAIN_PROVIDER_PAID_COMMAND_SHA256", "x" * 64),
+        ("CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED", "false"),
+    ),
+)
+def test_bootstrap_rejects_each_d7_authority_drift_before_effects(
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    inputs = {
+        "demo_inputs/agent_factory/sales_pipeline_brief/TO_BE_BUILT.md": "1" * 64,
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md": "2" * 64,
+        "demo_inputs/agent_factory/claims_resolution/TO_BE_BUILT.md": "3" * 64,
+    }
+    environment = {
+        "CAPTAIN_CAPABILITY_ASSEMBLY_REPOSITORY_REVISION": "a" * 40,
+        "CAPTAIN_CAPABILITY_ASSEMBLY_INPUTS_JSON": json.dumps(inputs),
+        "CAPTAIN_CAPABILITY_ASSEMBLY_TOOL_GAPS_JSON": json.dumps(
+            {digest: [] for digest in inputs.values()}
+        ),
+        "CAPTAIN_CAPABILITY_ASSEMBLY_SUBJECT_VERSION": "1",
+        "CAPTAIN_PRIVATE_BENCHMARK_ROOT": str((tmp_path / "private").resolve()),
+        "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_PATH": "catalog.json",
+        "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256": "e" * 64,
+        "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
+        "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-plan-token",
+        "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
+        "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": "artifacts",
+        "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": "authority",
+        "CAPTAIN_GATEWAY_URL": "http://127.0.0.1:8088",
+        "CAPTAIN_GATEWAY_TOKEN": "gateway-plan-token",
+        "MINIBOOK_BACKEND_URL": "http://127.0.0.1:8080",
+        "MINIBOOK_API_KEY": "minibook-plan-key",
+        "MINIBOOK_PROJECTION_API_KEY": "projection-plan-key",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-plan-token",
+        "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
+        "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "provider-plan-token",
+        "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
+        "CAPTAIN_PROVIDER_POLICY_SHA256": "c" * 64,
+        "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "d" * 64,
+        "CAPTAIN_PROVIDER_CONTEXT_SHA256": "4" * 64,
+        "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256": "5" * 64,
+        "CAPTAIN_PROVIDER_PROXY_CODE_SHA256": "6" * 64,
+        "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256": "7" * 64,
+        "CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED": "true",
+    }
+    environment[name] = value
+    touched: list[str] = []
+
+    with pytest.raises(
+        CapabilityAssemblyBootstrapConfigurationError,
+        match="provider authority is invalid",
+    ):
+        load_capability_assembly_bootstrap_settings(
+            environment=environment,
+            repository_root=tmp_path,
+            touch_probe=lambda: touched.append("effect"),
+        )
+
+    assert touched == []
+
+
 def test_bootstrap_settings_reject_non_loopback_http_and_redact_secrets(
     tmp_path: Path,
 ) -> None:
@@ -94,6 +162,11 @@ def test_bootstrap_settings_reject_non_loopback_http_and_redact_secrets(
         "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
         "CAPTAIN_PROVIDER_POLICY_SHA256": "c" * 64,
         "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "d" * 64,
+        "CAPTAIN_PROVIDER_CONTEXT_SHA256": "4" * 64,
+        "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256": "5" * 64,
+        "CAPTAIN_PROVIDER_PROXY_CODE_SHA256": "6" * 64,
+        "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256": "7" * 64,
+        "CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED": "true",
     }
 
     with pytest.raises(
@@ -592,8 +665,11 @@ def test_production_plan_is_pure_and_reuses_the_provisioner_source_authority(
     raw_artifacts = ContentAddressedArtifactAdapter(artifact_root)
     source_artifacts = RepositoryFactoryInputArtifactStore(artifacts=raw_artifacts)
     store = SimpleNamespace(
-        _runtime_provider_proxy_bindings=frozenset({
-            ("http://127.0.0.1:18091", "c" * 64, "d" * 64),
+        _runtime_provider_bundle_bindings=frozenset({
+            (
+                "http://127.0.0.1:18091", "c" * 64, "d" * 64,
+                "4" * 64, "5" * 64, "6" * 64, "7" * 64, True,
+            ),
         }),
         storage=SimpleNamespace(
             transaction=lambda: (_ for _ in ()).throw(
@@ -636,6 +712,11 @@ def test_production_plan_is_pure_and_reuses_the_provisioner_source_authority(
         "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
         "CAPTAIN_PROVIDER_POLICY_SHA256": "c" * 64,
         "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "d" * 64,
+        "CAPTAIN_PROVIDER_CONTEXT_SHA256": "4" * 64,
+        "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256": "5" * 64,
+        "CAPTAIN_PROVIDER_PROXY_CODE_SHA256": "6" * 64,
+        "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256": "7" * 64,
+        "CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED": "true",
     }
     monkeypatch.setattr(bootstrap, "_native_runtime_is_bound", lambda **_: True)
     monkeypatch.setattr(
@@ -663,6 +744,163 @@ def test_production_plan_is_pure_and_reuses_the_provisioner_source_authority(
 
     assert plan.source_artifacts is source_artifacts
     assert not (tmp_path / "authority").exists()
+
+
+def test_production_plan_rejects_deep_fake_team_ports_before_any_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gateway.capability_assembly_bootstrap as bootstrap
+
+    def bare(cls: type[object], **values: object) -> object:
+        instance = object.__new__(cls)
+        for name, value in values.items():
+            object.__setattr__(instance, name, value)
+        return instance
+
+    store = SimpleNamespace(
+        _runtime_provider_bundle_bindings=frozenset({
+            (
+                "http://127.0.0.1:18091", "c" * 64, "d" * 64,
+                "4" * 64, "5" * 64, "6" * 64, "7" * 64, True,
+            ),
+        }),
+        storage=SimpleNamespace(transaction=lambda: (_ for _ in ()).throw(
+            AssertionError("plan touched schema")
+        )),
+    )
+    repository = bare(bootstrap.GatewayFactoryRepository, _store=store)
+    n8n = bootstrap.GatewayCapabilityN8nWorkBatchAuthority(
+        gateway_store=store  # type: ignore[arg-type]
+    )
+    coordinator = bare(bootstrap.FactoryCoordinator, _repository=repository)
+    lease = bare(
+        bootstrap.GatewayNextActionLeaseIssuer,
+        _store=store,
+        _n8n_work_batch_source=n8n,
+    )
+    hermes = bare(bootstrap.HermesCliFactory, _workflow_artifacts=repository)
+    clock = lambda: datetime(2026, 8, 17, tzinfo=timezone.utc)
+    ports_for = bare(
+        bootstrap.GatewayTechnicalTeamExecutionPortsProvider,
+        _candidate_bindings=object(),
+        _technical_holdout_root=tmp_path / "holdouts",
+        _model_client_for=lambda _job, _invocation: object(),
+        _budget=object(),
+        _pricing_authority=object(),
+        _replay_store=object(),
+        _released_skill_catalog=repository,
+        _skill_root=tmp_path / "agenten" / "agent_factory" / "skills",
+        _provider="openai",
+        _model="gpt-5.6-terra",
+        _max_cost_per_call=Decimal("0.10"),
+        _clock=clock,
+    )
+    team = bare(
+        bootstrap.ProductionFactoryTeamExecutionPort,
+        _ports_for=ports_for,
+    )
+    candidate = bare(
+        bootstrap.CandidateEvaluationFactory,
+        _workflow_artifacts=repository,
+    )
+    benchmark = bare(bootstrap.BusinessBenchmarkDispatchService)
+    dispatcher = bare(
+        bootstrap.FactoryDispatcher,
+        _coordinator=coordinator,
+        _business_benchmark=benchmark,
+    )
+    runner = bare(
+        bootstrap.ProductionFactoryDispatchRunner,
+        _coordinator=coordinator,
+        _dispatcher=dispatcher,
+    )
+    factory = bootstrap.AgentFactoryLiveComposition(
+        repository=repository,  # type: ignore[arg-type]
+        coordinator=coordinator,  # type: ignore[arg-type]
+        lease_issuer=lease,  # type: ignore[arg-type]
+        hermes=hermes,  # type: ignore[arg-type]
+        team_execution=team,  # type: ignore[arg-type]
+        candidate_validator=candidate,  # type: ignore[arg-type]
+        business_benchmark=benchmark,  # type: ignore[arg-type]
+        dispatcher=dispatcher,  # type: ignore[arg-type]
+        runner=runner,  # type: ignore[arg-type]
+        improvement_authority=object(),  # type: ignore[arg-type]
+        runtime_retry_authority=None,
+    )
+    artifacts = ContentAddressedArtifactAdapter(tmp_path / "artifacts")
+    source = RepositoryFactoryInputArtifactStore(artifacts=artifacts)
+    private = bootstrap.GatewayPrivateHoldoutStore(
+        gateway_store=store  # type: ignore[arg-type]
+    )
+    provisioner = bare(
+        bootstrap.CurrentAuthorityCapabilityFactoryProvisioner,
+        _repository=repository,
+        _source_artifacts=source,
+        _work_batches=n8n,
+        _n8n_registry=n8n,
+        _compiler=SimpleNamespace(_holdout_store=private),
+    )
+    runtime = bootstrap.CapabilityAssemblyFactoryRuntime(
+        factory=factory,
+        provisioning=provisioner,  # type: ignore[arg-type]
+        n8n=n8n,
+    )
+    inputs = {
+        "demo_inputs/agent_factory/sales_pipeline_brief/TO_BE_BUILT.md": "1" * 64,
+        "demo_inputs/agent_factory/incident_command/TO_BE_BUILT.md": "2" * 64,
+        "demo_inputs/agent_factory/claims_resolution/TO_BE_BUILT.md": "3" * 64,
+    }
+    environment = {
+        "CAPTAIN_CAPABILITY_ASSEMBLY_REPOSITORY_REVISION": "a" * 40,
+        "CAPTAIN_CAPABILITY_ASSEMBLY_INPUTS_JSON": json.dumps(inputs),
+        "CAPTAIN_CAPABILITY_ASSEMBLY_TOOL_GAPS_JSON": json.dumps(
+            {digest: [] for digest in inputs.values()}
+        ),
+        "CAPTAIN_CAPABILITY_ASSEMBLY_SUBJECT_VERSION": "1",
+        "CAPTAIN_PRIVATE_BENCHMARK_ROOT": str((tmp_path / "private").resolve()),
+        "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_PATH": "catalog.json",
+        "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256": "e" * 64,
+        "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:8092/v1/execute",
+        "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-plan-token",
+        "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID": str(uuid4()),
+        "CAPTAIN_CAPABILITY_ARTIFACT_ROOT": "artifacts",
+        "CAPTAIN_CAPABILITY_AUTHORITY_ROOT": "authority",
+        "CAPTAIN_GATEWAY_URL": "http://127.0.0.1:8088",
+        "CAPTAIN_GATEWAY_TOKEN": "gateway-plan-token",
+        "MINIBOOK_BACKEND_URL": "http://127.0.0.1:8080",
+        "MINIBOOK_API_KEY": "minibook-plan-key",
+        "MINIBOOK_PROJECTION_API_KEY": "projection-plan-key",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-plan-token",
+        "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
+        "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "provider-plan-token",
+        "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
+        "CAPTAIN_PROVIDER_POLICY_SHA256": "c" * 64,
+        "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "d" * 64,
+        "CAPTAIN_PROVIDER_CONTEXT_SHA256": "4" * 64,
+        "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256": "5" * 64,
+        "CAPTAIN_PROVIDER_PROXY_CODE_SHA256": "6" * 64,
+        "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256": "7" * 64,
+        "CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED": "true",
+    }
+    monkeypatch.setattr(Path, "mkdir", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("plan created directory")
+    ))
+    monkeypatch.setattr(bootstrap.httpx, "Client", lambda **_k: (_ for _ in ()).throw(
+        AssertionError("plan created client")
+    ))
+
+    with pytest.raises(
+        CapabilityAssemblyBootstrapConfigurationError,
+        match="not Gateway-native",
+    ):
+        bootstrap.plan_production_capability_assembly_from_environment(
+            repository_root=tmp_path,
+            environment=environment,
+            store=store,  # type: ignore[arg-type]
+            runtime=runtime,
+            private_benchmark_catalog=private,
+            clock=clock,
+        )
 
 
 def test_bootstrap_rejects_raw_factory_runtime_before_schema_or_network() -> None:
@@ -709,6 +947,11 @@ def test_bootstrap_rejects_raw_factory_runtime_before_schema_or_network() -> Non
         "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
         "CAPTAIN_PROVIDER_POLICY_SHA256": "c" * 64,
         "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "d" * 64,
+        "CAPTAIN_PROVIDER_CONTEXT_SHA256": "4" * 64,
+        "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256": "5" * 64,
+        "CAPTAIN_PROVIDER_PROXY_CODE_SHA256": "6" * 64,
+        "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256": "7" * 64,
+        "CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED": "true",
     }
     touched_store = SimpleNamespace(storage=SimpleNamespace(transaction=lambda: (_ for _ in ()).throw(AssertionError("schema touched"))))
 
@@ -915,6 +1158,11 @@ def test_bootstrap_rejects_reused_credentials_before_runtime_or_schema(
         "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18091",
         "CAPTAIN_PROVIDER_POLICY_SHA256": "c" * 64,
         "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "d" * 64,
+        "CAPTAIN_PROVIDER_CONTEXT_SHA256": "4" * 64,
+        "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256": "5" * 64,
+        "CAPTAIN_PROVIDER_PROXY_CODE_SHA256": "6" * 64,
+        "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256": "7" * 64,
+        "CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED": "true",
     }
 
     with pytest.raises(

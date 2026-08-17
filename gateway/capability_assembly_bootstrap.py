@@ -42,12 +42,26 @@ from agenten.delivery.projection_cursor import ProjectionCursorStore
 from agenten.delivery.projector import MinibookProjector
 from agenten.validation.contracts import WorkBatch
 from gateway.agent_factory_live_composition import AgentFactoryLiveComposition
-from gateway.agent_factory_live_composition import ProductionFactoryTeamExecutionPort
+from gateway.agent_factory_live_composition import (
+    GatewayTechnicalTeamExecutionPortsProvider,
+    ProductionFactoryTeamExecutionPort,
+)
 from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
-from gateway.factory_repository import GatewayFactoryRepository
+from gateway.factory_repository import GatewayFactoryBudgetLedger, GatewayFactoryRepository
 from agenten.agent_factory.business_benchmark_dispatch import BusinessBenchmarkDispatchService
-from agenten.agent_factory.candidate_evaluation import CandidateEvaluationFactory
-from agenten.agent_factory.hermes_cli import HermesCliFactory
+from agenten.agent_factory.business_benchmark_production_ports import (
+    BusinessBenchmarkPricingAuthority,
+    ConfiguredBusinessBenchmarkPricingSource,
+    OpenAIBusinessBenchmarkModelClientBuilder,
+)
+from agenten.agent_factory.candidate_evaluation import (
+    CandidateEvaluationFactory,
+    GatewayForgeCandidateProvider,
+)
+from agenten.agent_factory.hermes_cli import (
+    FilesystemFactorySkillReplayStore,
+    HermesCliFactory,
+)
 from agenten.agent_factory.orchestration import FactoryDispatcher
 from agenten.agent_factory.production_dispatch_runner import ProductionFactoryDispatchRunner
 from agenten.agent_factory.service import FactoryCoordinator
@@ -124,6 +138,11 @@ class CapabilityAssemblyBootstrapSettings:
     provider_url: str
     provider_policy_sha256: str
     provider_price_card_sha256: str
+    provider_context_sha256: str
+    provider_proxy_executable_sha256: str
+    provider_proxy_code_sha256: str
+    provider_paid_command_sha256: str
+    provider_hard_ceiling_enforced: bool
     allowed_hosts: tuple[str, ...] = ()
 
 
@@ -144,6 +163,11 @@ _REQUIRED_BOOTSTRAP_NAMES = (
     "CAPTAIN_PROVIDER_PROXY_URL",
     "CAPTAIN_PROVIDER_POLICY_SHA256",
     "CAPTAIN_PROVIDER_PRICE_CARD_SHA256",
+    "CAPTAIN_PROVIDER_CONTEXT_SHA256",
+    "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256",
+    "CAPTAIN_PROVIDER_PROXY_CODE_SHA256",
+    "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256",
+    "CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED",
 )
 
 
@@ -180,11 +204,19 @@ def load_capability_assembly_bootstrap_settings(
     for digest_name in (
         "CAPTAIN_PROVIDER_POLICY_SHA256",
         "CAPTAIN_PROVIDER_PRICE_CARD_SHA256",
+        "CAPTAIN_PROVIDER_CONTEXT_SHA256",
+        "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256",
+        "CAPTAIN_PROVIDER_PROXY_CODE_SHA256",
+        "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256",
     ):
         if _SHA256.fullmatch(raw[digest_name]) is None:
             raise CapabilityAssemblyBootstrapConfigurationError(
                 "capability assembly provider authority is invalid"
             )
+    if raw["CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED"] != "true":
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "capability assembly provider authority is invalid"
+        )
     try:
         benchmark_authority_id = UUID(raw["CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID"])
     except ValueError:
@@ -253,6 +285,13 @@ def load_capability_assembly_bootstrap_settings(
         provider_url=provider_url,
         provider_policy_sha256=raw["CAPTAIN_PROVIDER_POLICY_SHA256"],
         provider_price_card_sha256=raw["CAPTAIN_PROVIDER_PRICE_CARD_SHA256"],
+        provider_context_sha256=raw["CAPTAIN_PROVIDER_CONTEXT_SHA256"],
+        provider_proxy_executable_sha256=raw[
+            "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256"
+        ],
+        provider_proxy_code_sha256=raw["CAPTAIN_PROVIDER_PROXY_CODE_SHA256"],
+        provider_paid_command_sha256=raw["CAPTAIN_PROVIDER_PAID_COMMAND_SHA256"],
+        provider_hard_ceiling_enforced=True,
         allowed_hosts=allowed_hosts,
     )
 
@@ -1312,6 +1351,8 @@ def plan_production_capability_assembly_from_environment(
         runtime=runtime,
         store=store,
         private_benchmark_catalog=private_benchmark_catalog,
+        clock=selected_clock,
+        repository_root=repository_root,
     ):
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly Factory runtime is not Gateway-native"
@@ -1320,9 +1361,14 @@ def plan_production_capability_assembly_from_environment(
         settings.provider_url,
         settings.provider_policy_sha256,
         settings.provider_price_card_sha256,
+        settings.provider_context_sha256,
+        settings.provider_proxy_executable_sha256,
+        settings.provider_proxy_code_sha256,
+        settings.provider_paid_command_sha256,
+        settings.provider_hard_ceiling_enforced,
     )
     if expected_provider_binding not in getattr(
-        store, "_runtime_provider_proxy_bindings", frozenset()
+        store, "_runtime_provider_bundle_bindings", frozenset()
     ):
         raise CapabilityAssemblyBootstrapConfigurationError(
             "capability assembly provider authority is not Gateway-bound"
@@ -1463,6 +1509,8 @@ def _native_runtime_is_bound(
     runtime: CapabilityAssemblyFactoryRuntime,
     store: GatewayStore,
     private_benchmark_catalog: GatewayPrivateHoldoutStore,
+    clock: Callable[[], datetime],
+    repository_root: Path,
 ) -> bool:
     factory = getattr(runtime, "factory", None)
     provisioning = getattr(runtime, "provisioning", None)
@@ -1484,6 +1532,12 @@ def _native_runtime_is_bound(
         or type(factory.hermes) is not HermesCliFactory
         or getattr(factory.hermes, "_workflow_artifacts", None) is not factory.repository
         or type(factory.team_execution) is not ProductionFactoryTeamExecutionPort
+        or not _native_team_execution_ports_are_bound(
+            factory.team_execution,
+            repository=factory.repository,
+            clock=clock,
+            repository_root=repository_root,
+        )
         or type(factory.candidate_validator) is not CandidateEvaluationFactory
         or getattr(factory.candidate_validator, "_workflow_artifacts", None)
         is not factory.repository
@@ -1503,6 +1557,66 @@ def _native_runtime_is_bound(
     ):
         return False
     return True
+
+
+def _native_team_execution_ports_are_bound(
+    team_execution: ProductionFactoryTeamExecutionPort,
+    *,
+    repository: GatewayFactoryRepository,
+    clock: Callable[[], datetime],
+    repository_root: Path,
+) -> bool:
+    """Validate the lazy TeamExecution authority without constructing its ports."""
+
+    provider = getattr(team_execution, "_ports_for", None)
+    if type(provider) is not GatewayTechnicalTeamExecutionPortsProvider:
+        return False
+    skill_root = getattr(provider, "_skill_root", None)
+    if not isinstance(skill_root, Path):
+        return False
+    try:
+        skill_root.resolve().relative_to(repository_root.resolve())
+    except ValueError:
+        return False
+    model_client = getattr(provider, "_model_client_for", None)
+    budget = getattr(provider, "_budget", None)
+    pricing = getattr(provider, "_pricing_authority", None)
+    pricing_source = getattr(pricing, "_source", None)
+    replay = getattr(provider, "_replay_store", None)
+    candidate_bindings = getattr(provider, "_candidate_bindings", None)
+    maximum = getattr(provider, "_max_cost_per_call", None)
+    replay_root = getattr(replay, "_root", None)
+    if not isinstance(replay_root, Path):
+        return False
+    try:
+        replay_root.resolve().relative_to(repository_root.resolve())
+    except ValueError:
+        return False
+    return (
+        getattr(provider, "_clock", None) is clock
+        and getattr(provider, "_released_skill_catalog", None) is repository
+        and getattr(provider, "_provider", None) == "openai"
+        and isinstance(getattr(provider, "_model", None), str)
+        and bool(getattr(provider, "_model", "").strip())
+        and maximum is not None
+        and maximum > 0
+        and type(model_client) is OpenAIBusinessBenchmarkModelClientBuilder
+        and model_client.provider == "openai"
+        and model_client.model == getattr(provider, "_model", None)
+        and type(budget) is GatewayFactoryBudgetLedger
+        and getattr(budget, "_store", None) is getattr(repository, "_store", None)
+        and type(pricing) is BusinessBenchmarkPricingAuthority
+        and type(pricing_source) is ConfiguredBusinessBenchmarkPricingSource
+        and getattr(pricing_source, "_provider", None) == "openai"
+        and getattr(pricing_source, "_model", None) == getattr(provider, "_model", None)
+        and getattr(pricing_source, "_max_cost_per_call", None) == maximum
+        and type(replay) is FilesystemFactorySkillReplayStore
+        and type(candidate_bindings) is GatewayForgeCandidateProvider
+        and getattr(candidate_bindings, "_repository", None) is repository
+        and callable(model_client)
+        and callable(getattr(provider, "_clock", None))
+        and callable(provider)
+    )
 
 
 async def close_production_capability_assembly(
