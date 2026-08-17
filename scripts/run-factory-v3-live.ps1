@@ -46,17 +46,12 @@ if (
 $runId = $null
 if (-not [string]::IsNullOrWhiteSpace($ResumeMetadata)) {
     $resolvedResume = (Resolve-Path -LiteralPath $ResumeMetadata -ErrorAction Stop).Path
-    $resume = Get-Content -LiteralPath $resolvedResume -Raw -Encoding UTF8 |
-        ConvertFrom-Json -Depth 20 -ErrorAction Stop
-    if (
-        $resume.schema -cne 'captain.factory-v3-live-preflight.v1' -or
-        [string]::IsNullOrWhiteSpace([string] $resume.run_id)
-    ) {
-        throw 'Factory V3 resume metadata is invalid.'
+    if ([IO.Path]::GetFileName($resolvedResume) -cne 'resume-metadata.json') {
+        throw 'Factory V3 resume requires canonical signed metadata.'
     }
-    $runId = [Guid]::Parse([string] $resume.run_id).ToString()
+    $runId = [Guid]::Parse([IO.Path]::GetFileName([IO.Path]::GetDirectoryName($resolvedResume))).ToString()
     $expectedResume = [IO.Path]::GetFullPath(
-        (Join-Path (Join-Path $resolvedEvidenceRoot $runId) 'preflight.json')
+        (Join-Path (Join-Path $resolvedEvidenceRoot $runId) 'resume-metadata.json')
     )
     if (-not [string]::Equals($resolvedResume, $expectedResume, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Factory V3 resume metadata is outside its durable run scope.'
@@ -84,6 +79,9 @@ $arguments = @(
     '--run-id', $runId,
     '--output', $preflightPath
 )
+if (-not [string]::IsNullOrWhiteSpace($ResumeMetadata)) {
+    $arguments += @('--resume-metadata', $resolvedResume)
+}
 
 Push-Location -LiteralPath $repositoryRoot
 try {

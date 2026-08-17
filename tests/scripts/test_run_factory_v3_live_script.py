@@ -64,7 +64,7 @@ def test_live_script_persists_unmet_preflight_without_starting_a_build(
     assert not tuple(evidence_root.rglob("build-started*"))
     assert not tuple(evidence_root.rglob("evidence.json"))
 
-    resumed = subprocess.run(
+    spoofed_preflight_resume = subprocess.run(
         [
             "pwsh",
             "-NoProfile",
@@ -86,7 +86,15 @@ def test_live_script_persists_unmet_preflight_without_starting_a_build(
         timeout=30,
         check=False,
     )
-    assert resumed.returncode == 3
-    resumed_summary = json.loads(resumed.stdout.strip().splitlines()[-1])
-    assert resumed_summary["run_id"] == report["run_id"]
+    assert spoofed_preflight_resume.returncode != 0
+    assert "canonical signed metadata" in spoofed_preflight_resume.stderr
     assert len(tuple(evidence_root.glob("*/preflight.json"))) == 1
+
+
+def test_live_script_delegates_signed_resume_validation_to_authenticated_preflight() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert "Get-Content -LiteralPath $resolvedResume" not in source
+    assert "ConvertFrom-Json" not in source
+    assert "resume-metadata.json" in source
+    assert "--resume-metadata" in source

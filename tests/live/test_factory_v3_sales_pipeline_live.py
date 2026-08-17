@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 from uuid import UUID
 
 import pytest
+
+from gateway.factory_v3_live_evidence import (
+    FactoryV3HttpEvidenceAuthority,
+    assert_factory_v3_live_secret_free,
+    verify_factory_v3_live_evidence,
+)
 
 
 pytestmark = pytest.mark.live
@@ -16,20 +22,11 @@ pytestmark = pytest.mark.live
 ROOT = Path(__file__).parents[2]
 SCRIPT = ROOT / "scripts" / "run-factory-v3-live.ps1"
 INPUT = ROOT / "tests" / "fixtures" / "agent_factory" / "sales_pipeline_brief.v3.json"
-AGENTS = (
-    "account_researcher",
-    "opportunity_qualifier",
-    "deal_strategist",
-    "executive_brief_writer",
-)
-HANDOFFS = (
-    ("account_researcher", "opportunity_qualifier"),
-    ("opportunity_qualifier", "deal_strategist"),
-    ("deal_strategist", "executive_brief_writer"),
-)
 
 
-def test_real_factory_v3_sales_pipeline_is_captain_accepted(tmp_path: Path) -> None:
+def test_real_factory_v3_sales_pipeline_is_independently_captain_accepted(
+    tmp_path: Path,
+) -> None:
     evidence_root = tmp_path / "factory-v3-live"
     completed = subprocess.run(
         [
@@ -61,32 +58,34 @@ def test_real_factory_v3_sales_pipeline_is_captain_accepted(tmp_path: Path) -> N
         unmet = summaries[-1].get("unmet_checks", []) if summaries else []
         pytest.fail(f"Factory V3 live gate did not run: {status}; unmet={unmet}")
 
-    evidence_files = tuple(evidence_root.glob("*/evidence.json"))
-    assert len(evidence_files) == 1
-    evidence = json.loads(evidence_files[0].read_text(encoding="utf-8"))
-    assert evidence["schema"] == "captain.factory-v3-live-evidence.v1"
-    assert evidence["status"] == "succeeded"
-    UUID(evidence["correlation_id"])
-    assert re.fullmatch(r"[0-9a-f]{64}", evidence["released_skill_sha256"])
-    assert evidence["hermes_invocation_count"] == 1
-    assert evidence["codex_session_count"] == 1
-    assert tuple(evidence["agent_ids"]) == AGENTS
-    assert tuple(tuple(item) for item in evidence["ordered_handoffs"]) == HANDOFFS
-    assert set(evidence["required_tool_ids"]) == {
-        "account_snapshot_reader",
-        "opportunity_scoring_rules",
-    }
-    assert evidence["required_tools_tested"] is True
-    assert evidence["minibook_package_status"] == "succeeded"
-    assert evidence["minibook_readback_status"] == "verified"
-    assert evidence["captain_acceptance_status"] == "accepted"
-    assert evidence["openfang_events"] == 0
-    assert evidence["promotion_events"] == 0
-    assert evidence["deployment_events"] == 0
-    assert evidence["ready_to_use_events"] == 0
-    serialized = json.dumps(evidence, sort_keys=True)
-    assert not re.search(r"[A-Za-z]:[/\\]", serialized)
-    assert not any(
-        marker in serialized.casefold()
-        for marker in ("authorization", "api_key", "password", "prompt", "holdout")
+    preflights = tuple(evidence_root.glob("*/preflight.json"))
+    indexes = tuple(evidence_root.glob("*/evidence-index.json"))
+    assert len(preflights) == 1
+    assert len(indexes) == 1
+    assert preflights[0].parent == indexes[0].parent
+    preflight_bytes = preflights[0].read_bytes()
+    preflight = json.loads(preflight_bytes)
+    index = json.loads(indexes[0].read_bytes())
+    assert_factory_v3_live_secret_free(preflight)
+    assert_factory_v3_live_secret_free(index)
+    assert preflight["schema"] == "captain.factory-v3-live-preflight.v1"
+    assert preflight["status"] == "ready"
+    run_id = UUID(preflight["run_id"])
+    assert UUID(index["preflight_run_id"]) == run_id
+    assert index["preflight_report_sha256"] == hashlib.sha256(
+        preflight_bytes
+    ).hexdigest()
+
+    authority = FactoryV3HttpEvidenceAuthority(
+        gateway_origin=os.environ["CAPTAIN_FACTORY_V3_GATEWAY_ORIGIN"],
+        minibook_origin=os.environ["CAPTAIN_FACTORY_V3_MINIBOOK_ORIGIN"],
+        captain_token=os.environ["CAPTAIN_FACTORY_V3_CAPTAIN_TOKEN"],
+        worker_token=os.environ["CAPTAIN_FACTORY_V3_WORKER_TOKEN"],
     )
+    verified = verify_factory_v3_live_evidence(index, authority=authority)
+
+    assert verified.preflight_run_id == run_id
+    assert verified.correlation_id == UUID(index["correlation_id"])
+    assert verified.factory_job_id == UUID(index["factory_job_id"])
+    assert verified.creation_job_id == UUID(index["creation_job_id"])
+    assert_factory_v3_live_secret_free(verified.as_dict())

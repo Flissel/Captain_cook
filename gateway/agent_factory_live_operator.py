@@ -9,13 +9,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -291,11 +292,86 @@ _FACTORY_V3_LIVE_SUMMARY_SCHEMA = "captain.factory-v3-live-preflight-summary.v1"
 _FACTORY_V3_LIVE_INPUT = Path(
     "tests/fixtures/agent_factory/sales_pipeline_brief.v3.json"
 )
+_FACTORY_V3_FROZEN_INPUT_SHA256 = (
+    "81e76f52fdc99f64aeea9e5008c00d6eba25972014ef7563d4fc0851cf85864f"
+)
+_FACTORY_V3_CODEX_SESSION_SHA256 = (
+    "2d7ca8acc7cb6dcdbc9882f3772be1cc8e9dd3ab210d2f87775b92b84023bbf3"
+)
+_FACTORY_V3_HERMES_GIT_SHA = "fcbdeca1ebedf1d1ee7f0199f4df7bf3f39619a0"
 _FACTORY_V3_AGENT_IDS = (
     "account_researcher",
     "opportunity_qualifier",
     "deal_strategist",
     "executive_brief_writer",
+)
+_FACTORY_V3_AUTHORITY_MANIFEST: dict[str, object] = {
+    "fixture_expected": {
+        "required_agent_ids": list(_FACTORY_V3_AGENT_IDS),
+        "ordered_handoffs": [
+            {
+                "from_agent_id": "account_researcher",
+                "to_agent_id": "opportunity_qualifier",
+            },
+            {
+                "from_agent_id": "opportunity_qualifier",
+                "to_agent_id": "deal_strategist",
+            },
+            {
+                "from_agent_id": "deal_strategist",
+                "to_agent_id": "executive_brief_writer",
+            },
+        ],
+        "tool_requirements": [
+            {"tool_id": "account_snapshot_reader", "required": True},
+            {"tool_id": "opportunity_scoring_rules", "required": True},
+            {"tool_id": "industry_signal_reader", "required": False},
+        ],
+        "allowed_optional_tool_gaps": ["industry_signal_reader"],
+        "public_assertion_ids": [
+            "assert-2b1d7c6a3666",
+            "assert-7f77e654f907",
+            "assert-b84ce004c78b",
+            "assert-cc0a96c5fc02",
+            "assert-9e6cdab86303",
+            "assert-9a5995ebfcb8",
+            "assert-3e8de9d245ae",
+            "assert-3153de4c492a",
+        ],
+    },
+    "build_authority": {
+        "allowed_output_roots": ["src", "tests", "evidence"],
+        "allowed_commands": [
+            ["python", "-m", "compileall", "src"],
+            ["python", "-m", "pytest"],
+        ],
+        "limits": {
+            "max_wall_clock_seconds": 300,
+            "max_provider_cost_usd": "1.50",
+            "max_retries": 0,
+            "max_files": 4096,
+        },
+        "network_allowed": False,
+    },
+}
+_FACTORY_V3_AUTHORITY_MANIFEST_SHA256 = (
+    "21fa9a028a9a1b2c53635dcf345d2321f675a7fa2012083c6581dc8ef092a382"
+)
+_FACTORY_V3_HEALTH_CAPABILITIES: dict[str, tuple[str, ...]] = {
+    "captain-gateway": (
+        "factory-v3-live-authority",
+        "action-inbox-read",
+    ),
+    "minibook-creation": ("creation-jobs-v3", "cas-readback-v1"),
+}
+_FACTORY_V3_CODEX_SESSION_MARKERS = (
+    b'ArgumentList.Add("--sandbox")',
+    b'ArgumentList.Add("--ask-for-approval")',
+    b'ArgumentList.Add("never")',
+    b'ArgumentList.Add("sandbox_workspace_write.network_access=false")',
+    b'ArgumentList.Add("--ignore-user-config")',
+    b'ArgumentList.Add("--json")',
+    b"$DeadlineAt",
 )
 _SAFE_CREDENTIAL_REF = re.compile(
     r"^credential://[A-Za-z0-9._~-]+/[A-Za-z0-9._~/-]+$"
@@ -334,6 +410,69 @@ class FactoryV3LiveActionInboxStatus:
 
 
 @dataclass(frozen=True)
+class FactoryV3LiveResumeMetadata:
+    run_id: UUID
+    correlation_id: UUID
+    factory_job_id: UUID
+    creation_job_id: UUID
+    request_id: UUID
+    expected_subject_version: int
+    safe_checkpoint_ref: ArtifactRef
+    safe_checkpoint_sha256: str
+    deadline_at: datetime
+    tenant_id: str
+    action_url: str
+    gateway_origin: str
+    issued_at: datetime
+    metadata_sha256: str
+    captain_signature: str
+    status: Literal["pending", "answered"] = "pending"
+
+    def unsigned_dict(self) -> dict[str, object]:
+        return {
+            "schema": "captain.factory-v3-resume-metadata.v1",
+            "run_id": str(self.run_id),
+            "correlation_id": str(self.correlation_id),
+            "factory_job_id": str(self.factory_job_id),
+            "creation_job_id": str(self.creation_job_id),
+            "request_id": str(self.request_id),
+            "expected_subject_version": self.expected_subject_version,
+            "safe_checkpoint_ref": self.safe_checkpoint_ref.model_dump(mode="json"),
+            "safe_checkpoint_sha256": self.safe_checkpoint_sha256,
+            "deadline_at": self.deadline_at.isoformat().replace("+00:00", "Z"),
+            "tenant_id": self.tenant_id,
+            "action_url": self.action_url,
+            "gateway_origin": self.gateway_origin,
+            "issued_at": self.issued_at.isoformat().replace("+00:00", "Z"),
+            "status": self.status,
+        }
+
+    def as_dict(self) -> dict[str, object]:
+        return self.unsigned_dict() | {
+            "metadata_sha256": self.metadata_sha256,
+            "captain_signature": self.captain_signature,
+        }
+
+    def immutable_binding(self) -> tuple[object, ...]:
+        return (
+            self.run_id,
+            self.correlation_id,
+            self.factory_job_id,
+            self.creation_job_id,
+            self.request_id,
+            self.expected_subject_version,
+            self.safe_checkpoint_ref.uri,
+            self.safe_checkpoint_ref.sha256,
+            self.safe_checkpoint_ref.media_type,
+            self.safe_checkpoint_sha256,
+            self.deadline_at,
+            self.tenant_id,
+            self.action_url,
+            self.gateway_origin,
+        )
+
+
+@dataclass(frozen=True)
 class FactoryV3LivePreflightReport:
     run_id: UUID
     checked_at: datetime
@@ -341,6 +480,7 @@ class FactoryV3LivePreflightReport:
     input_sha256: str
     checks: tuple[FactoryV3LivePreflightCheck, ...]
     action_inbox: FactoryV3LiveActionInboxStatus | None = None
+    resume_metadata: FactoryV3LiveResumeMetadata | None = None
 
     @property
     def ready(self) -> bool:
@@ -353,6 +493,7 @@ class FactoryV3LivePreflightReport:
             "checked_at": self.checked_at.isoformat().replace("+00:00", "Z"),
             "status": self.status,
             "input_sha256": self.input_sha256,
+            "authority_manifest_sha256": _FACTORY_V3_AUTHORITY_MANIFEST_SHA256,
             "checks": [check.as_dict() for check in self.checks],
         }
         if self.action_inbox is not None:
@@ -361,20 +502,36 @@ class FactoryV3LivePreflightReport:
 
 
 class _FactoryV3LiveReadOnlyProbe(Protocol):
-    def endpoint_ready(self, url: str, *, token: str) -> bool: ...
+    def service_health(
+        self,
+        *,
+        service: str,
+        origin: str,
+        token: str,
+    ) -> Mapping[str, object]: ...
 
     def released_skill_active(
         self,
         *,
+        gateway_origin: str,
+        token: str,
         skill_name: str,
         skill_sha256: str,
     ) -> bool: ...
+
+    def action_resume_metadata(
+        self,
+        *,
+        gateway_origin: str,
+        token: str,
+        run_id: UUID,
+    ) -> Mapping[str, object] | None: ...
 
 
 class _DefaultFactoryV3LiveReadOnlyProbe:
     """Perform bounded health reads and refuse unimplemented authority reads."""
 
-    def endpoint_ready(self, url: str, *, token: str) -> bool:
+    def _read_json(self, url: str, *, token: str) -> Mapping[str, object] | None:
         try:
             with httpx.Client(follow_redirects=False, timeout=5.0) as client:
                 with client.stream(
@@ -385,25 +542,52 @@ class _DefaultFactoryV3LiveReadOnlyProbe:
                         "Authorization": f"Bearer {token}",
                     },
                 ) as response:
-                    size = 0
+                    content = b""
                     for chunk in response.iter_bytes():
-                        size += len(chunk)
-                        if size > 4_096:
-                            return False
-                    return 200 <= response.status_code < 300
-        except httpx.HTTPError:
-            return False
+                        content += chunk
+                        if len(content) > 16_384:
+                            return None
+                    if response.status_code != 200:
+                        return None
+                    payload = json.loads(content)
+                    return payload if isinstance(payload, dict) else None
+        except (httpx.HTTPError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+    def service_health(
+        self,
+        *,
+        service: str,
+        origin: str,
+        token: str,
+    ) -> Mapping[str, object]:
+        del service
+        return self._read_json(f"{origin}/healthz", token=token) or {}
 
     def released_skill_active(
         self,
         *,
+        gateway_origin: str,
+        token: str,
         skill_name: str,
         skill_sha256: str,
     ) -> bool:
-        del skill_name, skill_sha256
+        del gateway_origin, token, skill_name, skill_sha256
         # The current Gateway has no read-only, correlation-bound active-skill
         # preflight. Local bytes or an environment value are not Captain proof.
         return False
+
+    def action_resume_metadata(
+        self,
+        *,
+        gateway_origin: str,
+        token: str,
+        run_id: UUID,
+    ) -> Mapping[str, object] | None:
+        return self._read_json(
+            f"{gateway_origin}/v1/factory/live-runs/{run_id}/resume-metadata",
+            token=token,
+        )
 
 
 def _factory_v3_check(code: str, condition: bool) -> FactoryV3LivePreflightCheck:
@@ -413,35 +597,102 @@ def _factory_v3_check(code: str, condition: bool) -> FactoryV3LivePreflightCheck
     )
 
 
-def _safe_live_url(value: str) -> bool:
+def _canonical_service_origin(value: str) -> str | None:
+    if not value or value != value.strip() or "\\" in value or "%" in value:
+        return None
     try:
         parsed = urlsplit(value)
-        parsed.port
+        port = parsed.port
     except ValueError:
-        return False
-    loopback = parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+        return None
+    hostname = parsed.hostname
+    if (
+        hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or parsed.scheme not in {"https", "http"}
+        or (parsed.scheme == "http" and hostname not in {"127.0.0.1", "::1", "localhost"})
+        or hostname.endswith(".")
+    ):
+        return None
+    host = f"[{hostname}]" if ":" in hostname else hostname.casefold()
+    authority = f"{parsed.scheme}://{host}"
+    if port is not None:
+        authority = f"{authority}:{port}"
+    return authority if value.rstrip("/").casefold() == authority.casefold() else None
+
+
+def _factory_v3_authority_origins(
+    environment: Mapping[str, str],
+) -> tuple[str, str] | None:
+    if any(
+        environment.get(name, "").strip()
+        for name in (
+            "CAPTAIN_FACTORY_V3_GATEWAY_HEALTH_URL",
+            "CAPTAIN_FACTORY_V3_MINIBOOK_HEALTH_URL",
+        )
+    ):
+        return None
+    gateway = _canonical_service_origin(
+        environment.get("CAPTAIN_FACTORY_V3_GATEWAY_ORIGIN", "").strip()
+    )
+    minibook = _canonical_service_origin(
+        environment.get("CAPTAIN_FACTORY_V3_MINIBOOK_ORIGIN", "").strip()
+    )
+    if gateway is None or minibook is None or gateway == minibook:
+        return None
+    return gateway, minibook
+
+
+def _factory_v3_service_health_payload_ready(
+    payload: Mapping[str, object],
+    *,
+    service: str,
+    origin: str,
+) -> bool:
+    expected_capabilities = _FACTORY_V3_HEALTH_CAPABILITIES.get(service)
+    capabilities = payload.get("capabilities")
     return bool(
-        parsed.hostname
-        and (parsed.scheme == "https" or (parsed.scheme == "http" and loopback))
-        and parsed.username is None
-        and parsed.password is None
-        and not parsed.query
-        and not parsed.fragment
+        expected_capabilities is not None
+        and set(payload) == {
+            "schema",
+            "service",
+            "version",
+            "origin",
+            "capabilities",
+            "ready",
+        }
+        and payload.get("schema") == "captain.factory-v3-service-health.v1"
+        and payload.get("service") == service
+        and payload.get("version") == "v3"
+        and payload.get("origin") == origin
+        and isinstance(capabilities, (list, tuple))
+        and tuple(capabilities) == expected_capabilities
+        and payload.get("ready") is True
     )
 
 
-def _bounded_endpoint_ready(
+def _bounded_service_health_ready(
     probe: _FactoryV3LiveReadOnlyProbe,
     *,
-    url: str,
+    service: str,
+    origin: str,
     token: str,
 ) -> bool:
-    if not url or not token or not _safe_live_url(url):
+    if not token or _canonical_service_origin(origin) != origin:
         return False
     try:
-        return probe.endpoint_ready(url, token=token) is True
+        payload = probe.service_health(service=service, origin=origin, token=token)
     except Exception:
         return False
+    return _factory_v3_service_health_payload_ready(
+        payload,
+        service=service,
+        origin=origin,
+    )
 
 
 def _isolated_factory_v3_roots_ready(*roots: Path) -> bool:
@@ -494,10 +745,9 @@ def _factory_v3_skill_digest(directory: Path) -> str | None:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _factory_v3_released_skill_ready(
+def _factory_v3_released_skill_identity(
     environment: Mapping[str, str],
-    probe: _FactoryV3LiveReadOnlyProbe,
-) -> bool:
+) -> tuple[str, str] | None:
     name = environment.get("CAPTAIN_FACTORY_V3_RELEASED_SKILL_NAME", "").strip()
     digest = environment.get("CAPTAIN_FACTORY_V3_RELEASED_SKILL_SHA256", "").strip()
     root_value = environment.get("CAPTAIN_FACTORY_V3_RELEASED_SKILL_ROOT", "").strip()
@@ -506,17 +756,33 @@ def _factory_v3_released_skill_ready(
         or _SAFE_DIGEST.fullmatch(digest) is None
         or not root_value
     ):
-        return False
+        return None
     try:
         root = Path(root_value).resolve(strict=True)
         directory = (root / name).resolve(strict=True)
         directory.relative_to(root)
     except (OSError, ValueError):
-        return False
+        return None
     if not directory.is_dir() or _factory_v3_skill_digest(directory) != digest:
+        return None
+    return name, digest
+
+
+def _factory_v3_released_skill_ready(
+    environment: Mapping[str, str],
+    probe: _FactoryV3LiveReadOnlyProbe,
+    *,
+    gateway_origin: str,
+) -> bool:
+    identity = _factory_v3_released_skill_identity(environment)
+    token = environment.get("CAPTAIN_FACTORY_V3_CAPTAIN_TOKEN", "").strip()
+    if identity is None or not token:
         return False
+    name, digest = identity
     try:
         return probe.released_skill_active(
+            gateway_origin=gateway_origin,
+            token=token,
             skill_name=name,
             skill_sha256=digest,
         ) is True
@@ -538,19 +804,36 @@ def _factory_v3_codex_session_ready(
     )
     if not all(values):
         return False
+    codex_path, pwsh_path, codex_home_path = (Path(value) for value in values)
     try:
-        codex = Path(values[0]).resolve(strict=True)
-        pwsh = Path(values[1]).resolve(strict=True)
-        codex_home = Path(values[2]).resolve(strict=True)
+        if any(path.is_symlink() for path in (codex_path, pwsh_path, codex_home_path)):
+            return False
+        codex = codex_path.resolve(strict=True)
+        pwsh = pwsh_path.resolve(strict=True)
+        codex_home = codex_home_path.resolve(strict=True)
         script = (
             repository_root.resolve(strict=True) / "scripts" / "codex-session.ps1"
         ).resolve(strict=True)
+        script_content = script.read_bytes()
     except OSError:
         return False
-    return codex.is_file() and pwsh.is_file() and codex_home.is_dir() and script.is_file()
+    return bool(
+        codex.is_file()
+        and codex.name.casefold() in {"codex", "codex.exe"}
+        and pwsh.is_file()
+        and pwsh.name.casefold() in {"pwsh", "pwsh.exe"}
+        and codex_home.is_dir()
+        and script.is_file()
+        and hashlib.sha256(script_content).hexdigest()
+        == _FACTORY_V3_CODEX_SESSION_SHA256
+        and all(marker in script_content for marker in _FACTORY_V3_CODEX_SESSION_MARKERS)
+    )
 
 
-def _factory_v3_hermes_runtime_ready(environment: Mapping[str, str]) -> bool:
+def _factory_v3_hermes_runtime_ready(
+    environment: Mapping[str, str],
+    repository_root: Path,
+) -> bool:
     executable_value = environment.get(
         "CAPTAIN_FACTORY_V3_HERMES_PYTHON", ""
     ).strip()
@@ -559,16 +842,67 @@ def _factory_v3_hermes_runtime_ready(environment: Mapping[str, str]) -> bool:
     ).strip()
     if not executable_value or not module_value:
         return False
+    executable_path = Path(executable_value)
+    module_path = Path(module_value)
     try:
-        executable = Path(executable_value).resolve(strict=True)
-        module_root = Path(module_value).resolve(strict=True)
-    except OSError:
+        if executable_path.is_symlink() or module_path.is_symlink():
+            return False
+        executable = executable_path.resolve(strict=True)
+        module_root = module_path.resolve(strict=True)
+        expected_module_root = (
+            repository_root.resolve(strict=True) / "hermes-agent"
+        ).resolve(strict=True)
+        executable.relative_to(module_root)
+    except (OSError, ValueError):
         return False
-    return bool(
+    if not (
         executable.is_file()
+        and executable.name.casefold() in {"python", "python.exe"}
+        and module_root == expected_module_root
         and module_root.is_dir()
+        and (module_root / ".git").exists()
         and (module_root / "hermes_cli" / "__init__.py").is_file()
         and (module_root / "concurrent_log_handler.py").is_file()
+    ):
+        return False
+    try:
+        gitlink = subprocess.run(
+            ["git", "ls-tree", "HEAD", "--", "hermes-agent"],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        child_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=module_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        child_status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=module_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    fields = gitlink.stdout.strip().split()
+    return bool(
+        gitlink.returncode == 0
+        and len(fields) >= 3
+        and fields[0] == "160000"
+        and re.fullmatch(r"[0-9a-f]{40}", fields[2]) is not None
+        and hmac.compare_digest(fields[2], _FACTORY_V3_HERMES_GIT_SHA)
+        and child_head.returncode == 0
+        and hmac.compare_digest(fields[2], child_head.stdout.strip())
+        and child_status.returncode == 0
+        and not child_status.stdout.strip()
     )
 
 
@@ -595,10 +929,10 @@ def _factory_v3_execution_bounds_ready(
         return False
     remaining_seconds = (deadline - now).total_seconds()
     return bool(
-        1 <= maximum_runtime <= 900
-        and 1 <= maximum_files <= 4_096
+        maximum_runtime == 300
+        and maximum_files == 4_096
         and maximum_cost.is_finite()
-        and Decimal("0") < maximum_cost <= Decimal("1.50")
+        and maximum_cost == Decimal("1.50")
         and 1 <= remaining_seconds <= maximum_runtime
         and environment.get("CAPTAIN_FACTORY_V3_NETWORK_ALLOWED", "") == "false"
     )
@@ -613,49 +947,251 @@ def _factory_v3_credentials_ready(environment: Mapping[str, str]) -> bool:
             "CAPTAIN_FACTORY_V3_CREATION_API_KEY",
         )
     )
-    return all(values) and len(set(values)) == len(values)
-
-
-def _factory_v3_action_inbox_status(
-    environment: Mapping[str, str],
-) -> FactoryV3LiveActionInboxStatus | None:
-    credential_ref = environment.get(
-        "CAPTAIN_FACTORY_V3_CREDENTIAL_REF", ""
+    resume_verification_key = environment.get(
+        "CAPTAIN_FACTORY_V3_RESUME_VERIFY_KEY", ""
     ).strip()
-    if _SAFE_CREDENTIAL_REF.fullmatch(credential_ref) is not None:
-        return None
-    url = environment.get("CAPTAIN_FACTORY_V3_ACTION_INBOX_URL", "").strip()
-    request_id_value = environment.get(
-        "CAPTAIN_FACTORY_V3_ACTION_REQUEST_ID", ""
-    ).strip()
-    checkpoint = environment.get(
-        "CAPTAIN_FACTORY_V3_SAFE_CHECKPOINT_SHA256", ""
-    ).strip()
-    if not _safe_live_url(url) or _SAFE_DIGEST.fullmatch(checkpoint) is None:
-        return None
-    try:
-        request_id = UUID(request_id_value)
-    except ValueError:
-        return None
-    return FactoryV3LiveActionInboxStatus(
-        status="pending",
-        url=url,
-        request_id=request_id,
-        safe_checkpoint_sha256=checkpoint,
+    if resume_verification_key:
+        values = (*values, resume_verification_key)
+    if not all(values):
+        return False
+    encoded = tuple(value.encode("utf-8") for value in values)
+    return not any(
+        hmac.compare_digest(left, right)
+        for index, left in enumerate(encoded)
+        for right in encoded[index + 1 :]
     )
 
 
-def _factory_v3_portal_ready(
+def _factory_v3_resume_canonical_bytes(payload: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _factory_v3_parse_resume_metadata(
+    payload: Mapping[str, object],
+    *,
+    gateway_origin: str,
+    run_id: UUID,
+    now: datetime,
+    verification_key: str,
+) -> FactoryV3LiveResumeMetadata | None:
+    expected_fields = {
+        "schema",
+        "run_id",
+        "correlation_id",
+        "factory_job_id",
+        "creation_job_id",
+        "request_id",
+        "expected_subject_version",
+        "safe_checkpoint_ref",
+        "safe_checkpoint_sha256",
+        "deadline_at",
+        "tenant_id",
+        "action_url",
+        "gateway_origin",
+        "issued_at",
+        "status",
+        "metadata_sha256",
+        "captain_signature",
+    }
+    if set(payload) != expected_fields or len(verification_key) < 16:
+        return None
+    unsigned = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"metadata_sha256", "captain_signature"}
+    }
+    try:
+        canonical = _factory_v3_resume_canonical_bytes(unsigned)
+        metadata_sha256 = str(payload["metadata_sha256"])
+        captain_signature = str(payload["captain_signature"])
+        expected_digest = hashlib.sha256(canonical).hexdigest()
+        expected_signature = hmac.new(
+            verification_key.encode("utf-8"),
+            canonical,
+            hashlib.sha256,
+        ).hexdigest()
+        if (
+            _SAFE_DIGEST.fullmatch(metadata_sha256) is None
+            or _SAFE_DIGEST.fullmatch(captain_signature) is None
+            or not hmac.compare_digest(metadata_sha256, expected_digest)
+            or not hmac.compare_digest(captain_signature, expected_signature)
+        ):
+            return None
+        parsed_run_id = UUID(str(payload["run_id"]))
+        correlation_id = UUID(str(payload["correlation_id"]))
+        factory_job_id = UUID(str(payload["factory_job_id"]))
+        creation_job_id = UUID(str(payload["creation_job_id"]))
+        request_id = UUID(str(payload["request_id"]))
+        expected_subject_version = payload["expected_subject_version"]
+        if (
+            not isinstance(expected_subject_version, int)
+            or isinstance(expected_subject_version, bool)
+            or expected_subject_version < 1
+        ):
+            return None
+        checkpoint_ref = ArtifactRef.model_validate(payload["safe_checkpoint_ref"])
+        checkpoint_sha256 = str(payload["safe_checkpoint_sha256"])
+        deadline_text = str(payload["deadline_at"])
+        issued_text = str(payload["issued_at"])
+        if not deadline_text.endswith("Z") or not issued_text.endswith("Z"):
+            return None
+        deadline = datetime.fromisoformat(deadline_text.replace("Z", "+00:00"))
+        issued_at = datetime.fromisoformat(issued_text.replace("Z", "+00:00"))
+        tenant_id = str(payload["tenant_id"])
+        action_url = str(payload["action_url"])
+        payload_origin = str(payload["gateway_origin"])
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return None
+    expected_action_url = f"{gateway_origin}/portal/factory-actions/{request_id}"
+    if (
+        payload.get("schema") != "captain.factory-v3-resume-metadata.v1"
+        or payload.get("status") not in {"pending", "answered"}
+        or parsed_run_id != run_id
+        or payload_origin != gateway_origin
+        or action_url != expected_action_url
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", tenant_id) is None
+        or checkpoint_sha256 != checkpoint_ref.sha256
+        or _SAFE_DIGEST.fullmatch(checkpoint_sha256) is None
+        or checkpoint_ref.media_type != "application/json"
+        or deadline.tzinfo is None
+        or deadline.utcoffset() != timezone.utc.utcoffset(deadline)
+        or issued_at.tzinfo is None
+        or issued_at.utcoffset() != timezone.utc.utcoffset(issued_at)
+        or issued_at > now
+        or deadline <= now
+    ):
+        return None
+    return FactoryV3LiveResumeMetadata(
+        run_id=parsed_run_id,
+        correlation_id=correlation_id,
+        factory_job_id=factory_job_id,
+        creation_job_id=creation_job_id,
+        request_id=request_id,
+        expected_subject_version=expected_subject_version,
+        safe_checkpoint_ref=checkpoint_ref,
+        safe_checkpoint_sha256=checkpoint_sha256,
+        deadline_at=deadline,
+        tenant_id=tenant_id,
+        action_url=action_url,
+        gateway_origin=gateway_origin,
+        issued_at=issued_at,
+        metadata_sha256=metadata_sha256,
+        captain_signature=captain_signature,
+        status=cast(Literal["pending", "answered"], payload["status"]),
+    )
+
+
+def _factory_v3_load_resume_metadata(
+    path: Path,
+    *,
+    gateway_origin: str,
+    run_id: UUID,
+    now: datetime,
+    verification_key: str,
+) -> FactoryV3LiveResumeMetadata | None:
+    try:
+        if path.is_symlink() or path.name != "resume-metadata.json":
+            return None
+        content = path.read_bytes()
+        if len(content) > 32_768:
+            return None
+        payload = json.loads(content)
+        if not isinstance(payload, dict):
+            return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return _factory_v3_parse_resume_metadata(
+        payload,
+        gateway_origin=gateway_origin,
+        run_id=run_id,
+        now=now,
+        verification_key=verification_key,
+    )
+
+
+def _factory_v3_authoritative_resume_metadata(
+    *,
     environment: Mapping[str, str],
-    action_inbox: FactoryV3LiveActionInboxStatus | None,
+    gateway_origin: str,
+    run_id: UUID,
+    now: datetime,
+    probe: _FactoryV3LiveReadOnlyProbe,
+    persisted_path: Path | None,
+) -> FactoryV3LiveResumeMetadata | None:
+    token = environment.get("CAPTAIN_FACTORY_V3_CAPTAIN_TOKEN", "").strip()
+    verification_key = environment.get(
+        "CAPTAIN_FACTORY_V3_RESUME_VERIFY_KEY", ""
+    ).strip()
+    if not token or len(verification_key) < 16:
+        return None
+    persisted = None
+    if persisted_path is not None:
+        persisted = _factory_v3_load_resume_metadata(
+            persisted_path,
+            gateway_origin=gateway_origin,
+            run_id=run_id,
+            now=now,
+            verification_key=verification_key,
+        )
+        if persisted is None:
+            return None
+    try:
+        payload = probe.action_resume_metadata(
+            gateway_origin=gateway_origin,
+            token=token,
+            run_id=run_id,
+        )
+    except Exception:
+        return None
+    if payload is None:
+        return None
+    current = _factory_v3_parse_resume_metadata(
+        payload,
+        gateway_origin=gateway_origin,
+        run_id=run_id,
+        now=now,
+        verification_key=verification_key,
+    )
+    if current is None:
+        return None
+    if persisted is None:
+        return current if current.status == "pending" else None
+    if (
+        persisted.status != "pending"
+        or current.status != "answered"
+        or current.immutable_binding() != persisted.immutable_binding()
+    ):
+        return None
+    return current
+
+
+def _factory_v3_portal_configuration_ready(
+    environment: Mapping[str, str],
 ) -> bool:
-    portal_url = environment.get("CAPTAIN_FACTORY_V3_PORTAL_URL", "").strip()
+    if any(
+        environment.get(name, "").strip()
+        for name in (
+            "CAPTAIN_FACTORY_V3_ACTION_INBOX_URL",
+            "CAPTAIN_FACTORY_V3_ACTION_REQUEST_ID",
+            "CAPTAIN_FACTORY_V3_SAFE_CHECKPOINT_SHA256",
+        )
+    ):
+        return False
     credential_ref = environment.get(
         "CAPTAIN_FACTORY_V3_CREDENTIAL_REF", ""
     ).strip()
-    return _safe_live_url(portal_url) and (
+    resume_key = environment.get(
+        "CAPTAIN_FACTORY_V3_RESUME_VERIFY_KEY", ""
+    ).strip()
+    return bool(
         _SAFE_CREDENTIAL_REF.fullmatch(credential_ref) is not None
-        or action_inbox is not None
+        or len(resume_key) >= 16
     )
 
 
@@ -664,21 +1200,38 @@ def _factory_v3_frozen_input_sha256(
     input_path: Path,
 ) -> str | None:
     try:
+        manifest_digest = hashlib.sha256(
+            json.dumps(
+                _FACTORY_V3_AUTHORITY_MANIFEST,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if not hmac.compare_digest(
+            manifest_digest,
+            _FACTORY_V3_AUTHORITY_MANIFEST_SHA256,
+        ):
+            return None
         root = repository_root.resolve(strict=True)
         expected_path = (root / _FACTORY_V3_LIVE_INPUT).resolve(strict=True)
         actual_path = input_path.resolve(strict=True)
         if actual_path != expected_path or input_path.is_symlink():
             return None
         content = actual_path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        if not hmac.compare_digest(digest, _FACTORY_V3_FROZEN_INPUT_SHA256):
+            return None
         payload = json.loads(content)
-        expected = payload.get("expected")
-        if not isinstance(expected, dict) or tuple(
-            expected.get("required_agent_ids", ())
-        ) != _FACTORY_V3_AGENT_IDS:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("expected")
+            != _FACTORY_V3_AUTHORITY_MANIFEST["fixture_expected"]
+        ):
             return None
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    return hashlib.sha256(content).hexdigest()
+    return digest
 
 
 def _factory_v3_live_runtime_enforcement_ready() -> bool:
@@ -697,6 +1250,7 @@ def preflight_factory_v3_live(
     cas_root: Path,
     state_root: Path,
     run_id: UUID,
+    resume_metadata_path: Path | None = None,
     clock: Callable[[], datetime] | None = None,
     _probe: _FactoryV3LiveReadOnlyProbe | None = None,
 ) -> FactoryV3LivePreflightReport:
@@ -709,66 +1263,125 @@ def preflight_factory_v3_live(
     ):
         raise ValueError("Factory V3 live preflight clock must be UTC")
     probe = _probe or _DefaultFactoryV3LiveReadOnlyProbe()
-    action_inbox = _factory_v3_action_inbox_status(environment)
     input_sha256 = _factory_v3_frozen_input_sha256(repository_root, input_path)
+    origins = _factory_v3_authority_origins(environment)
+    live_opt_in = environment.get("CAPTAIN_FACTORY_V3_LIVE", "") == "1"
+    isolated_roots = _isolated_factory_v3_roots_ready(
+        workspace_root,
+        cas_root,
+        state_root,
+    )
+    credentials = _factory_v3_credentials_ready(environment)
+    execution_bounds = _factory_v3_execution_bounds_ready(environment, current_time)
+    portal_configuration = _factory_v3_portal_configuration_ready(environment)
+    runtime_enforcement = _factory_v3_live_runtime_enforcement_ready()
+
+    # Stage 1 is entirely local. In particular, no token-bearing read is
+    # attempted while opt-in, origin, bounds, isolation, credentials, Portal,
+    # or the Captain-owned runtime enforcement gate is absent.
+    stage_one_ready = all(
+        (
+            input_sha256 is not None,
+            live_opt_in,
+            origins is not None,
+            isolated_roots,
+            credentials,
+            execution_bounds,
+            portal_configuration,
+            runtime_enforcement,
+        )
+    )
+    codex_session = False
+    hermes_runtime = False
+    released_skill_identity = False
+    if stage_one_ready:
+        codex_session = _factory_v3_codex_session_ready(environment, repository_root)
+        hermes_runtime = _factory_v3_hermes_runtime_ready(
+            environment,
+            repository_root,
+        )
+        released_skill_identity = (
+            _factory_v3_released_skill_identity(environment) is not None
+        )
+
+    stage_two_ready = bool(
+        stage_one_ready
+        and codex_session
+        and hermes_runtime
+        and released_skill_identity
+    )
+    gateway_reachable = False
+    minibook_reachable = False
+    released_skill_authority = False
+    resume_metadata: FactoryV3LiveResumeMetadata | None = None
+    action_inbox: FactoryV3LiveActionInboxStatus | None = None
+    credential_ref = environment.get(
+        "CAPTAIN_FACTORY_V3_CREDENTIAL_REF", ""
+    ).strip()
+    portal_prerequisites = bool(
+        portal_configuration
+        and _SAFE_CREDENTIAL_REF.fullmatch(credential_ref) is not None
+        and resume_metadata_path is None
+    )
+
+    # Stage 3 is the only token-bearing stage. Origins are canonical authorities
+    # and health paths are derived by the probe; callers cannot inject a URL.
+    if stage_two_ready and origins is not None:
+        gateway_origin, minibook_origin = origins
+        gateway_reachable = _bounded_service_health_ready(
+            probe,
+            service="captain-gateway",
+            origin=gateway_origin,
+            token=environment.get("CAPTAIN_FACTORY_V3_CAPTAIN_TOKEN", "").strip(),
+        )
+        minibook_reachable = _bounded_service_health_ready(
+            probe,
+            service="minibook-creation",
+            origin=minibook_origin,
+            token=environment.get("CAPTAIN_FACTORY_V3_WORKER_TOKEN", "").strip(),
+        )
+        if gateway_reachable and minibook_reachable:
+            released_skill_authority = _factory_v3_released_skill_ready(
+                environment,
+                probe,
+                gateway_origin=gateway_origin,
+            )
+        if released_skill_authority and (
+            resume_metadata_path is not None
+            or _SAFE_CREDENTIAL_REF.fullmatch(credential_ref) is None
+        ):
+            resume_metadata = _factory_v3_authoritative_resume_metadata(
+                environment=environment,
+                gateway_origin=gateway_origin,
+                run_id=run_id,
+                now=current_time,
+                probe=probe,
+                persisted_path=resume_metadata_path,
+            )
+            if resume_metadata is not None:
+                if resume_metadata.status == "pending":
+                    action_inbox = FactoryV3LiveActionInboxStatus(
+                        status="pending",
+                        url=resume_metadata.action_url,
+                        request_id=resume_metadata.request_id,
+                        safe_checkpoint_sha256=resume_metadata.safe_checkpoint_sha256,
+                    )
+                portal_prerequisites = True
+
     checks = (
         _factory_v3_check("frozen_input", input_sha256 is not None),
-        _factory_v3_check(
-            "live_opt_in", environment.get("CAPTAIN_FACTORY_V3_LIVE", "") == "1"
-        ),
-        _factory_v3_check(
-            "gateway_reachability",
-            _bounded_endpoint_ready(
-                probe,
-                url=environment.get(
-                    "CAPTAIN_FACTORY_V3_GATEWAY_HEALTH_URL", ""
-                ).strip(),
-                token=environment.get(
-                    "CAPTAIN_FACTORY_V3_CAPTAIN_TOKEN", ""
-                ).strip(),
-            ),
-        ),
-        _factory_v3_check(
-            "minibook_reachability",
-            _bounded_endpoint_ready(
-                probe,
-                url=environment.get(
-                    "CAPTAIN_FACTORY_V3_MINIBOOK_HEALTH_URL", ""
-                ).strip(),
-                token=environment.get(
-                    "CAPTAIN_FACTORY_V3_WORKER_TOKEN", ""
-                ).strip(),
-            ),
-        ),
-        _factory_v3_check(
-            "released_skill_authority",
-            _factory_v3_released_skill_ready(environment, probe),
-        ),
-        _factory_v3_check(
-            "hermes_runtime", _factory_v3_hermes_runtime_ready(environment)
-        ),
-        _factory_v3_check(
-            "codex_session",
-            _factory_v3_codex_session_ready(environment, repository_root),
-        ),
-        _factory_v3_check(
-            "isolated_roots",
-            _isolated_factory_v3_roots_ready(workspace_root, cas_root, state_root),
-        ),
-        _factory_v3_check(
-            "credential_separation", _factory_v3_credentials_ready(environment)
-        ),
-        _factory_v3_check(
-            "execution_bounds",
-            _factory_v3_execution_bounds_ready(environment, current_time),
-        ),
-        _factory_v3_check(
-            "portal_prerequisites",
-            _factory_v3_portal_ready(environment, action_inbox),
-        ),
-        _factory_v3_check(
-            "runtime_enforcement", _factory_v3_live_runtime_enforcement_ready()
-        ),
+        _factory_v3_check("live_opt_in", live_opt_in),
+        _factory_v3_check("authority_origins", origins is not None),
+        _factory_v3_check("gateway_reachability", gateway_reachable),
+        _factory_v3_check("minibook_reachability", minibook_reachable),
+        _factory_v3_check("released_skill_authority", released_skill_authority),
+        _factory_v3_check("hermes_runtime", hermes_runtime),
+        _factory_v3_check("codex_session", codex_session),
+        _factory_v3_check("isolated_roots", isolated_roots),
+        _factory_v3_check("credential_separation", credentials),
+        _factory_v3_check("execution_bounds", execution_bounds),
+        _factory_v3_check("portal_prerequisites", portal_prerequisites),
+        _factory_v3_check("runtime_enforcement", runtime_enforcement),
     )
     unmet = tuple(check for check in checks if check.status == "unmet")
     status: Literal["ready", "awaiting_user_input", "unmet_preflight"]
@@ -785,6 +1398,7 @@ def preflight_factory_v3_live(
         input_sha256=input_sha256 or "0" * 64,
         checks=checks,
         action_inbox=action_inbox,
+        resume_metadata=resume_metadata,
     )
 
 
@@ -799,6 +1413,7 @@ def _factory_v3_live_preflight_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-root", type=Path, required=True)
     parser.add_argument("--run-id", type=UUID, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--resume-metadata", type=Path)
     return parser
 
 
@@ -817,6 +1432,7 @@ def factory_v3_live_preflight_main(
         cas_root=args.cas_root,
         state_root=args.state_root,
         run_id=args.run_id,
+        resume_metadata_path=args.resume_metadata,
         clock=clock,
     )
     output = args.output.resolve()
@@ -830,6 +1446,25 @@ def factory_v3_live_preflight_main(
         json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
+    if report.resume_metadata is not None and args.resume_metadata is None:
+        resume_output = run_root / "resume-metadata.json"
+        encoded_resume = (
+            json.dumps(
+                report.resume_metadata.as_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        )
+        if resume_output.exists():
+            if resume_output.is_symlink() or resume_output.read_text(
+                encoding="utf-8"
+            ) != encoded_resume:
+                raise ValueError("Factory V3 resume metadata changed")
+        else:
+            resume_output.write_text(encoded_resume, encoding="utf-8")
     summary: dict[str, object] = {
         "schema": _FACTORY_V3_LIVE_SUMMARY_SCHEMA,
         "run_id": str(report.run_id),
@@ -1654,6 +2289,7 @@ __all__ = [
     "FactoryV3LiveActionInboxStatus",
     "FactoryV3LivePreflightCheck",
     "FactoryV3LivePreflightReport",
+    "FactoryV3LiveResumeMetadata",
     "FactoryLiveOperatorSettings",
     "compose_business_demo_factory_operator",
     "factory_v3_live_preflight_main",
