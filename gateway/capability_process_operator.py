@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import signal
@@ -64,6 +65,75 @@ def _pid_is_live(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _observed_process_identity(pid: int) -> tuple[str, str] | None:
+    """Read the kernel-owned executable/start identity for PID-reuse protection."""
+
+    if not _pid_is_live(pid):
+        return None
+    if os.name != "nt":
+        try:
+            executable = str(Path(f"/proc/{pid}/exe").resolve(strict=True))
+            fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+            return executable, fields[21]
+        except (OSError, IndexError):
+            return None
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    process = kernel32.OpenProcess(0x1000, False, pid)
+    if not process:
+        return None
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        query = kernel32.QueryFullProcessImageNameW
+        query.argtypes = (
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        query.restype = wintypes.BOOL
+        if not query(process, 0, buffer, ctypes.byref(size)):
+            return None
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        get_times = kernel32.GetProcessTimes
+        get_times.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        )
+        get_times.restype = wintypes.BOOL
+        if not get_times(
+            process,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return None
+        started = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        return str(Path(buffer.value).resolve()), str(started)
+    finally:
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(process)
+
+
+def _require_same_process(state: Mapping[str, object]) -> int:
+    pid = int(state.get("process_id", 0))
+    observed = _observed_process_identity(pid)
+    expected = (state.get("executable"), state.get("os_start_identity"))
+    if observed is None or observed != expected:
+        raise RuntimeError("managed process identity changed; refusing to stop PID")
+    return pid
 
 
 def _required(environment: Mapping[str, str], name: str) -> str:
@@ -142,7 +212,7 @@ def operate(
         if prior is not None:
             pid = int(prior.get("process_id", 0))
             if not sentinel and service != "n8n" and _pid_is_live(pid):
-                os.kill(pid, signal.SIGTERM)
+                os.kill(_require_same_process(prior), signal.SIGTERM)
     if action in {"stop", "restart"} and prior is not None:
         stopped = {
             **prior,
@@ -195,6 +265,10 @@ def operate(
         )
         process_id = process.pid
         output.close()
+        observed_identity = _observed_process_identity(process_id)
+        if observed_identity is None:
+            process.terminate()
+            raise RuntimeError("started process identity is unavailable")
     state = {
         "schema": "captain.production-process-state.v1",
         "service": service,
@@ -204,6 +278,8 @@ def operate(
         "process_identity": identity,
         "argv": list(argv),
     }
+    if not sentinel and service != "n8n":
+        state["executable"], state["os_start_identity"] = observed_identity
     _write_state(state_file, state)
     return state
 

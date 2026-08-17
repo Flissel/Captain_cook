@@ -10,6 +10,7 @@ from gateway.capability_assembly_bootstrap import (
     load_capability_production_bundle_manifest,
 )
 from gateway.capability_process_operator import operate, service_argv
+import gateway.capability_process_operator as process_operator
 
 
 def _environment() -> dict[str, str]:
@@ -141,6 +142,24 @@ def test_operator_executes_all_six_semantic_lifecycles_with_new_restart_identity
         assert restarted["process_identity"] != started["process_identity"]
         assert restarted["operation"] == "restart"
         assert stopped["status"] == "stopped"
+
+
+def test_operator_refuses_to_stop_a_reused_process_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        process_operator,
+        "_observed_process_identity",
+        lambda _pid: ("C:/other/python.exe", "later-start"),
+    )
+    with pytest.raises(RuntimeError, match="refusing to stop PID"):
+        process_operator._require_same_process(
+            {
+                "process_id": 4242,
+                "executable": "C:/expected/python.exe",
+                "os_start_identity": "original-start",
+            }
+        )
 
 
 def test_operator_manifest_fails_closed_before_probe_on_missing_or_reused_credentials() -> None:

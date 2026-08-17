@@ -1620,6 +1620,15 @@ def create_production_app_from_environment(
             bootstrap.provider_hard_ceiling_enforced,
         ),),
     )
+    if configured.portal_n8n_adapters_configured:
+        portal_bundle = build_portal_n8n_adapter_bundle(
+            reader=gateway,
+            settings=configured,
+        )
+        gateway.configure_portal_sources(
+            credential_source=portal_bundle.credential_source,
+            verification_source=portal_bundle.verification_source,
+        )
     private_catalog = GatewayPrivateHoldoutStore(gateway_store=gateway)
     runtime = runtime_builder(
         repository_root=root,
