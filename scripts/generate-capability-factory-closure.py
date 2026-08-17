@@ -38,7 +38,12 @@ def _imports(module: str, source: bytes) -> set[str]:
             result.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             if node.level:
-                package = module.rpartition(".")[0]
+                module_path = _path_for(module)
+                package = (
+                    module
+                    if module_path is not None and module_path.name == "__init__.py"
+                    else module.rpartition(".")[0]
+                )
                 relative = "." * node.level + (node.module or "")
                 try:
                     base = importlib.util.resolve_name(relative, package)
