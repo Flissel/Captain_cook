@@ -325,8 +325,9 @@ def _collect_exact_process_tree(
             if pid == root:
                 continue
             observed = _observed_process_identity(pid)
-            if observed is not None:
-                identities.append((pid, observed[0], observed[1]))
+            if observed is None:
+                raise RuntimeError("managed process tree is unavailable")
+            identities.append((pid, observed[0], observed[1]))
     except (OSError, ValueError, TypeError, json.JSONDecodeError,
             subprocess.SubprocessError):
         raise RuntimeError("managed process tree is unavailable") from None

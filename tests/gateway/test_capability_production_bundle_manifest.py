@@ -5,6 +5,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -497,6 +498,27 @@ def test_existing_ambiguous_starting_claim_never_spawns_second_process(
     retained = json.loads((state_root / "gateway.json").read_text())
     assert retained["status"] == "starting"
     assert retained["process_id"] == 7000
+
+
+def test_windows_tree_rejects_cim_child_without_exact_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_operator.os, "name", "nt")
+    monkeypatch.setattr(
+        process_operator.subprocess, "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=0, stdout="[8000,8001]"),
+    )
+    monkeypatch.setattr(
+        process_operator, "_observed_process_identity",
+        lambda pid: ("C:/python.exe", "parent") if pid == 8000 else None,
+    )
+    state = {
+        "process_id": 8000, "executable": "C:/python.exe",
+        "os_start_identity": "parent",
+    }
+
+    with pytest.raises(RuntimeError, match="process tree is unavailable"):
+        process_operator._collect_exact_process_tree(state)
 
 
 def test_existing_exact_healthy_starting_claim_becomes_running_without_spawn(
