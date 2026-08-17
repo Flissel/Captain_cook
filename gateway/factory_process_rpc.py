@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import secrets
 import json
+import base64
+import hashlib
+import hmac
 from typing import Literal, Protocol
 from uuid import UUID
 
@@ -49,6 +52,7 @@ class FactoryGatewayRpcCommand(BaseModel):
     input_id: str = Field(min_length=1, max_length=255)
     attempt: int = Field(ge=1)
     expected_revision: int = Field(ge=0)
+    gateway_capability: str = Field(min_length=32, max_length=4096)
     payload: dict[str, object]
 
     @model_validator(mode="after")
@@ -77,7 +81,9 @@ class FactoryGatewayRpcResult(BaseModel):
 
 
 class FactoryGatewayRpcAuthority(Protocol):
-    def read_receipt(self, idempotency_key: str) -> dict[str, object] | None: ...
+    def read_receipt(
+        self, command: FactoryGatewayRpcCommand,
+    ) -> dict[str, object] | None: ...
 
     def execute(self, command: FactoryGatewayRpcCommand) -> dict[str, object]: ...
 
@@ -85,22 +91,95 @@ class FactoryGatewayRpcAuthority(Protocol):
 class FactoryGatewayRpcService:
     """Validate envelope authority before invoking the durable Gateway adapter."""
 
-    def __init__(self, *, authority: FactoryGatewayRpcAuthority) -> None:
+    def __init__(
+        self, *, authority: FactoryGatewayRpcAuthority, capability_key: str,
+    ) -> None:
+        if len(capability_key) < 24:
+            raise ValueError("Factory Gateway capability authority is invalid")
         self._authority = authority
+        self._capability_key = capability_key
 
     def execute(self, command: FactoryGatewayRpcCommand) -> FactoryGatewayRpcResult:
         if command.operation not in _FACTORY_STORE_OPERATIONS:
             raise ValueError("Factory Gateway operation is unavailable")
+        _verify_factory_gateway_capability(
+            command=command, capability_key=self._capability_key,
+        )
         payload_job_id = command.payload.get("job_id")
         if payload_job_id is not None and str(payload_job_id) != str(command.job_id):
             raise ValueError("Factory Gateway job binding changed")
-        replay = self._authority.read_receipt(command.idempotency_key)
+        replay = self._authority.read_receipt(command)
         if replay is not None:
             result = FactoryGatewayRpcResult.model_validate(replay)
             if result.request_id != command.request_id or result.job_id != command.job_id:
                 raise ValueError("Factory Gateway replay binding changed")
             return result
         return FactoryGatewayRpcResult.model_validate(self._authority.execute(command))
+
+
+def issue_factory_gateway_capability(
+    *, capability_key: str, job_id: UUID | str, correlation_id: UUID | str,
+    input_id: str, attempt: int, allowed_operations: tuple[str, ...],
+) -> str:
+    """Issue an opaque Gateway-only signed capability for one Factory scope."""
+
+    if len(capability_key) < 24 or not input_id or attempt < 1:
+        raise ValueError("Factory Gateway capability authority is invalid")
+    operations = tuple(sorted(set(allowed_operations)))
+    if not operations or any(item not in _FACTORY_STORE_OPERATIONS for item in operations):
+        raise ValueError("Factory Gateway capability operation is invalid")
+    payload = json.dumps(
+        {
+            "schema": "captain.factory-gateway-capability.v1",
+            "job_id": str(UUID(str(job_id))),
+            "correlation_id": str(UUID(str(correlation_id))),
+            "input_id": input_id,
+            "attempt": attempt,
+            "allowed_operations": operations,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        capability_key.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256,
+    ).hexdigest()
+    return encoded + "." + signature
+
+
+def factory_gateway_request_sha256(command: FactoryGatewayRpcCommand) -> str:
+    """Digest the canonical complete request, including revision and payload."""
+
+    return hashlib.sha256(
+        command.model_dump_json(by_alias=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _verify_factory_gateway_capability(
+    *, command: FactoryGatewayRpcCommand, capability_key: str,
+) -> None:
+    try:
+        encoded, signature = command.gateway_capability.rsplit(".", 1)
+        expected = hmac.new(
+            capability_key.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256,
+        ).hexdigest()
+        if not secrets.compare_digest(signature, expected):
+            raise ValueError
+        padding = "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded + padding))
+    except Exception:
+        raise ValueError("Factory Gateway capability is invalid") from None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != "captain.factory-gateway-capability.v1"
+        or payload.get("job_id") != str(command.job_id)
+        or payload.get("correlation_id") != str(command.correlation_id)
+        or payload.get("input_id") != command.input_id
+        or payload.get("attempt") != command.attempt
+        or not isinstance(payload.get("allowed_operations"), list)
+        or command.operation not in payload["allowed_operations"]
+    ):
+        raise ValueError("Factory Gateway capability binding changed")
 
 
 def create_factory_gateway_rpc_router(
@@ -140,4 +219,6 @@ __all__ = [
     "FactoryGatewayRpcResult",
     "FactoryGatewayRpcService",
     "create_factory_gateway_rpc_router",
+    "factory_gateway_request_sha256",
+    "issue_factory_gateway_capability",
 ]

@@ -13,6 +13,10 @@ from agenten.agent_factory.production_dispatch_runner import ProductionFactoryDi
 from agenten.agent_factory.service import FactoryCoordinator
 from agenten.agent_factory.state_machine import FactoryActionKind
 from gateway.factory_repository import GatewayFactoryRepository
+from gateway.factory_process_rpc import (
+    _FACTORY_STORE_OPERATIONS,
+    issue_factory_gateway_capability,
+)
 
 
 class _FactoryProcessExecutionRequest(BaseModel):
@@ -28,6 +32,7 @@ class _FactoryProcessExecutionRequest(BaseModel):
     request_id: UUID
     idempotency_key: str
     expected_revision: int
+    gateway_capability: str
     maximum_dispatches: int
     stop_before_action: FactoryActionKind | None = None
 
@@ -37,13 +42,14 @@ class GatewayFactoryProcessClient:
 
     def __init__(
         self, *, repository: GatewayFactoryRepository, process_url: str,
-        factory_runtime_token: str, candidate_resolver: object,
+        factory_runtime_token: str, capability_key: str, candidate_resolver: object,
         send: Callable[[dict[str, object]], dict[str, object]] | None = None,
         timeout_seconds: float = 30.0,
     ) -> None:
         if (
             not process_url.startswith("http://127.0.0.1:")
             or process_url.endswith("/") or len(factory_runtime_token) < 16
+            or len(capability_key) < 24
             or not callable(getattr(candidate_resolver, "candidate_for", None))
         ):
             raise ValueError("Factory process client configuration is invalid")
@@ -51,6 +57,7 @@ class GatewayFactoryProcessClient:
         self._coordinator = FactoryCoordinator(repository)
         self._url = process_url + "/v1/execute"
         self._token = factory_runtime_token
+        self._capability_key = capability_key
         self._candidate_resolver = candidate_resolver
         self._send_override = send
         self._timeout = timeout_seconds
@@ -103,6 +110,14 @@ class GatewayFactoryProcessClient:
             input_id=job.required_capability, attempt=attempt, operation="run",
             request_id=uuid5(NAMESPACE_URL, "factory-process|" + key),
             idempotency_key=key, expected_revision=revision,
+            gateway_capability=issue_factory_gateway_capability(
+                capability_key=self._capability_key,
+                job_id=job_id,
+                correlation_id=job.correlation_id,
+                input_id=job.required_capability,
+                attempt=attempt,
+                allowed_operations=tuple(sorted(_FACTORY_STORE_OPERATIONS)),
+            ),
             maximum_dispatches=maximum_dispatches,
             stop_before_action=stop_before_action,
         )

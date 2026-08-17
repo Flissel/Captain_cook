@@ -14,8 +14,11 @@ from gateway.capability_factory_process_app import (
 from gateway.factory_gateway_store_client import GatewayFactoryStoreRpcClient
 from gateway.factory_process_rpc import (
     FactoryGatewayRpcCommand, FactoryGatewayRpcService,
-    create_factory_gateway_rpc_router,
+    create_factory_gateway_rpc_router, issue_factory_gateway_capability,
 )
+
+
+CAPABILITY_KEY = "gateway-only-capability-key-0001"
 
 
 class _DurableGatewayAuthority:
@@ -23,8 +26,8 @@ class _DurableGatewayAuthority:
         self.effects = 0
         self.receipts: dict[str, dict[str, object]] = {}
 
-    def read_receipt(self, key: str):
-        return self.receipts.get(key)
+    def read_receipt(self, command: FactoryGatewayRpcCommand):
+        return self.receipts.get(command.idempotency_key)
 
     def execute(self, command: FactoryGatewayRpcCommand):
         self.effects += 1
@@ -57,7 +60,9 @@ def test_factory_process_restart_replays_gateway_receipt_without_second_effect()
     authority = _DurableGatewayAuthority()
     gateway_token = "factory-runtime-token-0001"
     gateway_app = create_factory_gateway_rpc_router(
-        service=FactoryGatewayRpcService(authority=authority),
+        service=FactoryGatewayRpcService(
+            authority=authority, capability_key=CAPABILITY_KEY,
+        ),
         factory_runtime_token=gateway_token,
     )
 
@@ -87,6 +92,14 @@ def test_factory_process_restart_replays_gateway_receipt_without_second_effect()
         "expected_revision": 3, "maximum_dispatches": 1,
         "stop_before_action": "submit_forge_job",
     }
+    payload["gateway_capability"] = issue_factory_gateway_capability(
+        capability_key=CAPABILITY_KEY,
+        job_id=job_id,
+        correlation_id=correlation_id,
+        input_id="incident-command",
+        attempt=1,
+        allowed_operations=("record_factory_block",),
+    )
     headers = {"Authorization": "Bearer " + gateway_token}
     first = build_process_client().post("/v1/execute", json=payload, headers=headers)
     restarted = build_process_client().post("/v1/execute", json=payload, headers=headers)

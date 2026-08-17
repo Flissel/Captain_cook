@@ -1905,6 +1905,7 @@ def create_production_app_from_environment(
         provider_token=bootstrap.provider_token,
         minibook_api_key=bootstrap.minibook_api_key,
         factory_runtime_token=getattr(bootstrap, "factory_runtime_token", None),
+        factory_gateway_capability_key=bootstrap.gateway_token,
     )
     plan_production_capability_assembly_from_environment(
         repository_root=root,
@@ -1935,7 +1936,8 @@ def create_production_app_from_environment(
         factory_rpc = FactoryGatewayRpcService(
             authority=GatewayStoreFactoryRpcAuthority(
                 store=gateway, forge=factory_forge, n8n=runtime.n8n,
-            )
+            ),
+            capability_key=bootstrap.gateway_token.get_secret_value(),
         )
     return create_app(
         settings=configured,

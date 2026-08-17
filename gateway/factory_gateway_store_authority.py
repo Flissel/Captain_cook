@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import asyncio
 from typing import Any
@@ -19,7 +18,10 @@ from agenten.agent_factory.state_machine import FactoryAction
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.contracts import parse_factory_workflow_artifact
-from gateway.factory_process_rpc import FactoryGatewayRpcCommand
+from gateway.factory_process_rpc import (
+    FactoryGatewayRpcCommand,
+    factory_gateway_request_sha256,
+)
 from gateway.store import GatewayStore
 
 
@@ -32,8 +34,17 @@ class GatewayStoreFactoryRpcAuthority:
         self._forge = forge
         self._n8n = n8n
 
-    def read_receipt(self, idempotency_key: str) -> dict[str, object] | None:
-        return self._store.factory_runtime_rpc_receipt(idempotency_key)
+    def read_receipt(
+        self, command: FactoryGatewayRpcCommand,
+    ) -> dict[str, object] | None:
+        return self._store.factory_runtime_rpc_receipt(
+            command.idempotency_key,
+            request_id=command.request_id,
+            job_id=command.job_id,
+            correlation_id=command.correlation_id,
+            operation=command.operation,
+            request_sha256=factory_gateway_request_sha256(command),
+        )
 
     def execute(self, command: FactoryGatewayRpcCommand) -> dict[str, object]:
         current_revision = self._revision(command.job_id)
@@ -51,9 +62,7 @@ class GatewayStoreFactoryRpcAuthority:
             "revision": revision,
             "result": {"value": _json_value(value)},
         }
-        request_sha256 = hashlib.sha256(
-            command.model_dump_json(by_alias=True).encode("utf-8")
-        ).hexdigest()
+        request_sha256 = factory_gateway_request_sha256(command)
         return self._store.record_factory_runtime_rpc_receipt(
             idempotency_key=command.idempotency_key,
             request_id=command.request_id,
@@ -134,11 +143,33 @@ class GatewayStoreFactoryRpcAuthority:
         if operation == "factory_budget":
             return self._store.factory_budget(command.job_id)
         if operation == "runtime_operation":
-            return self._store.runtime_operation(UUID(str(payload["command_id"])))
+            value = self._store.runtime_operation(UUID(str(payload["command_id"])))
+            job = self._store.factory_job(command.job_id).job
+            runtime_command = getattr(value, "command", None)
+            result = getattr(value, "result", None)
+            if (
+                value is None
+                or getattr(runtime_command, "correlation_id", None)
+                != command.correlation_id
+                or getattr(runtime_command, "subject_id", None)
+                != job.required_capability
+                or (
+                    result is not None
+                    and (
+                        getattr(result, "correlation_id", None)
+                        != command.correlation_id
+                        or getattr(result, "subject_id", None)
+                        != job.required_capability
+                    )
+                )
+            ):
+                raise ValueError("Factory Gateway authority binding changed")
+            return value
         if operation == "business_benchmark_summary_by_artifact":
-            return self._store.business_benchmark_summary_by_artifact(
-                ArtifactRef.model_validate(_mapping(payload, "artifact_ref"))
-            )
+            reference = ArtifactRef.model_validate(_mapping(payload, "artifact_ref"))
+            if reference not in self._job_artifact_refs(command.job_id):
+                raise ValueError("Factory Gateway authority binding changed")
+            return self._store.business_benchmark_summary_by_artifact(reference)
         if operation == "generic_benchmark_quality_evidence":
             return self._store.generic_benchmark_quality_evidence(
                 command.job_id, command.attempt
@@ -147,6 +178,8 @@ class GatewayStoreFactoryRpcAuthority:
             batch_id = payload.get("batch_id")
             if not isinstance(batch_id, str) or not batch_id:
                 raise ValueError("Factory WorkBatch binding is invalid")
+            if self._store.capability_n8n_work_batch(command.job_id) != batch_id:
+                raise ValueError("Factory Gateway authority binding changed")
             return self._store.bundle(batch_id)
         if operation == "active_n8n_work_batch_id":
             if self._n8n is None:
@@ -162,9 +195,37 @@ class GatewayStoreFactoryRpcAuthority:
             if self._forge is None:
                 raise ValueError("Factory Forge authority is unavailable")
             creation_job_id = UUID(str(payload["creation_job_id"]))
+            if creation_job_id not in self._job_creation_ids(command.job_id):
+                raise ValueError("Factory Gateway authority binding changed")
             method = getattr(self._forge, operation.removeprefix("forge_"))
             return asyncio.run(method(creation_job_id))
         raise ValueError("Factory Gateway operation is unavailable")
+
+    def _job_artifact_refs(self, job_id: UUID) -> tuple[ArtifactRef, ...]:
+        projection = self._store.factory_job(job_id)
+        references: list[ArtifactRef] = []
+        for block in projection.blocks:
+            references.extend((*block.artifact_refs, *block.evidence_refs))
+        for artifact in self._store.factory_workflow_artifacts(job_id):
+            reference = getattr(artifact, "artifact_ref", None)
+            if isinstance(reference, ArtifactRef):
+                references.append(reference)
+            references.extend(
+                item
+                for item in getattr(artifact, "evidence_refs", ())
+                if isinstance(item, ArtifactRef)
+            )
+        return tuple(dict.fromkeys(references))
+
+    def _job_creation_ids(self, job_id: UUID) -> tuple[UUID, ...]:
+        identities: list[UUID] = []
+        for artifact in self._store.factory_workflow_artifacts(job_id):
+            for owner_name in ("build_assignment", "build_receipt"):
+                owner = getattr(artifact, owner_name, None)
+                identity = getattr(owner, "creation_job_id", None)
+                if isinstance(identity, UUID):
+                    identities.append(identity)
+        return tuple(dict.fromkeys(identities))
 
 
 def _mapping(payload: dict[str, object], key: str) -> dict[str, Any]:

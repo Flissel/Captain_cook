@@ -8064,7 +8064,8 @@ class GatewayStore:
         return block
 
     def factory_runtime_rpc_receipt(
-        self, idempotency_key: str,
+        self, idempotency_key: str, *, request_id: UUID, job_id: UUID,
+        correlation_id: UUID, operation: str, request_sha256: str,
     ) -> dict[str, object] | None:
         """Read the exact durable Factory-process response, if already committed."""
 
@@ -8074,7 +8075,9 @@ class GatewayStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT payload FROM factory_runtime_rpc_receipts
+                    SELECT request_id, job_id, correlation_id, operation,
+                           request_sha256, payload
+                    FROM factory_runtime_rpc_receipts
                     WHERE idempotency_key = %s
                     """,
                     (idempotency_key,),
@@ -8082,6 +8085,14 @@ class GatewayStore:
                 row = cursor.fetchone()
         if row is None:
             return None
+        if (
+            str(row["request_id"]) != str(request_id)
+            or str(row["job_id"]) != str(job_id)
+            or str(row["correlation_id"]) != str(correlation_id)
+            or row["operation"] != operation
+            or row["request_sha256"] != request_sha256
+        ):
+            raise HTTPException(status_code=409, detail="Factory RPC replay changed")
         payload = row["payload"]
         if isinstance(payload, str):
             payload = json.loads(payload)

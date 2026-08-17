@@ -43,6 +43,7 @@ class _FactoryRpcContext:
     input_id: str
     attempt: int
     revision: int
+    gateway_capability: str
 
 
 class GatewayFactoryStoreRpcClient:
@@ -74,11 +75,12 @@ class GatewayFactoryStoreRpcClient:
     @contextmanager
     def bind(
         self, *, job_id: UUID, correlation_id: UUID, input_id: str,
-        attempt: int, expected_revision: int,
+        attempt: int, expected_revision: int, gateway_capability: str,
     ) -> Iterator[None]:
         token = self._context.set(_FactoryRpcContext(
             job_id=job_id, correlation_id=correlation_id, input_id=input_id,
             attempt=attempt, revision=expected_revision,
+            gateway_capability=gateway_capability,
         ))
         try:
             yield
@@ -107,6 +109,7 @@ class GatewayFactoryStoreRpcClient:
             input_id=context.input_id,
             attempt=context.attempt,
             expected_revision=context.revision,
+            gateway_capability=context.gateway_capability,
             payload=payload,
         )
         raw = (

@@ -2191,6 +2191,7 @@ def materialize_capability_assembly_factory_runtime(
     provider_token: SecretStr | None = None,
     minibook_api_key: SecretStr | None = None,
     factory_runtime_token: SecretStr | None = None,
+    factory_gateway_capability_key: SecretStr | None = None,
     use_factory_process_client: bool = True,
 ) -> CapabilityAssemblyFactoryRuntime:
     """Import and construct only after the complete descriptor is attested."""
@@ -2210,7 +2211,11 @@ def materialize_capability_assembly_factory_runtime(
     )
     if plan.configuration.factory_runtime_url and use_factory_process_client:
         token = "" if factory_runtime_token is None else factory_runtime_token.get_secret_value()
-        if len(token) < 16:
+        capability_key = (
+            "" if factory_gateway_capability_key is None
+            else factory_gateway_capability_key.get_secret_value()
+        )
+        if len(token) < 16 or len(capability_key) < 24:
             raise CapabilityAssemblyBootstrapConfigurationError(
                 "capability assembly Factory process is unavailable"
             )
@@ -2225,6 +2230,7 @@ def materialize_capability_assembly_factory_runtime(
             repository=repository,
             process_url=plan.configuration.factory_runtime_url,
             factory_runtime_token=token,
+            capability_key=capability_key,
             candidate_resolver=candidate_provider,
         )
         provisioning = CurrentAuthorityCapabilityFactoryProvisioner(

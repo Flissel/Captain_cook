@@ -36,6 +36,7 @@ class FactoryProcessExecutionRequest(BaseModel):
     request_id: UUID
     idempotency_key: str = Field(pattern=r"^[0-9a-f]{64}$")
     expected_revision: int = Field(ge=0)
+    gateway_capability: str = Field(min_length=32, max_length=4096)
     maximum_dispatches: int = Field(default=12, ge=1, le=32)
     stop_before_action: FactoryActionKind | None = None
 
@@ -53,6 +54,7 @@ class FactoryProcessExecutor:
             job_id=request.job_id, correlation_id=request.correlation_id,
             input_id=request.input_id, attempt=request.attempt,
             expected_revision=request.expected_revision,
+            gateway_capability=request.gateway_capability,
         ):
             result = await self._composition.run(
                 request.job_id,
