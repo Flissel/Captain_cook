@@ -4,3 +4,24 @@
 deploy/portal-provider/templates/**/*.json text eol=lf
 examples/business_benchmark_candidates/**/*.json text eol=lf
 examples/business_benchmark_candidates/**/*.txt text eol=lf
+
+# These five files are hashed byte-for-byte (SHA-256 over raw bytes) by the
+# authority adapter bundle in agenten/agent_factory/authority_adapter_bundle.py
+# (BUNDLE_SOURCE_PATHS). Their line endings MUST be identical on every
+# platform, or a bundle pinned on one OS will fail digest verification when
+# loaded on another (e.g. a Windows checkout getting CRLF while the bundle
+# was pinned from LF bytes). Do not remove these lines as "noise" — removing
+# them re-introduces a real cross-platform digest-mismatch bug.
+agenten/orchestration/pipeline.py text eol=lf
+gateway/app.py text eol=lf
+agenten/agent_runtime/http_server.py text eol=lf
+scripts/rebuild_minibook_projection.py text eol=lf
+agenten/agent_runtime/n8n_mcp_broker_server.py text eol=lf
+
+# The adapter bundle JSON itself (config/authority-adapter-bundle.v1.json,
+# introduced alongside the loader above) is also content-addressed data
+# (its own bundle_sha256 is computed the same way) even though
+# load_adapter_bundle does not currently compare that digest against
+# anything. Pinning it keeps the artifact byte-stable for whenever that
+# changes, and for any external tooling that hashes it directly.
+config/authority-adapter-bundle.v1.json text eol=lf
