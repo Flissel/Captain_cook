@@ -597,3 +597,67 @@ Round-9 non-claims:
   paid OpenAI call or live usage receipt.
 - Hermes collection/readiness remains unclaimed because the initialized
   submodule runtime and fixture files are absent from this checkout.
+
+## Final Review Fix Round 10
+
+Commits:
+
+1. `be32c89` — scopes each Factory-to-Gateway capability to the exact job,
+   correlation, public input, attempt, allowed operation, subject version, and
+   job deadline. The HMAC payload includes a per-operation scope digest plus an
+   injected-clock UTC `issued_at`/`not_after` window of at most 15 minutes.
+   Recursive envelope checks and authoritative Store projection readback reject
+   nested block, lease, workflow artifact, or Forge action drift before any
+   Store/Forge write. A grant for attempt 1 cannot mutate current attempt 2.
+2. `1648cf7` — defines one canonical benchmark provider settlement identity as
+   `uuid5(command_id, provider_call_id)`, emitted by the proxy and independently
+   revalidated at Store admission and completion readback. `benchmark_cost` now
+   closes the same reservation. Exact admitted settlement replay remains
+   idempotent after close, while a new late settlement is rejected.
+
+Round-10 RED to GREEN evidence:
+
+- Factory scope RED comprised six failures: expiry fields were absent and five
+  nested block/lease/artifact/action job-or-attempt mutations reached the
+  authority. GREEN was 20 RPC/process tests plus 64 bootstrap/manifest/process
+  tests; the latter retained four known Minibook escape-sequence warnings.
+- Benchmark RED proved the proxy used a prefixed, noncanonical UUID and that
+  `_reservation_is_closed` omitted `benchmark_cost`. A subsequent behavioral
+  race/replay RED proved exact admitted settlement replay was rejected after
+  finalization. GREEN was 86 provider/benchmark/process/budget tests with seven
+  MariaDB-dependent skips.
+- The barrier race executes settlement admission and benchmark finalization
+  against one serialized transaction lock. The only legal outcomes close an
+  exact USD 0.20 reservation at actual USD 0.10 or USD 0.15 depending lock
+  order; remaining assembly budget is exactly USD 5.90 or USD 5.85. Finalize
+  replay returns the same total, admitted settlement replay is unchanged, and
+  a new late settlement fails.
+
+Round-10 verification status:
+
+- After the local command runner was restarted, the exact prior Windows
+  cleanup failure passed in isolation and the full two-case parameterization
+  passed three consecutive times. No product change was made for that
+  non-reproducing runner/process flake.
+- The corrected broad offline product gate was then rerun from scratch and
+  completed with 3,728 passed, 137 skipped, five warnings, zero failures, and
+  80.21% coverage in 380.82 seconds.
+- A combined Round-10 focused gate completed with 156 passed and seven
+  MariaDB-dependent skips. The independent Minibook gate completed with 132
+  passed and one live test deselected.
+- Architecture/import/workstream tests completed with 18 passed. `compileall`,
+  submission verification, working-tree and `07bcbfa..HEAD` diff checks all
+  passed. A high-confidence added-product-line credential scan reported zero
+  secret assignments.
+- `TEST_MARIADB_DSN` was absent; the seven focused MariaDB tests skipped. No
+  database was contacted.
+
+Round-10 non-claims:
+
+- No live network service, paid provider, Docker/PowerShell managed service,
+  n8n deployment/volume, or database was contacted or mutated, except that the
+  ordinary offline Windows cleanup test itself launched its documented local
+  fixture process.
+- The offline gates do not establish real MariaDB durability, initialized
+  Hermes readiness, service-process health, provider settlement, or a paid
+  end-to-end demo. Those remain integration and controlled-live prerequisites.
