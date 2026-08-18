@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -62,6 +64,50 @@ def test_digest_mismatch_names_role_but_never_content(tmp_path: Path) -> None:
     )[:64]
     assert forbidden_fragment.decode("utf-8", errors="ignore") not in message
     assert bundle.adapters[1].ref.sha256 not in message
+
+
+def test_bundle_source_paths_are_pinned_to_lf_line_endings() -> None:
+    """Guard against .gitattributes drifting away from BUNDLE_SOURCE_PATHS.
+
+    Every file in BUNDLE_SOURCE_PATHS is hashed byte-for-byte, so each one
+    must resolve `eol=lf`, or a Windows checkout normalizes it to CRLF and
+    the pinned digest can never verify (see the committed-bundle test
+    above, and .gitattributes for the full explanation). This test derives
+    its expectations straight from BUNDLE_SOURCE_PATHS rather than a second
+    hardcoded list, so an added/renamed role without a matching
+    .gitattributes entry fails here instead of only on Windows.
+    """
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is not available on this runner")
+
+    posix_paths = [path.as_posix() for path in BUNDLE_SOURCE_PATHS.values()]
+    try:
+        result = subprocess.run(
+            [git, "check-attr", "eol", "--", *posix_paths],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        pytest.skip(f"git check-attr is unavailable on this runner: {error}")
+
+    resolved: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        path_part, separator, value = line.rpartition(": eol: ")
+        if not separator:
+            continue
+        resolved[path_part] = value.strip()
+
+    for role, path in BUNDLE_SOURCE_PATHS.items():
+        posix_path = path.as_posix()
+        assert resolved.get(posix_path) == "lf", (
+            f"BUNDLE_SOURCE_PATHS[{role!r}] ({posix_path}) is hashed "
+            "byte-for-byte by the authority adapter bundle but "
+            ".gitattributes does not pin it to eol=lf; a Windows checkout "
+            "will normalize it to CRLF and the pinned digest will never "
+            "verify there."
+        )
 
 
 def test_bundle_missing_role_fails_closed(tmp_path: Path) -> None:
