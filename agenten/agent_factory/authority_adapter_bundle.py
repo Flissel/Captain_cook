@@ -114,6 +114,8 @@ def write_adapter_bundle(bundle: AuthorityAdapterBundleV1, target: Path) -> None
 
 def load_adapter_bundle(
     source: Path,
+    *,
+    root: Path | None = None,
 ) -> tuple[AuthorityAdapterBundleV1, str]:
     try:
         body, bundle_sha256 = sha256_of_verified_read(
@@ -132,6 +134,8 @@ def load_adapter_bundle(
     _require_complete_roles(bundle.adapters)
     for entry in bundle.adapters:
         source_path = Path(entry.source_path)
+        if root is not None:
+            source_path = root / source_path
         try:
             _, actual = sha256_of_verified_read(
                 source_path, maximum_size=MAX_ADAPTER_ARTIFACT_BYTES

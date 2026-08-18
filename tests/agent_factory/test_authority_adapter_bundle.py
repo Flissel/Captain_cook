@@ -152,3 +152,21 @@ def test_single_open_enforces_size_cap_and_rejects_empty(tmp_path: Path) -> None
     empty.write_bytes(b"")
     with pytest.raises(SingleOpenError, match="empty"):
         read_verified_bytes(empty, maximum_size=1024)
+
+
+def test_load_adapter_bundle_resolves_sources_against_an_explicit_root(tmp_path):
+    """The Gateway must verify the bundle regardless of its working directory."""
+    from pathlib import Path
+
+    from agenten.agent_factory.authority_adapter_bundle import (
+        BUNDLE_SOURCE_PATHS,
+        load_adapter_bundle,
+    )
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle_path = repo_root / "config" / "authority-adapter-bundle.v1.json"
+
+    bundle, digest = load_adapter_bundle(bundle_path, root=repo_root)
+
+    assert len(bundle.adapters) == len(BUNDLE_SOURCE_PATHS)
+    assert len(digest) == 64

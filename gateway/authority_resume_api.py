@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from agenten.agent_factory.authority_adapter_bundle import (
+    AuthorityAdapterBundleError,
+    load_adapter_bundle,
+)
 from gateway.auth import GatewayRole, require_captain
 from gateway.authority_resume_contracts import (
     SHA256_PATTERN,
@@ -22,6 +27,20 @@ _DENIAL_STATUS = {
     "already_consumed": status.HTTP_409_CONFLICT,
 }
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BUNDLE_PATH = REPO_ROOT / "config" / "authority-adapter-bundle.v1.json"
+
+
+def _verify_pinned_authority_bundle() -> None:
+    """Raise AuthorityAdapterBundleError unless every adapter matches its digest.
+
+    Resuming means handing authority back to code. If that code has drifted
+    from the bundle it was pinned as, the only safe answer is no. This raises
+    the domain error; the route converts it to a denial that names no role and
+    echoes no content.
+    """
+    load_adapter_bundle(BUNDLE_PATH, root=REPO_ROOT)
+
 
 class _DispatchBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -32,9 +51,11 @@ def build_authority_resume_router(
     store_provider: Callable[[], AuthorityResumeStore],
     *,
     clock: Callable[[], datetime] | None = None,
+    verify_authority_bundle: Callable[[], None] | None = None,
 ) -> APIRouter:
     router = APIRouter()
     now = clock or (lambda: datetime.now(timezone.utc))
+    verify_bundle = verify_authority_bundle or _verify_pinned_authority_bundle
 
     @router.post(
         "/v1/authority/assemblies/{assembly_id}/resume-authorizations",
@@ -45,6 +66,13 @@ def build_authority_resume_router(
         _: GatewayRole = Depends(require_captain),
     ) -> dict[str, str]:
         _require_assembly_id(assembly_id)
+        try:
+            verify_bundle()
+        except AuthorityAdapterBundleError:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="authority_bundle_unverified",
+            ) from None
         record, raw_token = store_provider().authorize(assembly_id, now=now())
         return {
             "authorization_id": str(record.authorization_id),
