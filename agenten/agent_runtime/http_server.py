@@ -58,7 +58,7 @@ def create_runtime_app(
         )
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
+    async def health(_: None = Depends(require_runtime_token)) -> dict[str, str]:
         return {"status": "ok"}
 
     @app.post("/v1/runtime/execute", response_model=AgentRuntimeResult)
