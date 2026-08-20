@@ -12,10 +12,15 @@ param(
     [Parameter(Mandatory, ParameterSetName = "Run")]
     [Parameter(Mandatory, ParameterSetName = "Cancel")]
     [Parameter(Mandatory, ParameterSetName = "Inspect")]
+    [Parameter(Mandatory, ParameterSetName = "CancelIdentity")]
+    [Parameter(Mandatory, ParameterSetName = "InspectIdentity")]
     [string] $SessionId,
 
-    [Parameter(Mandatory, ParameterSetName = "Run")]
+    [Parameter(ParameterSetName = "Run")]
     [string] $StatePath,
+
+    [Parameter(ParameterSetName = "Run")]
+    [switch] $EmitState,
 
     [Parameter(Mandatory, ParameterSetName = "Run")]
     [DateTimeOffset] $DeadlineAt,
@@ -23,6 +28,10 @@ param(
     [Parameter(ParameterSetName = "Run")]
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$')]
     [string] $ResumeThreadId,
+
+    [Parameter(ParameterSetName = "Run")]
+    [ValidatePattern('^http://127\.0\.0\.1:[0-9]{1,5}/v1$')]
+    [string] $ProviderProxyUrl,
 
     [Parameter(ParameterSetName = "Run")]
     [ValidateSet("read-only", "workspace-write")]
@@ -35,8 +44,21 @@ param(
     [string] $InspectStatePath,
 
     [Parameter(Mandatory, ParameterSetName = "Cancel")]
+    [Parameter(Mandatory, ParameterSetName = "CancelIdentity")]
     [ValidateSet("operator", "timeout", "shutdown", "claim_lost", "captain_revoked")]
-    [string] $CancellationReason
+    [string] $CancellationReason,
+
+    [Parameter(Mandatory, ParameterSetName = "CancelIdentity")]
+    [Parameter(Mandatory, ParameterSetName = "InspectIdentity")]
+    [int] $ProcessId,
+
+    [Parameter(Mandatory, ParameterSetName = "CancelIdentity")]
+    [Parameter(Mandatory, ParameterSetName = "InspectIdentity")]
+    [long] $ProcessStartTimeUtcTicks,
+
+    [Parameter(Mandatory, ParameterSetName = "CancelIdentity")]
+    [Parameter(Mandatory, ParameterSetName = "InspectIdentity")]
+    [string] $ProcessExecutable
 )
 
 Set-StrictMode -Version Latest
@@ -46,9 +68,18 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
     throw "PowerShell 7 or newer is required."
 }
 
-if ($PSCmdlet.ParameterSetName -eq "Inspect") {
-    $state = Get-Content -LiteralPath $InspectStatePath -Raw -Encoding UTF8 |
-        ConvertFrom-Json -ErrorAction Stop
+if ($PSCmdlet.ParameterSetName -in @("Inspect", "InspectIdentity")) {
+    $state = if ($PSCmdlet.ParameterSetName -eq "Inspect") {
+        Get-Content -LiteralPath $InspectStatePath -Raw -Encoding UTF8 |
+            ConvertFrom-Json -ErrorAction Stop
+    } else {
+        [pscustomobject] @{
+            session_id = $SessionId
+            pid = $ProcessId
+            start_time_utc_ticks = $ProcessStartTimeUtcTicks
+            executable = $ProcessExecutable
+        }
+    }
     if (
         $state.session_id -ne $SessionId -or
         [int] $state.pid -lt 1 -or
@@ -72,9 +103,19 @@ if ($PSCmdlet.ParameterSetName -eq "Inspect") {
     exit 0
 }
 
-if ($PSCmdlet.ParameterSetName -eq "Cancel") {
-    $state = Get-Content -LiteralPath $CancelStatePath -Raw -Encoding UTF8 |
-        ConvertFrom-Json -ErrorAction Stop
+if ($PSCmdlet.ParameterSetName -in @("Cancel", "CancelIdentity")) {
+    $state = if ($PSCmdlet.ParameterSetName -eq "Cancel") {
+        Get-Content -LiteralPath $CancelStatePath -Raw -Encoding UTF8 |
+            ConvertFrom-Json -ErrorAction Stop
+    } else {
+        [pscustomobject] @{
+            session_id = $SessionId
+            pid = $ProcessId
+            started_at_utc = "direct"
+            start_time_utc_ticks = $ProcessStartTimeUtcTicks
+            executable = $ProcessExecutable
+        }
+    }
     if (
         $state.session_id -ne $SessionId -or
         [int] $state.pid -lt 1 -or
@@ -114,6 +155,9 @@ if ($PSCmdlet.ParameterSetName -eq "Cancel") {
 if ($DeadlineAt.Offset -ne [TimeSpan]::Zero) {
     throw "Codex deadline must be a UTC timestamp."
 }
+if ([string]::IsNullOrWhiteSpace($StatePath) -eq (-not $EmitState)) {
+    throw "Exactly one Codex state output mode must be configured."
+}
 
 $resolvedWorkspace = (Resolve-Path -LiteralPath $Workspace -ErrorAction Stop).Path
 if (-not (Test-Path -LiteralPath $resolvedWorkspace -PathType Container)) {
@@ -136,6 +180,26 @@ $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
 $startInfo.ArgumentList.Add("--dangerously-bypass-approvals-and-sandbox")
+if ($ProviderProxyUrl) {
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model="gpt-5.6-terra"')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_provider="captain_budget_proxy"')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_reasoning_effort="high"')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_providers.captain_budget_proxy.name="Captain localhost budget proxy"')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add(('model_providers.captain_budget_proxy.base_url="{0}"' -f $ProviderProxyUrl))
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_providers.captain_budget_proxy.env_key="CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_providers.captain_budget_proxy.wire_api="responses"')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_providers.captain_budget_proxy.request_max_retries=0')
+    $startInfo.ArgumentList.Add("-c")
+    $startInfo.ArgumentList.Add('model_providers.captain_budget_proxy.stream_max_retries=0')
+}
 if ($ResumeThreadId) {
     # Every value is a distinct ArgumentList entry so neither thread names nor
     # prompts cross a shell parsing boundary.
@@ -171,14 +235,21 @@ try {
         start_time_utc_ticks = $process.StartTime.ToUniversalTime().Ticks
         executable = $resolvedCodex
     }
-    $resolvedStatePath = [IO.Path]::GetFullPath($StatePath)
-    $temporaryStatePath = "$resolvedStatePath.tmp"
-    [IO.File]::WriteAllText(
-        $temporaryStatePath,
-        ($identity | ConvertTo-Json -Compress),
-        [Text.UTF8Encoding]::new($false)
-    )
-    Move-Item -LiteralPath $temporaryStatePath -Destination $resolvedStatePath -Force
+    if ($EmitState) {
+        [Console]::Out.WriteLine(
+            "CAPTAIN_PROCESS_STATE:" + ($identity | ConvertTo-Json -Compress)
+        )
+        [Console]::Out.Flush()
+    } else {
+        $resolvedStatePath = [IO.Path]::GetFullPath($StatePath)
+        $temporaryStatePath = "$resolvedStatePath.tmp"
+        [IO.File]::WriteAllText(
+            $temporaryStatePath,
+            ($identity | ConvertTo-Json -Compress),
+            [Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporaryStatePath -Destination $resolvedStatePath -Force
+    }
 
     $stderrTask = $process.StandardError.BaseStream.CopyToAsync(
         [IO.Stream]::Null,

@@ -98,7 +98,7 @@ def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
 def test_live_demo_services_only_operates_captain_resources() -> None:
     source = SERVICES.read_text(encoding="utf-8")
     assert "$global:LASTEXITCODE = 0" in source
-    assert 'ValidateSet("start", "portal-start", "gateway-restart", "benchmark-start"' in source
+    assert 'ValidateSet("start", "status", "portal-start", "gateway-restart", "benchmark-start"' in source
     assert "captain-n8n.ps1" in source
     assert "minibook-demo.ps1" in source
     assert "docker compose" in source
@@ -161,7 +161,7 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "docker stop" in source
     assert "com.docker.compose.project=captain-n8n-builder" in source
     assert "application/json, text/event-stream" in PREFLIGHT.read_text(encoding="utf-8")
-    assert "bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials" in source
+    assert "& $MinibookCommand start" in source
     assert "OPENAI" not in source.upper()
     assert source.index("Initialize-CaptainN8n $values") < source.index("mariadb-test")
     lowered = source.lower()
