@@ -499,7 +499,12 @@ function Start-Runtime($Values) {
     New-Item -ItemType Directory -Force $stateDir | Out-Null
     $python = Get-RuntimePythonExecutable
     Set-ProcessEnvironment $Values
-    $process = Start-Process $python -ArgumentList '-m','agenten.agent_runtime.runtime_entrypoint' -WorkingDirectory $root -WindowStyle Hidden -PassThru
+    $stdoutLog = Join-Path $root 'runtime-stdout.log'
+    $stderrLog = Join-Path $root 'runtime-stderr.log'
+    $process = Start-Process $python `
+        -ArgumentList '-m','agenten.agent_runtime.runtime_entrypoint' `
+        -WorkingDirectory $root -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
     foreach ($attempt in 1..60) {
         if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) { break }
         try {
@@ -515,7 +520,12 @@ function Start-Runtime($Values) {
     if (Get-Process -Id $process.Id -ErrorAction SilentlyContinue) {
         & taskkill.exe /PID $process.Id /T /F *> $null
     }
-    throw 'Runtime did not become healthy.'
+    $detail = ''
+    if (Test-Path $stderrLog) { $detail = (Get-Content $stderrLog -Tail 20) -join "`n" }
+    if ([string]::IsNullOrWhiteSpace($detail) -and (Test-Path $stdoutLog)) {
+        $detail = (Get-Content $stdoutLog -Tail 20) -join "`n"
+    }
+    throw "Runtime did not become healthy.`n--- runtime output ---`n$detail"
 }
 function Stop-ManagedRuntime($Values) {
     $process = Get-ManagedRuntimeProcess $Values
