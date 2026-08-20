@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 
@@ -17,13 +20,28 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrantRevocation,
     HermesPlanResult,
     RuntimeOperation,
+    RuntimeCostEvidenceV1,
+    RuntimeResumeCostAuthorityV1,
+    RuntimeResumeCostSettlementV1,
     RuntimeStatus,
+    RuntimeUsagePricingSnapshotV1,
 )
 from agenten.agent_runtime.service import AgentRuntimeService, RuntimeContractViolation
 from agenten.validation.contracts import AcceptanceAssertion, AssertionKind, WorkBatch
 
 
 NOW = datetime(2026, 7, 17, 12, tzinfo=timezone.utc)
+PRICING = RuntimeUsagePricingSnapshotV1(
+    schema_name="captain.runtime-usage-pricing-snapshot.v1",
+    snapshot_id="openai-test-2026-08-09",
+    provider="openai",
+    model="gpt-5.6-terra",
+    input_cost_per_million_usd=Decimal("1.25"),
+    cached_input_cost_per_million_usd=Decimal("0.125"),
+    output_cost_per_million_usd=Decimal("10.00"),
+    effective_at=NOW,
+    expires_at=NOW + timedelta(days=1),
+)
 FIXTURE = (
     Path(__file__).parents[1]
     / "fixtures"
@@ -50,6 +68,27 @@ def command_for(operation: str = "codex.run") -> AgentRuntimeCommand:
             "planner" if operation == "hermes.plan" else "agent-designer"
         )
         value["payload"]["integration_intent"] = "none"
+    return AgentRuntimeCommand.model_validate(value)
+
+
+def resume_command_with_cost(*, ceiling: str = "0.75") -> AgentRuntimeCommand:
+    value: dict[str, Any] = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    value["event_id"] = str(uuid4())
+    value["correlation_id"] = str(uuid5(NAMESPACE_URL, "resume-correlation"))
+    value["occurred_at"] = NOW.isoformat().replace("+00:00", "Z")
+    value["payload"].update(
+        {
+            "operation": "codex.resume",
+            "maximum_cost_usd": ceiling,
+            "budget_reservation_id": str(uuid5(NAMESPACE_URL, "resume-reservation")),
+            "cost_authority_ref": "gateway://capability-resume-authorizations/authority-one",
+            "cost_job_id": str(uuid5(NAMESPACE_URL, "resume-job")),
+            "cost_run_id": str(uuid5(NAMESPACE_URL, "resume-run")),
+            "cost_input_id": "input-one",
+            "cost_capability_id": "claims-capability",
+            "cost_capability_version": 3,
+        }
+    )
     return AgentRuntimeCommand.model_validate(value)
 
 
@@ -143,10 +182,21 @@ class FakeState:
 class FakeArtifacts:
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self.contents: dict[str, bytes] = {}
 
     async def require(self, reference: ArtifactRef) -> None:
         assert reference.uri.startswith("artifact://")
         self.events.append("prompt_resolved")
+
+    async def write(self, content: bytes, media_type: str) -> ArtifactRef:
+        digest = hashlib.sha256(content).hexdigest()
+        self.contents[digest] = content
+        self.events.append("evidence_written")
+        return ArtifactRef(
+            uri=f"artifact://sha256/{digest}",
+            sha256=digest,
+            media_type=media_type,
+        )
 
 
 class FakeCodex:
@@ -155,6 +205,7 @@ class FakeCodex:
         self.calls: list[RuntimeOperation] = []
         self.fail = False
         self.mismatch = False
+        self.actual_cost_usd = Decimal("0.25")
 
     async def start(
         self, command: AgentRuntimeCommand, grant: CapabilityGrant
@@ -190,7 +241,7 @@ class FakeCodex:
         assert "grant_recorded" in self.events
         if self.fail:
             raise OSError("sensitive adapter detail")
-        return AgentRuntimeResult(
+        result = AgentRuntimeResult(
             schema_name="captain.agent-runtime-result.v1",
             event_id=uuid4(),
             command_id=uuid4() if self.mismatch else command.event_id,
@@ -205,6 +256,96 @@ class FakeCodex:
             session_id="codex-session-1",
             artifact_refs=(artifact("build-output"),),
             evidence_refs=(artifact("test-evidence"),),
+        )
+        if command.payload.operation is RuntimeOperation.CODEX_RESUME:
+            return result.model_copy(
+                update={
+                    "cost_evidence": RuntimeCostEvidenceV1(
+                        schema_name="captain.runtime-cost-evidence.v1",
+                        receipt_id=uuid5(command.event_id, "provider-usage"),
+                        command_id=command.event_id,
+                        result_id=result.event_id,
+                        original_command_id=command.causation_id or command.event_id,
+                        reservation_id=command.payload.budget_reservation_id,
+                        job_id=command.payload.cost_job_id,
+                        run_id=command.payload.cost_run_id,
+                        input_id=command.payload.cost_input_id,
+                        correlation_id=command.correlation_id,
+                        capability_id=command.payload.cost_capability_id,
+                        capability_version=command.payload.cost_capability_version,
+                        provider="openai",
+                        model="gpt-5.6-terra",
+                        input_units=100_000,
+                        cached_input_units=0,
+                        output_units=12_500,
+                        actual_cost_usd=self.actual_cost_usd,
+                        pricing_snapshot_id=PRICING.snapshot_id,
+                        pricing_snapshot_sha256=PRICING.snapshot_sha256,
+                        started_at=NOW,
+                        ended_at=NOW,
+                        evidence_ref=artifact("provider-usage", "f"),
+                    )
+                }
+            )
+        return result
+
+
+class FakeCostAuthority:
+    def __init__(
+        self,
+        *,
+        ceiling_usd: Decimal = Decimal("0.75"),
+        disposition: str = "accounted",
+        expired: bool = False,
+        hard_ceiling_enforced: bool = True,
+        metering_mode: str = "provider_usage_receipt",
+    ) -> None:
+        self.ceiling_usd = ceiling_usd
+        self.disposition = disposition
+        self.expired = expired
+        self.hard_ceiling_enforced = hard_ceiling_enforced
+        self.metering_mode = metering_mode
+        self.authorize_calls = 0
+        self.settle_calls = 0
+
+    async def authorize(self, command: AgentRuntimeCommand):
+        self.authorize_calls += 1
+        return RuntimeResumeCostAuthorityV1(
+            schema_name="captain.runtime-resume-cost-authority.v1",
+            authorization_receipt_id=uuid5(NAMESPACE_URL, "authority-one"),
+            cost_authority_ref=command.payload.cost_authority_ref,
+            reservation_id=command.payload.budget_reservation_id,
+            job_id=command.payload.cost_job_id,
+            run_id=command.payload.cost_run_id,
+            input_id=command.payload.cost_input_id,
+            correlation_id=command.correlation_id,
+            capability_id=command.payload.cost_capability_id,
+            capability_version=command.payload.cost_capability_version,
+            command_id=command.event_id,
+            ceiling_usd=self.ceiling_usd,
+            expires_at=(NOW - timedelta(seconds=1) if self.expired else NOW + timedelta(hours=1)),
+            hard_ceiling_enforced=self.hard_ceiling_enforced,
+            metering_mode=self.metering_mode,
+        )
+
+    async def settle(self, command, result, authority):
+        self.settle_calls += 1
+        actual = getattr(getattr(result, "cost_evidence", None), "actual_cost_usd", None)
+        return RuntimeResumeCostSettlementV1(
+            schema_name="captain.runtime-resume-cost-settlement.v1",
+            settlement_id=uuid5(command.event_id, "cost-settlement"),
+            command_id=command.event_id,
+            reservation_id=authority.reservation_id,
+            disposition=self.disposition,
+            actual_cost_usd=actual,
+            accounted_cost_usd=(
+                actual
+                if self.disposition == "overrun"
+                else authority.ceiling_usd
+                if self.disposition == "unmetered"
+                else actual
+            ),
+            evidence_refs=(artifact("cost-settlement", "e"),),
         )
 
 
@@ -247,6 +388,7 @@ def service_with(
     events: list[str],
     codex: FakeCodex,
     hermes: FakeHermes,
+    cost_authority: FakeCostAuthority | None = None,
 ) -> AgentRuntimeService:
     return AgentRuntimeService(
         state=state,
@@ -255,6 +397,7 @@ def service_with(
         artifacts=FakeArtifacts(events),
         capabilities=FakeCapabilityPolicy(),
         clock=FakeClock(),
+        cost_authority=cost_authority,
     )
 
 
@@ -330,13 +473,125 @@ async def test_captain_revocation_blocks_an_existing_grant_before_external_effec
 @pytest.mark.asyncio
 async def test_codex_operations_dispatch_explicitly(operation: str, expected: str) -> None:
     events: list[str] = []
-    command = command_for(operation)
+    command = (
+        resume_command_with_cost()
+        if operation == "codex.resume"
+        else command_for(operation)
+    )
+    state = FakeState(events, batch_for(command))
+    codex = FakeCodex(events)
+    costs = FakeCostAuthority() if operation == "codex.resume" else None
+
+    await service_with(
+        state, events, codex, FakeHermes(events), costs
+    ).execute(command)
+
+    assert [call.value for call in codex.calls] == [expected]
+
+
+@pytest.mark.asyncio
+async def test_resume_without_cost_authority_stops_before_codex_effect() -> None:
+    events: list[str] = []
+    command = command_for("codex.resume").model_copy(update={"producer": "captain"})
     state = FakeState(events, batch_for(command))
     codex = FakeCodex(events)
 
-    await service_with(state, events, codex, FakeHermes(events)).execute(command)
+    with pytest.raises(RuntimeContractViolation, match="cost authority"):
+        await service_with(state, events, codex, FakeHermes(events)).execute(command)
 
-    assert [call.value for call in codex.calls] == [expected]
+    assert codex.calls == []
+
+
+def test_resume_command_carries_complete_cost_authority_binding() -> None:
+    try:
+        command = resume_command_with_cost()
+    except Exception as exc:
+        pytest.fail(f"resume cost binding contract is unavailable: {type(exc).__name__}")
+
+    assert str(command.payload.cost_job_id) == str(uuid5(NAMESPACE_URL, "resume-job"))
+    assert str(command.payload.cost_run_id) == str(uuid5(NAMESPACE_URL, "resume-run"))
+    assert command.payload.cost_input_id == "input-one"
+    assert command.payload.cost_capability_id == "claims-capability"
+    assert command.payload.cost_capability_version == 3
+
+
+@pytest.mark.asyncio
+async def test_arbitrary_resume_ceiling_is_rejected_before_codex_effect() -> None:
+    events: list[str] = []
+    command = resume_command_with_cost(ceiling="0.01")
+    state = FakeState(events, batch_for(command))
+    codex = FakeCodex(events)
+    costs = FakeCostAuthority(ceiling_usd=Decimal("0.75"))
+
+    with pytest.raises(RuntimeContractViolation, match="cost authority binding"):
+        await service_with(
+            state, events, codex, FakeHermes(events), costs
+        ).execute(command)
+
+    assert costs.authorize_calls == 1
+    assert codex.calls == []
+
+
+@pytest.mark.parametrize(
+    "costs",
+    [
+        FakeCostAuthority(expired=True),
+        FakeCostAuthority(hard_ceiling_enforced=False),
+        FakeCostAuthority(metering_mode="unavailable"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unusable_resume_cost_authority_stops_before_codex_effect(
+    costs: FakeCostAuthority,
+) -> None:
+    events: list[str] = []
+    command = resume_command_with_cost()
+    state = FakeState(events, batch_for(command))
+    codex = FakeCodex(events)
+
+    with pytest.raises(RuntimeContractViolation, match="cost authority binding"):
+        await service_with(
+            state, events, codex, FakeHermes(events), costs
+        ).execute(command)
+
+    assert codex.calls == []
+
+
+@pytest.mark.asyncio
+async def test_valid_resume_authority_executes_once_and_accounts_actual_spend() -> None:
+    events: list[str] = []
+    command = resume_command_with_cost()
+    state = FakeState(events, batch_for(command))
+    codex = FakeCodex(events)
+    costs = FakeCostAuthority()
+
+    result = await service_with(
+        state, events, codex, FakeHermes(events), costs
+    ).execute(command)
+
+    assert codex.calls == [RuntimeOperation.CODEX_RESUME]
+    assert costs.authorize_calls == costs.settle_calls == 1
+    assert result.status is RuntimeStatus.SUCCEEDED
+    assert result.cost_evidence.actual_cost_usd == Decimal("0.25")
+
+
+@pytest.mark.asyncio
+async def test_resume_cost_overrun_never_persists_success() -> None:
+    events: list[str] = []
+    command = resume_command_with_cost()
+    state = FakeState(events, batch_for(command))
+    codex = FakeCodex(events)
+    codex.actual_cost_usd = Decimal("0.80")
+    costs = FakeCostAuthority(disposition="overrun")
+
+    result = await service_with(
+        state, events, codex, FakeHermes(events), costs
+    ).execute(command)
+
+    assert codex.calls == [RuntimeOperation.CODEX_RESUME]
+    assert costs.settle_calls == 1
+    assert result.status is not RuntimeStatus.SUCCEEDED
+    assert state.results[command.event_id] == result
 
 
 @pytest.mark.parametrize("operation", ["hermes.plan", "hermes.design_agent"])
@@ -382,7 +637,30 @@ async def test_adapter_exception_becomes_redacted_durable_infrastructure_result(
     assert result.status is RuntimeStatus.INFRASTRUCTURE_FAILED
     assert result.error == "codex.run adapter failed"
     assert "sensitive" not in result.model_dump_json()
+    assert len(result.evidence_refs) == 1
+    reference = result.evidence_refs[0]
+    assert reference.uri == f"artifact://sha256/{reference.sha256}"
     assert events[-1] == "result_recorded"
+
+
+@pytest.mark.asyncio
+async def test_resume_adapter_exception_remains_durable_infrastructure_failure_after_accounting() -> None:
+    events: list[str] = []
+    command = resume_command_with_cost()
+    state = FakeState(events, batch_for(command))
+    codex = FakeCodex(events)
+    codex.fail = True
+    costs = FakeCostAuthority(disposition="unmetered")
+
+    result = await service_with(
+        state, events, codex, FakeHermes(events), costs
+    ).execute(command)
+
+    assert costs.settle_calls == 1
+    assert result.status is RuntimeStatus.INFRASTRUCTURE_FAILED
+    assert result.error == "codex.resume adapter failed"
+    assert state.results[command.event_id] == result
+    assert result.evidence_refs[0].uri.startswith("artifact://sha256/")
 
 
 @pytest.mark.asyncio

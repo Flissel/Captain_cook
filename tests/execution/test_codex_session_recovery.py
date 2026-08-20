@@ -659,6 +659,48 @@ def test_powershell_launcher_expired_deadline_never_starts_codex_child(
     assert not state_path.exists()
 
 
+def test_powershell_launcher_emit_state_mode_writes_no_child_state_file(
+    tmp_path: Path,
+) -> None:
+    line = '{"type":"turn.completed"}'
+    fixture = _compile_streaming_fixture(
+        tmp_path,
+        jsonl_line=line,
+        sleep_milliseconds=1,
+    )
+
+    completed = subprocess.run(
+        [
+            _pwsh(),
+            "-NoProfile",
+            "-File",
+            str(Path("scripts/codex-session.ps1").resolve()),
+            "-Workspace",
+            str(tmp_path),
+            "-Prompt",
+            "harmless pathless state test",
+            "-CodexPath",
+            str(fixture),
+            "-SessionId",
+            "emit-state-1",
+            "-EmitState",
+            "-DeadlineAt",
+            FUTURE_DEADLINE.isoformat(),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode == 0
+    output = completed.stdout.splitlines()
+    assert output[0].startswith("CAPTAIN_PROCESS_STATE:")
+    identity = json.loads(output[0].split(":", 1)[1])
+    assert identity["session_id"] == "emit-state-1"
+    assert output[1] == line
+    assert not list(tmp_path.glob("*state*.json"))
+
+
 @pytest.mark.asyncio
 async def test_powershell_launcher_streams_complete_line_before_child_exit(
     tmp_path: Path,

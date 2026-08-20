@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 import yaml
 from pydantic import ValidationError
+
+import agenten.agent_runtime.contracts as runtime_contracts
 
 from agenten.agent_runtime.contracts import (
     AgentBlueprint,
@@ -23,6 +26,31 @@ from agenten.agent_runtime.contracts import (
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "contracts"
 NOW = datetime(2026, 7, 17, 12, tzinfo=timezone.utc)
+
+
+def test_runtime_usage_pricing_snapshot_is_digest_bound_and_computes_cost() -> None:
+    snapshot_type = getattr(
+        runtime_contracts, "RuntimeUsagePricingSnapshotV1", None
+    )
+    assert snapshot_type is not None, "runtime usage pricing snapshot is missing"
+    snapshot = snapshot_type(
+        schema_name="captain.runtime-usage-pricing-snapshot.v1",
+        snapshot_id="openai-test-2026-08-09",
+        provider="openai",
+        model="gpt-5.6-terra",
+        input_cost_per_million_usd=Decimal("1.25"),
+        cached_input_cost_per_million_usd=Decimal("0.125"),
+        output_cost_per_million_usd=Decimal("10.00"),
+        effective_at=datetime(2026, 8, 9, tzinfo=timezone.utc),
+        expires_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+    )
+
+    assert snapshot.cost(
+        input_units=100_000,
+        cached_input_units=20_000,
+        output_units=12_500,
+    ) == Decimal("0.227500")
+    assert len(snapshot.snapshot_sha256) == 64
 
 
 def artifact(name: str) -> dict[str, str]:
