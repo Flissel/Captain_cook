@@ -1,4 +1,4 @@
-#requires -Version 7.0
+﻿#requires -Version 7.0
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position=0)]
@@ -529,7 +529,7 @@ function Assert-RuntimeConfiguration($Values) {
     Get-RuntimeAdapterManifestMetadata $Values
     $python = Get-RuntimePythonExecutable
     Set-ProcessEnvironment $Values
-    & $python -c 'from agenten.agent_runtime.runtime_entrypoint import preflight_runtime; preflight_runtime()' *> $null
+    & $python -c 'from agenten.agent_runtime.runtime_entrypoint import preflight_runtime; preflight_runtime()'
     if ($LASTEXITCODE -ne 0) { throw 'Production Runtime configuration is unavailable; no services were started.' }
 }
 function Invoke-StartServices([switch]$RecoverDemoCredentials, [string]$SourceEnv) {
@@ -537,10 +537,10 @@ function Invoke-StartServices([switch]$RecoverDemoCredentials, [string]$SourceEn
         $values = [ordered]@{}
         & $CaptainStartProbe $values
     } else {
-        $runtimeAdapterValues = Read-Env $rootEnv @('CAPTAIN_RUNTIME_ADAPTER_MANIFEST','CAPTAIN_RUNTIME_ADAPTER_MANIFEST_SHA256')
+        $runtimeAdapterValues = Read-Env $rootEnv @('CAPTAIN_RUNTIME_ADAPTER_MANIFEST','CAPTAIN_RUNTIME_ADAPTER_MANIFEST_SHA256','CAPTAIN_HERMES_RUNTIME_SKILL','CAPTAIN_HERMES_RUNTIME_SKILL_SHA256','CAPTAIN_RUNTIME_URL','CAPTAIN_RUNTIME_TOKEN','CAPTAIN_GATEWAY_URL','CAPTAIN_GATEWAY_TOKEN')
         Get-RuntimeAdapterManifestMetadata $runtimeAdapterValues
         $values = Initialize-LocalEnvironment
-        foreach ($name in @('CAPTAIN_RUNTIME_ADAPTER_MANIFEST','CAPTAIN_RUNTIME_ADAPTER_MANIFEST_SHA256')) { $values[$name] = $runtimeAdapterValues[$name] }
+        foreach ($name in @('CAPTAIN_RUNTIME_ADAPTER_MANIFEST','CAPTAIN_RUNTIME_ADAPTER_MANIFEST_SHA256','CAPTAIN_HERMES_RUNTIME_SKILL','CAPTAIN_HERMES_RUNTIME_SKILL_SHA256','CAPTAIN_RUNTIME_URL','CAPTAIN_RUNTIME_TOKEN','CAPTAIN_GATEWAY_URL','CAPTAIN_GATEWAY_TOKEN')) { $values[$name] = $runtimeAdapterValues[$name] }
         Set-ProcessEnvironment $values
         Assert-RuntimeConfiguration $values
         Initialize-CaptainN8n $values -Recover:$RecoverDemoCredentials -SourceEnv $SourceEnv
