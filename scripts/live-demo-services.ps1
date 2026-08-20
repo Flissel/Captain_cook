@@ -196,6 +196,21 @@ function Assert-ManagedRuntimeListener($Process, [int]$Port) {
     if ($listeners.Count -ne 1) { throw 'Runtime requires exactly one managed listener.' }
     if ([int]$listeners[0].OwningProcess -ne $Process.Id) { throw 'Runtime listener is not owned by the managed process.' }
 }
+function Resolve-ManagedRuntimeListenerProcess($Process, [int]$Port) {
+    $listeners = @(Get-RuntimeListeners $Port)
+    if ($listeners.Count -ne 1) { throw 'Runtime requires exactly one managed listener.' }
+    $listenerProcess = Get-Process -Id $listeners[0].OwningProcess -ErrorAction Stop
+    if ($listenerProcess.Id -ne $Process.Id) {
+        $listenerMetadata = Get-CimInstance Win32_Process -Filter "ProcessId=$($listenerProcess.Id)"
+        if ([int]$listenerMetadata.ParentProcessId -ne $Process.Id) {
+            throw 'Runtime listener process is neither the managed launcher nor an exact child of it.'
+        }
+        if ([string]$listenerMetadata.CommandLine -notmatch '(?:^|\s)-m\s+agenten\.agent_runtime\.runtime_entrypoint(?:\s|$)') {
+            throw 'Runtime listener child process does not run the expected runtime entrypoint module.'
+        }
+    }
+    return $listenerProcess
+}
 function Recover-CaptainN8nEnvironment($Values, [string]$SourceEnv) {
     if ($SourceEnv -and [IO.Path]::GetFullPath($SourceEnv) -ne [IO.Path]::GetFullPath($rootEnv)) {
         if (-not (Test-Path $SourceEnv -PathType Leaf)) { throw 'The explicit credential source .env does not exist.' }
@@ -505,16 +520,18 @@ function Start-Runtime($Values) {
         -ArgumentList '-u','-m','agenten.agent_runtime.runtime_entrypoint' `
         -WorkingDirectory $root -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+    $identityFailure = ''
     foreach ($attempt in 1..60) {
         if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) { break }
         try {
             if (Test-AuthenticatedRuntimeHealth $Values) {
-                Assert-ManagedRuntimeListener $process $runtimePort
-                Write-ManagedProcessIdentity -Process $process -Path $runtimePid -ConfigurationSha256 $configurationSha256
+                $listenerProcess = Resolve-ManagedRuntimeListenerProcess $process $runtimePort
+                Write-ManagedProcessIdentity -Process $listenerProcess -Path $runtimePid -ConfigurationSha256 $configurationSha256
+                Assert-ManagedRuntimeListener $listenerProcess $runtimePort
                 Write-Host '[ready] authenticated Runtime boundary with verified process identity'
                 return
             }
-        } catch {}
+        } catch { $identityFailure = $_.Exception.Message }
         Start-Sleep -Milliseconds 500
     }
     if (Get-Process -Id $process.Id -ErrorAction SilentlyContinue) {
@@ -529,6 +546,7 @@ function Start-Runtime($Values) {
     } catch {
         $detail = "(runtime log could not be read: $($_.Exception.GetType().Name))"
     }
+    if ($identityFailure) { $detail = "process identity: $identityFailure`n$detail" }
     $runtimeSecretValueKeys = @(
         'MARIADB_PASSWORD','MARIADB_ROOT_PASSWORD','MARIADB_TEST_PASSWORD','MARIADB_TEST_ROOT_PASSWORD',
         'CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN','CAPTAIN_RUNTIME_TOKEN',
