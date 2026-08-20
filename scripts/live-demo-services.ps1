@@ -502,7 +502,7 @@ function Start-Runtime($Values) {
     $stdoutLog = Join-Path $root 'runtime-stdout.log'
     $stderrLog = Join-Path $root 'runtime-stderr.log'
     $process = Start-Process $python `
-        -ArgumentList '-m','agenten.agent_runtime.runtime_entrypoint' `
+        -ArgumentList '-u','-m','agenten.agent_runtime.runtime_entrypoint' `
         -WorkingDirectory $root -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
     foreach ($attempt in 1..60) {
@@ -521,9 +521,26 @@ function Start-Runtime($Values) {
         & taskkill.exe /PID $process.Id /T /F *> $null
     }
     $detail = ''
-    if (Test-Path $stderrLog) { $detail = (Get-Content $stderrLog -Tail 20) -join "`n" }
-    if ([string]::IsNullOrWhiteSpace($detail) -and (Test-Path $stdoutLog)) {
-        $detail = (Get-Content $stdoutLog -Tail 20) -join "`n"
+    try {
+        if (Test-Path $stderrLog) { $detail = (Get-Content $stderrLog -Tail 20 -ErrorAction Stop) -join "`n" }
+        if ([string]::IsNullOrWhiteSpace($detail) -and (Test-Path $stdoutLog)) {
+            $detail = (Get-Content $stdoutLog -Tail 20 -ErrorAction Stop) -join "`n"
+        }
+    } catch {
+        $detail = "(runtime log could not be read: $($_.Exception.GetType().Name))"
+    }
+    $runtimeSecretValueKeys = @(
+        'MARIADB_PASSWORD','MARIADB_ROOT_PASSWORD','MARIADB_TEST_PASSWORD','MARIADB_TEST_ROOT_PASSWORD',
+        'CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN','CAPTAIN_RUNTIME_TOKEN',
+        'N8N_API_KEY','N8N_MCP_TOKEN','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN',
+        'PORTAL_PROVIDER_CONTROL_TOKEN','PORTAL_EVIDENCE_TOKEN','PORTAL_RESTART_CONTROL_TOKEN',
+        'TEST_MARIADB_DSN','LEDGER_DSN'
+    )
+    foreach ($secretKey in $runtimeSecretValueKeys) {
+        if ($Values.Contains($secretKey)) {
+            $secretValue = [string]$Values[$secretKey]
+            if (-not [string]::IsNullOrWhiteSpace($secretValue)) { $detail = $detail.Replace($secretValue, '***') }
+        }
     }
     throw "Runtime did not become healthy.`n--- runtime output ---`n$detail"
 }
