@@ -25,3 +25,10 @@ agenten/agent_runtime/n8n_mcp_broker_server.py text eol=lf
 # anything. Pinning it keeps the artifact byte-stable for whenever that
 # changes, and for any external tooling that hashes it directly.
 config/authority-adapter-bundle.v1.json text eol=lf
+
+# Hashed byte-for-byte against its committed blob by
+# scripts/generate-runtime-adapter-manifest.py (it compares the working-tree
+# bytes to `git show HEAD:<path>`). Without eol=lf a Windows checkout gets
+# CRLF, the two digests can never match, and the live-demo health check fails
+# before any service starts. Do not remove this line as "noise".
+agenten/agent_runtime/captain_production_adapters.py text eol=lf
