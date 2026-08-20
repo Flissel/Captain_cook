@@ -1,5 +1,13 @@
 # Runtime-composition live proof — `agentfarm.deliver` via MCP (2026-08-19)
 
+> **Update (2026-08-20, round 3):** rounds 1-2 below ended in refusals and
+> recorded no ledger write. **Round 3 got through**: a fully-bound,
+> contract-valid command reached real Hermes adapter dispatch, and the full
+> chain (batch -> command -> grant -> result) is now persisted in the ledger.
+> The ledger proof this document originally lacked is in **Round 3** and
+> **Ledger proof (coordinator)** below. Read the rounds 1-2 summary that
+> follows as the state at the time it was written.
+
 **Both rounds ended in a fail-closed refusal, not a success — no ledger
 write is expected from either.** Round 1 (via the `origin/master` MCP
 server) got HTTP 422 `invalid runtime command` — a request-shape
@@ -488,7 +496,223 @@ as a finding rather than worked around.
   the reasons in §9. The controller's post-round-2 query is expected to
   again show the marker absent, consistent with (not a gap in) the query.
 
-## Ledger proof (controller)
+## Round 3 (2026-08-20) — the composed runtime reached real Hermes dispatch and wrote the full chain to the ledger
+
+Round 3 was run by the coordinator directly (no split agent), so every
+figure below comes from a command or query run in this session.
+
+### 3.1 The environment had to be rebuilt first
+
+`mariadb-test` was found `Exited (255)`, and ports 8090/8091 were dead. The
+test database mounts `/var/lib/mysql` as **tmpfs** (see
+`docker-compose.test.yml`), so restarting it produced an *empty* schema.
+That is why the round 1/2 finding "`blocks` is completely empty" no longer
+had to be taken on trust — it was re-established from zero.
+
+Note for future runs: the compose project name `captain-cook-test` is fixed
+in the compose file and is therefore **shared across worktrees**. Running
+`docker compose up` from this worktree adopted a container whose labels
+still record `working_dir=...\.worktrees\hermes-factory-c`. Same image,
+ports and env, but two worktrees can collide on this one container.
+
+### 3.2 A regression in this branch's own start script blocked the managed path
+
+`scripts/live-demo-services.ps1 start` failed with `Runtime did not become
+healthy.` while `runtime-stdout.log` showed the runtime answering
+**`GET /health -> 200 OK` fifteen times**. The health probe was never the
+problem.
+
+Cause, reproduced empirically rather than inferred: `Start-Runtime` launched
+`.venv\Scripts\python.exe` (PID 37156), but that venv stub is a pyenv-win
+redirector which re-execs the real interpreter
+(`~\.pyenv\pyenv-win\versions\3.11.0\python.exe`, PID 43016) as a **child**.
+The socket is bound by the child, so `Assert-ManagedRuntimeListener`, which
+compared the listener owner against the *launcher* PID, could never pass on
+this machine:
+
+```
+healthProbe200=True afterAttempts=1
+listenerCount=1
+  owningPID=43016  procName=python
+managedPID=37156  ownershipMatches=False
+```
+
+`git log -L` attributes that assertion to **8e95210**, a commit on this
+branch: `Start-Gateway` was ported to the listener-identity pattern and
+`Start-Runtime` was not. Because the assertion ran inside `try { } catch {}`,
+its exception was swallowed and the loop simply timed out, reporting a
+misleading "not healthy" message that contradicted the logs.
+
+Fixed here by porting `Start-Runtime` to the pattern `Start-Gateway` already
+uses: resolve the listener-owning process, require it to be the launcher
+**or an exact child of it** running the expected
+`-m agenten.agent_runtime.runtime_entrypoint` module, and record *that*
+process in the identity file. The swallowed error is now surfaced in the
+failure message. `tests/test_live_demo_operations.py`: **14 passed**.
+Result: `[ready] authenticated Runtime boundary with verified process identity`.
+
+Health matrix after the fix (reproducing section 1):
+`GET :8090/healthz -> 200 {"status":"ok","database":"ready"}`,
+`GET :8091/health` with bearer `-> 200 {"status":"ok"}`, without `-> 401`.
+
+### 3.3 Pre-run ledger snapshot (run by the coordinator, independent)
+
+```
+total_blocks            0
+preexisting_marker_rows 0
+```
+
+### 3.4 The released batch was provisioned through Captain's own endpoint
+
+`POST /blocks` (captain role) with `block_type: work_batch` and
+`batch_id: vm-landing-proof-20260819` — the marker doubles as the batch
+identity, which fits `WorkBatch.batch_id`'s own pattern
+`^[a-z0-9][a-z0-9-]{0,31}$` (25 characters). Result: **HTTP 201**, block
+index 0. `GET /batches/vm-landing-proof-20260819/bundle` then returned
+**HTTP 200** — the precondition that produced round 2's 503 was satisfied.
+
+### 3.5 Three further fail-closed layers, each found by measurement
+
+Provisioning the batch did not make `hermes.plan` succeed. Three more
+refusals followed, each isolated to a verbatim response:
+
+1. **`HTTP 409 {"detail":"runtime subtask was not released in the batch"}`**
+   — isolated by posting the command straight to `POST /v1/runtime/commands`,
+   with no side effect. When `batch_id` is present,
+   `store.py:_accept_runtime_command_once` requires `payload.subtask_id` to
+   be one of the batch's `subtask_ids`; `hermes.plan` carries no
+   `subtask_id`, and `None` is never in that list. The runtime surfaced this
+   only as an opaque 503.
+
+2. **`HTTP 422 {"detail":"invalid runtime command"}`** — adding `subtask_id`
+   alone is rejected by the envelope, whose validator states `subject_id
+   must match payload.subtask_id`. A subtask-bound command must therefore
+   also move `subject_id` from the project id to the subtask id.
+
+3. **`CapabilityDenied: runtime grants require batch, subtask, and workspace
+   bindings`** (surfaced as another opaque 503) —
+   `capabilities.py:derive_grant` requires all three bindings for *any*
+   operation.
+
+This is the same gap round 2 named, appearing three more times: the Pydantic
+contract exempts `hermes.plan` from the batch/subtask/workspace trio, while
+the accept path, the envelope rule and the capability layer each require it
+in practice. **No source was changed to get past any of them** — the
+contract permits those fields on `hermes.plan`, so a fully-bound,
+contract-valid command satisfies all three.
+
+### 3.6 The fully-bound command dispatched for real
+
+Same envelope as 8b plus `batch_id`, `subtask_id`, `workspace_ref:
+workspace://vm-landing-proof-20260819`, and `subject_id` set to the subtask
+id. Response:
+
+```
+HTTP 200
+{
+  "schema": "captain.agent-runtime-result.v1",
+  "command_id": "72190450-b992-4648-b38b-80bc915f89e9",
+  "subject_id": "vm-landing-proof-20260819-subtask-1",
+  "grant_id": "grant-9d713d996e37f736eccbe29c0df74665",
+  "operation": "hermes.plan",
+  "status": "infrastructure_failed",
+  "evidence_refs": [ { "uri": "artifact://sha256/f4fd7983ad4892ab9e3ba6b245f9baa449bd17ec37e701303ce06376b18e14b5", ... } ],
+  "error": "hermes.plan execution failed"
+}
+```
+
+A capability grant was issued, the adapter was dispatched, and the failure
+came back as a **structured result**, not an exception — the
+`infrastructure_failed` path round 2 predicted from source reading, now
+observed.
+
+Evidence artifact, verbatim:
+
+```json
+{"command_id":"72190450-b992-4648-b38b-80bc915f89e9","correlation_id":"dac82f26-2317-43c7-a2a4-3fec3ed1ef74","failure_id":"ef6e100b-bc58-51c4-a61a-6c253691248d","occurred_at":"2026-08-20T13:15:00.110878Z","operation":"hermes.plan","reason_code":"adapter_failed","schema":"captain.runtime-infrastructure-failure-evidence.v1","status":"infrastructure_failed"}
+```
+
+### 3.7 Why Hermes itself failed — traced to a boundary, not guessed
+
+`reason_code: adapter_failed` carries no detail, and nothing is logged, so
+the adapter call was reproduced in-process to obtain the real exception:
+
+```
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+  ... hermes_cli.py:4036 in _parse_evidence_payload
+The above exception was the direct cause of:
+agenten.agent_factory.orchestration.FactoryDispatchError:
+  Hermes must return exactly one typed runtime plan
+  ... captain_production_adapters.py:200 in _invoke
+```
+
+The adapter loaded is the digest-verified `CaptainHermesPlannerAdapter`. It
+spawned the Hermes CLI, which **returned empty/non-JSON stdout**, and the
+adapter refused to fabricate a plan.
+
+Checked, so that it is not guessed at: the CLI is installed and runnable
+(`hermes --version` -> `Hermes Agent v0.18.2 (2026.7.7.2)`), and
+`OPENAI_API_KEY` **is** present and non-empty in the environment. So this is
+*not* a missing-binary or missing-credential failure. Why the Hermes CLI
+emitted nothing for this runtime-plan envelope lies inside the Hermes agent
+subsystem; diagnosing that means driving a materially different subsystem,
+which was out of scope here and is reported rather than pursued.
+
+### 3.8 Observability findings (unfixed, reported)
+
+- `http_server.py` logs `logger.error("Runtime command execution failed")`
+  with **no `exc_info`**, so every distinct cause collapses to one
+  indistinguishable line plus a 503. All three refusals in 3.5 were
+  externally identical. This is what forced round 2 into source reading and
+  round 3 into in-process reproduction.
+- `reason_code: adapter_failed` records no underlying adapter error, and the
+  Hermes subprocess's stderr is not surfaced with the failure.
+
+Neither was changed — both are behavioural changes to the runtime, and the
+standing instruction is to report such things as findings.
+
+## Ledger proof (coordinator)
+
+Query run by the coordinator against its own commands' output, after the run
+in 3.6:
+
+```
+total_blocks   5
+marker_rows    5
+
+index  block_type             status                 event_id                              operation    hash16            prev16
+0      work_batch             pending                NULL                                  NULL         d9c4127520ae713c  0
+1      agent_runtime_command  accepted               9134b493-fca6-4dee-bf95-eb4b29320a3a  hermes.plan  0ed15c81a25baade  d9c4127520ae713c
+2      agent_runtime_command  accepted               72190450-b992-4648-b38b-80bc915f89e9  hermes.plan  c0e062ebdc455004  0ed15c81a25baade
+3      agent_runtime_grant    active                 NULL                                  NULL         0bfc5d4875651566  c0e062ebdc455004
+4      agent_runtime_result   infrastructure_failed  7fb784cf-607b-5816-97d6-e2ace3f49ecd  NULL         6627a1c63a7f6973  0bfc5d4875651566
+```
+
+**This is the end-to-end ledger proof the earlier rounds could not produce.**
+The whole chain persisted — batch -> command -> grant -> result — every row
+carries the marker, and each `previous_hash` equals its predecessor's `hash`,
+so the chain is intact and linear.
+
+Block 1 is worth keeping in view rather than tidying away: it is the
+subtask-bound command that was **accepted and persisted but never granted**,
+because it lacked `workspace_ref` (3.5, item 3). The ledger honestly records
+an accepted command that produced no grant and no result.
+
+### Cleanup status — deliberately not yet performed
+
+The marker rows are the evidence above, so they were not deleted on sight.
+Two things bear on how this should be cleaned up:
+
+- The rows are hash-chained. Deleting rows 0-4 individually would leave the
+  chain dangling rather than clean; this ledger is append-only by design.
+- The database is **tmpfs-backed and ephemeral**: tearing down
+  `captain-cook-test-mariadb-test-1` discards all five rows with no chain
+  damage, which is the natural cleanup for this environment.
+
+Left running so the proof stays inspectable. Teardown is a one-command step
+once the evidence has been reviewed.
+
+## Ledger proof (controller, rounds 1-2)
 
 *(Left empty — the controller fills this in with the raw SQL output from
 its own Step 4 query, per the spec's rule that only a query the controller
