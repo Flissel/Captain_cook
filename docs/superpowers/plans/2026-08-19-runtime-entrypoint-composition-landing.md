@@ -160,7 +160,7 @@ Expected: the patch file is non-empty, and `git status --short` still lists ` M 
 `34a6c13` was never pushed, so clone A cannot see it. Add clone B as a local remote and fetch.
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 git remote add cloneb /c/Users/User/Desktop/Captain_cook || git remote set-url cloneb /c/Users/User/Desktop/Captain_cook
 git fetch cloneb refs/heads/codex/live-demo-integration:refs/remotes/cloneb/live-demo-integration
 git log --oneline -1 cloneb/live-demo-integration
@@ -171,7 +171,7 @@ Expected: `34a6c13 fix: redact process probe exceptions`
 - [ ] **Step 3: Branch off main**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 git status --short
 git checkout main
 git pull --ff-only origin main
@@ -188,7 +188,7 @@ Expected: HEAD is `5aa409c fix(gitattributes): pin lf for authority-adapter-bund
 A merge would drag in 83 commits and revert main's fixes. Take the file contents directly.
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 for f in \
   agenten/agent_runtime/runtime_entrypoint.py \
   agenten/agent_runtime/production_bootstrap.py \
@@ -214,7 +214,7 @@ Expected: 12 files staged as modified or new. Confirm `agenten/constitution/` an
 This step proves Correction 1 rather than assuming it. It runs **without** the manifest variables, exercising the fail-closed path.
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 .venv/Scripts/python -c "
 import os
 for k in ('CAPTAIN_RUNTIME_ADAPTER_MANIFEST','CAPTAIN_RUNTIME_ADAPTER_MANIFEST_SHA256'):
@@ -246,7 +246,7 @@ Note precisely what this proves and what it does not: the blanket `raise` is gon
 Feed `_validate_binding` an object missing exactly one port method.
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 .venv/Scripts/python -c "
 from agenten.agent_runtime.production_bootstrap import (
     _validate_binding, RuntimeAdapterBinding, RuntimeAdapterManifestError,
@@ -282,7 +282,7 @@ If `RuntimeAdapterBinding` rejects this construction, read its definition in `pr
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 git add agenten/agent_runtime agenten/agent_factory/hermes_cli.py agenten/execution/codex_supervisor.py scripts/generate-runtime-adapter-manifest.py
 git commit -m "feat(runtime): compose the authenticated runtime from digest-verified adapter ports"
 ```
@@ -304,7 +304,7 @@ git commit -m "feat(runtime): compose the authenticated runtime from digest-veri
 Do not reuse a hand-assembled environment.
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 .venv/Scripts/python -m pip install --upgrade pip
 .venv/Scripts/python -m pip install -r requirements-dev.txt
 .venv/Scripts/python -m pytest --version
@@ -315,7 +315,7 @@ Expected: pytest **9.0.2**. If it reports 9.1.1, the pinned set did not take —
 - [ ] **Step 2: Record the pre-port baseline**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 .venv/Scripts/python -m pytest -q --no-cov -rs -m "not live" --ignore=tests/live 2>&1 | tail -20
 ```
 
@@ -324,7 +324,7 @@ Record the exact pass/fail counts. This is the number Task 2 must not regress.
 - [ ] **Step 3: Port the tests**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 git checkout cloneb/live-demo-integration -- tests/agent_runtime tests/execution
 git checkout cloneb/live-demo-integration -- tests/agent_factory/test_hermes_cli.py 2>/dev/null || true
 git status --short tests/
@@ -335,7 +335,7 @@ git status --short tests/
 - [ ] **Step 4: Run the ported tests alone first**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 .venv/Scripts/python -m pytest -q --no-cov -rs tests/agent_runtime tests/execution 2>&1 | tail -30
 ```
 
@@ -346,7 +346,7 @@ If an `ImportError` names `codex_build_execution` or `execution_budget`, port th
 - [ ] **Step 5: Run the full suite**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 .venv/Scripts/python -m pytest -q --no-cov -rs -m "not live" --ignore=tests/live 2>&1 | tail -30
 ```
 
@@ -362,7 +362,7 @@ git checkout main -- <the leaked file>
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 git add tests/ agenten/
 git commit -m "test(runtime): port the runtime composition suite onto the fixed baseline"
 ```
@@ -384,7 +384,7 @@ git commit -m "test(runtime): port the runtime composition suite onto the fixed 
 - [ ] **Step 1: Apply clone B's captured patch**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 git apply --3way /c/Users/User/AppData/Local/Temp/claude/cc-landing/cloneB-uncommitted.patch
 git diff --stat
 ```
@@ -400,7 +400,7 @@ agenten/agent_runtime/captain_production_adapters.py text eol=lf
 ```
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 grep -n "captain_production_adapters" .gitattributes
 ```
 
@@ -411,7 +411,7 @@ Expected: the line above is present. If absent, append it.
 `git add --renormalize` does **not** rewrite already-checked-out bytes on Windows. Delete and re-checkout.
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 git add .gitattributes && git commit -m "fix(gitattributes): pin lf for the runtime adapter module"
 rm agenten/agent_runtime/captain_production_adapters.py
 git checkout -- agenten/agent_runtime/captain_production_adapters.py
@@ -420,7 +420,7 @@ git checkout -- agenten/agent_runtime/captain_production_adapters.py
 - [ ] **Step 4: Prove the bytes are LF**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 .venv/Scripts/python -c "
 from pathlib import Path
 b = Path('agenten/agent_runtime/captain_production_adapters.py').read_bytes()
@@ -433,7 +433,7 @@ Expected: `CR count: 0`. A non-zero count means Step 3 did not take — re-run i
 - [ ] **Step 5: Commit the PowerShell fix**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 git add scripts/live-demo-services.ps1
 git commit -m "fix(scripts): read the runtime adapter settings in every live-demo action"
 ```
@@ -481,7 +481,7 @@ throw "Runtime did not become healthy.`n--- runtime output ---`n$detail"
 - [ ] **Step 3: Keep the logs out of git**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 printf 'runtime-stdout.log\nruntime-stderr.log\n' >> .gitignore
 grep -n "runtime-std" .gitignore
 ```
@@ -491,7 +491,7 @@ grep -n "runtime-std" .gitignore
 Deliberately break the environment and confirm the thrown message names the cause.
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 pwsh -NoProfile -Command "\$env:CAPTAIN_RUNTIME_ADAPTER_MANIFEST=''; ./scripts/live-demo-services.ps1 -Action start-runtime" 2>&1 | tail -25
 ```
 
@@ -502,7 +502,7 @@ The parameter is `-Action`, not `-Command`.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 git add scripts/live-demo-services.ps1 .gitignore
 git commit -m "fix(scripts): surface runtime startup failures instead of swallowing them"
 ```
@@ -526,27 +526,46 @@ docker ps --format '{{.Names}}\t{{.Status}}' | head -20
 
 If Docker hangs, do **not** script a restart — relaunch Docker Desktop via `explorer.exe` only. A scripted restart crashes it (reproduced three times on 2026-07-09).
 
-- [ ] **Step 2: Initialize settings and start the Gateway**
+> **Correction (2026-08-19).** This task originally called `-Action start-gateway` and
+> `-Action start-runtime`. **Neither action exists.** The script's `ValidateSet` accepts only
+> `start`, `status`, `portal-start`, `gateway-restart`, `benchmark-start`, `benchmark-restart`,
+> `health`, `stop`. There is one start action, and it brings the whole stack up in order:
+> manifest metadata → environment → n8n init → `mariadb-test` → `Start-Gateway` →
+> n8n broker → `Start-Runtime` → mailpit → `& $MinibookCommand start` → health.
+> Steps 2 and 3 below are therefore a single invocation.
+
+- [ ] **Step 2+3: Start the stack (Gateway and Runtime together)**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
-pwsh -NoProfile -File ./scripts/live-demo-services.ps1 -Action start-gateway 2>&1 | tail -20
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
+pwsh -NoProfile -File ./scripts/live-demo-services.ps1 -Action start 2>&1 | tail -40
 ```
 
-Expected — yesterday's run already reached this point:
+Expected along the way — last run already reached the Gateway line:
 
 ```
 [ready] Gateway database=captain_test with verified process and ledger identity
 ```
 
-- [ ] **Step 3: Generate the adapter manifest and start the Runtime**
+**If the run fails at `Minibook start failed.`**, that is expected and not a defect: Minibook is
+out of scope per the spec, and `scripts/minibook-demo.ps1` was deliberately left unported. Retry
+with Minibook neutralised through the script's own parameter — do **not** edit the script:
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
-pwsh -NoProfile -File ./scripts/live-demo-services.ps1 -Action start-runtime 2>&1 | tail -30
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
+printf 'exit 0\n' > /tmp/minibook-noop.ps1
+pwsh -NoProfile -File ./scripts/live-demo-services.ps1 -Action start -MinibookCommand /tmp/minibook-noop.ps1 2>&1 | tail -40
 ```
 
-**This is the step that failed yesterday.** With Task 4 in place, a failure now names its cause. Work the named cause:
+**Fallback if `-Action start` proves unworkable:** run `-Action portal-start`, which brings up
+`mariadb-test` and the Gateway and explicitly claims neither runtime nor Minibook
+(`non_claims=@('agent-runtime','minibook')`). It does **not** generate the adapter manifest, so
+generate it with `scripts/generate-runtime-adapter-manifest.py` and then launch the runtime
+directly with `python -m agenten.agent_runtime.runtime_entrypoint`. Say in the evidence document
+which route was used.
+
+**The runtime start is the step that failed last time.** With Task 4 in place, a failure now names
+its cause. Work the named cause:
 
 - `runtime adapter module digest mismatch` → working-tree bytes differ from committed bytes. Re-run Task 3 Steps 3–4, and check for **uncommitted** edits (`git status --short agenten/agent_runtime/`) — the loader verifies against *committed* bytes, so any uncommitted edit to an adapter breaks startup by design.
 - `repository revision mismatch` → HEAD moved after the manifest was generated. Regenerate the manifest.
@@ -556,7 +575,7 @@ pwsh -NoProfile -File ./scripts/live-demo-services.ps1 -Action start-runtime 2>&
 - [ ] **Step 4: Prove both listeners independently**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 pwsh -NoProfile -Command "
   \$t = (Get-Content .env | Select-String '^CAPTAIN_RUNTIME_TOKEN=').ToString().Split('=',2)[1]
   (Invoke-WebRequest 'http://127.0.0.1:8090/healthz' -UseBasicParsing -TimeoutSec 5).StatusCode
@@ -569,7 +588,7 @@ Expected: `200` then `200`.
 - [ ] **Step 5: Capture the ledger connection for Task 6**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 grep -E '^(LEDGER_DSN|MARIADB_TEST_PORT)=' .env
 docker ps --filter name=mariadb-test --format '{{.Names}}\t{{.Ports}}\t{{.Status}}'
 ```
@@ -604,7 +623,7 @@ Nothing else in the ledger will match it. Use it verbatim in Step 3 and search f
 Establishing "this row was not already there" is what makes the post-run row meaningful.
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 pwsh -NoProfile -Command "
   \$pw = (Get-Content .env | Select-String '^MARIADB_TEST_PASSWORD=').ToString().Split('=',2)[1]
   docker exec mariadb-test mariadb -u captain_test -p\$pw captain_test -e '
@@ -633,7 +652,7 @@ git show origin/master:scripts/mcp_servers/captain_cook_mcp.py \
 Drive it over stdio. It speaks MCP JSON-RPC; `captain_deliver` is the composite tool (`hermes.plan` then `codex.run`) and posts to `POST /v1/runtime/execute`.
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 pwsh -NoProfile -Command "
   \$env:CAPTAIN_RUNTIME_URL = 'http://127.0.0.1:8091'
   \$env:CAPTAIN_RUNTIME_TOKEN = (Get-Content .env | Select-String '^CAPTAIN_RUNTIME_TOKEN=').ToString().Split('=',2)[1]
@@ -659,7 +678,7 @@ Capture the **complete raw response**. If it returns `ok: false`, record the err
 This is the acceptance criterion. Nothing else substitutes for it.
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 pwsh -NoProfile -Command "
   \$pw = (Get-Content .env | Select-String '^MARIADB_TEST_PASSWORD=').ToString().Split('=',2)[1]
   docker exec mariadb-test mariadb -u captain_test -p\$pw captain_test -e '
@@ -695,7 +714,7 @@ State plainly which parts of the spec were proven and which were not. If `captai
 `blocks.parent_index` carries `ON DELETE CASCADE`, so deleting a marked block also removes its descendants. That is what we want here — the run's own children go with it — but it means a mistargeted `DELETE` can take unrelated subtrees. Delete strictly by marker, never by index range.
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 pwsh -NoProfile -Command "
   \$pw = (Get-Content .env | Select-String '^MARIADB_TEST_PASSWORD=').ToString().Split('=',2)[1]
   docker exec mariadb-test mariadb -u captain_test -p\$pw captain_test -e '
@@ -715,7 +734,7 @@ If `total_blocks` came back *lower* than Step 2's value, the cascade removed pre
 - [ ] **Step 7: Commit the evidence**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 git add docs/operations/2026-08-19-runtime-composition-live-proof.md
 git commit -m "docs(ops): live proof of the composed runtime entrypoint via agentfarm.deliver"
 ```
@@ -733,7 +752,7 @@ git commit -m "docs(ops): live proof of the composed runtime entrypoint via agen
 - [ ] **Step 1: Re-run the full suite one final time**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 .venv/Scripts/python -m pytest -q --no-cov -rs -m "not live" --ignore=tests/live 2>&1 | tail -10
 ```
 
@@ -742,7 +761,7 @@ Expected: 0 failures. Put the **actual** numbers in the PR body — PR #23's bod
 - [ ] **Step 2: Push and open the PR as Ready**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 git push -u origin feat/runtime-entrypoint-composition
 gh pr create --repo Flissel/Captain_cook --base main \
   --title "feat(runtime): compose the authenticated runtime entrypoint from verified adapter ports" \
@@ -760,7 +779,7 @@ The PR body must name, in its own section, the three corrections from the top of
 - [ ] **Step 4: Clean up the temporary remote**
 
 ```bash
-cd /c/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/captain_cook
+cd /c/Users/User/Desktop/Captain_cook/.worktrees/runtime-composition
 git remote remove cloneb
 ```
 
