@@ -55,7 +55,7 @@ $allowedNames = @('MAILPIT_WEB_PORT','MAILPIT_URL','MAILPIT_SMTP_PORT','CAPTAIN_
 $config = Read-SafeEnv $EnvFile $allowedNames
 # The running Captain Mailpit instance is intentionally published on 18025.
 $config['MAILPIT_WEB_PORT'] = '18025'
-$config['MAILPIT_URL'] = 'http://localhost:18025'
+$config['MAILPIT_URL'] = 'http://127.0.0.1:18025'
 Set-SafeDefault $config 'MAILPIT_SMTP_PORT' '1025'
 Set-SafeDefault $config 'CAPTAIN_N8N_URL' 'http://127.0.0.1:5679'
 Set-SafeDefault $config 'CAPTAIN_GATEWAY_URL' 'http://127.0.0.1:8090'
