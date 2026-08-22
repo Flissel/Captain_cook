@@ -75,6 +75,16 @@ class MemoryArtifacts:
     async def read(self, reference: ArtifactRef) -> bytes:
         return self.values[reference.uri]
 
+    async def write(self, content: bytes, media_type: str) -> ArtifactRef:
+        digest = hashlib.sha256(content).hexdigest()
+        reference = ArtifactRef(
+            uri=f"artifact://sha256/{digest}",
+            sha256=digest,
+            media_type=media_type,
+        )
+        self.values[reference.uri] = content
+        return reference
+
     async def require(self, reference: ArtifactRef) -> None:
         content = self.values[reference.uri]
         assert hashlib.sha256(content).hexdigest() == reference.sha256

@@ -23,6 +23,20 @@
     "limits": {
       "wall_seconds": 900,
       "max_iterations": 3
-    }
+    },
+    "maximum_cost_usd": null,
+    "budget_reservation_id": null,
+    "cost_authority_ref": null,
+    "cost_job_id": null,
+    "cost_run_id": null,
+    "cost_input_id": null,
+    "cost_capability_id": null,
+    "cost_capability_version": null,
+    "provider_proxy_url": null,
+    "provider_policy_sha256": null,
+    "provider_price_card_sha256": null,
+    "provider_context_sha256": null,
+    "provider_session_id": null,
+    "provider_result_id": null
   }
 }
