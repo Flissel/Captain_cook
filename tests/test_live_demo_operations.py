@@ -56,7 +56,9 @@ def test_normalize_writes_safe_defaults_and_aliases_without_secret_output(tmp_pa
     assert result.returncode == 0, output
     normalized = env_file.read_text(encoding="utf-8")
     assert "MAILPIT_WEB_PORT=18025" in normalized
-    assert "MAILPIT_URL=http://localhost:18025" in normalized
+    # 127.0.0.1, not localhost: Mailpit listens on IPv4 only and Invoke-WebRequest
+    # resolves localhost to ::1 first, burning the full probe timeout.
+    assert "MAILPIT_URL=http://127.0.0.1:18025" in normalized
     assert f"CAPTAIN_N8N_API_KEY={secret}" in normalized
     assert f"OPENAI_API_KEY={opaque_provider}" in normalized
     assert secret not in output

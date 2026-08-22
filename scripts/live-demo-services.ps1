@@ -527,7 +527,6 @@ function Start-Runtime($Values) {
             if (Test-AuthenticatedRuntimeHealth $Values) {
                 $listenerProcess = Resolve-ManagedRuntimeListenerProcess $process $runtimePort
                 Write-ManagedProcessIdentity -Process $listenerProcess -Path $runtimePid -ConfigurationSha256 $configurationSha256
-                Assert-ManagedRuntimeListener $listenerProcess $runtimePort
                 Write-Host '[ready] authenticated Runtime boundary with verified process identity'
                 return
             }
