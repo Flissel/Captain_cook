@@ -109,8 +109,18 @@ def run_claude(
     cli = resolve_cli()
     argv: list[str] = [cli, "-p", "--output-format", "json"]
 
+    # The system prompt goes through a file, never the command line: a real
+    # agent system prompt runs to tens of thousands of characters and Windows
+    # caps a whole command line at 32767, where the CLI aborts before it reads
+    # any input (observed: is_error with 0 input tokens after ~800ms).
+    system_prompt_file: str | None = None
     if system_prompt:
-        argv += ["--system-prompt", system_prompt]
+        handle, system_prompt_file = tempfile.mkstemp(
+            prefix="claude-shim-system-", suffix=".txt"
+        )
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(system_prompt)
+        argv += ["--system-prompt-file", system_prompt_file]
     resolved_model = _MODEL_ALIASES.get((model or "").strip())
     if resolved_model:
         argv += ["--model", resolved_model]
@@ -125,25 +135,34 @@ def run_claude(
     environment.pop("ANTHROPIC_API_KEY", None)
     environment.pop("ANTHROPIC_AUTH_TOKEN", None)
 
-    with tempfile.TemporaryDirectory(prefix="claude-shim-") as workdir:
-        try:
-            completed = subprocess.run(
-                argv,
-                input=transcript,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-                cwd=workdir,
-                env=environment,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ShimError(f"Claude Code CLI timed out after {timeout}s") from exc
+    try:
+        with tempfile.TemporaryDirectory(prefix="claude-shim-") as workdir:
+            try:
+                completed = subprocess.run(
+                    argv,
+                    input=transcript,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout,
+                    cwd=workdir,
+                    env=environment,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ShimError(f"Claude Code CLI timed out after {timeout}s") from exc
+    finally:
+        if system_prompt_file:
+            try:
+                os.unlink(system_prompt_file)
+            except OSError:
+                pass
 
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()
+        sys.stderr.write(f"cli rc={completed.returncode} output={detail[:4000]}\n")
+        sys.stderr.flush()
         raise ShimError(f"Claude Code CLI exited {completed.returncode}: {detail[:500]}")
 
     raw = (completed.stdout or "").strip()
@@ -281,6 +300,20 @@ class Handler(BaseHTTPRequestHandler):
 
         model = str(body.get("model") or DEFAULT_MODEL_ID)
         system_prompt, transcript = render_messages(body.get("messages") or [])
+
+        roles = [str(m.get("role", "?")) for m in (body.get("messages") or [])]
+        sys.stderr.write(
+            "request: model=%s roles=%s system=%dch transcript=%dch stream=%s tools=%d\n"
+            % (
+                model,
+                ",".join(roles),
+                len(system_prompt),
+                len(transcript),
+                bool(body.get("stream")),
+                len(body.get("tools") or []),
+            )
+        )
+        sys.stderr.flush()
 
         try:
             payload = run_claude(
