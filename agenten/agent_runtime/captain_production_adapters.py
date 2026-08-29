@@ -138,12 +138,22 @@ class CaptainHermesPlannerAdapter:
             / "workspaces"
             / "hermes-runtime"
         ).root
+        # Without an explicit provider/model the Hermes CLI falls back to its
+        # own default endpoint, which in this deployment is an OpenRouter route
+        # that has neither a key nor a model name -- the CLI then reports
+        # "API call failed" on stdout and exits 0, so the wrapper sees only
+        # unparseable output. Both are configured together or not at all;
+        # HermesCliSettings rejects a half-configured pair.
+        provider = context.environ.get("CAPTAIN_HERMES_PROVIDER", "").strip() or None
+        model = context.environ.get("CAPTAIN_HERMES_MODEL", "").strip() or None
         factory = HermesCliFactory(
             settings=HermesCliSettings(
                 executable=(
                     context.environ.get("HERMES_EXECUTABLE", "hermes").strip()
                     or "hermes"
                 ),
+                provider=provider,
+                model=model,
                 skill_root=skill_root,
                 evidence_root=(
                     context.repository_root
