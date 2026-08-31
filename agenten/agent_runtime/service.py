@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import json
 import hashlib
 from uuid import uuid5
@@ -26,6 +28,9 @@ from agenten.agent_runtime.ports import (
     RuntimeStatePort,
     RuntimeCostAuthorityPort,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeContractViolation(RuntimeError):
@@ -94,6 +99,12 @@ class AgentRuntimeService:
         try:
             adapter_result = await self._dispatch(command, grant)
         except Exception:
+            # The evidence artifact records only reason_code, by contract: it
+            # must not reproduce local paths. The cause still has to be
+            # recoverable, so it goes to the log instead of the artifact.
+            logger.exception(
+                "Adapter dispatch failed for %s", command.payload.operation.value
+            )
             result = await self._infrastructure_failure(command, grant)
         else:
             if isinstance(adapter_result, HermesPlanResult):

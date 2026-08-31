@@ -476,8 +476,13 @@ class HermesCliFactory(HermesFactoryPort):
         try:
             result = HermesPlanResult.model_validate(_parse_evidence_payload(stdout))
         except (TypeError, ValueError, ValidationError) as exc:
+            # Name what actually came back. Without it this message is the same
+            # whether the model wrote prose before the JSON, omitted a required
+            # field, or returned nothing at all -- three very different faults.
+            preview = stdout.decode("utf-8", errors="replace").strip()[:300]
             raise FactoryDispatchError(
-                "Hermes must return exactly one typed runtime plan"
+                "Hermes must return exactly one typed runtime plan; "
+                f"got {len(stdout)} bytes starting {preview!r} ({exc})"
             ) from exc
         if (
             result.correlation_id != command.correlation_id

@@ -69,7 +69,11 @@ def create_runtime_app(
         try:
             result = await executor.execute(command)
         except Exception:
-            logger.error("Runtime command execution failed")
+            # exc_info: without it every distinct cause -- a refused batch
+            # binding, a denied capability, an adapter fault -- collapses into
+            # one indistinguishable line, and the 503 body deliberately says
+            # nothing. The traceback stays server-side.
+            logger.error("Runtime command execution failed", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="runtime execution failed",
