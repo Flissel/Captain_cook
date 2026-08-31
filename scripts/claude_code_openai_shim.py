@@ -418,6 +418,25 @@ def main() -> None:
 
     Handler.timeout_seconds = args.timeout
     cli = resolve_cli()
+
+    # The artifact root is pinned to whichever Captain checkout is in use. If
+    # that moves, the tools would silently disappear and the planner would fall
+    # back to inlining plans -- a failure that surfaces far from its cause. Say
+    # so at startup instead.
+    store_root = os.environ.get("CAPTAIN_ARTIFACT_ROOT", "").strip()
+    if not store_root:
+        sys.stderr.write(
+            "warning: CAPTAIN_ARTIFACT_ROOT is unset - serving without artifact "
+            "tools; a planner asked for artifact:// refs will not be able to "
+            "produce them\n"
+        )
+    elif not os.path.isdir(store_root):
+        sys.stderr.write(
+            f"warning: CAPTAIN_ARTIFACT_ROOT does not exist: {store_root}\n"
+            "         the artifact tools will fail; has the Captain checkout moved?\n"
+        )
+    else:
+        sys.stderr.write(f"artifact tools enabled against {store_root}\n")
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     sys.stderr.write(
         f"claude-code-openai-shim listening on http://{args.host}:{args.port}/v1 "

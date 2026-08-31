@@ -59,7 +59,7 @@ $config['MAILPIT_URL'] = 'http://127.0.0.1:18025'
 Set-SafeDefault $config 'MAILPIT_SMTP_PORT' '1025'
 Set-SafeDefault $config 'CAPTAIN_N8N_URL' 'http://127.0.0.1:5679'
 Set-SafeDefault $config 'CAPTAIN_GATEWAY_URL' 'http://127.0.0.1:8090'
-Set-SafeDefault $config 'MINIBOOK_BACKEND_URL' 'http://127.0.0.1:3456'
+Set-SafeDefault $config 'MINIBOOK_BACKEND_URL' 'http://127.0.0.1:8080'
 if (-not $config.Contains('CAPTAIN_N8N_API_KEY') -and $config.Contains('N8N_API_KEY')) { $config['CAPTAIN_N8N_API_KEY'] = $config['N8N_API_KEY'] }
 if (-not $config.Contains('CAPTAIN_N8N_MCP_TOKEN') -and $config.Contains('N8N_MCP_TOKEN')) { $config['CAPTAIN_N8N_MCP_TOKEN'] = $config['N8N_MCP_TOKEN'] }
 Save-SafeEnv $config $EnvFile

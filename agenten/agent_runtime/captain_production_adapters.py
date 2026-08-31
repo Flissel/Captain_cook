@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
@@ -146,6 +147,16 @@ class CaptainHermesPlannerAdapter:
         # HermesCliSettings rejects a half-configured pair.
         provider = context.environ.get("CAPTAIN_HERMES_PROVIDER", "").strip() or None
         model = context.environ.get("CAPTAIN_HERMES_MODEL", "").strip() or None
+
+        # Hermes resolves a custom provider endpoint from OPENAI_BASE_URL, which
+        # it reads from its own process environment. That name is provider
+        # specific, so Captain carries it as CAPTAIN_HERMES_BASE_URL and this
+        # adapter -- the one component that is allowed to know about Hermes --
+        # translates it here, so the operations scripts stay provider agnostic.
+        base_url = context.environ.get("CAPTAIN_HERMES_BASE_URL", "").strip()
+        if base_url:
+            os.environ["OPENAI_BASE_URL"] = base_url
+            os.environ.setdefault("OPENAI_API_KEY", "captain-hermes-local-endpoint")
         factory = HermesCliFactory(
             settings=HermesCliSettings(
                 executable=(
