@@ -275,7 +275,7 @@ class _CaptainCapabilityPolicy:
     def derive(
         self,
         command: AgentRuntimeCommand,
-        batch: WorkBatch,
+        batch: WorkBatch | None,
         now: datetime,
     ) -> CapabilityGrant:
         return derive_grant(command, batch, now)

@@ -65,7 +65,7 @@ class CapabilityPolicyPort(Protocol):
     def derive(
         self,
         command: AgentRuntimeCommand,
-        batch: WorkBatch,
+        batch: WorkBatch | None,
         now: datetime,
     ) -> CapabilityGrant: ...
 

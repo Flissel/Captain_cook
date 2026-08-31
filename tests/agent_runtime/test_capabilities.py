@@ -10,6 +10,7 @@ import pytest
 
 from agenten.agent_runtime.capabilities import (
     PROFILE_CAPABILITIES,
+    may_run_unbound,
     CapabilityDenied,
     derive_grant,
     validate_grant,
@@ -295,4 +296,85 @@ def test_revocation_for_another_grant_fails_closed() -> None:
     )
 
     with pytest.raises(CapabilityDenied, match="different grant"):
-        validate_grant(grant, command, NOW + timedelta(seconds=2), revocation)
+        validate_grant(grant, command, NOW + timedelta(seconds=2), revocation)
+
+def planning_command(
+    *,
+    profile: str = "planner",
+    operation: str = "hermes.plan",
+) -> AgentRuntimeCommand:
+    """A command as the intended flow issues it: planning, before any batch.
+
+    CaptainPipeline turns a project description into released batches, so the
+    planner runs first and the batch is its product. Every other command helper
+    here starts from a codex.run fixture and keeps its bindings, which is
+    exactly why this path went untested.
+    """
+
+    value: dict[str, Any] = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    value["event_id"] = str(uuid4())
+    value["occurred_at"] = NOW.isoformat().replace("+00:00", "Z")
+    payload = value["payload"]
+    assert isinstance(payload, dict)
+    value["subject_id"] = payload["project_id"]
+    payload.update(
+        {
+            "operation": operation,
+            "capability_profile": profile,
+            "integration_intent": "none",
+            "batch_id": None,
+            "subtask_id": None,
+            "workspace_ref": None,
+        }
+    )
+    return AgentRuntimeCommand.model_validate(value)
+
+
+def test_planning_is_granted_without_a_released_batch() -> None:
+    command = planning_command()
+
+    grant = derive_grant(command, None, NOW)
+
+    assert grant.batch_id is None
+    assert grant.batch_version is None
+    assert grant.subtask_id is None
+    assert grant.workspace_ref is None
+    assert frozenset(grant.capabilities) == PROFILE_CAPABILITIES[CapabilityProfile.PLANNER]
+    assert validate_grant(grant, command, NOW + timedelta(minutes=1)) is grant
+
+
+def test_only_profiles_that_cannot_mutate_a_workspace_may_run_unbound() -> None:
+    assert may_run_unbound(CapabilityProfile.PLANNER)
+    assert may_run_unbound(CapabilityProfile.AGENT_DESIGNER)
+    assert not may_run_unbound(CapabilityProfile.CODE_BUILDER)
+    assert not may_run_unbound(CapabilityProfile.N8N_BUILDER)
+
+
+def test_unbound_grant_is_refused_for_a_workspace_mutating_profile() -> None:
+    command = planning_command()
+    unbound = derive_grant(command, None, NOW)
+    borrowed = unbound.model_copy(
+        update={"profile": CapabilityProfile.CODE_BUILDER}
+    )
+
+    with pytest.raises(CapabilityDenied):
+        validate_grant(borrowed, command, NOW + timedelta(minutes=1))
+
+
+def test_grant_bindings_are_all_present_or_all_absent() -> None:
+    command = planning_command()
+    unbound = derive_grant(command, None, NOW)
+
+    half_bound = unbound.model_dump(mode="json", by_alias=True) | {"batch_id": "batch-1"}
+
+    with pytest.raises(ValueError, match="all present or all absent"):
+        CapabilityGrant.model_validate(half_bound)
+
+
+def test_planning_command_cannot_carry_only_some_bindings() -> None:
+    command = planning_command()
+    half_bound = command.model_dump(mode="json", by_alias=True)
+    half_bound["payload"]["batch_id"] = "batch-1"
+
+    with pytest.raises(CapabilityDenied):
+        derive_grant(AgentRuntimeCommand.model_validate(half_bound), None, NOW)

@@ -69,7 +69,14 @@ class AgentRuntimeService:
             return existing_result
 
         now = self._clock.now()
-        batch = await self._state.get_released_batch(command)
+        # Only work bound to released output needs the batch read. Planning
+        # runs before a batch exists, so demanding one here would make the
+        # operation that produces batches depend on already having one.
+        batch = (
+            await self._state.get_released_batch(command)
+            if command.payload.batch_id is not None
+            else None
+        )
         grant = await self._state.get_grant(command.event_id)
         if grant is None:
             derived = self._capabilities.derive(command, batch, now)

@@ -228,10 +228,15 @@ class CapabilityGrant(_FrozenContract):
     )
     grant_id: str = Field(pattern=IDENTIFIER_PATTERN)
     command_id: UUID
-    batch_id: str = Field(pattern=IDENTIFIER_PATTERN)
-    batch_version: int = Field(ge=1, strict=True)
-    subtask_id: str = Field(pattern=IDENTIFIER_PATTERN)
-    workspace_ref: str = Field(min_length=1)
+    # A grant is either bound to released work or bound to nothing at all.
+    # Planning runs before any batch exists -- it is the operation that
+    # produces one -- so demanding a batch there is circular. An unbound
+    # grant says so instead of naming a batch that does not exist; which
+    # profiles may hold one is policy, enforced in capabilities.py.
+    batch_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
+    batch_version: int | None = Field(default=None, ge=1, strict=True)
+    subtask_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
+    workspace_ref: str | None = Field(default=None, min_length=1)
     profile: CapabilityProfile
     capabilities: tuple[str, ...] = Field(min_length=1)
     mcp_servers: tuple[str, ...] = ()
@@ -240,13 +245,20 @@ class CapabilityGrant(_FrozenContract):
 
     @field_validator("workspace_ref")
     @classmethod
-    def require_workspace_uri(cls, value: str) -> str:
-        if not value.startswith("workspace://"):
+    def require_workspace_uri(cls, value: str | None) -> str | None:
+        if value is not None and not value.startswith("workspace://"):
             raise ValueError("workspace_ref must use workspace://")
         return value
 
     @model_validator(mode="after")
     def validate_lifetime_and_capabilities(self) -> "CapabilityGrant":
+        bindings = (self.batch_id, self.batch_version, self.subtask_id, self.workspace_ref)
+        if any(value is not None for value in bindings) and not all(
+            value is not None for value in bindings
+        ):
+            raise ValueError(
+                "capability grant bindings are all present or all absent"
+            )
         issued_at = _require_utc(self.issued_at)
         expires_at = _require_utc(self.expires_at)
         if expires_at <= issued_at:
