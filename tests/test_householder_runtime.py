@@ -15,6 +15,12 @@ from agenten.tools.base import ToolRegistry
 from agenten.workers.base import WorkerExecutionError
 
 
+async def _accept_all_judge(description, ruleset) -> bool:
+    """Layer 2 is mandatory; this test exercises layer 1 and says so."""
+
+    return True
+
+
 @pytest.mark.asyncio
 async def test_householder_worker_emits_a_json_safe_offline_report():
     role = load_householder_roles()[0]
@@ -74,7 +80,7 @@ async def test_householder_roles_route_through_the_real_pipeline():
     pipeline = build_pipeline(
         blockchain=Blockchain(storage=InMemoryStorage()),
         llm_decompose=household_decompose,
-        worker_factories=create_householder_worker_factories(),
+        worker_factories=create_householder_worker_factories(), llm_judge=_accept_all_judge
     )
 
     await pipeline.start()
@@ -117,7 +123,7 @@ async def test_pipeline_rejects_a_householder_capability_that_would_shadow_echo(
         build_pipeline(
             blockchain=Blockchain(storage=InMemoryStorage()),
             llm_decompose=lambda description, depth: None,
-            worker_factories=[shadow_factory],
+            worker_factories=[shadow_factory], llm_judge=_accept_all_judge
         )
 
 

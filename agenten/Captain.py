@@ -236,8 +236,8 @@ class CaptainAgent:
         builds the event-driven supply-chain pipeline and stores the result
         on self.supply_chain_pipeline.
 
-        `llm_decompose` (required by build_pipeline) and, if wanted,
-        `llm_judge` must be supplied via `pipeline_kwargs` -- this
+        `llm_decompose` and `llm_judge` are both required by
+        build_pipeline and must be supplied via `pipeline_kwargs` -- this
         CaptainAgent's own `self.llm_config` is a pyautogen-0.2-style
         config dict, not directly usable as the plain async callables the
         new pipeline expects. Real LLM-backed implementations live in

@@ -106,12 +106,33 @@ def wire_bus() -> (InMemoryEventBus, Recorder, Recorder):
     return bus, accepted_recorder, rejected_recorder
 
 
+async def accept_all(description: str, rs: ConstitutionRuleset) -> bool:
+    """Layer 2 is mandatory, so a test that only exercises layer 1 says so."""
+
+    return True
+
+
 @pytest.mark.asyncio
-async def test_accept_path_no_llm_judge():
+async def test_gatekeeper_refuses_to_exist_without_layer_two():
+    """A half-configured gate still answers, which is worse than none."""
+
+    bus, _accepted, _rejected = wire_bus()
+
+    with pytest.raises(ValueError, match="requires an llm_judge"):
+        ConstitutionGatekeeper(
+            bus=bus,
+            ruleset=make_ruleset(),
+            ledger_query=FakeLedgerQuery(),
+            llm_judge=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_accept_path_with_layer_one_only_judge():
     bus, accepted, rejected = wire_bus()
     ruleset = make_ruleset()
     ledger_query = FakeLedgerQuery()
-    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=ruleset, ledger_query=ledger_query)
+    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=ruleset, ledger_query=ledger_query, llm_judge=accept_all)
 
     event = make_proposed()
     await gatekeeper.handle_subproblem_proposed(event)
@@ -147,7 +168,7 @@ async def test_accept_path_with_passing_llm_judge():
 @pytest.mark.asyncio
 async def test_rejects_when_description_empty_malformed():
     bus, accepted, rejected = wire_bus()
-    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery())
+    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery(), llm_judge=accept_all)
 
     event = make_proposed(description="   ")
     await gatekeeper.handle_subproblem_proposed(event)
@@ -160,7 +181,7 @@ async def test_rejects_when_description_empty_malformed():
 @pytest.mark.asyncio
 async def test_rejects_when_capability_tags_empty_malformed():
     bus, accepted, rejected = wire_bus()
-    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery())
+    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery(), llm_judge=accept_all)
 
     event = make_proposed(capability_tags=[])
     await gatekeeper.handle_subproblem_proposed(event)
@@ -179,7 +200,7 @@ async def test_rejects_when_not_minimal_longer_than_parent():
         Stage.ACCEPTED,
         FakeBlock(index=1, data={"subproblem_id": "parent-1", "description": "Bake bread."}),
     )
-    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=make_ruleset(), ledger_query=ledger_query)
+    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=make_ruleset(), ledger_query=ledger_query, llm_judge=accept_all)
 
     event = make_proposed(
         parent_id="parent-1",
@@ -207,7 +228,7 @@ async def test_rejects_duplicate_pending_subproblem():
             },
         ),
     )
-    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=make_ruleset(), ledger_query=ledger_query)
+    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=make_ruleset(), ledger_query=ledger_query, llm_judge=accept_all)
 
     event = make_proposed(
         subproblem_id="sp-1",
@@ -236,7 +257,7 @@ async def test_duplicate_check_ignores_other_root_problems():
             },
         ),
     )
-    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=make_ruleset(), ledger_query=ledger_query)
+    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=make_ruleset(), ledger_query=ledger_query, llm_judge=accept_all)
 
     event = make_proposed(
         subproblem_id="sp-1",
@@ -315,7 +336,7 @@ async def test_llm_exception_rejects_conservatively():
 async def test_meta_stamps_constitution_version_on_rejection_too():
     bus, accepted, rejected = wire_bus()
     ruleset = make_ruleset(version="my-special-version")
-    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=ruleset, ledger_query=FakeLedgerQuery())
+    gatekeeper = ConstitutionGatekeeper(bus=bus, ruleset=ruleset, ledger_query=FakeLedgerQuery(), llm_judge=accept_all)
 
     event = make_proposed(description="")
     await gatekeeper.handle_subproblem_proposed(event)
@@ -333,7 +354,7 @@ async def test_duplicate_sibling_in_same_batch_is_rejected():
     """
     bus, accepted, rejected = wire_bus()
     gatekeeper = ConstitutionGatekeeper(
-        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery()
+        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery(), llm_judge=accept_all
     )
 
     await gatekeeper.handle_subproblem_proposed(
@@ -361,7 +382,7 @@ async def test_in_flight_memory_ban_is_released_by_eviction_not_the_ledger():
     """
     bus, accepted, rejected = wire_bus()
     gatekeeper = ConstitutionGatekeeper(
-        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery()
+        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery(), llm_judge=accept_all
     )
 
     await gatekeeper.handle_subproblem_proposed(
@@ -393,7 +414,7 @@ async def test_identical_descriptions_under_different_roots_are_both_accepted():
     """The in-flight memory must stay scoped to one root problem."""
     bus, accepted, rejected = wire_bus()
     gatekeeper = ConstitutionGatekeeper(
-        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery()
+        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery(), llm_judge=accept_all
     )
 
     await gatekeeper.handle_subproblem_proposed(
@@ -425,7 +446,7 @@ async def test_in_flight_memory_is_bounded_and_evicts_oldest_first():
     """
     bus, accepted, rejected = wire_bus()
     gatekeeper = ConstitutionGatekeeper(
-        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery()
+        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery(), llm_judge=accept_all
     )
 
     for index in range(gatekeeper.IN_FLIGHT_MEMORY_LIMIT + 1):
@@ -457,7 +478,7 @@ async def test_prune_does_not_query_the_ledger():
 
     ledger = CountingLedgerQuery()
     gatekeeper = ConstitutionGatekeeper(
-        bus=bus, ruleset=make_ruleset(), ledger_query=ledger
+        bus=bus, ruleset=make_ruleset(), ledger_query=ledger, llm_judge=accept_all
     )
 
     await gatekeeper.handle_subproblem_proposed(
@@ -490,7 +511,7 @@ async def test_ledger_outage_during_pending_lookup_does_not_break_in_flight_dedu
             raise RuntimeError("ledger unavailable")
 
     gatekeeper = ConstitutionGatekeeper(
-        bus=bus, ruleset=make_ruleset(), ledger_query=RaisingLedgerQuery()
+        bus=bus, ruleset=make_ruleset(), ledger_query=RaisingLedgerQuery(), llm_judge=accept_all
     )
 
     await gatekeeper.handle_subproblem_proposed(
@@ -515,7 +536,7 @@ async def test_redelivery_of_an_already_accepted_subproblem_does_not_shrink_the_
     """
     bus, accepted, rejected = wire_bus()
     gatekeeper = ConstitutionGatekeeper(
-        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery()
+        bus=bus, ruleset=make_ruleset(), ledger_query=FakeLedgerQuery(), llm_judge=accept_all
     )
 
     for index in range(gatekeeper.IN_FLIGHT_MEMORY_LIMIT):
