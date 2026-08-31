@@ -20,10 +20,14 @@ from autogen_core.models import ChatCompletionClient, ModelFamily, ModelInfo
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_ext.models.replay import ReplayChatCompletionClient
 
-from config.llm_config import API_KEY, MODEL
+from config.llm_config import API_KEY, BASE_URL, MODEL
 
 
-def build_model_client(api_key: Optional[str] = None, model: Optional[str] = None) -> ChatCompletionClient:
+def build_model_client(
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> ChatCompletionClient:
     """Build a real OpenAI-backed `ChatCompletionClient`.
 
     `api_key`/`model` default to `config.llm_config.API_KEY`/`MODEL` (which
@@ -36,6 +40,7 @@ def build_model_client(api_key: Optional[str] = None, model: Optional[str] = Non
     """
     resolved_model = model if model is not None else MODEL
     resolved_api_key = api_key if api_key is not None else API_KEY
+    resolved_base_url = base_url if base_url is not None else BASE_URL
 
     kwargs = {
         "model": resolved_model,
@@ -44,6 +49,26 @@ def build_model_client(api_key: Optional[str] = None, model: Optional[str] = Non
     }
     if resolved_api_key is not None:
         kwargs["api_key"] = resolved_api_key
+
+    # A configured endpoint is passed explicitly rather than left to the SDK's
+    # OPENAI_BASE_URL lookup, so which path this client takes is visible here
+    # instead of depending on ambient environment. Local shims ignore the key
+    # but the SDK still insists on one, hence the placeholder.
+    if resolved_base_url:
+        kwargs["base_url"] = resolved_base_url
+        kwargs.setdefault("api_key", "captain-local-endpoint")
+        # A custom endpoint usually serves a model name the SDK does not know,
+        # and it refuses to construct without capabilities for it. Declared to
+        # match what the endpoint genuinely does: the local shim carries a
+        # requested schema into the prompt, so json/structured output holds,
+        # while tool calling does not.
+        kwargs["model_info"] = ModelInfo(
+            vision=False,
+            function_calling=False,
+            json_output=True,
+            family=ModelFamily.UNKNOWN,
+            structured_output=True,
+        )
 
     return OpenAIChatCompletionClient(**kwargs)
 

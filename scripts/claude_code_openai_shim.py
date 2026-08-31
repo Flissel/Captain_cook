@@ -100,20 +100,50 @@ def render_messages(messages: list[dict[str, Any]]) -> tuple[str, str]:
     return "\n\n".join(system_parts).strip(), transcript
 
 
+def schema_instruction(response_format: Any) -> str:
+    """Turn an OpenAI ``response_format`` into an instruction the CLI can honour.
+
+    The CLI has no structured-output mode, so the contract is carried in the
+    prompt instead. Callers that ask for a schema get one described to them
+    verbatim; anything less would mean advertising structured output the
+    backend cannot actually deliver.
+    """
+
+    if not isinstance(response_format, dict):
+        return ""
+    kind = response_format.get("type")
+    if kind == "json_object":
+        return (
+            "\n\nOutput format: reply with a single JSON object and nothing "
+            "else -- no preamble, no code fences, no text outside the braces."
+        )
+    if kind != "json_schema":
+        return ""
+    spec = response_format.get("json_schema") or {}
+    schema = spec.get("schema") or spec.get("json_schema")
+    if not schema:
+        return ""
+    name = spec.get("name") or "the requested object"
+    return (
+        f"\n\nOutput format: reply with a single JSON object named {name} that "
+        "validates against this JSON Schema, and nothing else -- no preamble, "
+        "no code fences, no text before the opening brace or after the closing "
+        "brace. Include every required property and add no property the schema "
+        "does not define.\n\n" + json.dumps(schema)
+    )
+
+
 def run_claude(
     *,
     system_prompt: str,
     transcript: str,
     model: str | None,
     timeout: float,
+    response_format: Any = None,
 ) -> dict[str, Any]:
     cli = resolve_cli()
     argv: list[str] = [cli, "-p", "--output-format", "json"]
 
-    # The system prompt goes through a file, never the command line: a real
-    # agent system prompt runs to tens of thousands of characters and Windows
-    # caps a whole command line at 32767, where the CLI aborts before it reads
-    # any input (observed: is_error with 0 input tokens after ~800ms).
     resolved_model = _MODEL_ALIASES.get((model or "").strip())
     if resolved_model:
         argv += ["--model", resolved_model]
@@ -182,6 +212,12 @@ def run_claude(
             "instead."
         )
 
+    system_prompt += schema_instruction(response_format)
+
+    # The system prompt goes through a file, never the command line: a real
+    # agent system prompt runs to tens of thousands of characters and Windows
+    # caps a whole command line at 32767, where the CLI aborts before it reads
+    # any input (observed: is_error with 0 input tokens after ~800ms).
     system_prompt_file: str | None = None
     if system_prompt:
         handle, system_prompt_file = tempfile.mkstemp(
@@ -371,7 +407,7 @@ class Handler(BaseHTTPRequestHandler):
         if tool_names:
             sys.stderr.write("tools offered: %s\n" % ", ".join(tool_names))
         sys.stderr.write(
-            "request: model=%s roles=%s system=%dch transcript=%dch stream=%s tools=%d\n"
+            "request: model=%s roles=%s system=%dch transcript=%dch stream=%s tools=%d response_format=%s\n"
             % (
                 model,
                 ",".join(roles),
@@ -379,6 +415,9 @@ class Handler(BaseHTTPRequestHandler):
                 len(transcript),
                 bool(body.get("stream")),
                 len(body.get("tools") or []),
+                body.get("response_format", {}).get("type", "none")
+                if isinstance(body.get("response_format"), dict)
+                else "none",
             )
         )
         sys.stderr.flush()
@@ -389,6 +428,7 @@ class Handler(BaseHTTPRequestHandler):
                 transcript=transcript,
                 model=model,
                 timeout=self.timeout_seconds,
+                response_format=body.get("response_format"),
             )
             completion = to_completion(payload, model)
         except ShimError as exc:
