@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -113,6 +114,74 @@ def run_claude(
     # agent system prompt runs to tens of thousands of characters and Windows
     # caps a whole command line at 32767, where the CLI aborts before it reads
     # any input (observed: is_error with 0 input tokens after ~800ms).
+    resolved_model = _MODEL_ALIASES.get((model or "").strip())
+    if resolved_model:
+        argv += ["--model", resolved_model]
+
+    # Keep the call cheap and deterministic: no inherited project/user settings
+    # and no ambient MCP servers.
+    #
+    # The one exception is Captain's artifact store. A planner is required to
+    # return resolvable artifact:// references; without a way to persist one it
+    # can only inline the plan or fabricate a digest, and fabricating is the
+    # wrong answer. So when an artifact root is configured we hand the model
+    # exactly two tools -- write_artifact and read_artifact -- and nothing else.
+    mcp_servers: dict[str, Any] = {}
+    allowed_tools: list[str] = []
+    store_root = os.environ.get("CAPTAIN_ARTIFACT_ROOT", "").strip()
+    mcp_script = os.environ.get(
+        "CAPTAIN_ARTIFACT_MCP",
+        str(pathlib.Path(__file__).resolve().parent / "captain_artifact_mcp.py"),
+    )
+    if store_root and os.path.isfile(mcp_script):
+        # get_contract_schema imports Captain's Pydantic contracts, so the server
+        # needs an interpreter that has them -- usually the repo venv, not this
+        # process's own interpreter.
+        mcp_python = os.environ.get("CAPTAIN_MCP_PYTHON", "").strip() or sys.executable
+        mcp_env = {"CAPTAIN_ARTIFACT_ROOT": store_root}
+        repo_root = os.environ.get("CAPTAIN_REPO_ROOT", "").strip()
+        if repo_root:
+            mcp_env["CAPTAIN_REPO_ROOT"] = repo_root
+        mcp_servers["captain"] = {
+            "command": mcp_python,
+            "args": [mcp_script],
+            "env": mcp_env,
+        }
+        allowed_tools = [
+            "mcp__captain__write_artifact",
+            "mcp__captain__read_artifact",
+            "mcp__captain__get_contract_schema",
+        ]
+
+    argv += ["--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": mcp_servers})]
+    argv += ["--setting-sources", ""]
+    if allowed_tools:
+        argv += ["--allowedTools", *allowed_tools]
+
+    # The caller's own prompt asks for opaque artifact references but cannot know
+    # how this backend produces one, so the side that supplies the tool documents
+    # it. Without this the model has no way to persist anything and falls back to
+    # inlining the body -- which then fails the caller's schema.
+    if allowed_tools and system_prompt:
+        system_prompt += (
+            "\n\nTooling for this backend. Before composing a typed result, call "
+            "get_contract_schema with the schema name you were asked to return "
+            "(for example captain.hermes-plan-result.v1) and follow it exactly: "
+            "supply every required field and add no field it does not define, "
+            "because the contract rejects both omissions and extras. Persist every "
+            "plan body, decision log and blueprint with write_artifact and use the "
+            "uri and sha256 it returns verbatim in the matching *_ref field. Never "
+            "inline such a body where a reference is expected, and never invent a "
+            "digest. Use read_artifact to dereference any artifact:// uri you are "
+            "given.\n\nOutput format: when a typed result is requested, your entire "
+            "final message must be that single JSON object and nothing else -- no "
+            "preamble, no explanation, no code fences, no text before the opening "
+            "brace or after the closing brace. The caller parses from the first "
+            "character and any prose makes the whole result unreadable. Put "
+            "anything you would have explained into the decision log artifact "
+            "instead."
+        )
+
     system_prompt_file: str | None = None
     if system_prompt:
         handle, system_prompt_file = tempfile.mkstemp(
@@ -121,14 +190,6 @@ def run_claude(
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             stream.write(system_prompt)
         argv += ["--system-prompt-file", system_prompt_file]
-    resolved_model = _MODEL_ALIASES.get((model or "").strip())
-    if resolved_model:
-        argv += ["--model", resolved_model]
-
-    # Keep the call cheap and deterministic: no MCP servers, no inherited
-    # project/user settings, no tools. A planner turn only needs text back.
-    argv += ["--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": {}})]
-    argv += ["--setting-sources", ""]
 
     environment = os.environ.copy()
     # Never let an ambient key silently redirect the CLI itself.
@@ -302,6 +363,13 @@ class Handler(BaseHTTPRequestHandler):
         system_prompt, transcript = render_messages(body.get("messages") or [])
 
         roles = [str(m.get("role", "?")) for m in (body.get("messages") or [])]
+        tool_names = [
+            str((t.get("function") or {}).get("name") or t.get("name") or "?")
+            for t in (body.get("tools") or [])
+            if isinstance(t, dict)
+        ]
+        if tool_names:
+            sys.stderr.write("tools offered: %s\n" % ", ".join(tool_names))
         sys.stderr.write(
             "request: model=%s roles=%s system=%dch transcript=%dch stream=%s tools=%d\n"
             % (
