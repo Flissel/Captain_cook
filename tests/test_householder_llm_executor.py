@@ -11,6 +11,8 @@ for the real judge adapter.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from pathlib import Path
 from typing import Any, List, Sequence
 
 import pytest
@@ -100,6 +102,27 @@ async def test_well_formed_response_maps_to_a_householder_report():
     assert report.artifacts == ("agents/household/architect.md",)
     assert "reviewed the batch schema" in report.evidence
     assert report.limitations == ("no live deployment was attempted",)
+
+
+@pytest.mark.asyncio
+async def test_evidence_is_marked_with_llm_provenance():
+    """Pins the self-describing evidence marker so a ledger reader can always
+    tell this executor's evidence/artifacts are an unverified model
+    self-report, not a machine-observed fact -- the same self-labelling
+    pattern `DeterministicHouseholderExecutor` uses for its own evidence
+    ("deterministic offline executor"). Also pins that the marker survives
+    `HouseholderReport.as_result()`, since that dict -- not the dataclass --
+    is what actually reaches `SubproblemCompleted.result` and the ledger.
+    Exists so this marking cannot be quietly dropped later."""
+    role = _architect_role()
+    client = FakeChatCompletionClient([_report_json()])
+    executor = LlmHouseholderExecutor(client)
+
+    report = await executor.run(role, "sp-1", "Review the planner/ledger boundary")
+
+    marker = "llm_reported: unverified model self-report; no tool or file access beyond the role prompt"
+    assert report.evidence[0] == marker
+    assert report.as_result()["evidence"][0] == marker
 
 
 @pytest.mark.asyncio
@@ -195,6 +218,31 @@ async def test_empty_description_raises_not_retriable_before_any_model_call():
 
     assert failure.value.retriable is False
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_missing_prompt_file_raises_not_retriable_before_any_model_call():
+    role = replace(_architect_role(), prompt_path=Path("agents/household/does-not-exist.md"))
+    client = FakeChatCompletionClient([_report_json()])
+    executor = LlmHouseholderExecutor(client)
+
+    with pytest.raises(HouseholderExecutionError) as failure:
+        await executor.run(role, "sp-1", "Review the planner/ledger boundary")
+
+    assert failure.value.retriable is False
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_non_string_model_content_raises_retriable():
+    role = _architect_role()
+    client = FakeChatCompletionClient([None])
+    executor = LlmHouseholderExecutor(client)
+
+    with pytest.raises(HouseholderExecutionError) as failure:
+        await executor.run(role, "sp-1", "Review the planner/ledger boundary")
+
+    assert failure.value.retriable is True
 
 
 @pytest.mark.asyncio

@@ -180,3 +180,90 @@ deleted.
 - Everything else in the brief (Protocol shape, error taxonomy, retriable
   semantics, prompt/tool-claim requirements, test list) matched the actual
   code exactly on inspection — no other surprises.
+
+## Fix round (on top of `ef9583d`)
+
+Review confirmed port conformance, client injection, retriable mapping, and
+that the permitted-tools claim check does what it claims with an honest
+(non-oversold) comment. The `LlmStage.HOUSEHOLDER_EXECUTE` addition was
+accepted as-is (reviewer checked for exhaustive `LlmStage` consumers, found
+none). Two required changes plus one optional addition, both applied.
+
+### 1. Evidence/artifact provenance marking
+
+The model has no grounding beyond its own role prompt (no file contents, no
+codebase access, no prior tool output), yet `evidence`/`artifacts` flowed
+into `HouseholderReport` — described by its own docstring as "a JSON-safe,
+audit-friendly result" — and from there into `SubproblemCompleted.result`
+and the ledger, indistinguishable from machine-observed fact.
+
+Fixed by following the exact house pattern already used by
+`DeterministicHouseholderExecutor` (its evidence self-labels as
+`"deterministic offline executor"`), **without any change to
+`HouseholderReport`** (still a frozen dataclass, contract untouched):
+
+- `agenten/household/llm_executor.py` now defines
+  `_LLM_EVIDENCE_PROVENANCE_MARKER = "llm_reported: unverified model
+  self-report; no tool or file access beyond the role prompt"` and `run()`
+  prepends it as `evidence[0]` on every report — before the model's own
+  evidence entries and before the `tool_used:` entries. It survives
+  `as_result()` unchanged since it is just a plain string element of the
+  `evidence` tuple/list, not a new field.
+- The system prompt (`_build_system_message`) gained an explicit honesty
+  instruction covering `decision`, `artifacts`, and `evidence` (previously
+  only `tools_used` had one): the model is told it has no file, tool, or
+  codebase access beyond the role definition and subproblem description, to
+  never report an artifact or evidence entry it did not genuinely produce or
+  gather, and that an honest empty list plus a stated `limitations` entry is
+  the correct answer when it has none.
+- New pinning test: `test_evidence_is_marked_with_llm_provenance` asserts
+  `report.evidence[0]` equals the exact marker string *and* that
+  `report.as_result()["evidence"][0]` matches — the dict form, since that is
+  what actually reaches `SubproblemCompleted.result`/the ledger, not the
+  dataclass.
+
+### 2. Missing refusal test
+
+Added `test_missing_prompt_file_raises_not_retriable_before_any_model_call`:
+constructs a role via `dataclasses.replace(_architect_role(), prompt_path=Path("agents/household/does-not-exist.md"))`,
+asserts `HouseholderExecutionError(retriable=False)` and `client.calls ==
+[]`, same shape as the two existing empty-`subproblem_id`/empty-`description`
+refusal tests. This behavior (the `except OSError` branch around
+`role.prompt_path.read_text()`) already existed in `ef9583d`'s
+implementation — only the test was missing; no production code changed for
+this item.
+
+### Optional items
+
+- Added `test_non_string_model_content_raises_retriable` for the defensive
+  `if not isinstance(content, str)` branch (fake client returns a
+  `_CreateResult(None)`) — cheap, closed a real gap, kept.
+- Kept `test_deterministic_executor_still_satisfies_the_port_unchanged`
+  per the coordinator's stated lean — it is a cheap guard against a future
+  "simplification" of the port breaking the deterministic executor's
+  contract, even though it duplicates coverage already in
+  `tests/test_householder_runtime.py` and touches a file this change never
+  modifies.
+
+### Verification
+
+```
+$ python -m pytest tests/test_householder_llm_executor.py -v --no-cov
+12 passed in 0.93s
+```
+
+```
+$ python -m pytest tests/test_householder_llm_executor.py tests/test_householder_runtime.py \
+    tests/test_householder_roles.py tests/llm/ tests/planning/ -q --no-cov
+142 passed in 4.45s
+```
+
+(139 passed before this round + 3 new tests = 142; no prior test needed
+changing, since the provenance marker is additive to `evidence` and the
+existing `"reviewed the batch schema" in report.evidence` style membership
+assertion still holds with the marker prepended.)
+
+Only `agenten/household/llm_executor.py` and
+`tests/test_householder_llm_executor.py` changed in this round (`git diff
+--stat` confirms). `DeterministicHouseholderExecutor`, `worker.py`, the
+pipeline, and the ledger remain untouched. No network in tests; no push.

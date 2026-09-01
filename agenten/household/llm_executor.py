@@ -17,6 +17,16 @@ it only asks a model for a structured report. A role's `permitted_tools`
 tools the role may *claim* to have used, and the response is checked against
 that list before being trusted -- see the comment at that check for why this
 is a claim check on the model's self-report, not a call-boundary sandbox.
+
+Evidence provenance: the model gets no grounding beyond its own role prompt
+-- no file contents, no codebase access, no prior tool output -- so
+`decision`/`artifacts`/`evidence` in the returned `HouseholderReport` are the
+model's self-report, not machine-observed fact. `run()` therefore prepends
+one self-describing evidence entry to every report it returns, the same
+pattern `DeterministicHouseholderExecutor` already uses for its own evidence
+("deterministic offline executor"), so a later reader -- including the
+ledger -- can tell an LLM-reported claim from an observed one. This needs no
+change to the frozen `HouseholderReport` contract.
 """
 import logging
 from typing import List
@@ -29,6 +39,16 @@ from agenten.household.roles import HouseholderRoleSpec
 from agenten.llm.resilience import LlmSchemaError, LlmStage, LlmStageError, run_llm_stage
 
 logger = logging.getLogger(__name__)
+
+# Prepended to every report's `evidence` so a ledger reader can tell an
+# LLM-reported claim from a machine-observed fact -- the same self-labelling
+# pattern `DeterministicHouseholderExecutor` uses ("deterministic offline
+# executor"), applied here because this executor's evidence/artifacts are
+# entirely the model's self-report: it has no file, tool, or codebase access
+# of its own to verify them against.
+_LLM_EVIDENCE_PROVENANCE_MARKER = (
+    "llm_reported: unverified model self-report; no tool or file access beyond the role prompt"
+)
 
 
 class HouseholderReportModel(BaseModel):
@@ -55,6 +75,14 @@ def _build_system_message(role: HouseholderRoleSpec, prompt_text: str) -> str:
         f"--- Role definition ({role.prompt_path.name}) ---\n"
         f"{prompt_text}\n"
         "--- End role definition ---\n\n"
+        "You have no file, tool, or codebase access beyond the role definition "
+        "above and the subproblem description that follows -- you cannot open, "
+        "read, or run anything. Do not report a `decision`, `artifacts` entry, or "
+        "`evidence` entry that you did not genuinely reach or gather from what "
+        "you were given here. If you have no genuine artifacts or evidence for "
+        "this subproblem, report an empty list for that field and say so "
+        "explicitly in `limitations` instead -- an honest empty list is the "
+        "correct answer, not an invented, plausible-sounding one.\n\n"
         f"You may report `tools_used` ONLY from this exact list, and only tools "
         f"you genuinely used for this subproblem: {permitted}. Never claim a tool "
         "outside this list.\n\n"
@@ -158,7 +186,11 @@ class LlmHouseholderExecutor:
                 retriable=True,
             )
 
-        evidence = tuple(parsed.evidence) + tuple(f"tool_used:{tool}" for tool in claimed_tools)
+        evidence = (
+            (_LLM_EVIDENCE_PROVENANCE_MARKER,)
+            + tuple(parsed.evidence)
+            + tuple(f"tool_used:{tool}" for tool in claimed_tools)
+        )
 
         return HouseholderReport(
             role=role.role_id,
