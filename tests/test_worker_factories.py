@@ -8,6 +8,12 @@ from agenten.orchestration.pipeline import build_pipeline
 from agenten.workers.base import WorkerAgent
 
 
+async def _accept_all_judge(description, ruleset) -> bool:
+    """Layer 2 is mandatory; this test exercises layer 1 and says so."""
+
+    return True
+
+
 class ManifestWorker(WorkerAgent):
     agent_type = "manifest_worker"
     capability_tags = ["manifest_review"]
@@ -40,7 +46,7 @@ async def test_pipeline_injects_a_worker_factory_with_ledger_resolved_descriptio
     pipeline = build_pipeline(
         blockchain=Blockchain(storage=InMemoryStorage()),
         llm_decompose=decompose,
-        worker_factories=(factory,),
+        worker_factories=(factory,), llm_judge=_accept_all_judge
     )
     await pipeline.start()
     await pipeline.submit_problem("Check the worker factory contract")

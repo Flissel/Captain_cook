@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from agenten.agent_runtime.contracts import (
@@ -13,6 +13,8 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     CapabilityGrantRevocation,
     HermesPlanResult,
+    RuntimeResumeCostAuthorityV1,
+    RuntimeResumeCostSettlementV1,
 )
 from agenten.validation.contracts import WorkBatch
 
@@ -39,15 +41,31 @@ class RuntimeStatePort(Protocol):
     async def record_result(self, result: AgentRuntimeResult) -> AgentRuntimeResult: ...
 
 
+@runtime_checkable
 class ArtifactPort(Protocol):
     async def require(self, reference: ArtifactRef) -> None: ...
+
+    async def write(self, content: bytes, media_type: str) -> ArtifactRef: ...
+
+
+class RuntimeCostAuthorityPort(Protocol):
+    async def authorize(
+        self, command: AgentRuntimeCommand
+    ) -> RuntimeResumeCostAuthorityV1: ...
+
+    async def settle(
+        self,
+        command: AgentRuntimeCommand,
+        result: AgentRuntimeResult,
+        authority: RuntimeResumeCostAuthorityV1,
+    ) -> RuntimeResumeCostSettlementV1: ...
 
 
 class CapabilityPolicyPort(Protocol):
     def derive(
         self,
         command: AgentRuntimeCommand,
-        batch: WorkBatch,
+        batch: WorkBatch | None,
         now: datetime,
     ) -> CapabilityGrant: ...
 
@@ -60,6 +78,7 @@ class CapabilityPolicyPort(Protocol):
     ) -> CapabilityGrant: ...
 
 
+@runtime_checkable
 class HermesPlannerPort(Protocol):
     async def plan(
         self,
@@ -74,6 +93,7 @@ class HermesPlannerPort(Protocol):
     ) -> HermesPlanResult: ...
 
 
+@runtime_checkable
 class CodexExecutionPort(Protocol):
     async def start(
         self,

@@ -8,7 +8,7 @@ from io import BytesIO
 import json
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,7 +73,35 @@ CodexOutputFailureKind = Literal[
     "unterminated_record",
     "journal_size_limit_exceeded",
     "journal_record_count_exceeded",
+    "observer_failed",
 ]
+CodexCancellationOutcome = Literal[
+    "no_active_process",
+    "requested_unverified",
+    "verified_cancelled",
+]
+
+
+CodexJsonlObserver = Callable[[dict[str, object]], Awaitable[None]]
+CodexProcessStateObserver = Callable[[dict[str, object]], Awaitable[None]]
+_PROCESS_STATE_PREFIX = b"CAPTAIN_PROCESS_STATE:"
+
+
+@dataclass(frozen=True)
+class CodexOutputJournalPolicy:
+    """Choose whether parsed JSONL is retained and optionally stream each event."""
+
+    retain_raw_records: bool = True
+    observer: CodexJsonlObserver | None = field(default=None, repr=False, compare=False)
+    process_state_observer: CodexProcessStateObserver | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.retain_raw_records, bool):
+            raise TypeError("Codex output retention policy must be boolean")
 
 
 class CodexOutputEvidenceError(RuntimeError):
@@ -94,7 +122,7 @@ class CodexOutputEvidenceError(RuntimeError):
         self,
         *,
         process_cleanup_status: CodexProcessCleanupStatus,
-        journal_path: Path,
+        journal_path: Path | None,
         journal_sha256: str,
         journal_byte_count: int,
         event_count: int,
@@ -102,8 +130,8 @@ class CodexOutputEvidenceError(RuntimeError):
     ) -> None:
         if self.process_cleanup_status is not None:
             raise ValueError("Codex output failure evidence is already bound")
-        resolved = journal_path.resolve()
-        if not resolved.is_absolute():
+        resolved = journal_path.resolve() if journal_path is not None else None
+        if resolved is not None and not resolved.is_absolute():
             raise ValueError("Codex output failure journal path must be absolute")
         if len(journal_sha256) != 64 or any(
             value not in "0123456789abcdef" for value in journal_sha256
@@ -163,10 +191,18 @@ class CodexJournalRecordCountLimitError(CodexOutputEvidenceError):
     failure_kind: CodexOutputFailureKind = "journal_record_count_exceeded"
 
 
+class CodexOutputObserverError(CodexOutputEvidenceError):
+    """A runtime observer rejected one parsed event; private detail is redacted."""
+
+    failure_kind: CodexOutputFailureKind = "observer_failed"
+
+
 @dataclass
 class _JournalEvidenceState:
     persisted_bytes: bytearray = field(default_factory=bytearray)
     record_count: int = 0
+    accepted_byte_count: int = 0
+    event_types: set[str] = field(default_factory=set)
 
 
 class CodexRunRequest(BaseModel):
@@ -217,7 +253,7 @@ class CodexRunResult(BaseModel):
     exit_code: int
     terminal_status: CodexRunTerminalStatus
     process_cleanup_status: CodexProcessCleanupStatus
-    journal_path: Path
+    journal_path: Path | None
     journal_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     artifact_references: tuple[str, ...]
     jsonl_lines: tuple[str, ...]
@@ -253,15 +289,17 @@ class PowerShellCodexRunner:
         script_path: Path,
         codex_path: Path,
         session_id: str,
-        state_path: Path,
-        journal_path: Path,
+        state_path: Path | None,
+        journal_path: Path | None,
         artifact_references: tuple[str, ...],
         codex_home: Path,
+        provider_proxy_url: str | None = None,
         deadline_at: datetime,
         timeout_seconds: float = 600,
         max_jsonl_record_bytes: int = DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES,
         max_journal_bytes: int = DEFAULT_MAX_CODEX_JOURNAL_BYTES,
         max_journal_records: int = DEFAULT_MAX_CODEX_JOURNAL_RECORDS,
+        output_policy: CodexOutputJournalPolicy | None = None,
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
@@ -301,19 +339,42 @@ class PowerShellCodexRunner:
         self._script_path = script_path.resolve(strict=True)
         self._codex_path = codex_path.resolve(strict=True)
         self._session_id = session_id
-        self._state_path = state_path.resolve()
-        self._journal_path = journal_path.resolve()
+        self._state_path = state_path.resolve() if state_path is not None else None
+        self._journal_path = journal_path.resolve() if journal_path is not None else None
         self._artifact_references = artifact_references
         self._codex_home = codex_home.resolve(strict=True)
+        self._provider_proxy_url = provider_proxy_url
         self._deadline_at = deadline_at
         self._timeout_seconds = timeout_seconds
         self._max_jsonl_record_bytes = max_jsonl_record_bytes
         self._max_journal_bytes = max_journal_bytes
         self._max_journal_records = max_journal_records
+        self._output_policy = output_policy or CodexOutputJournalPolicy()
+        if self._output_policy.retain_raw_records and self._journal_path is None:
+            raise ValueError("retained Codex output requires a journal path")
+        if (
+            self._state_path is None
+            and self._output_policy.process_state_observer is None
+        ):
+            raise ValueError("pathless Codex process state requires an observer")
+        self._process_state: dict[str, object] | None = None
+        self._process_started = False
+        self._process_state_ready = asyncio.Event()
+        self._run_finished = asyncio.Event()
+        self._operator_cancel_requested = False
+        self._cancellation_lock = asyncio.Lock()
+        self._cancellation_attempted = False
+        self._cancellation_verified = False
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic or time.monotonic
 
     async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
+        try:
+            return await self._run_once(authorized)
+        finally:
+            self._run_finished.set()
+
+    async def _run_once(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
         standard_command = (
             len(authorized.command) == 4
             and authorized.command[:3] == ("codex", "exec", "--json")
@@ -326,13 +387,14 @@ class PowerShellCodexRunner:
             raise ValueError("PowerShell Codex runner command is invalid")
         prompt = authorized.command[-1]
         resume_thread_id = authorized.command[-2] if resume_command else None
-        self._journal_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        journal_descriptor = os.open(
-            self._journal_path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
-            0o600,
-        )
-        os.close(journal_descriptor)
+        if self._journal_path is not None:
+            self._journal_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            journal_descriptor = os.open(
+                self._journal_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                0o600,
+            )
+            os.close(journal_descriptor)
         child_environment = authorized.child_environment()
         child_environment["CODEX_HOME"] = str(self._codex_home)
         wrapper_launch_at = self._clock()
@@ -359,20 +421,26 @@ class PowerShellCodexRunner:
             str(self._codex_path),
             "-SessionId",
             self._session_id,
-            "-StatePath",
-            str(self._state_path),
             "-DeadlineAt",
             self._deadline_at.isoformat(),
         ]
+        if self._state_path is None:
+            launcher_arguments.append("-EmitState")
+        else:
+            launcher_arguments.extend(("-StatePath", str(self._state_path)))
         if resume_thread_id is not None:
             launcher_arguments.extend(("-ResumeThreadId", resume_thread_id))
+        if self._provider_proxy_url is not None:
+            launcher_arguments.extend(("-ProviderProxyUrl", self._provider_proxy_url))
         process = await asyncio.create_subprocess_exec(
             *launcher_arguments,
             cwd=authorized.workspace,
             env=child_environment,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=self._max_jsonl_record_bytes + 2,
         )
+        self._process_started = True
         assert process.stdout is not None
         assert process.stderr is not None
         timed_out = False
@@ -382,7 +450,12 @@ class PowerShellCodexRunner:
         journal_state = _JournalEvidenceState()
         journal_bytes = b""
         journal_lines: tuple[str, ...] = ()
-        with self._journal_path.open("a+b") as journal:
+        journal_context = (
+            self._journal_path.open("a+b")
+            if self._journal_path is not None
+            else BytesIO()
+        )
+        with journal_context as journal:
             process_waiter = asyncio.create_task(process.wait())
             stdout_reader = asyncio.create_task(
                 self._journal_stdout(process.stdout, journal, journal_state)
@@ -434,33 +507,56 @@ class PowerShellCodexRunner:
                 except BaseException as exc:
                     if evidence_failure is None:
                         evidence_failure = self._redact_reader_failure(exc)
-            try:
-                journal_bytes = self._read_bounded_journal(journal)
-            except CodexOutputEvidenceError as exc:
-                if evidence_failure is None:
-                    evidence_failure = exc
-                journal_bytes = bytes(journal_state.persisted_bytes)
-            try:
-                journal_lines, event_types = self._parse_journal_snapshot(
-                    journal_bytes,
-                    tolerate_partial=evidence_failure is not None,
+            if (
+                self._state_path is None
+                and self._process_state is None
+                and evidence_failure is None
+            ):
+                evidence_failure = CodexJsonlInvalidObjectError(
+                    "Codex process state record is missing"
                 )
-            except CodexOutputEvidenceError as exc:
-                if evidence_failure is None:
-                    evidence_failure = exc
-                journal_lines, event_types = self._parse_journal_snapshot(
-                    bytes(journal_state.persisted_bytes),
-                    tolerate_partial=True,
-                )
-                journal_bytes = bytes(journal_state.persisted_bytes)
+            if self._journal_path is None:
+                journal_bytes = b""
+                journal_lines = ()
+                event_types = tuple(sorted(journal_state.event_types))
+            else:
+                try:
+                    journal_bytes = self._read_bounded_journal(journal)
+                except CodexOutputEvidenceError as exc:
+                    if evidence_failure is None:
+                        evidence_failure = exc
+                    journal_bytes = bytes(journal_state.persisted_bytes)
+                try:
+                    journal_lines, event_types = self._parse_journal_snapshot(
+                        journal_bytes,
+                        tolerate_partial=evidence_failure is not None,
+                    )
+                except CodexOutputEvidenceError as exc:
+                    if evidence_failure is None:
+                        evidence_failure = exc
+                    journal_lines, event_types = self._parse_journal_snapshot(
+                        bytes(journal_state.persisted_bytes),
+                        tolerate_partial=True,
+                    )
+                    journal_bytes = bytes(journal_state.persisted_bytes)
             if evidence_failure is not None:
+                evidence_event_count = (
+                    len(journal_lines)
+                    if self._output_policy.retain_raw_records
+                    else journal_state.record_count
+                )
+                evidence_event_types = (
+                    event_types
+                    if self._output_policy.retain_raw_records
+                    else tuple(sorted(journal_state.event_types))
+                )
                 evidence_failure.bind_terminal_evidence(
                     process_cleanup_status=process_cleanup_status,
                     journal_path=self._journal_path,
                     journal_sha256=hashlib.sha256(journal_bytes).hexdigest(),
                     journal_byte_count=len(journal_bytes),
-                    event_count=len(journal_lines),
-                    event_types=event_types,
+                    event_count=evidence_event_count,
+                    event_types=evidence_event_types,
                 )
 
         if evidence_failure is not None:
@@ -490,6 +586,16 @@ class PowerShellCodexRunner:
         )
 
     def _prelaunch_timeout_result(self) -> CodexRunResult:
+        if self._journal_path is None:
+            return CodexRunResult(
+                exit_code=124,
+                terminal_status="timed_out",
+                process_cleanup_status="not_required",
+                journal_path=None,
+                journal_sha256=hashlib.sha256(b"").hexdigest(),
+                artifact_references=(),
+                jsonl_lines=(),
+            )
         try:
             with self._journal_path.open("rb") as journal:
                 journal_bytes = self._read_bounded_journal(journal)
@@ -545,8 +651,13 @@ class PowerShellCodexRunner:
                 if record.endswith(b"\r"):
                     record = record[:-1]
                 if record.strip():
-                    self._require_json_object(record)
-                    self._persist_jsonl_record(journal, record, state)
+                    if record.startswith(_PROCESS_STATE_PREFIX):
+                        await self._accept_process_state(
+                            record[len(_PROCESS_STATE_PREFIX):]
+                        )
+                    else:
+                        event = self._require_json_object(record)
+                        await self._accept_jsonl_record(journal, record, event, state)
                 cursor = newline + 1
                 if cursor == len(chunk):
                     break
@@ -554,6 +665,48 @@ class PowerShellCodexRunner:
             raise CodexJsonlUnterminatedRecordError(
                 "Codex JSONL stream ended with an unterminated record"
             )
+
+    async def _accept_process_state(self, record: bytes) -> None:
+        if self._state_path is not None or self._process_state is not None:
+            raise CodexJsonlInvalidObjectError("Codex process state record is invalid")
+        state = self._require_json_object(record)
+        expected_keys = {
+            "session_id",
+            "pid",
+            "started_at_utc",
+            "start_time_utc_ticks",
+            "executable",
+        }
+        pid = state.get("pid")
+        ticks = state.get("start_time_utc_ticks")
+        if (
+            set(state) != expected_keys
+            or state.get("session_id") != self._session_id
+            or isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid <= 0
+            or not isinstance(state.get("started_at_utc"), str)
+            or not state["started_at_utc"]
+            or isinstance(ticks, bool)
+            or not isinstance(ticks, int)
+            or ticks <= 0
+            or not isinstance(state.get("executable"), str)
+            or not state["executable"]
+        ):
+            raise CodexJsonlInvalidObjectError("Codex process state record is invalid")
+        self._process_state = dict(state)
+        self._process_state_ready.set()
+        observer = self._output_policy.process_state_observer
+        if observer is None:
+            raise CodexOutputObserverError("Codex process state observer is unavailable")
+        try:
+            await observer(dict(state))
+        except BaseException:
+            raise CodexOutputObserverError(
+                "Codex process state observer rejected process identity"
+            ) from None
+        if self._operator_cancel_requested:
+            await self._cancel_once("operator")
 
     def _extend_jsonl_record(
         self,
@@ -571,10 +724,11 @@ class PowerShellCodexRunner:
             )
         pending.extend(segment)
 
-    def _persist_jsonl_record(
+    async def _accept_jsonl_record(
         self,
         journal: BinaryIO,
         record: bytes,
+        event: dict[str, object],
         state: _JournalEvidenceState,
     ) -> None:
         serialized = record + b"\n"
@@ -582,22 +736,158 @@ class PowerShellCodexRunner:
             raise CodexJournalRecordCountLimitError(
                 "Codex JSONL journal exceeds configured record count limit"
             )
-        if len(state.persisted_bytes) + len(serialized) > self._max_journal_bytes:
+        if state.accepted_byte_count + len(serialized) > self._max_journal_bytes:
             raise CodexJournalSizeLimitError(
                 "Codex JSONL journal exceeds configured safe limit"
             )
-        try:
-            written = journal.write(serialized)
-            if written != len(serialized):
-                raise OSError
-            journal.flush()
-            os.fsync(journal.fileno())
-        except OSError:
-            raise CodexJournalPersistenceError(
-                "Codex JSONL journal persistence failed"
-            ) from None
-        state.persisted_bytes.extend(serialized)
+        observer = self._output_policy.observer
+        if observer is not None:
+            try:
+                await observer(dict(event))
+            except BaseException:
+                raise CodexOutputObserverError(
+                    "Codex JSONL observer rejected a parsed event"
+                ) from None
+        if self._output_policy.retain_raw_records:
+            try:
+                written = journal.write(serialized)
+                if written != len(serialized):
+                    raise OSError
+                journal.flush()
+                os.fsync(journal.fileno())
+            except OSError:
+                raise CodexJournalPersistenceError(
+                    "Codex JSONL journal persistence failed"
+                ) from None
+            state.persisted_bytes.extend(serialized)
+        state.accepted_byte_count += len(serialized)
         state.record_count += 1
+        state.event_types.add(canonical_codex_event_type(event.get("type")))
+
+    async def cancel(self) -> CodexCancellationOutcome:
+        """Cancel this runner's exact session-owned process tree once verified."""
+
+        if self._state_path is None:
+            if self._process_state is None and not self._process_started:
+                return "no_active_process"
+            self._operator_cancel_requested = True
+            if self._process_state is None:
+                state_ready = asyncio.create_task(self._process_state_ready.wait())
+                run_finished = asyncio.create_task(self._run_finished.wait())
+                _done, pending = await asyncio.wait(
+                    (state_ready, run_finished),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for waiter in pending:
+                    waiter.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                if self._process_state is None:
+                    return "requested_unverified"
+        elif not self._state_path.is_file():
+            return "no_active_process"
+        return (
+            "verified_cancelled"
+            if await self._cancel_once("operator")
+            else "requested_unverified"
+        )
+
+    @staticmethod
+    async def inspect_process_state(
+        *,
+        pwsh_path: Path,
+        script_path: Path,
+        state_path: Path,
+        session_id: str,
+    ) -> Literal["active", "lost", "identity_mismatch", "missing", "unresolved"]:
+        """Inspect one durable session identity through the established launcher."""
+
+        if not state_path.is_file():
+            return "missing"
+        inspection = await asyncio.create_subprocess_exec(
+            str(pwsh_path),
+            "-NoProfile",
+            "-File",
+            str(script_path),
+            "-InspectStatePath",
+            str(state_path),
+            "-SessionId",
+            session_id,
+            env=PowerShellCodexRunner._cancellation_environment(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(inspection.communicate(), timeout=15)
+        except TimeoutError:
+            inspection.kill()
+            await inspection.wait()
+            return "unresolved"
+        if inspection.returncode != 0:
+            return "unresolved"
+        try:
+            result = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return "unresolved"
+        if not isinstance(result, dict):
+            return "unresolved"
+        status = result.get("status")
+        if result.get("session_id") != session_id or status not in {
+            "active",
+            "lost",
+            "identity_mismatch",
+        }:
+            return "unresolved"
+        return status
+
+    @staticmethod
+    async def inspect_process_identity(
+        *,
+        pwsh_path: Path,
+        script_path: Path,
+        process_state: dict[str, object],
+        session_id: str,
+    ) -> Literal["active", "lost", "identity_mismatch", "unresolved"]:
+        """Inspect an already confined process identity without a child state path."""
+
+        arguments = PowerShellCodexRunner._identity_arguments(
+            process_state=process_state,
+            session_id=session_id,
+        )
+        if arguments is None:
+            return "unresolved"
+        inspection = await asyncio.create_subprocess_exec(
+            str(pwsh_path),
+            "-NoProfile",
+            "-File",
+            str(script_path),
+            "-InspectIdentity",
+            *arguments,
+            env=PowerShellCodexRunner._cancellation_environment(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(inspection.communicate(), timeout=15)
+        except TimeoutError:
+            inspection.kill()
+            await inspection.wait()
+            return "unresolved"
+        if inspection.returncode != 0:
+            return "unresolved"
+        try:
+            result = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return "unresolved"
+        if not isinstance(result, dict):
+            return "unresolved"
+        status = result.get("status")
+        if result.get("session_id") != session_id or status not in {
+            "active",
+            "lost",
+            "identity_mismatch",
+        }:
+            return "unresolved"
+        return status
 
     def _read_bounded_journal(self, journal: BinaryIO) -> bytes:
         try:
@@ -806,23 +1096,45 @@ class PowerShellCodexRunner:
         await asyncio.gather(process_waiter, return_exceptions=True)
 
     async def _cancel_timed_out_process(self) -> bool:
-        return await self._cancel_process("timeout")
+        return await self._cancel_once("timeout")
 
     async def _cancel_evidence_failure_process(self) -> bool:
-        return await self._cancel_process("operator")
+        return await self._cancel_once("operator")
+
+    async def _cancel_once(self, reason: Literal["operator", "timeout"]) -> bool:
+        async with self._cancellation_lock:
+            if self._cancellation_attempted:
+                return self._cancellation_verified
+            self._cancellation_attempted = True
+            self._cancellation_verified = await self._cancel_process(reason)
+            return self._cancellation_verified
 
     async def _cancel_process(self, reason: Literal["operator", "timeout"]) -> bool:
-        if not self._state_path.is_file():
-            return False
+        if self._state_path is None:
+            if self._process_state is None:
+                return False
+            identity_arguments = self._identity_arguments(
+                process_state=self._process_state,
+                session_id=self._session_id,
+            )
+            if identity_arguments is None:
+                return False
+            state_arguments = ("-CancelIdentity", *identity_arguments)
+        else:
+            if not self._state_path.is_file():
+                return False
+            state_arguments = (
+                "-CancelStatePath",
+                str(self._state_path),
+                "-SessionId",
+                self._session_id,
+            )
         cancellation = await asyncio.create_subprocess_exec(
             str(self._pwsh_path),
             "-NoProfile",
             "-File",
             str(self._script_path),
-            "-CancelStatePath",
-            str(self._state_path),
-            "-SessionId",
-            self._session_id,
+            *state_arguments,
             "-CancellationReason",
             reason,
             env=self._cancellation_environment(),
@@ -849,6 +1161,38 @@ class PowerShellCodexRunner:
             "outcome": "cancelled",
             "cancellation_reason": reason,
         }
+
+    @staticmethod
+    def _identity_arguments(
+        *,
+        process_state: dict[str, object],
+        session_id: str,
+    ) -> tuple[str, ...] | None:
+        pid = process_state.get("pid")
+        ticks = process_state.get("start_time_utc_ticks")
+        executable = process_state.get("executable")
+        if (
+            process_state.get("session_id") != session_id
+            or isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid <= 0
+            or isinstance(ticks, bool)
+            or not isinstance(ticks, int)
+            or ticks <= 0
+            or not isinstance(executable, str)
+            or not executable
+        ):
+            return None
+        return (
+            "-SessionId",
+            session_id,
+            "-ProcessId",
+            str(pid),
+            "-ProcessStartTimeUtcTicks",
+            str(ticks),
+            "-ProcessExecutable",
+            executable,
+        )
 
     @staticmethod
     def _cancellation_environment() -> dict[str, str]:

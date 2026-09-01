@@ -101,9 +101,16 @@ class ConstitutionGatekeeper:
         bus: EventBus,
         ruleset: ConstitutionRuleset,
         ledger_query: LedgerQuery,
-        llm_judge: Optional[LlmJudge] = None,
+        llm_judge: LlmJudge,
         llm_timeout_seconds: float = 15.0,
     ):
+        # Layer 2 is not optional. A gate missing half its admission check
+        # still answers, which is worse than one that refuses to exist:
+        # nothing downstream can tell a thorough pass from a skipped one.
+        # Callers that deliberately want layer 1 alone pass an explicit
+        # accept-all judge, so that choice is visible at the wiring site.
+        if llm_judge is None:
+            raise ValueError("ConstitutionGatekeeper requires an llm_judge")
         self.bus = bus
         self.ruleset = ruleset
         self.ledger_query = ledger_query
@@ -132,16 +139,13 @@ class ConstitutionGatekeeper:
             await self._reject(event, reason, detail)
             return
 
-        if self.llm_judge is not None:
-            passed = await self._run_llm_judge(event.description)
-            if not passed:
-                await self._reject(event, "quality_bar", "semantic scope/quality check did not pass")
-                return
+        if not await self._run_llm_judge(event.description):
+            await self._reject(event, "quality_bar", "semantic scope/quality check did not pass")
+            return
 
         await self._accept(event)
 
     async def _run_llm_judge(self, description: str) -> bool:
-        assert self.llm_judge is not None
         try:
             return await asyncio.wait_for(
                 self.llm_judge(description, self.ruleset), timeout=self.llm_timeout_seconds

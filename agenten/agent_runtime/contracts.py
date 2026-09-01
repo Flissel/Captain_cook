@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import Any, Literal
 from uuid import UUID
@@ -94,6 +96,22 @@ class AgentRuntimeCommandPayload(_FrozenContract):
     integration_intent: IntegrationIntent = IntegrationIntent.NONE
     capability_profile: CapabilityProfile
     limits: RuntimeLimits
+    maximum_cost_usd: Decimal | None = None
+    budget_reservation_id: UUID | None = None
+    cost_authority_ref: str | None = Field(default=None, min_length=1)
+    cost_job_id: UUID | None = None
+    cost_run_id: UUID | None = None
+    cost_input_id: str | None = Field(default=None, min_length=1)
+    cost_capability_id: str | None = Field(default=None, min_length=1)
+    cost_capability_version: int | None = Field(default=None, ge=1, strict=True)
+    provider_proxy_url: str | None = Field(default=None, pattern=r"^http://127\.0\.0\.1:[0-9]{1,5}/v1$")
+    provider_policy_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_price_card_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_context_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_session_id: str | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    provider_result_id: UUID | None = None
 
     @field_validator("workspace_ref")
     @classmethod
@@ -144,6 +162,36 @@ class AgentRuntimeCommandPayload(_FrozenContract):
             CapabilityProfile.FACTORY_TOOL_INTEGRATOR,
         }:
             raise ValueError("Codex operations require a builder profile")
+        cost_fields = (
+            self.maximum_cost_usd,
+            self.budget_reservation_id,
+            self.cost_authority_ref,
+            self.cost_job_id,
+            self.cost_run_id,
+            self.cost_input_id,
+            self.cost_capability_id,
+            self.cost_capability_version,
+        )
+        if any(value is not None for value in cost_fields) and not all(
+            value is not None for value in cost_fields
+        ):
+            raise ValueError("runtime cost authority must be complete")
+        if self.maximum_cost_usd is not None and (
+            not self.maximum_cost_usd.is_finite() or self.maximum_cost_usd <= 0
+        ):
+            raise ValueError("runtime maximum cost must be finite and positive")
+        provider_fields = (
+            self.provider_proxy_url,
+            self.provider_policy_sha256,
+            self.provider_price_card_sha256,
+            self.provider_context_sha256,
+            self.provider_session_id,
+            self.provider_result_id,
+        )
+        if any(value is not None for value in provider_fields) and not all(
+            value is not None for value in provider_fields
+        ):
+            raise ValueError("runtime provider proxy binding must be complete")
         return self
 
 
@@ -180,10 +228,15 @@ class CapabilityGrant(_FrozenContract):
     )
     grant_id: str = Field(pattern=IDENTIFIER_PATTERN)
     command_id: UUID
-    batch_id: str = Field(pattern=IDENTIFIER_PATTERN)
-    batch_version: int = Field(ge=1, strict=True)
-    subtask_id: str = Field(pattern=IDENTIFIER_PATTERN)
-    workspace_ref: str = Field(min_length=1)
+    # A grant is either bound to released work or bound to nothing at all.
+    # Planning runs before any batch exists -- it is the operation that
+    # produces one -- so demanding a batch there is circular. An unbound
+    # grant says so instead of naming a batch that does not exist; which
+    # profiles may hold one is policy, enforced in capabilities.py.
+    batch_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
+    batch_version: int | None = Field(default=None, ge=1, strict=True)
+    subtask_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
+    workspace_ref: str | None = Field(default=None, min_length=1)
     profile: CapabilityProfile
     capabilities: tuple[str, ...] = Field(min_length=1)
     mcp_servers: tuple[str, ...] = ()
@@ -192,13 +245,20 @@ class CapabilityGrant(_FrozenContract):
 
     @field_validator("workspace_ref")
     @classmethod
-    def require_workspace_uri(cls, value: str) -> str:
-        if not value.startswith("workspace://"):
+    def require_workspace_uri(cls, value: str | None) -> str | None:
+        if value is not None and not value.startswith("workspace://"):
             raise ValueError("workspace_ref must use workspace://")
         return value
 
     @model_validator(mode="after")
     def validate_lifetime_and_capabilities(self) -> "CapabilityGrant":
+        bindings = (self.batch_id, self.batch_version, self.subtask_id, self.workspace_ref)
+        if any(value is not None for value in bindings) and not all(
+            value is not None for value in bindings
+        ):
+            raise ValueError(
+                "capability grant bindings are all present or all absent"
+            )
         issued_at = _require_utc(self.issued_at)
         expires_at = _require_utc(self.expires_at)
         if expires_at <= issued_at:
@@ -234,6 +294,267 @@ class CapabilityGrantRevocation(_FrozenContract):
         return _require_utc(value)
 
 
+class RuntimeResumeCostAuthorityV1(_FrozenContract):
+    """Authenticated Gateway authority for one bounded resume effect."""
+
+    schema_name: Literal["captain.runtime-resume-cost-authority.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    authorization_receipt_id: UUID
+    cost_authority_ref: str = Field(
+        pattern=r"^gateway://capability-resume-authorizations/"
+    )
+    reservation_id: UUID
+    job_id: UUID
+    run_id: UUID
+    input_id: str = Field(min_length=1)
+    correlation_id: UUID
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    command_id: UUID
+    ceiling_usd: Decimal
+    expires_at: datetime
+    hard_ceiling_enforced: bool = Field(strict=True)
+    metering_mode: Literal["provider_usage_receipt", "unavailable"]
+    provider_proxy_url: str | None = Field(default=None, pattern=r"^http://127\.0\.0\.1:[0-9]{1,5}/v1$")
+    provider_policy_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_price_card_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_context_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_session_id: str | None = Field(default=None, min_length=1)
+    provider_result_id: UUID | None = None
+
+    @field_validator("ceiling_usd", mode="before")
+    @classmethod
+    def require_positive_ceiling(cls, value: object) -> Decimal:
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount <= 0:
+            raise ValueError("resume cost ceiling must be finite and positive")
+        return amount
+
+    @field_validator("expires_at")
+    @classmethod
+    def require_utc_expiry(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+
+class RuntimeUsagePricingSnapshotV1(_FrozenContract):
+    """Immutable model allowlist and token pricing used for independent verification."""
+
+    schema_name: Literal["captain.runtime-usage-pricing-snapshot.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    snapshot_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    provider: Literal["openai"]
+    model: str = Field(pattern=IDENTIFIER_PATTERN)
+    input_cost_per_million_usd: Decimal
+    cached_input_cost_per_million_usd: Decimal
+    output_cost_per_million_usd: Decimal
+    effective_at: datetime
+    expires_at: datetime
+
+    @field_validator(
+        "input_cost_per_million_usd",
+        "cached_input_cost_per_million_usd",
+        "output_cost_per_million_usd",
+        mode="before",
+    )
+    @classmethod
+    def require_nonnegative_price(cls, value: object) -> Decimal:
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("runtime usage price must be finite and non-negative")
+        return amount
+
+    @field_validator("effective_at", "expires_at")
+    @classmethod
+    def require_utc_price_time(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+    @model_validator(mode="after")
+    def require_active_price_window(self) -> "RuntimeUsagePricingSnapshotV1":
+        if self.expires_at <= self.effective_at:
+            raise ValueError("runtime usage pricing window is invalid")
+        return self
+
+    @property
+    def snapshot_sha256(self) -> str:
+        return hashlib.sha256(canonical_json_bytes(self)).hexdigest()
+
+    def cost(
+        self,
+        *,
+        input_units: int,
+        cached_input_units: int,
+        output_units: int,
+    ) -> Decimal:
+        if (
+            min(input_units, cached_input_units, output_units) < 0
+            or cached_input_units > input_units
+        ):
+            raise ValueError("runtime usage token counts are invalid")
+        cost = (
+            Decimal(input_units - cached_input_units)
+            * self.input_cost_per_million_usd
+            + Decimal(cached_input_units)
+            * self.cached_input_cost_per_million_usd
+            + Decimal(output_units) * self.output_cost_per_million_usd
+        ) / Decimal(1_000_000)
+        return cost.quantize(Decimal("0.000001"))
+
+
+class RuntimeProviderUsageReceiptV1(_FrozenContract):
+    """Raw-free provider usage persisted in CAS and independently repriced."""
+
+    schema_name: Literal["captain.runtime-provider-usage-receipt.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    receipt_id: UUID
+    request_id: UUID
+    command_id: UUID
+    result_id: UUID
+    reservation_id: UUID
+    job_id: UUID
+    run_id: UUID
+    input_id: str = Field(min_length=1)
+    correlation_id: UUID
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    session_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    provider: Literal["openai"]
+    model: str = Field(min_length=1)
+    input_units: int = Field(ge=0, strict=True)
+    cached_input_units: int = Field(ge=0, strict=True)
+    output_units: int = Field(ge=0, strict=True)
+    actual_cost_usd: Decimal
+    pricing_snapshot_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    pricing_snapshot_sha256: str = Field(pattern=SHA256_PATTERN)
+    started_at: datetime
+    ended_at: datetime
+
+    @field_validator("actual_cost_usd", mode="before")
+    @classmethod
+    def require_known_receipt_cost(cls, value: object) -> Decimal:
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("runtime provider cost must be finite and non-negative")
+        return amount
+
+    @field_validator("started_at", "ended_at")
+    @classmethod
+    def require_utc_receipt_time(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+    @model_validator(mode="after")
+    def require_valid_receipt(self) -> "RuntimeProviderUsageReceiptV1":
+        if self.cached_input_units > self.input_units or self.ended_at < self.started_at:
+            raise ValueError("runtime provider usage receipt is invalid")
+        return self
+
+
+class RuntimeProviderCostSettlementV1(_FrozenContract):
+    """Provider-authoritative immutable usage settlement for one exact call."""
+
+    schema_name: Literal["captain.runtime-provider-cost-settlement.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    settlement_id: UUID
+    provider_call_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    receipt: RuntimeProviderUsageReceiptV1
+    receipt_sha256: str = Field(pattern=SHA256_PATTERN)
+    settled_at: datetime
+
+    @field_validator("settled_at")
+    @classmethod
+    def require_utc_settlement_time(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+    @model_validator(mode="after")
+    def require_digest_bound_settlement(self) -> "RuntimeProviderCostSettlementV1":
+        digest = hashlib.sha256(canonical_json_bytes(self.receipt)).hexdigest()
+        if self.receipt_sha256 != digest or self.settled_at < self.receipt.ended_at:
+            raise ValueError("runtime provider settlement is not digest bound")
+        return self
+
+
+class RuntimeCostEvidenceV1(_FrozenContract):
+    """Provider-originated actual usage for one runtime resume command."""
+
+    schema_name: Literal["captain.runtime-cost-evidence.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    receipt_id: UUID
+    command_id: UUID
+    result_id: UUID
+    original_command_id: UUID
+    reservation_id: UUID
+    job_id: UUID
+    run_id: UUID
+    input_id: str = Field(min_length=1)
+    correlation_id: UUID
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    input_units: int = Field(ge=0, strict=True)
+    cached_input_units: int = Field(ge=0, strict=True)
+    output_units: int = Field(ge=0, strict=True)
+    actual_cost_usd: Decimal
+    pricing_snapshot_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    pricing_snapshot_sha256: str = Field(pattern=SHA256_PATTERN)
+    started_at: datetime
+    ended_at: datetime
+    evidence_ref: ArtifactRef
+
+    @field_validator("actual_cost_usd", mode="before")
+    @classmethod
+    def require_known_actual_cost(cls, value: object) -> Decimal:
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("actual runtime cost must be finite and non-negative")
+        return amount
+
+    @field_validator("started_at", "ended_at")
+    @classmethod
+    def require_utc_usage_time(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+    @model_validator(mode="after")
+    def require_ordered_usage_time(self) -> "RuntimeCostEvidenceV1":
+        if (
+            self.ended_at < self.started_at
+            or self.cached_input_units > self.input_units
+        ):
+            raise ValueError("runtime cost evidence usage is invalid")
+        return self
+
+
+class RuntimeResumeCostSettlementV1(_FrozenContract):
+    """Atomic Gateway accounting result for a terminal resume attempt."""
+
+    schema_name: Literal["captain.runtime-resume-cost-settlement.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    settlement_id: UUID
+    command_id: UUID
+    reservation_id: UUID
+    disposition: Literal["accounted", "overrun", "unmetered"]
+    actual_cost_usd: Decimal | None = None
+    accounted_cost_usd: Decimal
+    evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+
+    @field_validator("actual_cost_usd", "accounted_cost_usd", mode="before")
+    @classmethod
+    def require_nonnegative_settlement_cost(
+        cls, value: object
+    ) -> Decimal | None:
+        if value is None:
+            return None
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("settlement cost must be finite and non-negative")
+        return amount
+
+
 class AgentRuntimeResult(_FrozenContract):
     schema_name: Literal["captain.agent-runtime-result.v1"] = Field(
         alias="schema",
@@ -252,6 +573,7 @@ class AgentRuntimeResult(_FrozenContract):
     session_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
     artifact_refs: tuple[ArtifactRef, ...] = ()
     evidence_refs: tuple[ArtifactRef, ...] = ()
+    cost_evidence: RuntimeCostEvidenceV1 | None = None
     error: str | None = Field(default=None, min_length=1)
 
     @field_validator("occurred_at")
@@ -271,6 +593,39 @@ class AgentRuntimeResult(_FrozenContract):
         if self.status not in failures and self.error is not None:
             raise ValueError("non-failed runtime results cannot contain an error")
         return self
+
+
+class RuntimeInfrastructureFailureEvidenceV1(_FrozenContract):
+    """Redacted, content-addressed identity for an adapter infrastructure failure."""
+
+    schema_name: Literal["captain.runtime-infrastructure-failure-evidence.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    failure_id: UUID
+    command_id: UUID
+    correlation_id: UUID
+    operation: RuntimeOperation
+    status: Literal["infrastructure_failed"] = "infrastructure_failed"
+    reason_code: Literal["adapter_failed"] = "adapter_failed"
+    occurred_at: datetime
+
+    @field_validator("occurred_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+
+class RuntimeResumeCostSettlementRequestV1(_FrozenContract):
+    """Terminal Runtime truth submitted for atomic Gateway cost accounting."""
+
+    schema_name: Literal["captain.runtime-resume-cost-settlement-request.v1"] = Field(
+        default="captain.runtime-resume-cost-settlement-request.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    command: AgentRuntimeCommand
+    result: AgentRuntimeResult
+    authority: RuntimeResumeCostAuthorityV1
 
 
 class MinibookReference(_FrozenContract):

@@ -83,20 +83,82 @@ PROFILE_CAPABILITIES: dict[CapabilityProfile, frozenset[str]] = {
     ),
 }
 
+# Capabilities that change a workspace. A profile carrying none of them can
+# hold an unbound grant: planning produces artifacts and creates the batch,
+# so requiring a released batch to plan would be circular. Derived rather
+# than hardcoded per profile, so a new profile is classified automatically.
+_WORKSPACE_MUTATING = frozenset(
+    {
+        "workspace.write",
+        "tests.run",
+        "codex.run",
+        "codex.resume",
+        "codex.cancel",
+        "codex.heartbeat",
+    }
+)
+
+
+def may_run_unbound(profile: CapabilityProfile) -> bool:
+    """True when the profile can never mutate a workspace."""
+
+    return not (PROFILE_CAPABILITIES[profile] & _WORKSPACE_MUTATING)
+
+
 LEASE_DURATION = timedelta(minutes=15)
+
+
+def _derive_unbound_grant(
+    command: AgentRuntimeCommand,
+    issued_at: datetime,
+) -> CapabilityGrant:
+    """Grant for work that runs before any batch exists.
+
+    Only profiles that cannot mutate a workspace qualify, so an unbound
+    grant can never authorise a change to released work. The bindings stay
+    absent rather than being filled with the project id: the ledger should
+    not record a batch that was never released.
+    """
+
+    payload = command.payload
+    profile = payload.capability_profile
+    if not may_run_unbound(profile):
+        raise CapabilityDenied(
+            f"{profile.value} can mutate a workspace and requires a released batch"
+        )
+    capabilities = PROFILE_CAPABILITIES[profile]
+    if payload.operation.value not in capabilities:
+        raise CapabilityDenied(
+            f"{payload.operation.value} is not permitted by profile {profile.value}"
+        )
+    return CapabilityGrant(
+        schema_name="captain.capability-grant.v1",
+        grant_id=_grant_id(command, None),
+        command_id=command.event_id,
+        profile=profile,
+        capabilities=tuple(sorted(capabilities)),
+        mcp_servers=("n8n-mcp",) if profile is CapabilityProfile.N8N_BUILDER else (),
+        issued_at=issued_at,
+        expires_at=issued_at + LEASE_DURATION,
+    )
 
 
 def derive_grant(
     command: AgentRuntimeCommand,
-    released_batch: WorkBatch,
+    released_batch: WorkBatch | None,
     now: datetime,
 ) -> CapabilityGrant:
     """Derive the only grant allowed by an exact command/batch pairing."""
 
     issued_at = _require_utc(now)
     payload = command.payload
-    if payload.batch_id is None or payload.subtask_id is None or payload.workspace_ref is None:
-        raise CapabilityDenied("runtime grants require batch, subtask, and workspace bindings")
+    bound = (payload.batch_id, payload.subtask_id, payload.workspace_ref)
+    if any(value is None for value in bound):
+        if any(value is not None for value in bound):
+            raise CapabilityDenied(
+                "runtime commands carry batch, subtask and workspace together or not at all"
+            )
+        return _derive_unbound_grant(command, issued_at)
     if payload.batch_id != released_batch.batch_id:
         raise CapabilityDenied("command batch does not match the released batch")
     if payload.subtask_id not in released_batch.subtask_ids:
@@ -141,8 +203,10 @@ def validate_grant(
         raise CapabilityDenied("grant belongs to a different command")
     if grant.batch_id != payload.batch_id:
         raise CapabilityDenied("grant belongs to a different batch")
-    if grant.batch_version != command.subject_version:
+    if grant.batch_id is not None and grant.batch_version != command.subject_version:
         raise CapabilityDenied("grant belongs to a different batch version")
+    if grant.batch_id is None and not may_run_unbound(grant.profile):
+        raise CapabilityDenied("profile requires a released batch binding")
     if grant.subtask_id != payload.subtask_id:
         raise CapabilityDenied("grant belongs to a different subtask")
     if grant.workspace_ref != payload.workspace_ref:
@@ -173,11 +237,11 @@ def validate_grant(
     return grant
 
 
-def _grant_id(command: AgentRuntimeCommand, released_batch: WorkBatch) -> str:
+def _grant_id(command: AgentRuntimeCommand, released_batch: WorkBatch | None) -> str:
     binding = "|".join(
         (
             str(command.event_id),
-            released_batch.batch_id,
+            released_batch.batch_id if released_batch is not None else "",
             str(command.subject_version),
             command.payload.subtask_id or "",
             command.payload.workspace_ref or "",

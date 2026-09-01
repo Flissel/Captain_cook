@@ -23,3 +23,7 @@ chromedriver*
 
 # Autogen_AgentFarm dropped — minibook vendored at ./minibook (2026-07-15)
 Autogen_AgentFarm/
+
+# Runtime start diagnostic captures (Task 4, 2026-08-19)
+runtime-stdout.log
+runtime-stderr.log

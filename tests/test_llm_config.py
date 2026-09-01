@@ -1,7 +1,11 @@
 import importlib
 
 
-def test_default_model_is_gpt_5_6(monkeypatch):
+def test_default_model_is_gpt_5_6(monkeypatch, tmp_path):
+    # The module also reads a .env from the working directory, so the
+    # default is only pinned once both sources are known to be empty --
+    # otherwise this asserts whatever the developer happens to have set.
+    monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("CAPTAIN_MODEL", raising=False)
 
     import config.llm_config as llm_config

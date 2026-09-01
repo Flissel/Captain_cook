@@ -56,7 +56,9 @@ def test_normalize_writes_safe_defaults_and_aliases_without_secret_output(tmp_pa
     assert result.returncode == 0, output
     normalized = env_file.read_text(encoding="utf-8")
     assert "MAILPIT_WEB_PORT=18025" in normalized
-    assert "MAILPIT_URL=http://localhost:18025" in normalized
+    # 127.0.0.1, not localhost: Mailpit listens on IPv4 only and Invoke-WebRequest
+    # resolves localhost to ::1 first, burning the full probe timeout.
+    assert "MAILPIT_URL=http://127.0.0.1:18025" in normalized
     assert f"CAPTAIN_N8N_API_KEY={secret}" in normalized
     assert f"OPENAI_API_KEY={opaque_provider}" in normalized
     assert secret not in output
@@ -98,7 +100,7 @@ def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
 def test_live_demo_services_only_operates_captain_resources() -> None:
     source = SERVICES.read_text(encoding="utf-8")
     assert "$global:LASTEXITCODE = 0" in source
-    assert 'ValidateSet("start", "portal-start", "gateway-restart", "benchmark-start"' in source
+    assert 'ValidateSet("start", "status", "portal-start", "gateway-restart", "benchmark-start"' in source
     assert "captain-n8n.ps1" in source
     assert "minibook-demo.ps1" in source
     assert "docker compose" in source
@@ -107,7 +109,9 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "mailpit" in source
     assert "evidence/live-demo-services.json" in source
     assert "docker-compose.test.yml" in source
-    assert "$project = 'captain-cook-test'" in source
+    # Derived per checkout, fixed prefix: worktrees get their own containers
+    # while the project stays identifiable as a Captain disposable test one.
+    assert "$project = 'captain-cook-test-'" in source
     assert "captain-cook-live-demo" not in source
     assert "mariadb-test" in source
     assert "python" in source and "gateway.app" in source
@@ -161,7 +165,7 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "docker stop" in source
     assert "com.docker.compose.project=captain-n8n-builder" in source
     assert "application/json, text/event-stream" in PREFLIGHT.read_text(encoding="utf-8")
-    assert "bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials" in source
+    assert "& $MinibookCommand start" in source
     assert "OPENAI" not in source.upper()
     assert source.index("Initialize-CaptainN8n $values") < source.index("mariadb-test")
     lowered = source.lower()

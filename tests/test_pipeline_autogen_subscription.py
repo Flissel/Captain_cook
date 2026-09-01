@@ -1,6 +1,6 @@
 """Real-runtime integration test for the unit-U11 integration point.
 
-`agenten/orchestration/pipeline.py`'s `build_pipeline()` wires the full
+`agenten/orchestration/pipeline.py`'s `build_pipeline( llm_judge=_accept_all_judge)` wires the full
 business-logic pipeline over `InMemoryEventBus` on purpose (see that
 module's docstring for why `AutoGenEventBus` is not a drop-in replacement
 for the whole pipeline today). What IS proven end-to-end against the real,
@@ -47,6 +47,12 @@ from agenten.workers.base import make_routed_agent_class  # noqa: E402
 from agenten.workers.echo_worker import EchoWorker  # noqa: E402
 
 
+async def _accept_all_judge(description, ruleset) -> bool:
+    """Layer 2 is mandatory; this test exercises layer 1 and says so."""
+
+    return True
+
+
 class PublishOnlyBus(EventBus):
     def __init__(self) -> None:
         self.handlers = []
@@ -63,7 +69,7 @@ def test_pipeline_rejects_publish_only_bus_before_wiring():
     bus = PublishOnlyBus()
 
     with pytest.raises(TypeError, match="SubscribableEventBus"):
-        build_pipeline(llm_decompose=_empty_decompose, bus=bus)
+        build_pipeline(llm_decompose=_empty_decompose, bus=bus, llm_judge=_accept_all_judge)
 
     assert bus.handlers == []
 

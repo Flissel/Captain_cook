@@ -255,7 +255,7 @@ class SupplyChainPipeline:
 def build_pipeline(
     *,
     llm_decompose: LlmDecompose,
-    llm_judge: Optional[LlmJudge] = None,
+    llm_judge: LlmJudge,
     bus: SubscribableEventBus | None = None,
     blockchain: Optional[Blockchain] = None,
     storage: Optional[LedgerStorage] = None,
@@ -276,9 +276,10 @@ def build_pipeline(
     """Construct and wire up the full supply-chain pipeline.
 
     ``llm_decompose`` is required (``DecomposerAgent`` has no usable default
-    -- see its own constructor); ``llm_judge`` is optional (``None`` skips
-    the Gatekeeper's semantic layer-2 check per
-    ``ConstitutionGatekeeper``'s own documented escape hatch).
+    -- see its own constructor), and so is ``llm_judge``: the Gatekeeper's
+    semantic layer-2 check is not optional. A caller that deliberately wants
+    layer 1 alone passes an explicit accept-all callable, so that choice is
+    visible at the wiring site instead of hiding in a default.
 
     Real LLM-backed implementations of both callables exist in
     ``agenten.llm``: ``make_llm_decompose(model_client, known_capability_tags)``

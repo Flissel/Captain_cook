@@ -11,6 +11,8 @@ from uuid import uuid5
 import httpx
 import pytest
 
+import agenten.agent_runtime.runtime_entrypoint as runtime_entrypoint
+
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
@@ -23,6 +25,12 @@ from agenten.agent_runtime.runtime_entrypoint import (
     RuntimeEntrypointSettings,
 )
 from tests.agent_runtime.test_service import batch_for
+from tests.agent_runtime.test_service import (
+    FakeCodex,
+    FakeCostAuthority,
+    FakeCapabilityPolicy,
+    resume_command_with_cost,
+)
 from tests.agent_runtime.test_gateway_client import command, result
 
 
@@ -164,16 +172,30 @@ async def test_execute_does_not_log_or_return_token_or_command_body(
 
 
 @pytest.mark.asyncio
-async def test_health_is_available_without_runtime_credentials() -> None:
+@pytest.mark.parametrize(
+    ("authorization", "expected_status"),
+    [
+        (None, 401),
+        ("Bearer wrong-runtime-token", 401),
+        (f"Bearer {TOKEN}", 200),
+    ],
+)
+async def test_health_requires_the_configured_runtime_bearer_token(
+    authorization: str | None,
+    expected_status: int,
+) -> None:
     response = await _request(
         RecordingExecutor(),
         method="GET",
         path="/health",
-        authorization=None,
+        authorization=authorization,
     )
 
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.status_code == expected_status
+    if expected_status == 200:
+        assert response.json() == {"status": "ok"}
+    else:
+        assert response.json() == {"detail": "runtime authentication failed"}
 
 
 def test_runtime_entrypoint_settings_are_strict_and_secret_redacting() -> None:
@@ -222,6 +244,55 @@ async def test_gateway_backed_state_loads_the_released_batch_with_captain_auth()
     assert requests[0].headers["authorization"] == "Bearer gateway-state-secret"
 
 
+@pytest.mark.asyncio
+async def test_gateway_backed_cost_authority_uses_authenticated_typed_routes() -> None:
+    adapter_type = getattr(runtime_entrypoint, "GatewayBackedRuntimeCostAuthority", None)
+    assert adapter_type is not None, "authenticated runtime cost port is missing"
+    command = resume_command_with_cost()
+    expected_authority = await FakeCostAuthority().authorize(command)
+    grant = FakeCapabilityPolicy().derive(command, batch_for(command), command.occurred_at)
+    result = await FakeCodex(["command_accepted", "grant_recorded"]).resume(
+        command, grant
+    )
+    expected_settlement = await FakeCostAuthority().settle(
+        command, result, expected_authority
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        response = (
+            expected_authority
+            if request.url.path.endswith("/validate")
+            else expected_settlement
+        )
+        return httpx.Response(
+            200,
+            json=response.model_dump(mode="json", by_alias=True),
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        costs = adapter_type(
+            base_url="http://gateway.test",
+            token="gateway-cost-secret",
+            client=http,
+        )
+        authority = await costs.authorize(command)
+        settlement = await costs.settle(command, result, authority)
+
+    assert authority == expected_authority
+    assert settlement == expected_settlement
+    assert [request.url.path for request in requests] == [
+        "/v1/capability-resumes/cost-authorities/validate",
+        "/v1/capability-resumes/cost-authorities/settle",
+    ]
+    assert all(
+        request.headers["authorization"] == "Bearer gateway-cost-secret"
+        for request in requests
+    )
+
+
 def test_live_demo_service_script_manages_runtime_by_verified_identity() -> None:
     root = Path(__file__).parents[2]
     script = (root / "scripts" / "live-demo-services.ps1").read_text(encoding="utf-8")
@@ -264,13 +335,14 @@ def test_start_preflights_runtime_before_any_service_mutation(tmp_path: Path) ->
         r"""
 $script:events = [Collections.Generic.List[string]]::new()
 function Initialize-LocalEnvironment { $script:events.Add('environment'); return [ordered]@{} }
+function Get-RuntimeAdapterManifestMetadata($Values) { $script:events.Add('runtime-manifest') }
 function Set-ProcessEnvironment($Values) { $script:events.Add('process-env') }
 function Assert-RuntimeConfiguration($Values) { $script:events.Add('runtime-preflight'); throw 'expected preflight failure' }
 function Initialize-CaptainN8n($Values, [switch]$Recover, [string]$SourceEnv) { $script:events.Add('n8n') }
 try { Invoke-StartServices -Recover:$false -SourceEnv '' } catch {
     if ($_.Exception.Message -ne 'expected preflight failure') { throw }
 }
-if (($script:events -join ',') -ne 'environment,process-env,runtime-preflight') {
+if (($script:events -join ',') -ne 'runtime-manifest,environment,process-env,runtime-preflight') {
     throw "Unexpected start order: $($script:events -join ',')"
 }
 "preflight-order-ok"
@@ -293,7 +365,12 @@ function Get-NetTCPConnection {
     return [pscustomobject]@{OwningProcess=424242;LocalPort=8091;State='Listen'}
 }
 function taskkill.exe { throw 'taskkill must not run for an unmanaged listener' }
-$values = [ordered]@{CAPTAIN_RUNTIME_URL='http://127.0.0.1:8091'}
+$values = [ordered]@{
+    CAPTAIN_RUNTIME_URL='http://127.0.0.1:8091'
+    CAPTAIN_RUNTIME_TOKEN='fixture-runtime-token'
+    CAPTAIN_RUNTIME_ADAPTER_MANIFEST='C:\runtime-adapters\manifest.json'
+    CAPTAIN_RUNTIME_ADAPTER_MANIFEST_SHA256=('a' * 64)
+}
 try { Start-Runtime $values; throw 'expected unmanaged listener refusal' } catch {
     if ($_.Exception.Message -ne 'Runtime port is occupied by an unmanaged process; refusing to reuse or stop it.') { throw }
 }
@@ -305,18 +382,70 @@ try { Start-Runtime $values; throw 'expected unmanaged listener refusal' } catch
     assert "unmanaged-refusal-ok" in completed.stdout
 
 
+@pytest.mark.parametrize(
+    ("listener_owner", "expected"),
+    [
+        ("$PID", "fresh-listener-verified"),
+        ("($PID + 1)", "fresh-listener-rejected"),
+    ],
+)
+def test_runtime_fresh_start_binds_the_listener_before_writing_ready_identity(
+    tmp_path: Path,
+    listener_owner: str,
+    expected: str,
+) -> None:
+    completed = _run_powershell_helpers(
+        tmp_path,
+        rf"""
+$script:listenerCalls = 0
+function Get-ManagedRuntimeProcess($Values) {{ return $null }}
+function Get-RuntimeConfigurationSha256($Values) {{ return ('a' * 64) }}
+function Get-RuntimePythonExecutable {{ return (Get-Process -Id $PID).Path }}
+function Set-ProcessEnvironment($Values) {{}}
+function Start-Process {{ param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle, [switch]$PassThru); return Get-Process -Id $PID }}
+function Test-AuthenticatedRuntimeHealth($Values) {{ return $true }}
+function Get-RuntimeListeners([int]$Port) {{
+    $script:listenerCalls++
+    if ($script:listenerCalls -eq 1) {{ return @() }}
+    return @([pscustomobject]@{{OwningProcess={listener_owner}}})
+}}
+function Start-Sleep {{ throw 'fresh-listener-rejected' }}
+$values = [ordered]@{{
+    CAPTAIN_RUNTIME_URL='http://127.0.0.1:8091'
+    CAPTAIN_RUNTIME_TOKEN='fixture-runtime-token'
+    CAPTAIN_RUNTIME_ADAPTER_MANIFEST='C:\runtime-adapters\manifest.json'
+    CAPTAIN_RUNTIME_ADAPTER_MANIFEST_SHA256=('a' * 64)
+}}
+if ('{expected}' -eq 'fresh-listener-verified') {{
+    Start-Runtime $values
+    if ($script:listenerCalls -ne 2) {{ throw 'fresh listener was not rechecked after health' }}
+    '{expected}'
+}} else {{
+    try {{ Start-Runtime $values; throw 'fresh start accepted foreign listener' }} catch {{
+        if ($_.Exception.Message -ne 'fresh-listener-rejected') {{ throw }}
+    }}
+    '{expected}'
+}}
+""",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert expected in completed.stdout
+
+
 def test_runtime_identity_mismatch_refuses_process_tree_stop(tmp_path: Path) -> None:
     completed = _run_powershell_helpers(
         tmp_path,
         r"""
 $runtimePid = Join-Path $PSScriptRoot 'runtime.pid'
-@{pid=424242;started_at='2026-07-21T10:00:00.0000000Z';executable='C:\expected\python.exe'} | ConvertTo-Json -Compress | Set-Content $runtimePid -Encoding utf8
+@{schema='captain.managed-process-identity.v1';pid=424242;started_at='2026-07-21T10:00:00.0000000Z';executable='C:\expected\python.exe';configuration_sha256=('a' * 64)} | ConvertTo-Json -Compress | Set-Content $runtimePid -Encoding utf8
+function Get-RuntimeConfigurationSha256($Values) { return ('a' * 64) }
 function Get-Process {
     param([int]$Id, $ErrorAction)
     return [pscustomobject]@{Id=$Id;StartTime=[datetime]'2026-07-21T10:00:00Z';Path='C:\foreign\python.exe'}
 }
 function taskkill.exe { throw 'taskkill must not run after identity mismatch' }
-try { Stop-ManagedRuntime; throw 'expected identity mismatch refusal' } catch {
+try { Stop-ManagedRuntime ([ordered]@{fixture='values'}); throw 'expected identity mismatch refusal' } catch {
     if ($_.Exception.Message -ne 'PID no longer belongs to the managed Runtime process.') { throw }
 }
 "identity-mismatch-ok"
