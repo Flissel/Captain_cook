@@ -1,4 +1,5 @@
-"""Bounded timeout and retry policy for Captain-owned LLM stages."""
+"""Bounded timeout and retry policy for LLM-backed stages: Captain planning
+(decompose/align/enrich) and householder execution."""
 
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ class LlmStage(str, Enum):
     DECOMPOSE = "decompose"
     ALIGN = "align"
     ENRICH = "enrich"
+    HOUSEHOLDER_EXECUTE = "householder_execute"
 
 
 class LlmStageError(RuntimeError):
