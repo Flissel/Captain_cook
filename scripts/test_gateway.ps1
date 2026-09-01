@@ -205,7 +205,10 @@ try {
     Push-Location -LiteralPath $repoRoot
     $locationPushed = $true
 
-    & $dockerCommand compose --project-name captain-cook-test --file $composeFile up -d --wait
+    # Per-checkout project, mirroring live-demo-services: a fixed name let one
+    # worktree's compose command tear down another's running database.
+    $composeProject = 'captain-cook-test-' + ((Split-Path $PSScriptRoot -Parent | Split-Path -Leaf).ToLowerInvariant() -replace '[^a-z0-9_-]', '-')
+    & $dockerCommand compose --project-name $composeProject --file $composeFile up -d --wait
     $upExitCode = $LASTEXITCODE
     if ($upExitCode -ne 0) {
         throw "Isolated MariaDB startup failed with exit code $upExitCode"
@@ -267,7 +270,7 @@ try {
     $primaryError = $_
 } finally {
     try {
-        & $dockerCommand compose --project-name captain-cook-test --file $composeFile down --remove-orphans
+        & $dockerCommand compose --project-name $composeProject --file $composeFile down --remove-orphans
         $downExitCode = $LASTEXITCODE
         if ($downExitCode -ne 0) {
             $cleanupErrors.Add("Isolated MariaDB cleanup failed with exit code $downExitCode")

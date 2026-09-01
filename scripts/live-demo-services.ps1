@@ -41,7 +41,14 @@ $benchmarkGatewayPid = Join-Path $stateDir 'gateway-business-benchmark.pid'
 $benchmarkRuntimeEnv = Join-Path $stateDir 'private/business-benchmarks/business-benchmark-runtime.env'
 $runtimePid = Join-Path $stateDir 'runtime-demo.pid'
 $evidence = Join-Path $stateDir 'evidence/live-demo-services.json'
-$project = 'captain-cook-test'
+# One compose project per checkout. The name used to be fixed, so every
+# Captain worktree drove the same containers and a compose command in one
+# stopped the database another was mid-test against -- observed five times
+# in a day, each an abrupt exit 255 with no MariaDB error in its own log.
+# What keeps tests off a real database is the DSN guard in
+# tests/support/mariadb.py, not this name, so a per-checkout suffix costs
+# no isolation; the prefix keeps the project identifiable as disposable.
+$project = 'captain-cook-test-' + ((Split-Path $root -Leaf).ToLowerInvariant() -replace '[^a-z0-9_-]', '-')
 $benchmarkProject = 'captain-cook-business-benchmark'
 . (Join-Path $PSScriptRoot 'managed-process-identity.ps1')
 

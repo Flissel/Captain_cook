@@ -367,13 +367,17 @@ def test_gate_uses_only_the_absolute_isolated_compose_project() -> None:
     source = (ROOT / "scripts/test_gateway.ps1").read_text(encoding="utf-8")
 
     assert "[System.IO.Path]::GetFullPath" in source
+    # The project is derived per checkout so two worktrees cannot drive the
+    # same containers, but the prefix stays fixed: the gate can still only
+    # ever address a Captain disposable test project, never an arbitrary one.
+    assert "'captain-cook-test-'" in source
     assert re.search(
-        r"compose\s+--project-name\s+captain-cook-test\s+--file\s+\$composeFile\s+up\s+-d\s+--wait",
+        r"compose\s+--project-name\s+\$composeProject\s+--file\s+\$composeFile\s+up\s+-d\s+--wait",
         source,
         re.IGNORECASE,
     )
     down_match = re.search(
-        r"compose\s+--project-name\s+captain-cook-test\s+--file\s+\$composeFile\s+down[^\r\n]*",
+        r"compose\s+--project-name\s+\$composeProject\s+--file\s+\$composeFile\s+down[^\r\n]*",
         source,
         re.IGNORECASE,
     )

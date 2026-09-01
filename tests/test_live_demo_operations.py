@@ -109,7 +109,9 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "mailpit" in source
     assert "evidence/live-demo-services.json" in source
     assert "docker-compose.test.yml" in source
-    assert "$project = 'captain-cook-test'" in source
+    # Derived per checkout, fixed prefix: worktrees get their own containers
+    # while the project stays identifiable as a Captain disposable test one.
+    assert "$project = 'captain-cook-test-'" in source
     assert "captain-cook-live-demo" not in source
     assert "mariadb-test" in source
     assert "python" in source and "gateway.app" in source
