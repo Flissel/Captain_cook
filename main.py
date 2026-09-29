@@ -6,19 +6,33 @@ import asyncio
 from pathlib import Path
 from typing import Sequence
 
-from agenten.demo import run_demo
+from agenten.demo import DemoSummary, run_demo
+
+# Committed deterministic evidence; an LLM run must never overwrite it.
+DEMO_OUTPUT = Path("artifacts/demo-run.json")
+# Default for `--householder-executor llm`; gitignored, provider output varies.
+LLM_DEMO_OUTPUT = Path("artifacts/demo-run-llm.json")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Captain Cook demos")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    demo_parser = subparsers.add_parser("demo", help="Run the offline audited pipeline demo")
+    demo_parser = subparsers.add_parser(
+        "demo",
+        help=(
+            "Run the audited pipeline demo (deterministic and offline unless "
+            "--householder-executor llm)"
+        ),
+    )
     demo_parser.add_argument(
         "--output",
         type=Path,
-        default=Path("artifacts/demo-run.json"),
-        help="Path for the generated JSON evidence artifact",
+        default=None,
+        help=(
+            f"Path for the generated JSON evidence artifact (default {DEMO_OUTPUT}, "
+            f"or {LLM_DEMO_OUTPUT} with --householder-executor llm)"
+        ),
     )
     demo_parser.add_argument(
         "--householder-executor",
@@ -80,15 +94,37 @@ def run_legacy() -> int:
     return 0
 
 
+def demo_output_path(output: Path | None, householder_executor: str) -> Path:
+    """Explicit --output wins; an LLM run defaults away from committed evidence."""
+    if output is not None:
+        return output
+    return LLM_DEMO_OUTPUT if householder_executor == "llm" else DEMO_OUTPUT
+
+
+async def _run_llm_demo(output_path: Path) -> DemoSummary:
+    from agenten.llm.model_client import build_model_client
+    from config import llm_config
+
+    profile = llm_config.get_profile()
+    model_client = build_model_client(profile=profile)
+    try:
+        return await run_demo(
+            output_path,
+            householder_model_client=model_client,
+            householder_model=profile.model,
+        )
+    finally:
+        await model_client.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "demo":
-        model_client = None
+        output_path = demo_output_path(args.output, args.householder_executor)
         if args.householder_executor == "llm":
-            from agenten.llm.model_client import build_model_client
-
-            model_client = build_model_client()
-        summary = asyncio.run(run_demo(args.output, householder_model_client=model_client))
+            summary = asyncio.run(_run_llm_demo(output_path))
+        else:
+            summary = asyncio.run(run_demo(output_path))
         print(f"Demo complete: {summary.done_count} subproblems reached done")
         return 0
     if args.command == "recover-gateway":

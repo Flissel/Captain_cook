@@ -105,7 +105,11 @@ OpenAI-compatible API by default.
 2. Optional: set `CAPTAIN_MODEL` to another Token Factory model id; the
    default is Nemotron 3 Super.
 3. Run the pipeline demo with LLM householders:
-   `.\.venv\Scripts\python.exe main.py demo --householder-executor llm`
+   `.\.venv\Scripts\python.exe main.py demo --householder-executor llm --output artifacts/demo-run-llm.json`
+   (that gitignored path is also the default for `--householder-executor llm`;
+   the committed deterministic evidence `artifacts/demo-run.json` is never
+   overwritten by an LLM run). The JSON records `householder_executor` and
+   the `model` id.
 
 `CAPTAIN_LLM_PROVIDER=openai` or `=custom` (with `CAPTAIN_LLM_BASE_URL`)
 switch back to OpenAI or a local endpoint. The offline demo

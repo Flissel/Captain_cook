@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Literal
 
 from autogen_core.models import ChatCompletionClient
 
@@ -30,13 +31,19 @@ LLM_CONVERGENCE_TIMEOUT_SECONDS = (
 
 @dataclass(frozen=True)
 class DemoSummary:
-    """Inspectable outcome of one deterministic pipeline execution."""
+    """Inspectable outcome of one pipeline demo execution.
+
+    `householder_executor` and `model` record which path produced the
+    evidence; a deterministic run has no model.
+    """
 
     success: bool
     problem_id: str
     terminal_count: int
     done_count: int
     blocks: list[dict[str, object]]
+    householder_executor: Literal["deterministic", "llm"] = "deterministic"
+    model: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -98,13 +105,17 @@ async def run_demo(
     output_path: Path | None = None,
     *,
     householder_model_client: ChatCompletionClient | None = None,
+    householder_model: str | None = None,
 ) -> DemoSummary:
     """Run the pipeline demo and optionally persist its evidence.
 
     Without a model client the householders stay deterministic and the demo
     needs no network. With one, all four householders report through
-    `LlmHouseholderExecutor`, whose evidence is marked `llm_reported:`.
+    `LlmHouseholderExecutor`, whose evidence is marked `llm_reported:`;
+    `householder_model` names the model recorded in the summary.
     """
+    if householder_model_client is None and householder_model is not None:
+        raise ValueError("householder_model requires householder_model_client")
     blockchain = Blockchain(storage=InMemoryStorage())
     executor = (
         LlmHouseholderExecutor(
@@ -150,6 +161,8 @@ async def run_demo(
             terminal_count=terminal_count,
             done_count=done_count,
             blocks=[_serialize_block(block) for block in blockchain.chain],
+            householder_executor="deterministic" if executor is None else "llm",
+            model=householder_model,
         )
     finally:
         await pipeline.stop()

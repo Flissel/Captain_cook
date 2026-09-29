@@ -89,3 +89,120 @@ async def test_llm_path_timeout_covers_the_executor_worst_case(monkeypatch):
 
     assert timeout == demo.LLM_CONVERGENCE_TIMEOUT_SECONDS == 270.0
     assert timeout >= 4 * demo.LLM_CALL_TIMEOUT_SECONDS * demo.LLM_CALL_MAX_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_summary_records_the_llm_executor_and_model(tmp_path):
+    client = build_replay_model_client([_report() for _ in range(4)])
+    output = tmp_path / "demo-run-llm.json"
+
+    summary = await run_demo(
+        output, householder_model_client=client, householder_model="nvidia/test-model"
+    )
+
+    assert summary.householder_executor == "llm"
+    assert summary.model == "nvidia/test-model"
+    written = json.loads(output.read_text(encoding="utf-8"))
+    assert written["householder_executor"] == "llm"
+    assert written["model"] == "nvidia/test-model"
+
+
+@pytest.mark.asyncio
+async def test_summary_records_the_deterministic_executor_without_a_model():
+    summary = await run_demo()
+
+    assert summary.householder_executor == "deterministic"
+    assert summary.model is None
+
+
+class _ClosingClient:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _stub_llm_demo(monkeypatch, *, fail: bool = False):
+    from agenten.llm import model_client as model_client_module
+    from config import llm_config
+    from config.llm_provider import NEBIUS_BASE_URL, ProviderProfile
+
+    profile = ProviderProfile("nebius", "nvidia/test-model", NEBIUS_BASE_URL, "nb-test", True, True)
+    client = _ClosingClient()
+    calls: list[dict[str, object]] = []
+
+    async def fake_run_demo(output_path=None, **kwargs):
+        calls.append({"output_path": output_path, **kwargs})
+        if fail:
+            raise RuntimeError("provider failed")
+        return type("Summary", (), {"done_count": 4})()
+
+    monkeypatch.setattr(llm_config, "get_profile", lambda: profile)
+    monkeypatch.setattr(model_client_module, "build_model_client", lambda **_: client)
+    monkeypatch.setattr(main, "run_demo", fake_run_demo)
+    return client, calls
+
+
+def test_llm_demo_defaults_to_its_own_evidence_file(monkeypatch):
+    client, calls = _stub_llm_demo(monkeypatch)
+
+    assert main.main(["demo", "--householder-executor", "llm"]) == 0
+
+    # The committed deterministic evidence is never overwritten by an LLM run.
+    assert calls[0]["output_path"] == main.LLM_DEMO_OUTPUT
+    assert main.LLM_DEMO_OUTPUT != main.DEMO_OUTPUT
+    assert calls[0]["householder_model_client"] is client
+    assert calls[0]["householder_model"] == "nvidia/test-model"
+    assert client.closed is True
+
+
+def test_llm_demo_respects_an_explicit_output(monkeypatch, tmp_path):
+    _client, calls = _stub_llm_demo(monkeypatch)
+
+    main.main(["demo", "--householder-executor", "llm", "--output", str(tmp_path / "x.json")])
+
+    assert calls[0]["output_path"] == tmp_path / "x.json"
+
+
+def test_llm_demo_closes_the_client_when_the_run_fails(monkeypatch):
+    client, _calls = _stub_llm_demo(monkeypatch, fail=True)
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        main.main(["demo", "--householder-executor", "llm"])
+    assert client.closed is True
+
+
+def test_deterministic_demo_keeps_the_committed_output_path(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    async def fake_run_demo(output_path=None, **kwargs):
+        calls.append({"output_path": output_path, **kwargs})
+        return type("Summary", (), {"done_count": 4})()
+
+    monkeypatch.setattr(main, "run_demo", fake_run_demo)
+
+    assert main.main(["demo"]) == 0
+    assert calls == [{"output_path": main.DEMO_OUTPUT}]
+
+
+def test_llm_evidence_file_is_gitignored_but_committed_evidence_is_not():
+    import subprocess
+
+    def ignored(path: str) -> bool:
+        return (
+            subprocess.run(
+                ["git", "check-ignore", "-q", "--no-index", path], check=False
+            ).returncode
+            == 0
+        )
+
+    assert ignored("artifacts/demo-run-llm.json")
+    assert not ignored("artifacts/demo-run.json")
+
+
+def test_demo_help_no_longer_claims_offline_only(capsys):
+    with pytest.raises(SystemExit):
+        main.parse_args(["--help"])
+
+    assert "offline audited pipeline demo" not in capsys.readouterr().out

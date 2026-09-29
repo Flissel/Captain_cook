@@ -12,6 +12,8 @@ blockchain.json
 .captain-cook/runtime-adapters/
 artifacts/evaluations/
 artifacts/agent-factory/
+# Provider-backed demo output; the committed deterministic evidence is artifacts/demo-run.json.
+artifacts/demo-run-llm.json
 config/swarm_agents.json
 output/
 .venv/
