@@ -1,3 +1,7 @@
+import os
+
+import pytest
+
 from agenten.agent_factory import live_demo_entrypoint
 
 
@@ -47,3 +51,43 @@ def test_live_demo_hermes_without_provider_keeps_defaults(monkeypatch, tmp_path)
 
     assert settings.provider is None
     assert settings.model is None
+
+
+def test_live_demo_hermes_on_token_factory_carries_the_nebius_endpoint(monkeypatch, tmp_path):
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    settings = _build(
+        monkeypatch,
+        tmp_path,
+        {
+            "CAPTAIN_HERMES_PROVIDER": "custom",
+            "CAPTAIN_HERMES_MODEL": "nvidia/Nemotron-3-Super-120b-a12b",
+            "CAPTAIN_HERMES_BASE_URL": "https://api.tokenfactory.nebius.com/v1",
+            "NEBIUS_API_KEY": "nb-test",
+        },
+    )
+
+    assert dict(settings.environment_overrides) == {
+        "OPENAI_BASE_URL": "https://api.tokenfactory.nebius.com/v1",
+        "OPENAI_API_KEY": "nb-test",
+    }
+    assert "OPENAI_API_KEY" not in os.environ
+
+
+def test_live_demo_hermes_on_token_factory_without_key_fails_closed(monkeypatch, tmp_path):
+    with pytest.raises(live_demo_entrypoint.LiveDemoConfigurationError, match="NEBIUS_API_KEY"):
+        _build(
+            monkeypatch,
+            tmp_path,
+            {
+                "CAPTAIN_HERMES_PROVIDER": "custom",
+                "CAPTAIN_HERMES_MODEL": "nvidia/x",
+                "CAPTAIN_HERMES_BASE_URL": "https://api.tokenfactory.nebius.com/v1",
+            },
+        )
+
+
+def test_live_demo_hermes_without_base_url_has_no_overrides(monkeypatch, tmp_path):
+    settings = _build(monkeypatch, tmp_path, {})
+
+    assert dict(settings.environment_overrides) == {}

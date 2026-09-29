@@ -19,6 +19,7 @@ from agenten.agent_factory.hermes_cli import (
     HermesCliFactory,
     HermesCliSettings,
 )
+from agenten.agent_factory.hermes_endpoint import hermes_endpoint_overrides
 from agenten.agent_factory.live_demo_one_shot import LiveDemoEvidenceSummary, LiveDemoOneShot
 from agenten.agent_factory.live_demo_runtime_chain import (
     LiveDemoRuntimeChain,
@@ -83,6 +84,12 @@ def build_live_demo_hermes(
     values = os.environ if environ is None else environ
     provider = values.get("CAPTAIN_HERMES_PROVIDER", "").strip() or None
     model = values.get("CAPTAIN_HERMES_MODEL", "").strip() or None
+    # Same endpoint/key translation as the production runtime adapter; the
+    # key reaches only the Hermes child process, never os.environ.
+    try:
+        environment_overrides = hermes_endpoint_overrides(values)
+    except ValueError as exc:
+        raise LiveDemoConfigurationError(str(exc)) from None
     settings = HermesCliSettings(
         executable=hermes_executable,
         skill_root=skill_root,
@@ -90,6 +97,7 @@ def build_live_demo_hermes(
         released_skill_root=released_skill_root,
         provider=provider,
         model=model,
+        environment_overrides=environment_overrides,
     )
     factory = HermesCliFactory(
         settings=settings,
