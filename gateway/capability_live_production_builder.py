@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from agenten.agent_factory.benchmark_providers import BENCHMARK_PROVIDERS
 from agenten.agent_factory.capability_live_runner import CapabilityLiveRunner
 from agenten.agent_runtime.production_bootstrap import (
     RuntimeAdapterManifestError,
@@ -89,7 +90,7 @@ class CapabilityLiveProductionSettings:
             raise CapabilityLiveProductionConfigurationError(
                 "current capability live configuration is blocked"
             )
-        if values["benchmark_provider"] != "openai":
+        if values["benchmark_provider"] not in BENCHMARK_PROVIDERS:
             raise CapabilityLiveProductionConfigurationError(
                 "current capability benchmark provider is unsupported"
             )

@@ -26,6 +26,10 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import httpx
 
+from agenten.agent_factory.benchmark_providers import (
+    BENCHMARK_PROVIDERS,
+    benchmark_provider_secret_name,
+)
 from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkCaseV1,
     BusinessBenchmarkReceiptV1,
@@ -1708,7 +1712,11 @@ def build_production_business_benchmark_composition(
             "token issuer, Captain endpoint, and deployed workflow binding"
         )
 
-    if canonical.provider != "openai" or canonical.provider_secret_name != "OPENAI_API_KEY":
+    if (
+        canonical.provider not in BENCHMARK_PROVIDERS
+        or canonical.provider_secret_name
+        != benchmark_provider_secret_name(canonical.provider)
+    ):
         raise ValueError("benchmark provider authority is not allowlisted")
     _required_bootstrap_setting(environment, "CAPTAIN_GATEWAY_URL")
     _required_bootstrap_setting(environment, "CAPTAIN_GATEWAY_TOKEN")

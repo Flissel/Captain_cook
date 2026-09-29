@@ -12,6 +12,7 @@ from uuid import UUID
 
 from autogen_core.models import ChatCompletionClient
 
+from agenten.agent_factory.benchmark_providers import BENCHMARK_PROVIDERS
 from agenten.agent_factory.business_benchmark import BusinessBenchmarkEvaluator
 from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkSummaryV1,
@@ -195,7 +196,7 @@ class GatewayTechnicalTeamExecutionPortsProvider:
         max_cost_per_call: Decimal,
         clock: Callable[[], datetime],
     ) -> None:
-        if provider != "openai" or not model.strip() or max_cost_per_call <= 0:
+        if provider not in BENCHMARK_PROVIDERS or not model.strip() or max_cost_per_call <= 0:
             raise ValueError("technical team provider configuration is invalid")
         self._candidate_bindings = candidate_bindings
         self._technical_holdout_root = technical_holdout_root.resolve()

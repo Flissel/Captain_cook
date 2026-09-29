@@ -18,6 +18,10 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from fastapi import HTTPException
 import httpx
 
+from agenten.agent_factory.benchmark_providers import (
+    BENCHMARK_PROVIDERS,
+    benchmark_provider_secret_name,
+)
 from agenten.agent_factory.business_benchmark_bootstrap import (
     CaptainClaimsBusinessBenchmarkExecutorBuilder,
     CaptainRenewalBusinessBenchmarkExecutorBuilder,
@@ -583,8 +587,9 @@ class GatewayBusinessBenchmarkLiveCompositionLoader:
         )
         environment = self._environment
         if (
-            canonical.provider != "openai"
-            or canonical.provider_secret_name != "OPENAI_API_KEY"
+            canonical.provider not in BENCHMARK_PROVIDERS
+            or canonical.provider_secret_name
+            != benchmark_provider_secret_name(canonical.provider)
         ):
             raise ValueError("benchmark provider authority is not allowlisted")
         authority = GatewayBusinessBenchmarkCompositionAuthority(

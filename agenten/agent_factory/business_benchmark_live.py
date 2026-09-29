@@ -41,12 +41,16 @@ from agenten.agent_factory.team_execution import (
     FactoryToolExecutionEvidenceV1,
 )
 from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
+from agenten.agent_factory.benchmark_providers import BENCHMARK_PROVIDERS
+from config.llm_provider import PROVIDER_SECRET_NAMES
 
 
 _SAFE_FACT_ID = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 _SAFE_AGENT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _EVIDENCE_RELATIVE_ROOT = Path(".captain-cook/evidence/business-benchmarks")
-_PROVIDER_SECRET_NAMES = {"openai": "OPENAI_API_KEY"}
+_PROVIDER_SECRET_NAMES = {
+    name: PROVIDER_SECRET_NAMES[name] for name in BENCHMARK_PROVIDERS
+}
 _DEFAULT_REDACTION_POLICY_SHA256 = hashlib.sha256(
     b"captain-business-benchmark-redaction-policy-v1"
 ).hexdigest()

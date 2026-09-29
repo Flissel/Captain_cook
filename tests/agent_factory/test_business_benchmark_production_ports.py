@@ -259,7 +259,7 @@ def test_openai_builder_is_job_bound_and_keeps_secret_out_of_repr() -> None:
     created: list[dict[str, str]] = []
     replay = replay_client(["unused"])
 
-    def build_client(*, api_key: str, model: str):
+    def build_client(*, provider: str, api_key: str, model: str):
         created.append({"api_key": api_key, "model": model})
         return replay
 
@@ -283,7 +283,7 @@ def test_openai_builder_is_job_bound_and_keeps_secret_out_of_repr() -> None:
 def test_openai_client_does_not_apply_tool_only_arguments_globally(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import agenten.agent_factory.business_benchmark_production_ports as ports
+    import agenten.agent_factory.benchmark_providers as ports
 
     observed: dict[str, object] = {}
 
@@ -293,7 +293,9 @@ def test_openai_client_does_not_apply_tool_only_arguments_globally(
 
     monkeypatch.setattr(ports, "OpenAIChatCompletionClient", capture)
 
-    ports._build_openai_client(api_key="test-secret", model="approved-model-id")
+    ports.build_benchmark_model_client(
+        provider="openai", api_key="test-secret", model="approved-model-id"
+    )
 
     assert observed == {
         "api_key": "test-secret",
@@ -308,7 +310,7 @@ def test_openai_builder_rejects_wrong_provider_and_non_live_job() -> None:
         OpenAIBusinessBenchmarkModelClientBuilder,
     )
 
-    with pytest.raises(ValueError, match="provider must be openai"):
+    with pytest.raises(ValueError, match="nebius, openai"):
         OpenAIBusinessBenchmarkModelClientBuilder.from_environment(
             {
                 "CAPTAIN_BENCHMARK_PROVIDER": "other",

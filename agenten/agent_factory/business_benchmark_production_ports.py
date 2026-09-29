@@ -16,9 +16,14 @@ from typing import Literal, Protocol
 from uuid import UUID
 
 from autogen_core.models import ChatCompletionClient
-from autogen_ext.models.openai import OpenAIChatCompletionClient
 from pydantic import BaseModel, ConfigDict, Field
 
+from agenten.agent_factory.benchmark_providers import (
+    BENCHMARK_PROVIDERS,
+    benchmark_provider_secret_name,
+    build_benchmark_model_client,
+    require_benchmark_provider,
+)
 from agenten.agent_factory.candidate_evaluation import (
     FactoryCandidateManifest,
     ResolvedFactoryCandidate,
@@ -246,15 +251,6 @@ class BusinessBenchmarkContentAddressedArtifactStore:
 BenchmarkModelClientFactory = Callable[..., ChatCompletionClient]
 
 
-def _build_openai_client(*, api_key: str, model: str) -> ChatCompletionClient:
-    return OpenAIChatCompletionClient(
-        api_key=api_key,
-        model=model,
-        max_retries=0,
-        temperature=0,
-    )
-
-
 @dataclass(frozen=True)
 class OpenAIBusinessBenchmarkModelClientBuilder:
     """Build a real OpenAI client only for the exact authorized benchmark job."""
@@ -263,7 +259,7 @@ class OpenAIBusinessBenchmarkModelClientBuilder:
     model: str
     _api_key: str = field(repr=False)
     _client_factory: BenchmarkModelClientFactory = field(
-        default=_build_openai_client,
+        default=build_benchmark_model_client,
         repr=False,
         compare=False,
     )
@@ -273,15 +269,16 @@ class OpenAIBusinessBenchmarkModelClientBuilder:
         cls,
         environment: Mapping[str, str],
         *,
-        client_factory: BenchmarkModelClientFactory = _build_openai_client,
+        client_factory: BenchmarkModelClientFactory = build_benchmark_model_client,
     ) -> "OpenAIBusinessBenchmarkModelClientBuilder":
-        provider = _required(environment, "CAPTAIN_BENCHMARK_PROVIDER")
-        if provider != "openai":
-            raise ValueError("business benchmark provider must be openai")
+        provider = require_benchmark_provider(
+            _required(environment, "CAPTAIN_BENCHMARK_PROVIDER")
+        )
+        secret_name = benchmark_provider_secret_name(provider)
         return cls(
             provider=provider,
             model=_required(environment, "CAPTAIN_BENCHMARK_MODEL"),
-            _api_key=_required(environment, "OPENAI_API_KEY"),
+            _api_key=_required(environment, secret_name),
             _client_factory=client_factory,
         )
 
@@ -290,17 +287,18 @@ class OpenAIBusinessBenchmarkModelClientBuilder:
         cls,
         environment: Mapping[str, str],
         *,
-        client_factory: BenchmarkModelClientFactory = _build_openai_client,
+        client_factory: BenchmarkModelClientFactory = build_benchmark_model_client,
     ) -> "OpenAIBusinessBenchmarkModelClientBuilder":
         """Validate public provider settings while deferring the secret to effects."""
 
-        provider = _required(environment, "CAPTAIN_BENCHMARK_PROVIDER")
-        if provider != "openai":
-            raise ValueError("business benchmark provider must be openai")
+        provider = require_benchmark_provider(
+            _required(environment, "CAPTAIN_BENCHMARK_PROVIDER")
+        )
+        secret_name = benchmark_provider_secret_name(provider)
         return cls(
             provider=provider,
             model=_required(environment, "CAPTAIN_BENCHMARK_MODEL"),
-            _api_key=environment.get("OPENAI_API_KEY", "").strip(),
+            _api_key=environment.get(secret_name, "").strip(),
             _client_factory=client_factory,
         )
 
@@ -316,16 +314,18 @@ class OpenAIBusinessBenchmarkModelClientBuilder:
         ):
             raise ValueError("model invocation is not bound to the Captain job")
         if not self._api_key:
-            raise ValueError("OpenAI provider secret is not present")
+            raise ValueError("benchmark provider secret is not present")
         policy = job.execution_policy
         if (
-            self.provider != "openai"
+            self.provider not in BENCHMARK_PROVIDERS
             or not policy.live_execution
             or self.model not in policy.allowed_models
             or FactoryLiveCapability.MODEL_INVOKE not in policy.live_capabilities
         ):
-            raise ValueError("OpenAI model is not Captain-authorized")
-        return self._client_factory(api_key=self._api_key, model=self.model)
+            raise ValueError("benchmark model is not Captain-authorized")
+        return self._client_factory(
+            provider=self.provider, api_key=self._api_key, model=self.model
+        )
 
 
 class BusinessBenchmarkPricingQuoteSourcePort(Protocol):
@@ -356,8 +356,7 @@ class ConfiguredBusinessBenchmarkPricingSource:
         minimum_cost_usd: Decimal,
         artifacts: BusinessBenchmarkContentAddressedArtifactStore,
     ) -> None:
-        if provider != "openai":
-            raise ValueError("business benchmark pricing provider must be openai")
+        require_benchmark_provider(provider)
         if not model.strip() or not version.strip() or len(version) > 64:
             raise ValueError("business benchmark price card identity is invalid")
         if effective_at.tzinfo is None or effective_at.utcoffset() != timezone.utc.utcoffset(effective_at):
@@ -388,8 +387,7 @@ class ConfiguredBusinessBenchmarkPricingSource:
         artifacts: BusinessBenchmarkContentAddressedArtifactStore,
     ) -> "ConfiguredBusinessBenchmarkPricingSource":
         provider = _required(environment, "CAPTAIN_BENCHMARK_PROVIDER")
-        if provider != "openai":
-            raise ValueError("business benchmark pricing provider must be openai")
+        require_benchmark_provider(provider)
         maximum = _decimal(
             environment,
             "CAPTAIN_BENCHMARK_MAX_COST_PER_CALL_USD",
