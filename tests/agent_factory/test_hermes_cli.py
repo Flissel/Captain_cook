@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import signal
 import time
 from types import SimpleNamespace
@@ -4547,3 +4548,68 @@ async def test_skill_usage_timeout_terminates_the_hermes_subprocess(
         ).issue_skill_usage(request, max_seconds=0.5)
 
     assert terminated is True
+
+
+@pytest.mark.asyncio
+async def test_environment_overrides_reach_only_the_hermes_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-openai-key")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    observed_options: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"{}", b""
+
+    async def create_process(*command: str, **options: object) -> Process:
+        observed_options.update(options)
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    await HermesCliFactory(
+        settings=HermesCliSettings(
+            evidence_root=tmp_path / "evidence",
+            environment_overrides={
+                "OPENAI_BASE_URL": "https://api.tokenfactory.nebius.com/v1",
+                "OPENAI_API_KEY": "nb-child-only",
+            },
+        )
+    )._run_skill_prompt("sealed prompt", max_seconds=30)
+
+    environment = observed_options["env"]
+    assert isinstance(environment, dict)
+    assert environment["OPENAI_BASE_URL"] == "https://api.tokenfactory.nebius.com/v1"
+    assert environment["OPENAI_API_KEY"] == "nb-child-only"
+    assert os.environ["OPENAI_API_KEY"] == "ambient-openai-key"
+    assert "OPENAI_BASE_URL" not in os.environ
+
+
+def test_environment_override_values_never_appear_in_the_settings_repr() -> None:
+    settings = HermesCliSettings(environment_overrides={"OPENAI_API_KEY": "nb-secret"})
+
+    assert "nb-secret" not in repr(settings)
+    assert dict(settings.environment_overrides) == {"OPENAI_API_KEY": "nb-secret"}
+
+
+def test_environment_overrides_are_frozen_copies() -> None:
+    source = {"OPENAI_BASE_URL": "http://127.0.0.1:8114/v1"}
+    settings = HermesCliSettings(environment_overrides=source)
+    source["OPENAI_BASE_URL"] = "http://changed"
+
+    assert settings.environment_overrides["OPENAI_BASE_URL"] == "http://127.0.0.1:8114/v1"
+    with pytest.raises(TypeError):
+        settings.environment_overrides["OPENAI_BASE_URL"] = "x"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"": "x"}, {"BAD NAME": "x"}, {"OPENAI_API_KEY": 1}, {"OPENAI_API_KEY": "a\x00b"}],
+)
+def test_invalid_environment_overrides_are_rejected(overrides: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="environment override"):
+        HermesCliSettings(environment_overrides=overrides)  # type: ignore[arg-type]

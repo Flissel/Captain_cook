@@ -1727,12 +1727,30 @@ def _hermes_context(tmp_path: Path, extra: dict[str, str]) -> RuntimeAdapterCont
     )
 
 
+def _capture_hermes_settings(monkeypatch: pytest.MonkeyPatch) -> dict[str, HermesCliSettings]:
+    import agenten.agent_runtime.captain_production_adapters as adapters_module
+
+    captured: dict[str, HermesCliSettings] = {}
+    real_factory = adapters_module.HermesCliFactory
+
+    def capture(*, settings: HermesCliSettings, **options: object) -> HermesCliFactory:
+        captured["settings"] = settings
+        return real_factory(settings=settings, **options)
+
+    monkeypatch.setattr(adapters_module, "HermesCliFactory", capture)
+    return captured
+
+
+def _clear_ambient_openai(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("OPENAI_BASE_URL", "OPENAI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def test_hermes_on_token_factory_uses_the_nebius_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    for name in ("OPENAI_BASE_URL", "OPENAI_API_KEY"):
-        monkeypatch.setenv(name, "x")  # registers restoration of the adapter's writes
-        monkeypatch.delenv(name)
+    _clear_ambient_openai(monkeypatch)
+    captured = _capture_hermes_settings(monkeypatch)
     context = _hermes_context(
         tmp_path,
         {
@@ -1745,16 +1763,19 @@ def test_hermes_on_token_factory_uses_the_nebius_key(
 
     create_runtime_adapters(context)
 
-    assert os.environ["OPENAI_BASE_URL"] == "https://api.tokenfactory.nebius.com/v1"
-    assert os.environ["OPENAI_API_KEY"] == "nb-test"
+    assert dict(captured["settings"].environment_overrides) == {
+        "OPENAI_BASE_URL": "https://api.tokenfactory.nebius.com/v1",
+        "OPENAI_API_KEY": "nb-test",
+    }
+    # The key reaches only the Hermes child, never the Captain process.
+    assert "OPENAI_BASE_URL" not in os.environ
+    assert "OPENAI_API_KEY" not in os.environ
 
 
 def test_hermes_on_token_factory_without_key_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    for name in ("OPENAI_BASE_URL", "OPENAI_API_KEY"):
-        monkeypatch.setenv(name, "x")  # registers restoration of the adapter's writes
-        monkeypatch.delenv(name)
+    _clear_ambient_openai(monkeypatch)
     context = _hermes_context(
         tmp_path,
         {
@@ -1767,23 +1788,43 @@ def test_hermes_on_token_factory_without_key_is_rejected(
     with pytest.raises(ValueError, match="NEBIUS_API_KEY"):
         create_runtime_adapters(context)
     assert "OPENAI_API_KEY" not in os.environ
+    assert "OPENAI_BASE_URL" not in os.environ
 
 
 def test_hermes_local_shim_keeps_the_placeholder_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    for name in ("OPENAI_BASE_URL", "OPENAI_API_KEY"):
-        monkeypatch.setenv(name, "x")  # registers restoration of the adapter's writes
-        monkeypatch.delenv(name)
+    _clear_ambient_openai(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-openai-key")
+    captured = _capture_hermes_settings(monkeypatch)
     context = _hermes_context(
         tmp_path,
         {
             "CAPTAIN_HERMES_PROVIDER": "custom",
             "CAPTAIN_HERMES_MODEL": "claude-code",
             "CAPTAIN_HERMES_BASE_URL": "http://127.0.0.1:8114/v1",
+            "NEBIUS_API_KEY": "nb-must-not-reach-the-shim",
         },
     )
 
     create_runtime_adapters(context)
 
-    assert os.environ["OPENAI_API_KEY"] == "captain-hermes-local-endpoint"
+    assert dict(captured["settings"].environment_overrides) == {
+        "OPENAI_BASE_URL": "http://127.0.0.1:8114/v1",
+        "OPENAI_API_KEY": "captain-hermes-local-endpoint",
+    }
+    assert os.environ["OPENAI_API_KEY"] == "ambient-openai-key"
+    assert "OPENAI_BASE_URL" not in os.environ
+
+
+def test_hermes_without_base_url_has_no_endpoint_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_ambient_openai(monkeypatch)
+    captured = _capture_hermes_settings(monkeypatch)
+    context = _hermes_context(tmp_path, {"NEBIUS_API_KEY": "nb-test"})
+
+    create_runtime_adapters(context)
+
+    assert dict(captured["settings"].environment_overrides) == {}
+    assert "OPENAI_API_KEY" not in os.environ

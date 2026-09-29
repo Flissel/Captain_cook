@@ -11,10 +11,12 @@ import signal
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, get_args
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -105,8 +107,32 @@ class HermesCliSettings:
     unresolved_effect_reserve_usd: Decimal | None = None
     maximum_iterations: int = 16
     maximum_output_tokens: int = 2048
+    # Applied only to the Hermes child process environment (e.g. the endpoint
+    # and key from `hermes_endpoint_overrides`); never written to os.environ.
+    # Values may be secrets, so they are excluded from repr and hashing.
+    environment_overrides: Mapping[str, str] = field(
+        default_factory=lambda: MappingProxyType({}),
+        repr=False,
+        hash=False,
+    )
 
     def __post_init__(self) -> None:
+        overrides = self.environment_overrides
+        if not isinstance(overrides, Mapping):
+            raise ValueError("Hermes environment overrides must be a mapping")
+        for name, value in overrides.items():
+            if (
+                not isinstance(name, str)
+                or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name) is None
+            ):
+                raise ValueError("Hermes environment override name is invalid")
+            if not isinstance(value, str) or "\x00" in value:
+                raise ValueError(f"Hermes environment override {name} is invalid")
+        object.__setattr__(
+            self,
+            "environment_overrides",
+            MappingProxyType(dict(overrides)),
+        )
         if (self.provider is None) != (self.model is None):
             raise ValueError("Hermes provider and model must be configured together")
         for value, label in ((self.provider, "provider"), (self.model, "model")):
@@ -1303,6 +1329,7 @@ class HermesCliFactory(HermesFactoryPort):
         command_prefix = [self._settings.executable]
         process_options: dict[str, object] = _async_process_group_options()
         environment = os.environ.copy()
+        environment.update(self._settings.environment_overrides)
         if hermes_home is not None:
             resolved_hermes_home = hermes_home.resolve(strict=True)
             environment["HERMES_HOME"] = str(resolved_hermes_home)

@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
-import os
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
@@ -13,7 +12,6 @@ from typing import Protocol
 from urllib.parse import urlsplit
 from uuid import uuid5
 
-from config.llm_provider import NEBIUS_BASE_URL
 from agenten.agent_runtime.runtime_codex import (
     RuntimeCodexExecution,
     RuntimeCodexTerminalEvidenceV1,
@@ -21,6 +19,7 @@ from agenten.agent_runtime.runtime_codex import (
 )
 from agenten.agent_factory.codex_build_recovery import canonical_factory_codex_model
 from agenten.agent_factory.hermes_cli import HermesCliFactory, HermesCliSettings
+from agenten.agent_factory.hermes_endpoint import hermes_endpoint_overrides
 from agenten.agent_factory.orchestration import FactoryDispatchError
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
@@ -149,26 +148,12 @@ class CaptainHermesPlannerAdapter:
         provider = context.environ.get("CAPTAIN_HERMES_PROVIDER", "").strip() or None
         model = context.environ.get("CAPTAIN_HERMES_MODEL", "").strip() or None
 
-        # Hermes resolves a custom provider endpoint from OPENAI_BASE_URL, which
-        # it reads from its own process environment. That name is provider
-        # specific, so Captain carries it as CAPTAIN_HERMES_BASE_URL and this
-        # adapter -- the one component that is allowed to know about Hermes --
-        # translates it here, so the operations scripts stay provider agnostic.
-        base_url = context.environ.get("CAPTAIN_HERMES_BASE_URL", "").strip()
-        if base_url:
-            # Token Factory needs the real Nebius key; a local shim ignores the
-            # key but the OpenAI client inside Hermes still requires one.
-            if base_url.rstrip("/") == NEBIUS_BASE_URL:
-                nebius_key = context.environ.get("NEBIUS_API_KEY", "").strip()
-                if not nebius_key:
-                    raise ValueError(
-                        "NEBIUS_API_KEY is required for the Token Factory Hermes endpoint"
-                    )
-                os.environ["OPENAI_BASE_URL"] = base_url
-                os.environ["OPENAI_API_KEY"] = nebius_key
-            else:
-                os.environ["OPENAI_BASE_URL"] = base_url
-                os.environ.setdefault("OPENAI_API_KEY", "captain-hermes-local-endpoint")
+        # Hermes resolves a custom provider endpoint from OPENAI_BASE_URL and
+        # OPENAI_API_KEY in its own process environment. Captain carries the
+        # endpoint as CAPTAIN_HERMES_BASE_URL; the shared helper translates it
+        # into overrides for the Hermes child only, so os.environ (and every
+        # later OpenAI client or child process) never sees the Nebius key.
+        environment_overrides = hermes_endpoint_overrides(context.environ)
         factory = HermesCliFactory(
             settings=HermesCliSettings(
                 executable=(
@@ -191,6 +176,7 @@ class CaptainHermesPlannerAdapter:
                     / "released-skills"
                 ),
                 working_directory=hermes_workspace,
+                environment_overrides=environment_overrides,
             )
         )
         factory.validate_runtime_skill(
