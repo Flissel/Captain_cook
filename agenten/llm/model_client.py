@@ -5,8 +5,9 @@ Two entry points:
 
 - `build_model_client`: a real OpenAI-backed client
   (`autogen_ext.models.openai.OpenAIChatCompletionClient`), defaulting
-  provider, endpoint, key and model from `config.llm_config.PROFILE` so
-  callers don't have to duplicate that env-var wiring. SDK-level
+  provider, endpoint, key and model from `config.llm_config.get_profile()`
+  (resolved at build time, never at import time) so callers don't have to
+  duplicate that env-var wiring. SDK-level
   retries are disabled so the Captain stage wrapper remains the sole retry
   owner.
 - `build_replay_model_client`: a deterministic, offline client
@@ -20,7 +21,7 @@ from autogen_core.models import ChatCompletionClient, ModelFamily, ModelInfo
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_ext.models.replay import ReplayChatCompletionClient
 
-from config.llm_config import PROFILE
+from config import llm_config
 from config.llm_provider import (
     CUSTOM_ENDPOINT_PLACEHOLDER_KEY,
     ProviderConfigurationError,
@@ -37,12 +38,14 @@ def build_model_client(
 ) -> ChatCompletionClient:
     """Build a real `ChatCompletionClient` for the configured provider.
 
-    Defaults come from `config.llm_config.PROFILE` (Nebius Token Factory with
-    Nemotron unless the environment opts into OpenAI or a custom endpoint).
+    Defaults come from `config.llm_config.get_profile()` (Nebius Token
+    Factory with Nemotron unless the environment opts into OpenAI or a custom
+    endpoint). It is resolved here, so a contradictory configuration raises
+    `ProviderConfigurationError` at construction instead of at import.
     Explicit arguments override the profile. SDK retries stay disabled so the
     Captain stage wrapper remains the sole retry owner.
     """
-    active = profile if profile is not None else PROFILE
+    active = profile if profile is not None else llm_config.get_profile()
     resolved_model = model if model is not None else active.model
     resolved_api_key = api_key if api_key is not None else active.api_key
     resolved_base_url = base_url if base_url is not None else active.base_url

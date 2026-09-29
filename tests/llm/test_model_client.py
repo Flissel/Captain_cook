@@ -3,6 +3,7 @@ from typing import Any
 import pytest
 
 from agenten.llm import model_client as model_client_module
+from config import llm_config
 from config.llm_provider import (
     CUSTOM_ENDPOINT_PLACEHOLDER_KEY,
     NEBIUS_BASE_URL,
@@ -84,8 +85,20 @@ def test_explicit_arguments_override_the_profile(monkeypatch: pytest.MonkeyPatch
 
 def test_default_profile_comes_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _capture(monkeypatch)
-    monkeypatch.setattr(model_client_module, "PROFILE", _NEBIUS)
+    monkeypatch.setattr(llm_config, "get_profile", lambda: _NEBIUS)
 
     model_client_module.build_model_client()
 
     assert captured["base_url"] == NEBIUS_BASE_URL
+
+
+def test_default_profile_is_resolved_at_build_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    _capture(monkeypatch)
+
+    def contradictory() -> ProviderProfile:
+        raise ProviderConfigurationError("CAPTAIN_MODEL=gpt-5.6 is an OpenAI model")
+
+    monkeypatch.setattr(llm_config, "get_profile", contradictory)
+
+    with pytest.raises(ProviderConfigurationError, match="gpt-5.6"):
+        model_client_module.build_model_client()
