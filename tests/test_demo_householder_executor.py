@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -192,7 +193,9 @@ def test_llm_evidence_file_is_gitignored_but_committed_evidence_is_not():
     def ignored(path: str) -> bool:
         return (
             subprocess.run(
-                ["git", "check-ignore", "-q", "--no-index", path], check=False
+                ["git", "check-ignore", "-q", "--no-index", path],
+                cwd=Path(__file__).resolve().parents[1],
+                check=False,
             ).returncode
             == 0
         )
