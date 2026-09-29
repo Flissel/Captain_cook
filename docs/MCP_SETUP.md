@@ -5,15 +5,21 @@ offline demo's requirements or imply that an external integration is working.
 
 ## Local environment
 
-The root `.env` file is ignored by Git and loaded by `config/llm_config.py`
-for the LLM-backed legacy command. Add secrets only to that file:
+The root `.env` file is ignored by Git and read by `config/llm_config.py`
+when an LLM-backed command builds its model client. Captain defaults to NVIDIA
+Nemotron on Nebius Token Factory. Add secrets only to that file:
 
 ```dotenv
-OPENAI_API_KEY=replace-locally
-CAPTAIN_MODEL=gpt-5.6
+NEBIUS_API_KEY=replace-locally
+# Optional: another Token Factory model id; leave unset for Nemotron.
+# CAPTAIN_MODEL=
 ```
 
-`python main.py demo` never reads or needs an OpenAI key. Do not include `.env`
+OpenAI is opt-in: set `CAPTAIN_LLM_PROVIDER=openai` together with
+`OPENAI_API_KEY` (and optionally `CAPTAIN_MODEL=gpt-5.6`). An OpenAI model id
+such as `gpt-5.6` without that opt-in is rejected when a model client is built.
+
+`python main.py demo` never reads or needs a provider key. Do not include `.env`
 content in an issue, artifact, screenshot, video, prompt, or commit.
 
 ## Current Codex MCPs

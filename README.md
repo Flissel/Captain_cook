@@ -115,6 +115,13 @@ OpenAI-compatible API by default.
 switch back to OpenAI or a local endpoint. The offline demo
 (`main.py demo`) needs no key.
 
+Migrating a Build-Week `.env`: an old `.env` usually still contains
+`CAPTAIN_MODEL=gpt-5.6`. With the Nebius default that OpenAI model id is
+rejected when a model client is built. Either remove the `CAPTAIN_MODEL` line
+(and add `NEBIUS_API_KEY`) to use Nemotron, or keep it and set
+`CAPTAIN_LLM_PROVIDER=openai` to stay on OpenAI. The offline demo and test
+suite are unaffected either way.
+
 ## What is working now
 
 - Deterministic problem decomposition into atomic, capability-tagged tasks.
@@ -143,7 +150,10 @@ python -m agenten.planning.cli docs/superpowers/specs/2026-07-15-hackathon-pipel
   --output artifacts/captain-release
 ```
 
-The command uses `CAPTAIN_MODEL` (default `gpt-5.6`) and `OPENAI_API_KEY`.
+The command uses the configured provider: Nemotron on Nebius Token Factory
+with `NEBIUS_API_KEY` by default (`CAPTAIN_MODEL` selects another Token
+Factory model id), or OpenAI with `CAPTAIN_LLM_PROVIDER=openai` and
+`OPENAI_API_KEY`.
 It writes build-visible contracts to `batches/<batch-id>.json` and hidden
 evaluation inputs to `holdouts/<batch-id>.json`. Releases are idempotent:
 re-running identical output succeeds, while conflicting content for an
