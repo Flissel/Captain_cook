@@ -95,6 +95,22 @@ Demo complete: 4 subproblems reached done
 
 The command writes [artifacts/demo-run.json](artifacts/demo-run.json), a compact evidence artifact containing the generated problem ID, terminal counts, and every ledger block in the run. See [docs/DEMO.md](docs/DEMO.md) for the schema and inspection steps.
 
+## Running on Nebius Token Factory (NVIDIA Nemotron)
+
+Captain's planner, judge, decomposition, Hermes fleet, evaluation, and
+business benchmark call NVIDIA Nemotron through Nebius Token Factory's
+OpenAI-compatible API by default.
+
+1. Put `NEBIUS_API_KEY=<your key>` into the ignored `.env`.
+2. Optional: set `CAPTAIN_MODEL` to another Token Factory model id; the
+   default is Nemotron 3 Super.
+3. Run the pipeline demo with LLM householders:
+   `.\.venv\Scripts\python.exe main.py demo --householder-executor llm`
+
+`CAPTAIN_LLM_PROVIDER=openai` or `=custom` (with `CAPTAIN_LLM_BASE_URL`)
+switch back to OpenAI or a local endpoint. The offline demo
+(`main.py demo`) needs no key.
+
 ## What is working now
 
 - Deterministic problem decomposition into atomic, capability-tagged tasks.
