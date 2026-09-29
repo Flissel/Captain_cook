@@ -617,3 +617,21 @@ def test_readme_documents_safe_recording_commands() -> None:
     env = (ROOT / ".env.example").read_text(encoding="utf-8")
     for name in ("MARIADB_TEST_PORT", "MARIADB_TEST_PASSWORD", "MARIADB_TEST_ROOT_PASSWORD", "TEST_MARIADB_DSN"):
         assert f"{name}=" in env
+
+
+def test_services_forward_and_redact_the_hermes_endpoint_secrets() -> None:
+    source = SERVICES.read_text(encoding="utf-8")
+    local_allowlist = source.split("function Initialize-LocalEnvironment", 1)[1].split(
+        "Read-Env $rootEnv $allowed", 1
+    )[0]
+    start = source.split("function Invoke-StartServices", 1)[1].split(
+        "Set-ProcessEnvironment $values", 1
+    )[0]
+    redaction = source.split("$runtimeSecretValueKeys = @(", 1)[1].split(")", 1)[0]
+
+    for name in ("CAPTAIN_HERMES_BASE_URL", "NEBIUS_API_KEY", "CAPTAIN_HERMES_API_KEY"):
+        assert f"'{name}'" in local_allowlist
+        # Read from .env and copied into the runtime environment.
+        assert start.count(f"'{name}'") == 2
+    for secret in ("NEBIUS_API_KEY", "CAPTAIN_HERMES_API_KEY"):
+        assert f"'{secret}'" in redaction
