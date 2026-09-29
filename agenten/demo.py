@@ -5,9 +5,12 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from autogen_core.models import ChatCompletionClient
+
 from blockchain.Blockchain_modell import Blockchain
 from blockchain.storage import InMemoryStorage
 
+from agenten.household.llm_executor import LlmHouseholderExecutor
 from agenten.household.worker import create_householder_worker_factories
 from agenten.ledger_bridge.stage_machine import Stage, TERMINAL_STAGES
 from agenten.orchestration.pipeline import build_pipeline
@@ -82,14 +85,28 @@ def _serialize_block(block: object) -> dict[str, object]:
     return serialized
 
 
-async def run_demo(output_path: Path | None = None) -> DemoSummary:
-    """Run the dependency-free pipeline demo and optionally persist its evidence."""
+async def run_demo(
+    output_path: Path | None = None,
+    *,
+    householder_model_client: ChatCompletionClient | None = None,
+) -> DemoSummary:
+    """Run the pipeline demo and optionally persist its evidence.
+
+    Without a model client the householders stay deterministic and the demo
+    needs no network. With one, all four householders report through
+    `LlmHouseholderExecutor`, whose evidence is marked `llm_reported:`.
+    """
     blockchain = Blockchain(storage=InMemoryStorage())
+    executor = (
+        LlmHouseholderExecutor(householder_model_client)
+        if householder_model_client is not None
+        else None
+    )
     pipeline = build_pipeline(
         llm_decompose=_deterministic_decompose,
         llm_judge=_accept_all,
         blockchain=blockchain,
-        worker_factories=create_householder_worker_factories(),
+        worker_factories=create_householder_worker_factories(executor=executor),
     )
 
     await pipeline.start()

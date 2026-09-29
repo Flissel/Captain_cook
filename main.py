@@ -20,6 +20,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=Path("artifacts/demo-run.json"),
         help="Path for the generated JSON evidence artifact",
     )
+    demo_parser.add_argument(
+        "--householder-executor",
+        choices=("deterministic", "llm"),
+        default="deterministic",
+        help="llm runs the four householders on the configured provider (Nebius Nemotron by default)",
+    )
     subparsers.add_parser("legacy", help="Run the API-key-backed legacy prototype")
     recovery_parser = subparsers.add_parser(
         "recover-gateway",
@@ -77,7 +83,12 @@ def run_legacy() -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "demo":
-        summary = asyncio.run(run_demo(args.output))
+        model_client = None
+        if args.householder_executor == "llm":
+            from agenten.llm.model_client import build_model_client
+
+            model_client = build_model_client()
+        summary = asyncio.run(run_demo(args.output, householder_model_client=model_client))
         print(f"Demo complete: {summary.done_count} subproblems reached done")
         return 0
     if args.command == "recover-gateway":
