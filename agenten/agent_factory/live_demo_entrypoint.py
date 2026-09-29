@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 import json
 import os
@@ -75,14 +76,20 @@ def build_live_demo_hermes(
     released_skill_root: Path,
     evidence_root: Path,
     clock: Callable[[], datetime],
+    environ: Mapping[str, str] | None = None,
 ) -> HermesCliFactory:
     """Build and preflight the production Hermes adapter without live effects."""
 
+    values = os.environ if environ is None else environ
+    provider = values.get("CAPTAIN_HERMES_PROVIDER", "").strip() or None
+    model = values.get("CAPTAIN_HERMES_MODEL", "").strip() or None
     settings = HermesCliSettings(
         executable=hermes_executable,
         skill_root=skill_root,
         evidence_root=evidence_root,
         released_skill_root=released_skill_root,
+        provider=provider,
+        model=model,
     )
     factory = HermesCliFactory(
         settings=settings,

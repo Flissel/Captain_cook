@@ -1710,3 +1710,80 @@ async def test_factory_bound_hermes_uses_dedicated_confined_working_directory(
     assert launches[0]["options"]["cwd"] == str(
         tmp_path / ".captain-cook" / "workspaces" / "hermes-runtime"
     )
+
+
+def _hermes_context(tmp_path: Path, extra: dict[str, str]) -> RuntimeAdapterContext:
+    skill = tmp_path / "agenten" / "agent_factory" / "skills" / "captain-agent-factory-loop"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# released\n", encoding="utf-8")
+    return RuntimeAdapterContext(
+        repository_root=tmp_path,
+        artifact_root=tmp_path / ".captain-cook" / "artifacts" / "sha256",
+        environ={
+            "CAPTAIN_HERMES_RUNTIME_SKILL_SHA256": _skill_digest(skill),
+            "CAPTAIN_CODEX_EXECUTABLE": "codex",
+            **extra,
+        },
+    )
+
+
+def test_hermes_on_token_factory_uses_the_nebius_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("OPENAI_BASE_URL", "OPENAI_API_KEY"):
+        monkeypatch.setenv(name, "x")  # registers restoration of the adapter's writes
+        monkeypatch.delenv(name)
+    context = _hermes_context(
+        tmp_path,
+        {
+            "CAPTAIN_HERMES_PROVIDER": "custom",
+            "CAPTAIN_HERMES_MODEL": "nvidia/Nemotron-3-Super-120b-a12b",
+            "CAPTAIN_HERMES_BASE_URL": "https://api.tokenfactory.nebius.com/v1",
+            "NEBIUS_API_KEY": "nb-test",
+        },
+    )
+
+    create_runtime_adapters(context)
+
+    assert os.environ["OPENAI_BASE_URL"] == "https://api.tokenfactory.nebius.com/v1"
+    assert os.environ["OPENAI_API_KEY"] == "nb-test"
+
+
+def test_hermes_on_token_factory_without_key_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("OPENAI_BASE_URL", "OPENAI_API_KEY"):
+        monkeypatch.setenv(name, "x")  # registers restoration of the adapter's writes
+        monkeypatch.delenv(name)
+    context = _hermes_context(
+        tmp_path,
+        {
+            "CAPTAIN_HERMES_PROVIDER": "custom",
+            "CAPTAIN_HERMES_MODEL": "nvidia/x",
+            "CAPTAIN_HERMES_BASE_URL": "https://api.tokenfactory.nebius.com/v1",
+        },
+    )
+
+    with pytest.raises(ValueError, match="NEBIUS_API_KEY"):
+        create_runtime_adapters(context)
+    assert "OPENAI_API_KEY" not in os.environ
+
+
+def test_hermes_local_shim_keeps_the_placeholder_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("OPENAI_BASE_URL", "OPENAI_API_KEY"):
+        monkeypatch.setenv(name, "x")  # registers restoration of the adapter's writes
+        monkeypatch.delenv(name)
+    context = _hermes_context(
+        tmp_path,
+        {
+            "CAPTAIN_HERMES_PROVIDER": "custom",
+            "CAPTAIN_HERMES_MODEL": "claude-code",
+            "CAPTAIN_HERMES_BASE_URL": "http://127.0.0.1:8114/v1",
+        },
+    )
+
+    create_runtime_adapters(context)
+
+    assert os.environ["OPENAI_API_KEY"] == "captain-hermes-local-endpoint"

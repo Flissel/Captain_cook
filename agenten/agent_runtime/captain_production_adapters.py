@@ -13,6 +13,7 @@ from typing import Protocol
 from urllib.parse import urlsplit
 from uuid import uuid5
 
+from config.llm_provider import NEBIUS_BASE_URL
 from agenten.agent_runtime.runtime_codex import (
     RuntimeCodexExecution,
     RuntimeCodexTerminalEvidenceV1,
@@ -155,8 +156,19 @@ class CaptainHermesPlannerAdapter:
         # translates it here, so the operations scripts stay provider agnostic.
         base_url = context.environ.get("CAPTAIN_HERMES_BASE_URL", "").strip()
         if base_url:
-            os.environ["OPENAI_BASE_URL"] = base_url
-            os.environ.setdefault("OPENAI_API_KEY", "captain-hermes-local-endpoint")
+            # Token Factory needs the real Nebius key; a local shim ignores the
+            # key but the OpenAI client inside Hermes still requires one.
+            if base_url.rstrip("/") == NEBIUS_BASE_URL:
+                nebius_key = context.environ.get("NEBIUS_API_KEY", "").strip()
+                if not nebius_key:
+                    raise ValueError(
+                        "NEBIUS_API_KEY is required for the Token Factory Hermes endpoint"
+                    )
+                os.environ["OPENAI_BASE_URL"] = base_url
+                os.environ["OPENAI_API_KEY"] = nebius_key
+            else:
+                os.environ["OPENAI_BASE_URL"] = base_url
+                os.environ.setdefault("OPENAI_API_KEY", "captain-hermes-local-endpoint")
         factory = HermesCliFactory(
             settings=HermesCliSettings(
                 executable=(
