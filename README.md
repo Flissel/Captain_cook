@@ -182,8 +182,10 @@ the Captain manifest is `accepted`; `2` means the run produced a durable
 exit code `1`. Provider cost is reported as unavailable when the client cannot
 provide a trustworthy value.
 
-The real-model smoke gate is opt-in and fixes its own stricter budget. Set
-`AGENTFARM_INPUT_PATH` and `OPENAI_API_KEY` only in the local process
+The real-model smoke gate is opt-in and fixes its own stricter budget. It uses
+the configured provider (Nebius Token Factory by default). Set
+`AGENTFARM_INPUT_PATH` and that provider's key (`NEBIUS_API_KEY`, or
+`OPENAI_API_KEY` with `CAPTAIN_LLM_PROVIDER=openai`) only in the local process
 environment, then run:
 
 ```powershell

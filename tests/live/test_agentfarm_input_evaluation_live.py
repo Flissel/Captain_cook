@@ -12,6 +12,11 @@ from agenten.evaluation.cli import (
     verify_source_digest,
 )
 from agenten.evaluation.models import EvaluationManifest, EvaluationStatus
+from config.llm_provider import (
+    PROVIDER_SECRET_NAMES,
+    ProviderConfigurationError,
+    resolve_provider,
+)
 
 
 EXPECTED_AGENTFARM_SOURCE_SHA256 = (
@@ -23,8 +28,15 @@ def require_live_evaluation_environment() -> Path:
     configured = os.environ.get("AGENTFARM_INPUT_PATH")
     if not configured:
         pytest.skip("AGENTFARM_INPUT_PATH is required for the live evaluation gate")
-    if not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("OPENAI_API_KEY is required for the live evaluation gate")
+    # Gate on the provider the evaluation CLI will resolve (Nebius by default),
+    # from the same source it reads: the process environment.
+    try:
+        profile = resolve_provider(os.environ)
+    except ProviderConfigurationError as exc:
+        pytest.fail(f"live evaluation provider configuration is invalid: {exc}")
+    if profile.api_key is None:
+        secret = PROVIDER_SECRET_NAMES.get(profile.name, "the provider API key")
+        pytest.skip(f"{secret} is required for the live evaluation gate")
     return verify_source_digest(
         Path(configured),
         expected_sha256=EXPECTED_AGENTFARM_SOURCE_SHA256,
@@ -48,7 +60,10 @@ def test_live_configured_digest_mismatch_fails_instead_of_skipping(
     changed = tmp_path / "input.md"
     changed.write_text("# changed source\n", encoding="utf-8")
     monkeypatch.setenv("AGENTFARM_INPUT_PATH", str(changed))
-    monkeypatch.setenv("OPENAI_API_KEY", "test-only-key")
+    monkeypatch.setenv("CAPTAIN_LLM_PROVIDER", "nebius")
+    monkeypatch.delenv("CAPTAIN_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("CAPTAIN_MODEL", raising=False)
+    monkeypatch.setenv("NEBIUS_API_KEY", "test-only-key")
 
     with pytest.raises(EvaluationSourceDigestMismatch, match="digest"):
         require_live_evaluation_environment()
@@ -99,4 +114,7 @@ async def test_live_agentfarm_evaluation_is_real_bounded_and_planning_only(
     assert summary["artifact_reference"] == f"{run_id}/evaluation.md"
     assert str(input_path) not in json.dumps(summary)
     assert str(output) not in json.dumps(summary)
-    assert os.environ["OPENAI_API_KEY"] not in json.dumps(summary)
+    for secret_name in ("NEBIUS_API_KEY", "OPENAI_API_KEY"):
+        secret_value = os.environ.get(secret_name, "").strip()
+        if secret_value:
+            assert secret_value not in json.dumps(summary)
