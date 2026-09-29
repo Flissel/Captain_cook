@@ -26,6 +26,8 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_ext.models.replay import ReplayChatCompletionClient
 from pydantic import BaseModel, ValidationError
 
+from config.llm_provider import ProviderConfigurationError, ProviderProfile, resolve_provider
+
 from .models import EvaluationStatus, EvaluationTelemetry, ProviderCallReservation
 from .service import AgentFarmEvaluationService
 from .source import EvaluationSourceError, load_evaluation_source
@@ -33,7 +35,6 @@ from .store import EvaluationConflictError, JsonEvaluationStore
 from .tools import EvaluationToolService
 
 
-DEFAULT_MODEL = "gpt-5.6"
 PROMPT_VERSION = "agentfarm-evaluation-v1"
 
 _TOOL_ARGUMENT_KEYS = {
@@ -193,26 +194,42 @@ class UsageTrackingChatCompletionClient(ChatCompletionClient):
 
 def build_evaluation_model_client(
     *,
-    model: str,
-    api_key: str | None,
+    profile: ProviderProfile,
+    model: str | None = None,
 ) -> ChatCompletionClient:
     """Build the real tool-capable provider with concurrent tool calls disabled."""
 
+    if not profile.tool_calling:
+        raise ProviderConfigurationError(
+            f"evaluation needs tool calling; provider {profile.name} does not declare it"
+        )
+    if profile.api_key is None:
+        secret = "NEBIUS_API_KEY" if profile.name == "nebius" else "OPENAI_API_KEY"
+        raise ProviderConfigurationError(f"{secret} is not configured for evaluation")
     kwargs: dict[str, object] = {
-        "model": model,
+        "model": model or profile.model,
+        "api_key": profile.api_key,
         "max_retries": 0,
         "parallel_tool_calls": False,
-        "reasoning_effort": "none",
-        "model_info": ModelInfo(
+    }
+    if profile.name == "openai":
+        kwargs["reasoning_effort"] = "none"
+        kwargs["model_info"] = ModelInfo(
             vision=True,
             function_calling=True,
             json_output=True,
             family=ModelFamily.GPT_5,
             structured_output=True,
-        ),
-    }
-    if api_key is not None:
-        kwargs["api_key"] = api_key
+        )
+    else:
+        kwargs["base_url"] = profile.base_url
+        kwargs["model_info"] = ModelInfo(
+            vision=False,
+            function_calling=True,
+            json_output=True,
+            family=ModelFamily.UNKNOWN,
+            structured_output=profile.structured_output,
+        )
     return OpenAIChatCompletionClient(**kwargs)
 
 
@@ -248,14 +265,19 @@ async def async_main(
         _print_summary({"error": "invalid_source", "status": "failed"})
         return 1
 
-    model_identifier = args.model or os.environ.get("CAPTAIN_MODEL") or DEFAULT_MODEL
+    try:
+        profile = resolve_provider(os.environ)
+    except ProviderConfigurationError:
+        _print_summary({"error": "invalid_provider", "status": "failed"})
+        return 1
+    model_identifier = args.model or profile.model
     run_id = args.run_id or f"agentfarm-{source.sha256[:12]}"
     store = JsonEvaluationStore(args.output)
     owned_client = model_client is None
     try:
         inner = model_client or build_evaluation_model_client(
+            profile=profile,
             model=model_identifier,
-            api_key=os.environ.get("OPENAI_API_KEY"),
         )
         tracked_client = UsageTrackingChatCompletionClient(
             inner,

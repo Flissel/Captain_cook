@@ -10,6 +10,7 @@ from autogen_core import FunctionCall
 from autogen_core.models import CreateResult, ModelFamily, ModelInfo, RequestUsage
 from autogen_ext.models.replay import ReplayChatCompletionClient
 
+from config.llm_provider import ProviderProfile
 from agenten.evaluation.cli import (
     EvaluationSourceDigestMismatch,
     EvaluationCallBudgetExceeded,
@@ -53,8 +54,7 @@ def test_evaluation_model_client_disables_parallel_tool_calls(
     )
 
     client = build_evaluation_model_client(
-        model="gpt-5.6",
-        api_key="runtime-only-secret",
+        profile=ProviderProfile("openai", "gpt-5.6", None, "runtime-only-secret", True, True),
     )
 
     assert isinstance(client, CapturingClient)
