@@ -39,11 +39,17 @@ class GatewaySettings(BaseModel):
     ledger_dsn: SecretStr
     captain_gateway_token: SecretStr
     worker_gateway_token: SecretStr
+    provider_receipt_gateway_token: SecretStr | None = None
+    provider_proxy_url: str | None = None
+    provider_policy_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    provider_price_card_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     approval_enabled: bool = False
     host: Literal["127.0.0.1"] = "127.0.0.1"
     port: int = Field(default=8090, ge=1, le=65535)
     claim_ttl_seconds: int = Field(default=5_400, ge=1, le=86_400)
     captain_n8n_ui_url: str = "http://localhost:5679"
+    captain_runtime_url: str | None = None
+    captain_runtime_token: SecretStr | None = None
     portal_supabase_issuer: str | None = None
     portal_supabase_audience: str | None = None
     portal_supabase_jwks_url: str | None = None
@@ -83,6 +89,41 @@ class GatewaySettings(BaseModel):
         ):
             raise ValueError("Captain n8n URL must be a safe HTTP URL")
         return value.rstrip("/")
+
+    @field_validator("captain_runtime_url")
+    @classmethod
+    def _runtime_url_must_be_safe(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Captain Runtime URL must be a safe HTTP URL")
+        return value.rstrip("/")
+
+    @field_validator("captain_runtime_token")
+    @classmethod
+    def _runtime_token_must_not_be_blank(
+        cls, value: SecretStr | None
+    ) -> SecretStr | None:
+        if value is not None and not value.get_secret_value().strip():
+            raise ValueError("Captain Runtime token must not be blank")
+        return value
+
+    @field_validator("provider_receipt_gateway_token")
+    @classmethod
+    def _provider_receipt_token_must_not_be_blank(
+        cls, value: SecretStr | None
+    ) -> SecretStr | None:
+        if value is not None and not value.get_secret_value().strip():
+            raise ValueError("provider receipt token must not be blank")
+        return value
 
     @field_validator(
         "portal_supabase_issuer",
@@ -146,6 +187,52 @@ class GatewaySettings(BaseModel):
             self.worker_gateway_token.get_secret_value(),
         ):
             raise ValueError("gateway role tokens must be distinct")
+        if self.provider_receipt_gateway_token is not None:
+            provider_token = self.provider_receipt_gateway_token.get_secret_value()
+            isolated_tokens = [
+                self.captain_gateway_token.get_secret_value(),
+                self.worker_gateway_token.get_secret_value(),
+            ]
+            isolated_tokens.extend(
+                value.get_secret_value()
+                for value in (
+                    self.captain_runtime_token,
+                    self.portal_provider_control_token,
+                    self.portal_evidence_token,
+                    self.portal_restart_control_token,
+                    self.portal_n8n_api_key,
+                    self.portal_n8n_mcp_token,
+                )
+                if value is not None
+            )
+            if any(
+                secrets.compare_digest(provider_token, actor_token)
+                for actor_token in isolated_tokens
+            ):
+                raise ValueError("provider receipt token must be a distinct authority")
+        if (self.captain_runtime_url is None) != (self.captain_runtime_token is None):
+            raise ValueError("Captain Runtime settings must be configured together")
+        proxy_fields = (
+            self.provider_proxy_url,
+            self.provider_policy_sha256,
+            self.provider_price_card_sha256,
+        )
+        if any(value is not None for value in proxy_fields) and not all(
+            value is not None for value in proxy_fields
+        ):
+            raise ValueError("provider proxy binding must be complete")
+        if self.provider_proxy_url is not None:
+            parsed = urlsplit(self.provider_proxy_url)
+            if (
+                parsed.scheme != "http"
+                or parsed.hostname != "127.0.0.1"
+                or parsed.path.rstrip("/") != "/v1"
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError("provider proxy URL must be loopback HTTP /v1")
         portal_settings = (
             self.portal_supabase_issuer,
             self.portal_supabase_audience,
@@ -246,6 +333,8 @@ class GatewaySettings(BaseModel):
             "LEDGER_DSN",
             "CAPTAIN_GATEWAY_TOKEN",
             "WORKER_GATEWAY_TOKEN",
+            "CAPTAIN_RUNTIME_URL",
+            "CAPTAIN_RUNTIME_TOKEN",
         )
         missing = [
             name
@@ -308,6 +397,21 @@ class GatewaySettings(BaseModel):
                 ledger_dsn=SecretStr(source["LEDGER_DSN"]),
                 captain_gateway_token=SecretStr(captain_token),
                 worker_gateway_token=SecretStr(worker_token),
+                provider_receipt_gateway_token=(
+                    SecretStr(source["PROVIDER_RECEIPT_GATEWAY_TOKEN"])
+                    if source.get("PROVIDER_RECEIPT_GATEWAY_TOKEN") is not None
+                    else None
+                ),
+                provider_proxy_url=(
+                    source.get("CAPTAIN_PROVIDER_PROXY_RESPONSES_URL")
+                    or (
+                        source["CAPTAIN_PROVIDER_PROXY_URL"].rstrip("/") + "/v1"
+                        if source.get("CAPTAIN_PROVIDER_PROXY_URL")
+                        else None
+                    )
+                ),
+                provider_policy_sha256=source.get("CAPTAIN_PROVIDER_POLICY_SHA256"),
+                provider_price_card_sha256=source.get("CAPTAIN_PROVIDER_PRICE_CARD_SHA256"),
                 approval_enabled=approval_enabled,
                 port=port,
                 claim_ttl_seconds=claim_ttl_seconds,
@@ -315,6 +419,8 @@ class GatewaySettings(BaseModel):
                     "CAPTAIN_N8N_URL",
                     "http://localhost:5679",
                 ),
+                captain_runtime_url=source["CAPTAIN_RUNTIME_URL"],
+                captain_runtime_token=SecretStr(source["CAPTAIN_RUNTIME_TOKEN"]),
                 portal_supabase_issuer=source.get("PORTAL_SUPABASE_ISSUER"),
                 portal_supabase_audience=source.get("PORTAL_SUPABASE_AUDIENCE"),
                 portal_supabase_jwks_url=source.get("PORTAL_SUPABASE_JWKS_URL"),

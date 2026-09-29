@@ -5,9 +5,12 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path as FileSystemPath
 from threading import Lock
 from typing import Any, Callable, Literal, Protocol
 from uuid import UUID, uuid4
+
+import httpx
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response, status
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -23,6 +26,18 @@ from agenten.agent_runtime.contracts import (
     ArtifactRef,
     CapabilityGrant,
     CapabilityGrantRevocation,
+    RuntimeResumeCostAuthorityV1,
+    RuntimeResumeCostSettlementRequestV1,
+    RuntimeResumeCostSettlementV1,
+    RuntimeProviderCostSettlementV1,
+    RuntimeUsagePricingSnapshotV1,
+)
+from agenten.agent_runtime.captain_production_adapters import (
+    ContentAddressedArtifactAdapter,
+)
+from agenten.provider_proxy.contracts import (
+    ProviderBudgetContextV1,
+    RuntimeProviderProxyBindingV1,
 )
 from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob, FactoryLease, FactoryPhase
 from agenten.agent_factory.execution_budget import (
@@ -43,6 +58,7 @@ from gateway.auth import (
     require_actor,
     require_captain,
     require_reader,
+    require_provider_receipt_authority,
     require_worker,
 )
 from gateway.contracts import (
@@ -106,6 +122,32 @@ from gateway.integration_setup_contracts import (
     PersistedIntegrationSetupV1,
     IntegrationSetupSurfaceV1,
     build_integration_setup_surface,
+)
+from agenten.agent_runtime.http_executor import AgentRuntimeHttpExecutor
+from gateway.capability_live_pipeline import (
+    CapabilityExecutionAuthority,
+    CapabilityResumeAuthorization,
+)
+from gateway.capability_resume_repository import (
+    GatewayCapabilityResumeAuthoritySource,
+    GatewayCapabilityResumeRepository,
+)
+from gateway.capability_resume_contracts import (
+    CapabilityResumeAuthorizationHttpRequest,
+    CapabilityResumeAuthorizeHttpRequest,
+)
+from gateway.capability_resume_service import (
+    CapabilityResumeConflict,
+    CapabilityResumeDispatchFailed,
+    CapabilityResumeExecutor,
+    CapabilityResumeNotFound,
+    CapabilityResumeService,
+    CapabilityResumeUnavailable,
+)
+from gateway.capability_assembly_api import (
+    CapabilityAssemblyCompositionFactory,
+    create_production_capability_assembly_router,
+    unavailable_capability_assembly_composition,
 )
 from gateway.portal_live_contracts import (
     PortalLiveEvidenceQueryV1,
@@ -270,6 +312,15 @@ def create_app(
     portal_credential_source: PortalCredentialMetadataSource | None = None,
     portal_verification_source: PortalCredentialVerificationSource | None = None,
     portal_clock: Callable[[], datetime] | None = None,
+    capability_resume_service: CapabilityResumeService | None = None,
+    capability_resume_executor: CapabilityResumeExecutor | None = None,
+    capability_assembly_composition_factory: (
+        CapabilityAssemblyCompositionFactory | None
+    ) = None,
+    runtime_usage_artifacts: ContentAddressedArtifactAdapter | None = None,
+    runtime_usage_pricing_snapshots: tuple[
+        RuntimeUsagePricingSnapshotV1, ...
+    ] = (),
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
@@ -286,6 +337,22 @@ def create_app(
             ),
             portal_credential_source=portal_credential_source,
             portal_verification_source=portal_verification_source,
+            runtime_usage_artifacts=(
+                runtime_usage_artifacts
+                or ContentAddressedArtifactAdapter(
+                    FileSystemPath.cwd() / ".captain-cook" / "artifacts" / "sha256"
+                )
+            ),
+            runtime_usage_pricing_snapshots=runtime_usage_pricing_snapshots,
+            runtime_provider_proxy_bindings=(
+                (
+                    configured.provider_proxy_url,
+                    configured.provider_policy_sha256,
+                    configured.provider_price_card_sha256,
+                ),
+            )
+            if configured is not None and configured.provider_proxy_url is not None
+            else (),
         )
         if (
             configured is not None
@@ -306,6 +373,9 @@ def create_app(
     store: GatewayStore | None = gateway_store or (
         configured_store(storage, settings) if storage else None
     )
+    resume_service = capability_resume_service
+    runtime_http_client: httpx.AsyncClient | None = None
+    resume_service_lock = Lock()
     portal_clock = portal_clock or (lambda: datetime.now(timezone.utc))
     portal_control_boot_id = str(uuid4())
     sink_calls: list[dict[str, Any]] = []
@@ -319,6 +389,8 @@ def create_app(
         try:
             yield
         finally:
+            if runtime_http_client is not None:
+                await runtime_http_client.aclose()
             stop = getattr(mirror, "stop", None)
             if stop:
                 await stop()
@@ -334,6 +406,12 @@ def create_app(
     app.state.gateway_settings = settings
     app.state.gateway_settings_lock = Lock()
     initialize_portal_auth(app)
+    app.include_router(
+        create_production_capability_assembly_router(
+            capability_assembly_composition_factory
+            or unavailable_capability_assembly_composition
+        )
+    )
 
     @app.exception_handler(RequestValidationError)
     async def sanitized_review_validation_error(
@@ -350,6 +428,18 @@ def create_app(
             return JSONResponse(
                 status_code=422,
                 content={"detail": "invalid factory request"},
+            )
+        if request.method == "POST" and path.startswith(
+            "/v1/capability-resumes/"
+        ):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "invalid capability resume request"},
+            )
+        if path.startswith("/v1/capability-assemblies"):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "invalid capability assembly request"},
             )
         if (
             request.method == "POST"
@@ -372,6 +462,71 @@ def create_app(
                     dsn = configured.ledger_dsn.get_secret_value()
                     store = configured_store(MariaDBStorage(dsn), configured)
         return store
+
+    def get_capability_resume_service() -> CapabilityResumeService:
+        nonlocal resume_service, runtime_http_client
+        if resume_service is None:
+            with resume_service_lock:
+                if resume_service is None:
+                    gateway = get_store()
+                    configured = load_gateway_settings(app)
+                    selected_executor = capability_resume_executor
+                    if selected_executor is None:
+                        if (
+                            configured.captain_runtime_url is None
+                            or configured.captain_runtime_token is None
+                        ):
+                            raise CapabilityResumeUnavailable(
+                                "Captain Runtime resume configuration is unavailable"
+                            )
+                        runtime_http_client = httpx.AsyncClient(
+                            verify=configured.tls_ca_bundle_path or True,
+                            timeout=30.0,
+                        )
+                        selected_executor = AgentRuntimeHttpExecutor(
+                            base_url=configured.captain_runtime_url,
+                            token=configured.captain_runtime_token.get_secret_value(),
+                            client=runtime_http_client,
+                        )
+                    authority = GatewayCapabilityResumeAuthoritySource(
+                        gateway,
+                    )
+                    resume_service = CapabilityResumeService(
+                        repository=GatewayCapabilityResumeRepository(gateway),
+                        authority_source=authority,
+                        runtime_reader=authority,
+                        executor=selected_executor,
+                        provider_proxy_binding=(
+                            RuntimeProviderProxyBindingV1(
+                                schema="captain.runtime-provider-proxy-binding.v1",
+                                responses_url=configured.provider_proxy_url,
+                                policy_sha256=configured.provider_policy_sha256,
+                                price_card_sha256=configured.provider_price_card_sha256,
+                            )
+                            if configured.provider_proxy_url is not None
+                            else None
+                        ),
+                    )
+        return resume_service
+
+    app.state.get_capability_resume_service = get_capability_resume_service
+
+    def translate_capability_resume_error(error: Exception) -> HTTPException:
+        if isinstance(error, CapabilityResumeNotFound):
+            return HTTPException(status_code=404, detail=str(error))
+        if isinstance(error, CapabilityResumeConflict):
+            return HTTPException(status_code=409, detail=str(error))
+        if isinstance(error, CapabilityResumeUnavailable):
+            return HTTPException(status_code=409, detail=str(error))
+        if isinstance(error, CapabilityResumeDispatchFailed):
+            return HTTPException(
+                status_code=502,
+                detail={
+                    "code": "authoritative_runtime_failure",
+                    "failure_id": str(error.failure.execution.execution_result_id),
+                },
+            )
+        return HTTPException(status_code=503, detail="capability resume unavailable")
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -928,6 +1083,115 @@ def create_app(
         return await run_in_threadpool(
             get_store().record_minibook_projection_rebuild_receipt,
             receipt,
+        )
+
+    @app.post(
+        "/v1/capability-resumes/authorizations",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def authorize_capability_resume(
+        request: CapabilityResumeAuthorizeHttpRequest,
+        _: GatewayRole = Depends(require_captain),
+    ) -> CapabilityResumeAuthorization:
+        try:
+            return await run_in_threadpool(
+                get_capability_resume_service().authorize,
+                request.to_domain(),
+            )
+        except (
+            CapabilityResumeConflict,
+            CapabilityResumeNotFound,
+            CapabilityResumeUnavailable,
+            CapabilityResumeDispatchFailed,
+        ) as exc:
+            raise translate_capability_resume_error(exc) from None
+
+    @app.post(
+        "/v1/capability-resumes/dispatches",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def dispatch_capability_resume(
+        authorization: CapabilityResumeAuthorizationHttpRequest,
+        _: GatewayRole = Depends(require_captain),
+    ) -> CapabilityExecutionAuthority:
+        try:
+            return await get_capability_resume_service().dispatch(
+                authorization.to_domain()
+            )
+        except (
+            CapabilityResumeConflict,
+            CapabilityResumeNotFound,
+            CapabilityResumeUnavailable,
+            CapabilityResumeDispatchFailed,
+        ) as exc:
+            raise translate_capability_resume_error(exc) from None
+
+    @app.post("/v1/capability-resumes/readbacks")
+    async def readback_capability_resume(
+        authorization: CapabilityResumeAuthorizationHttpRequest,
+        _: GatewayRole = Depends(require_captain),
+    ) -> CapabilityExecutionAuthority:
+        try:
+            return await run_in_threadpool(
+                get_capability_resume_service().readback,
+                authorization.to_domain(),
+            )
+        except (
+            CapabilityResumeConflict,
+            CapabilityResumeNotFound,
+            CapabilityResumeUnavailable,
+            CapabilityResumeDispatchFailed,
+        ) as exc:
+            raise translate_capability_resume_error(exc) from None
+
+    @app.post("/v1/capability-resumes/cost-authorities/validate")
+    async def validate_capability_resume_cost_authority(
+        command: AgentRuntimeCommand,
+        _: GatewayRole = Depends(require_captain),
+    ) -> RuntimeResumeCostAuthorityV1:
+        return await run_in_threadpool(
+            get_store().validate_capability_resume_cost_authority,
+            command,
+            now=datetime.now(timezone.utc),
+        )
+
+    @app.post(
+        "/v1/capability-resumes/provider-settlements",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def record_runtime_provider_settlement(
+        settlement: RuntimeProviderCostSettlementV1,
+        response: Response,
+        _: GatewayRole = Depends(require_provider_receipt_authority),
+    ) -> RuntimeWriteReceipt:
+        receipt = await run_in_threadpool(
+            get_store().record_runtime_provider_settlement,
+            settlement,
+        )
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.post("/v1/capability-resumes/provider-authorities/preflight")
+    async def preflight_runtime_provider_authority(
+        context: ProviderBudgetContextV1,
+        _: GatewayRole = Depends(require_provider_receipt_authority),
+    ) -> ProviderBudgetContextV1:
+        return await run_in_threadpool(
+            get_store().validate_provider_proxy_authority,
+            context,
+            now=datetime.now(timezone.utc),
+        )
+
+    @app.post("/v1/capability-resumes/cost-authorities/settle")
+    async def settle_capability_resume_cost(
+        request: RuntimeResumeCostSettlementRequestV1,
+        _: GatewayRole = Depends(require_captain),
+    ) -> RuntimeResumeCostSettlementV1:
+        return await run_in_threadpool(
+            get_store().settle_capability_resume_cost,
+            request,
+            now=datetime.now(timezone.utc),
         )
 
     @app.post("/v1/runtime/commands", status_code=status.HTTP_202_ACCEPTED)

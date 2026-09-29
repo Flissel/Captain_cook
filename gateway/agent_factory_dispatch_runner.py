@@ -178,6 +178,17 @@ class GatewayNextActionLeaseIssuer:
             now=now,
         )
 
+    def register_n8n_work_batch(self, job: FactoryJob, batch_id: str) -> None:
+        """Bind a provisioned generic n8n WorkBatch to exactly one Factory job."""
+
+        expected = f"n8n-{job.job_id.hex[:24]}"
+        if batch_id != expected:
+            raise FactoryLeaseDenied("n8n WorkBatch is not derived from the Factory job")
+        existing = self._n8n_work_batches.get(job.job_id)
+        if existing is not None and existing != batch_id:
+            raise FactoryLeaseDenied("n8n WorkBatch binding changed for the Factory job")
+        self._n8n_work_batches[job.job_id] = batch_id
+
     def ensure_recovery_for(
         self,
         job: FactoryJob,
@@ -312,7 +323,8 @@ class GatewayNextActionLeaseIssuer:
             or action.kind is not FactoryActionKind.DISPATCH_TOOL_INTEGRATOR
         ):
             return IntegrationIntent.NONE
-        expected_batch_id = f"renewal-{job.job_id.hex[:24]}"
+        renewal_batch_id = f"renewal-{job.job_id.hex[:24]}"
+        generic_batch_id = f"n8n-{job.job_id.hex[:24]}"
         try:
             batch = WorkBatch.model_validate(self._store.bundle(batch_id))
         except Exception as exc:
@@ -321,11 +333,18 @@ class GatewayNextActionLeaseIssuer:
             ) from exc
         if (
             batch.batch_id != batch_id
-            or batch.batch_id != expected_batch_id
             or batch.target != "n8n"
             or batch.runtime != "n8n"
             or "n8n-builder" not in batch.capability_tags
-            or "renewal_context_read" not in batch.subtask_ids
+            or (
+                batch.batch_id == renewal_batch_id
+                and "renewal_context_read" not in batch.subtask_ids
+            )
+            or (
+                batch.batch_id == generic_batch_id
+                and "n8n-workflow" not in batch.subtask_ids
+            )
+            or batch.batch_id not in {renewal_batch_id, generic_batch_id}
         ):
             raise FactoryLeaseDenied(
                 "n8n Factory lease requires a released n8n WorkBatch"

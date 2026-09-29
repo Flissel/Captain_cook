@@ -2260,7 +2260,7 @@ class CodexCliFactoryBuildExecutor:
             checkpoint.resume_ordinal,
         )
         target.parent.mkdir(parents=True, exist_ok=True)
-        _write_once(target, content)
+        write_once_codex_evidence(target, content)
         return content, verified_receipt
 
     def _load_reconciliation_receipt(
@@ -3442,7 +3442,7 @@ class CodexCliFactoryBuildExecutor:
     ) -> Path:
         target = self._session_receipt_path(invocation, resume_ordinal)
         target.parent.mkdir(parents=True, exist_ok=True)
-        _write_once(target, content)
+        write_once_codex_evidence(target, content)
         return target
 
     def _session_receipt_path(
@@ -3902,7 +3902,14 @@ def _bounded_codex_journal_lines(content: bytes) -> tuple[str, ...]:
     return tuple(records)
 
 
-def _write_once(target: Path, content: bytes) -> None:
+def write_once_codex_evidence(
+    target: Path,
+    content: bytes,
+    *,
+    conflict: str = "Codex session receipt replay conflicts",
+) -> None:
+    """Persist exact evidence bytes once without weakening replay checks."""
+
     try:
         descriptor = os.open(
             target,
@@ -3911,7 +3918,7 @@ def _write_once(target: Path, content: bytes) -> None:
         )
     except FileExistsError:
         if target.read_bytes() != content:
-            raise FactoryDispatchError("Codex session receipt replay conflicts")
+            raise FactoryDispatchError(conflict)
         return
     with os.fdopen(descriptor, "wb") as stream:
         stream.write(content)
@@ -3953,4 +3960,5 @@ __all__ = [
     "GitDetachedFactoryWorkspacePreparer",
     "PreparedFactoryWorkspace",
     "PowerShellFactoryCodexProcessInspector",
+    "write_once_codex_evidence",
 ]

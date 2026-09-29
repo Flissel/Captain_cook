@@ -14,6 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+from agenten.agent_runtime.contracts import AgentRuntimeCommand
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.app import create_app
 from gateway.auth import GatewayRole, require_actor
@@ -72,6 +73,13 @@ def client(storage: MariaDBStorage, mirror: RecordingMirror) -> TestClient:
 
 def load(name: str) -> dict[str, Any]:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def canonical_runtime_command(value: dict[str, Any]) -> dict[str, Any]:
+    return AgentRuntimeCommand.model_validate(value).model_dump(
+        mode="json",
+        by_alias=True,
+    )
 
 
 def release_batch(client: TestClient) -> None:
@@ -158,7 +166,7 @@ def test_grant_and_result_require_the_exact_command(client: TestClient) -> None:
 
     operation = client.get(f"/v1/runtime/operations/{command['event_id']}")
     assert operation.status_code == 200
-    assert operation.json()["command"] == command
+    assert operation.json()["command"] == canonical_runtime_command(command)
     assert operation.json()["grant"] == grant
     assert operation.json()["result"] == result
 
@@ -259,7 +267,7 @@ def test_duplicate_concurrent_submission_and_restart_retrieval(
     with TestClient(application(storage, mirror)) as restarted:
         recovered = restarted.get(f"/v1/runtime/operations/{command['event_id']}")
     assert recovered.status_code == 200
-    assert recovered.json()["command"] == command
+    assert recovered.json()["command"] == canonical_runtime_command(command)
 
 
 def test_mirror_receives_only_redacted_projection_after_commit(

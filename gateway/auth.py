@@ -14,6 +14,7 @@ from gateway.settings import GatewayConfigurationError, GatewaySettings
 class GatewayRole(str, Enum):
     CAPTAIN = "captain"
     WORKER = "worker"
+    PROVIDER_RECEIPT = "provider_receipt"
 
 
 _bearer = HTTPBearer(auto_error=False)
@@ -94,6 +95,32 @@ def require_captain(actor: GatewayRole = Depends(require_actor)) -> GatewayRole:
 
 def require_worker(actor: GatewayRole = Depends(require_actor)) -> GatewayRole:
     return _require_role(actor, GatewayRole.WORKER)
+
+
+def require_provider_receipt_authority(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    settings: GatewaySettings = Depends(get_gateway_settings),
+) -> GatewayRole:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise _unauthorized()
+    presented = credentials.credentials
+    provider = settings.provider_receipt_gateway_token
+    if provider is not None and secrets.compare_digest(
+        presented, provider.get_secret_value()
+    ):
+        return GatewayRole.PROVIDER_RECEIPT
+    if any(
+        secrets.compare_digest(presented, token.get_secret_value())
+        for token in (
+            settings.captain_gateway_token,
+            settings.worker_gateway_token,
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="insufficient gateway role",
+        )
+    raise _unauthorized()
 
 
 def require_reader(actor: GatewayRole = Depends(require_actor)) -> GatewayRole:

@@ -136,15 +136,20 @@ class FactoryBudgetProjection(_FrozenContract):
     def require_canonical_reserved_amount(cls, value: object) -> Decimal:
         return _parse_usd(value, "projection amount")
 
-    @field_validator("consumed_usd", "remaining_usd", mode="before")
+    @field_validator("consumed_usd", mode="before")
     @classmethod
     def require_canonical_usage_amount(cls, value: object) -> Decimal:
         return _parse_usage_usd(value, "projection amount")
 
+    @field_validator("remaining_usd", mode="before")
+    @classmethod
+    def require_canonical_remaining_amount(cls, value: object) -> Decimal:
+        return _parse_signed_usage_usd(value, "projection remaining amount")
+
     @model_validator(mode="after")
     def require_consistent_totals(self) -> "FactoryBudgetProjection":
         expected = self.limit_usd - self.consumed_usd - self.reserved_usd
-        if self.remaining_usd != expected or expected < 0:
+        if self.remaining_usd != expected:
             raise ValueError("factory budget projection totals are inconsistent")
         if len(self.active_reservation_ids) != len(set(self.active_reservation_ids)):
             raise ValueError("active reservation IDs must not contain duplicates")
@@ -538,6 +543,20 @@ def _parse_usage_usd(value: object, field_name: str) -> Decimal:
         raise ValueError(
             f"{field_name} must be finite, non-negative, and use micro-USD"
         )
+    return _canonical_usd(amount)
+
+
+def _parse_signed_usage_usd(value: object, field_name: str) -> Decimal:
+    """Parse a projection balance that may expose authoritative overspend."""
+
+    if isinstance(value, (bool, float)) or not isinstance(value, (str, Decimal)):
+        raise ValueError(f"{field_name} must be a decimal string")
+    try:
+        amount = Decimal(value)
+    except InvalidOperation as exc:
+        raise ValueError(f"{field_name} must be finite") from exc
+    if not amount.is_finite() or amount.as_tuple().exponent < -6:
+        raise ValueError(f"{field_name} must be finite and use micro-USD")
     return _canonical_usd(amount)
 
 
