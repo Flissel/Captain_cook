@@ -1,34 +1,57 @@
 import importlib
+import os
+
+from config.llm_provider import NEMOTRON_DEFAULT_MODEL
+
+_PROVIDER_VARS = (
+    "CAPTAIN_LLM_PROVIDER",
+    "CAPTAIN_LLM_BASE_URL",
+    "CAPTAIN_MODEL",
+    "NEBIUS_API_KEY",
+    "OPENAI_API_KEY",
+)
 
 
-def test_default_model_is_gpt_5_6(monkeypatch, tmp_path):
-    # The module also reads a .env from the working directory, so the
-    # default is only pinned once both sources are known to be empty --
-    # otherwise this asserts whatever the developer happens to have set.
+def _clean(monkeypatch, tmp_path):
+    # The module also reads a .env from the working directory, so defaults are
+    # only pinned once both sources are known to be empty.
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("CAPTAIN_MODEL", raising=False)
+    for name in _PROVIDER_VARS:
+        monkeypatch.delenv(name, raising=False)
 
+
+def test_default_model_is_nemotron_on_nebius(monkeypatch, tmp_path):
+    _clean(monkeypatch, tmp_path)
     import config.llm_config as llm_config
 
     reloaded = importlib.reload(llm_config)
 
-    assert reloaded.MODEL == "gpt-5.6"
+    assert reloaded.PROFILE.name == "nebius"
+    assert reloaded.MODEL == NEMOTRON_DEFAULT_MODEL
 
 
-def test_local_env_file_supplies_legacy_model_configuration(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("CAPTAIN_MODEL", raising=False)
+def test_local_env_file_supplies_openai_opt_in(monkeypatch, tmp_path):
+    _clean(monkeypatch, tmp_path)
     (tmp_path / ".env").write_text(
-        "OPENAI_API_KEY=test-key\nCAPTAIN_MODEL=test-model\n",
+        "CAPTAIN_LLM_PROVIDER=openai\nOPENAI_API_KEY=test-key\nCAPTAIN_MODEL=test-model\n",
         encoding="utf-8",
     )
-
     import config.llm_config as llm_config
 
     reloaded = importlib.reload(llm_config)
 
     assert reloaded.API_KEY == "test-key"
     assert reloaded.MODEL == "test-model"
-    assert "OPENAI_API_KEY" not in __import__("os").environ
-    assert "CAPTAIN_MODEL" not in __import__("os").environ
+    assert "OPENAI_API_KEY" not in os.environ
+    assert "CAPTAIN_MODEL" not in os.environ
+
+
+def test_local_env_file_supplies_nebius_key(monkeypatch, tmp_path):
+    _clean(monkeypatch, tmp_path)
+    (tmp_path / ".env").write_text("NEBIUS_API_KEY=nb-test\n", encoding="utf-8")
+    import config.llm_config as llm_config
+
+    reloaded = importlib.reload(llm_config)
+
+    assert reloaded.API_KEY == "nb-test"
+    assert "NEBIUS_API_KEY" not in os.environ
