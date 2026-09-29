@@ -57,3 +57,35 @@ def test_cli_defaults_to_the_deterministic_executor():
 
 def test_cli_accepts_the_llm_executor():
     assert main.parse_args(["demo", "--householder-executor", "llm"]).householder_executor == "llm"
+
+
+async def _timeout_seen_by_pipeline(monkeypatch, **kwargs) -> float:
+    from agenten.orchestration.pipeline import SupplyChainPipeline as Pipeline
+
+    seen: list[float] = []
+    original = Pipeline.wait_until_terminal
+
+    async def spy(self, expected_subproblem_count, timeout=5.0, poll_interval=0.01):
+        seen.append(timeout)
+        return await original(self, expected_subproblem_count, timeout, poll_interval)
+
+    monkeypatch.setattr(Pipeline, "wait_until_terminal", spy)
+    await run_demo(**kwargs)
+    return seen[0]
+
+
+@pytest.mark.asyncio
+async def test_deterministic_path_keeps_the_five_second_timeout(monkeypatch):
+    assert await _timeout_seen_by_pipeline(monkeypatch) == 5.0
+
+
+@pytest.mark.asyncio
+async def test_llm_path_timeout_covers_the_executor_worst_case(monkeypatch):
+    from agenten import demo
+
+    client = build_replay_model_client([_report() for _ in range(4)])
+
+    timeout = await _timeout_seen_by_pipeline(monkeypatch, householder_model_client=client)
+
+    assert timeout == demo.LLM_CONVERGENCE_TIMEOUT_SECONDS == 270.0
+    assert timeout >= 4 * demo.LLM_CALL_TIMEOUT_SECONDS * demo.LLM_CALL_MAX_ATTEMPTS

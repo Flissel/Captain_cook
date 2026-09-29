@@ -17,6 +17,15 @@ from agenten.orchestration.pipeline import build_pipeline
 
 DEMO_PROBLEM = "Prepare a small engineering brief for a new workflow automation."
 EXPECTED_SUBPROBLEM_COUNT = 4
+DETERMINISTIC_CONVERGENCE_TIMEOUT_SECONDS = 5.0
+LLM_CALL_TIMEOUT_SECONDS = 30.0
+LLM_CALL_MAX_ATTEMPTS = 2
+LLM_CONVERGENCE_MARGIN_SECONDS = 30.0
+# Worst case: every householder runs sequentially and exhausts all attempts.
+LLM_CONVERGENCE_TIMEOUT_SECONDS = (
+    EXPECTED_SUBPROBLEM_COUNT * LLM_CALL_TIMEOUT_SECONDS * LLM_CALL_MAX_ATTEMPTS
+    + LLM_CONVERGENCE_MARGIN_SECONDS
+)
 
 
 @dataclass(frozen=True)
@@ -98,9 +107,18 @@ async def run_demo(
     """
     blockchain = Blockchain(storage=InMemoryStorage())
     executor = (
-        LlmHouseholderExecutor(householder_model_client)
+        LlmHouseholderExecutor(
+            householder_model_client,
+            timeout_seconds=LLM_CALL_TIMEOUT_SECONDS,
+            max_attempts=LLM_CALL_MAX_ATTEMPTS,
+        )
         if householder_model_client is not None
         else None
+    )
+    convergence_timeout = (
+        DETERMINISTIC_CONVERGENCE_TIMEOUT_SECONDS
+        if householder_model_client is None
+        else LLM_CONVERGENCE_TIMEOUT_SECONDS
     )
     pipeline = build_pipeline(
         llm_decompose=_deterministic_decompose,
@@ -114,10 +132,12 @@ async def run_demo(
         problem_id = await pipeline.submit_problem(DEMO_PROBLEM)
         converged = await pipeline.wait_until_terminal(
             expected_subproblem_count=EXPECTED_SUBPROBLEM_COUNT,
-            timeout=5.0,
+            timeout=convergence_timeout,
         )
         if not converged:
-            raise RuntimeError("Offline demo did not reach a terminal state within five seconds")
+            raise RuntimeError(
+                f"Demo did not reach a terminal state within {convergence_timeout:g} seconds"
+            )
 
         terminal_count = sum(
             pipeline.ledger_query.count_in_stage(stage)
