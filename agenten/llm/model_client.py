@@ -5,8 +5,8 @@ Two entry points:
 
 - `build_model_client`: a real OpenAI-backed client
   (`autogen_ext.models.openai.OpenAIChatCompletionClient`), defaulting
-  `api_key`/`model` from the existing `config.llm_config` module (`API_KEY`,
-  `MODEL`) so callers don't have to duplicate that env-var wiring. SDK-level
+  provider, endpoint, key and model from `config.llm_config.PROFILE` so
+  callers don't have to duplicate that env-var wiring. SDK-level
   retries are disabled so the Captain stage wrapper remains the sole retry
   owner.
 - `build_replay_model_client`: a deterministic, offline client
@@ -20,29 +20,39 @@ from autogen_core.models import ChatCompletionClient, ModelFamily, ModelInfo
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_ext.models.replay import ReplayChatCompletionClient
 
-from config.llm_config import API_KEY, BASE_URL, MODEL
+from config.llm_config import PROFILE
+from config.llm_provider import (
+    CUSTOM_ENDPOINT_PLACEHOLDER_KEY,
+    ProviderConfigurationError,
+    ProviderProfile,
+)
 
 
 def build_model_client(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
     base_url: Optional[str] = None,
+    *,
+    profile: Optional[ProviderProfile] = None,
 ) -> ChatCompletionClient:
-    """Build a real OpenAI-backed `ChatCompletionClient`.
+    """Build a real `ChatCompletionClient` for the configured provider.
 
-    `api_key`/`model` default to `config.llm_config.API_KEY`/`MODEL` (which
-    in turn reads `OPENAI_API_KEY` from the environment) when not given
-    explicitly. If the resolved api key is still `None`, it is simply
-    omitted from the underlying client's kwargs rather than passed through
-    as an explicit `None` — this lets the OpenAI SDK make its own attempt
-    to read `OPENAI_API_KEY` from the environment rather than failing
-    immediately at construction time on a redundant lookup.
+    Defaults come from `config.llm_config.PROFILE` (Nebius Token Factory with
+    Nemotron unless the environment opts into OpenAI or a custom endpoint).
+    Explicit arguments override the profile. SDK retries stay disabled so the
+    Captain stage wrapper remains the sole retry owner.
     """
-    resolved_model = model if model is not None else MODEL
-    resolved_api_key = api_key if api_key is not None else API_KEY
-    resolved_base_url = base_url if base_url is not None else BASE_URL
+    active = profile if profile is not None else PROFILE
+    resolved_model = model if model is not None else active.model
+    resolved_api_key = api_key if api_key is not None else active.api_key
+    resolved_base_url = base_url if base_url is not None else active.base_url
 
-    kwargs = {
+    if active.name == "nebius" and resolved_api_key is None:
+        raise ProviderConfigurationError(
+            "NEBIUS_API_KEY is not configured for the Nebius Token Factory provider"
+        )
+
+    kwargs: dict[str, object] = {
         "model": resolved_model,
         "max_retries": 0,
         "parallel_tool_calls": False,
@@ -51,23 +61,19 @@ def build_model_client(
         kwargs["api_key"] = resolved_api_key
 
     # A configured endpoint is passed explicitly rather than left to the SDK's
-    # OPENAI_BASE_URL lookup, so which path this client takes is visible here
-    # instead of depending on ambient environment. Local shims ignore the key
-    # but the SDK still insists on one, hence the placeholder.
+    # OPENAI_BASE_URL lookup, so which path this client takes is visible here.
     if resolved_base_url:
         kwargs["base_url"] = resolved_base_url
-        kwargs.setdefault("api_key", "captain-local-endpoint")
-        # A custom endpoint usually serves a model name the SDK does not know,
-        # and it refuses to construct without capabilities for it. Declared to
-        # match what the endpoint genuinely does: the local shim carries a
-        # requested schema into the prompt, so json/structured output holds,
-        # while tool calling does not.
+        kwargs.setdefault("api_key", CUSTOM_ENDPOINT_PLACEHOLDER_KEY)
+        # Non-OpenAI model names are unknown to the SDK, which refuses to
+        # construct without declared capabilities. They come from the profile
+        # so they match what the endpoint verifiably does.
         kwargs["model_info"] = ModelInfo(
             vision=False,
-            function_calling=False,
+            function_calling=active.tool_calling,
             json_output=True,
             family=ModelFamily.UNKNOWN,
-            structured_output=True,
+            structured_output=active.structured_output,
         )
 
     return OpenAIChatCompletionClient(**kwargs)
