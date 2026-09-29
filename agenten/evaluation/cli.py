@@ -225,7 +225,7 @@ def build_evaluation_model_client(
         kwargs["base_url"] = profile.base_url
         kwargs["model_info"] = ModelInfo(
             vision=False,
-            function_calling=True,
+            function_calling=profile.tool_calling,
             json_output=True,
             family=ModelFamily.UNKNOWN,
             structured_output=profile.structured_output,
@@ -310,6 +310,10 @@ async def async_main(
             }
         )
         return 0 if manifest.status is EvaluationStatus.ACCEPTED else 2
+    except ProviderConfigurationError:
+        # e.g. a missing provider key detected while building the client.
+        _print_summary({"error": "invalid_provider", "status": "failed"})
+        return 1
     except Exception:
         _print_summary({"error": "evaluation_failed", "status": "failed"})
         return 1

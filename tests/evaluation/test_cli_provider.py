@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 import pytest
@@ -61,3 +62,46 @@ def test_nebius_evaluation_without_key_is_rejected(monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(ProviderConfigurationError, match="NEBIUS_API_KEY"):
         evaluation_cli.build_evaluation_model_client(profile=keyless)
+
+
+def test_evaluation_model_info_follows_the_profile_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _capture(monkeypatch)
+    profile = ProviderProfile("nebius", "nvidia/x", NEBIUS_BASE_URL, "nb-test", True, False)
+
+    evaluation_cli.build_evaluation_model_client(profile=profile)
+
+    assert captured["model_info"]["function_calling"] is profile.tool_calling
+    assert captured["model_info"]["structured_output"] is False
+
+
+@pytest.mark.asyncio
+async def test_missing_nebius_key_is_reported_as_invalid_provider(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for name in ("CAPTAIN_LLM_PROVIDER", "CAPTAIN_LLM_BASE_URL", "CAPTAIN_MODEL", "NEBIUS_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    constructed: list[object] = []
+    monkeypatch.setattr(
+        evaluation_cli, "OpenAIChatCompletionClient", lambda **kw: constructed.append(kw) or object()
+    )
+    input_path = tmp_path / "input.md"
+    input_path.write_text("# Team\n\nBuild CRM.\n", encoding="utf-8")
+
+    exit_code = await evaluation_cli.async_main(
+        [
+            str(input_path),
+            "--source-reference",
+            "agentfarm/input.md",
+            "--output",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+
+    assert exit_code == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "invalid_provider",
+        "status": "failed",
+    }
+    assert constructed == []

@@ -66,3 +66,19 @@ def test_builder_does_not_accept_the_openai_secret_for_nebius():
         OpenAIBusinessBenchmarkModelClientBuilder.from_environment(
             {"CAPTAIN_BENCHMARK_PROVIDER": "nebius", "CAPTAIN_BENCHMARK_MODEL": "nvidia/x", "OPENAI_API_KEY": "sk-old"}
         )
+
+
+def test_nebius_benchmark_capabilities_come_from_the_provider_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        benchmark_providers, "OpenAIChatCompletionClient", lambda **kw: captured.update(kw) or object()
+    )
+    monkeypatch.setattr(benchmark_providers, "NEMOTRON_TOOL_CALLING", False)
+    monkeypatch.setattr(benchmark_providers, "NEMOTRON_STRUCTURED_OUTPUT", False)
+
+    build_benchmark_model_client(provider="nebius", api_key="nb-test", model="nvidia/x")
+
+    assert captured["model_info"]["function_calling"] is False
+    assert captured["model_info"]["structured_output"] is False
