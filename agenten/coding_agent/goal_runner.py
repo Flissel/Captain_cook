@@ -22,7 +22,7 @@ from agenten.coding_agent.contracts import (
 from agenten.coding_agent.goal_prompt import render_goal_prompt, render_resume_prompt
 from agenten.coding_agent.sandbox import SandboxCommand, SandboxPort
 
-_MODEL = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
+_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _SESSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost"})
 
@@ -44,7 +44,7 @@ class ClaudeRunnerSettings:
         parsed = urlsplit(self.relay_url)
         secure = parsed.scheme == "https" and bool(parsed.hostname)
         local = parsed.scheme == "http" and parsed.hostname in _LOCAL_HOSTS
-        if not (secure or local) or parsed.username or parsed.password or parsed.query:
+        if not (secure or local) or parsed.username or parsed.password or parsed.query or "#" in self.relay_url:
             raise ValueError("relay_url must be https (or http on localhost)")
         for value in (self.model, self.small_model):
             if _MODEL.fullmatch(value) is None:
@@ -78,6 +78,27 @@ def build_claude_env(settings: ClaudeRunnerSettings, run_token: str) -> dict[str
     }
 
 
+_REDACTED = "<redacted>"
+
+
+def _redactor(token: str) -> Callable[[str], str]:
+    """Replace the run token in agent-controlled text; an empty token redacts nothing."""
+
+    def redact(text: str) -> str:
+        return text.replace(token, _REDACTED) if token else text
+
+    return redact
+
+
+def _redact_report(report: AcceptanceReportV1, redact: Callable[[str], str]) -> AcceptanceReportV1:
+    return AcceptanceReportV1(
+        checks=tuple(
+            check.model_copy(update={"command": redact(check.command), "output_tail": redact(check.output_tail)})
+            for check in report.checks
+        )
+    )
+
+
 class ClaudeGoalRunner:
     def __init__(
         self,
@@ -99,6 +120,7 @@ class ClaudeGoalRunner:
         report: AcceptanceReportV1 | None = None
         rounds: list[AgentGoalRoundV1] = []
         env = build_claude_env(self._settings, run_token)
+        redact = _redactor(run_token)
         workdir = self._settings.workdir
 
         def finish(status: GoalStatus, reason: str | None) -> AgentGoalResultV1:
@@ -124,24 +146,35 @@ class ClaudeGoalRunner:
                 ),
             )
             summary = summarize_claude_stream(run.stdout)
-            session = summary.session_id or session
+            reported_session = summary.session_id
+            leaked_session = reported_session is not None and bool(run_token) and run_token in reported_session
+            bad_session = reported_session is not None and _SESSION.fullmatch(reported_session) is None
+            if reported_session is not None and not leaked_session and not bad_session:
+                session = reported_session
             input_image, image = image, run.output_image_id
             paths = await changed_paths(
                 self._sandbox, before_image_id=input_image, after_image_id=image, workdir=workdir
             )
             outside = {path for path in paths if not path_allowed(path, goal.allowed_paths)}
             judge = set(protected_paths(paths, explicitly_allowed=goal.allowed_paths))
-            violations = tuple(sorted(outside | judge))
+            exfiltrating = {path for path in paths if run_token and run_token in path}
+            violations = tuple(redact(path) for path in sorted(outside | judge | exfiltrating))
+            paths = tuple(redact(path) for path in paths)
+            session_usable = reported_session is not None and not leaked_session and not bad_session
             acceptance = None
-            if not run.timed_out and not violations and summary.session_id is not None:
-                acceptance = await run_acceptance(
-                    self._sandbox, image_id=image, commands=goal.acceptance_commands,
-                    workdir=workdir, timeout_seconds=self._settings.acceptance_timeout_seconds,
+            if not run.timed_out and not violations and session_usable:
+                acceptance = _redact_report(
+                    await run_acceptance(
+                        self._sandbox, image_id=image, commands=goal.acceptance_commands,
+                        workdir=workdir, timeout_seconds=self._settings.acceptance_timeout_seconds,
+                    ),
+                    redact,
                 )
             rounds.append(
                 AgentGoalRoundV1(
                     round=number, input_image_id=input_image, output_image_id=image,
-                    session_id=summary.session_id, result_subtype=summary.result_subtype,
+                    session_id=redact(reported_session) if reported_session is not None else None,
+                    result_subtype=redact(summary.result_subtype) if summary.result_subtype is not None else None,
                     num_turns=summary.num_turns, tool_call_count=summary.tool_call_count,
                     exit_code=run.exit_code, timed_out=run.timed_out,
                     journal_sha256=summary.journal_sha256, changed_paths=paths,
@@ -150,10 +183,14 @@ class ClaudeGoalRunner:
             )
             if run.timed_out:
                 return finish("timeout", "claude round timed out")
-            if summary.session_id is None:
+            if leaked_session:
+                return finish("policy_violation", "claude session id carried the run token")
+            if reported_session is None:
                 return finish("failed", "claude stream carried no session")
+            if bad_session:
+                return finish("failed", "claude session id is not a plain identifier")
             if violations:
-                return finish("policy_violation", f"changed path outside allowed_paths: {violations[0]}"[:300])
+                return finish("policy_violation", f"disallowed changed path: {violations[0]}"[:300])
             if acceptance is None:  # unreachable: guarded by the conditions above
                 return finish("failed", "acceptance did not run")
             if acceptance.passed:

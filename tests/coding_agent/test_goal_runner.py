@@ -57,6 +57,7 @@ class _Script:
         self.claude_stdout = claude_stdout or _stream()
         self.timed_out = timed_out
         self.claude_runs = 0
+        self.acceptance_images = []
 
     def __call__(self, image, command):
         if command.shell.startswith("cd /work && claude "):
@@ -68,6 +69,7 @@ class _Script:
             else:
                 entries = {"src/app.py": "b" * 64, **self.extra_after}
             return ok(_manifest(entries), image="discard")
+        self.acceptance_images.append(image)
         return ok("tail", image="discard", exit_code=self.acceptance.pop(0))
 
 
@@ -123,6 +125,13 @@ async def test_red_then_green_resumes_the_same_session():
     assert sandbox.calls[0][0] == "img-0"
     assert TOKEN not in result.model_dump_json()
     assert TOKEN not in repr(result)
+    assert script.acceptance_images == ["img-r1", "img-r2"]
+    assert "img-0" not in script.acceptance_images
+    for _, command in sandbox.calls:
+        assert TOKEN not in command.shell
+        if not command.shell.startswith("cd /work && claude "):
+            assert dict(command.env) == {}
+    assert dict(claude_calls[0].env)["ANTHROPIC_AUTH_TOKEN"] == TOKEN
 
 
 @pytest.mark.asyncio
@@ -214,3 +223,74 @@ async def test_goal_timeout_stops_before_next_round():
     result = await runner.run(_goal(timeout_seconds=600), workspace_image_id="img-0", run_token=TOKEN)
     assert result.status == "timeout"
     assert len(result.rounds) == 1
+
+
+@pytest.mark.parametrize("model", ["-rf", "--help", "-x/y"])
+def test_settings_reject_model_ids_that_look_like_flags(model):
+    with pytest.raises(ValueError):
+        ClaudeRunnerSettings(relay_url="https://relay.example", model=model, small_model="n")
+    with pytest.raises(ValueError):
+        ClaudeRunnerSettings(relay_url="https://relay.example", model="m", small_model=model)
+
+
+@pytest.mark.parametrize("url", ["https://relay.example/x#frag", "https://relay.example/x#"])
+def test_settings_reject_relay_urls_with_fragment(url):
+    with pytest.raises(ValueError):
+        ClaudeRunnerSettings(relay_url=url, model="m", small_model="n")
+
+
+@pytest.mark.asyncio
+async def test_token_in_changed_path_is_a_violation_and_is_redacted():
+    script = _Script(acceptance_exit_codes=[], extra_after={"src/" + TOKEN: "c" * 64})
+    runner, sandbox = _runner(script)
+    result = await runner.run(_goal(), workspace_image_id="img-0", run_token=TOKEN)
+    assert result.status == "policy_violation"
+    assert result.rounds[0].acceptance is None
+    assert result.rounds[0].policy_violations == ("src/<redacted>",)
+    assert "src/<redacted>" in result.rounds[0].changed_paths
+    dumped = result.model_dump_json()
+    assert TOKEN not in dumped
+    assert TOKEN not in repr(result)
+    assert "<redacted>" in dumped
+    assert TOKEN not in (result.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_token_in_stream_session_is_redacted_and_ends_the_goal():
+    script = _Script(acceptance_exit_codes=[], claude_stdout=_stream(session="s-" + TOKEN))
+    runner, sandbox = _runner(script)
+    result = await runner.run(_goal(), workspace_image_id="img-0", run_token=TOKEN)
+    assert result.status == "policy_violation"
+    assert result.rounds[0].session_id == "s-<redacted>"
+    assert script.claude_runs == 1
+    assert script.acceptance_images == []
+    assert TOKEN not in result.model_dump_json()
+    assert TOKEN not in repr(result)
+    assert all(TOKEN not in command.shell for _, command in sandbox.calls)
+
+
+@pytest.mark.asyncio
+async def test_token_in_stream_result_subtype_is_redacted():
+    script = _Script(acceptance_exit_codes=[1, 1], claude_stdout=_stream(subtype="error_" + TOKEN))
+    runner, _ = _runner(script)
+    result = await runner.run(_goal(max_rounds=2), workspace_image_id="img-0", run_token=TOKEN)
+    assert TOKEN not in result.model_dump_json()
+    assert TOKEN not in repr(result)
+    assert result.rounds[0].result_subtype == "error_<redacted>"
+
+
+@pytest.mark.asyncio
+async def test_token_in_acceptance_output_is_redacted():
+    class _Leaky(_Script):
+        def __call__(self, image, command):
+            if "sha256sum" in command.shell or command.shell.startswith("cd /work && claude "):
+                return super().__call__(image, command)
+            self.acceptance_images.append(image)
+            return ok("leak " + TOKEN, image="discard", exit_code=self.acceptance.pop(0))
+
+    script = _Leaky(acceptance_exit_codes=[1, 0])
+    runner, _ = _runner(script)
+    result = await runner.run(_goal(), workspace_image_id="img-0", run_token=TOKEN)
+    assert result.status == "achieved"
+    assert TOKEN not in result.model_dump_json()
+    assert "leak <redacted>" in result.rounds[0].acceptance.checks[0].output_tail
