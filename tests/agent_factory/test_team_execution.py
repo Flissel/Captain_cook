@@ -2686,6 +2686,216 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
     assert timeout.value.identity.case_sha256 == job.private_holdout_refs[0].sha256
 
 
+def _graph_flow_candidate(tmp_path: Path) -> ResolvedFactoryCandidate:
+    source = tmp_path / "graph-flow-team.zip"
+    prompts = {
+        "builder": b"Build what the task asks for.",
+        "reviewer": b"Reply APPROVE or ITERATE on the first line.",
+        "reporter": b"Summarize the accepted result.",
+    }
+    workflow = b"{}"
+    input_schema = b'{"type":"object"}'
+    output_schema = b'{"type":"object"}'
+    team = json.dumps(
+        {
+            "schema": "autogen-team.v1",
+            "name": "build_loop",
+            "conversation_pattern": "graph_flow",
+            "graph": {
+                "entry": "builder",
+                "edges": [
+                    {"source": "builder", "target": "reviewer"},
+                    {"source": "reviewer", "target": "builder", "when": "iterate"},
+                    {"source": "reviewer", "target": "reporter", "when": "approve"},
+                ],
+            },
+            "agents": [
+                {
+                    "name": name,
+                    "tools": [],
+                    "system_prompt_ref": _artifact(
+                        f"factory-prompts/{name}",
+                        hashlib.sha256(body).hexdigest(),
+                        media_type="text/plain",
+                    ).model_dump(mode="json"),
+                    "handoffs": [],
+                }
+                for name, body in prompts.items()
+            ],
+            "memory_policy": "buffered",
+            "max_messages": 20,
+            "max_handoffs": 0,
+            "max_tool_calls": 6,
+            "termination_conditions": ["max_messages"],
+            "entrypoint_command": ["python", "run_team.py"],
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("team_manifest.json", team)
+        for name, body in prompts.items():
+            archive.writestr(f"prompts/{name}.txt", body)
+        archive.writestr("workflows/support_triage.json", workflow)
+        archive.writestr("schemas/input.json", input_schema)
+        archive.writestr("schemas/output.json", output_schema)
+        archive.writestr("run_team.py", "print('unused')")
+    source_ref = _artifact(
+        "factory-source",
+        hashlib.sha256(source.read_bytes()).hexdigest(),
+        media_type="application/zip",
+    )
+    input_ref = _artifact("factory-schema/input", hashlib.sha256(input_schema).hexdigest())
+    output_ref = _artifact("factory-schema/output", hashlib.sha256(output_schema).hexdigest())
+    return ResolvedFactoryCandidate(
+        candidate=FactoryCandidateManifest(
+            candidate_id="support_triage_v1",
+            source_archive_ref=source_ref,
+            team_manifest={
+                "reference": _artifact("factory-team", hashlib.sha256(team).hexdigest()),
+                "relative_path": "team_manifest.json",
+            },
+            workflow_artifacts=(
+                {
+                    "reference": _artifact("factory-workflow", hashlib.sha256(workflow).hexdigest()),
+                    "relative_path": "workflows/support_triage.json",
+                },
+            ),
+            tool_schema_artifacts=(
+                {"reference": input_ref, "relative_path": "schemas/input.json"},
+                {"reference": output_ref, "relative_path": "schemas/output.json"},
+            ),
+            n8n_tools=(
+                TypedN8nTool(
+                    name="support_triage",
+                    description="Route a support request.",
+                    input_schema_ref=input_ref.uri,
+                    output_schema_ref=output_ref.uri,
+                ),
+            ),
+            build_command=("python", "-m", "compileall", "-q", "."),
+            real_case_command=("python", "run_team.py"),
+            timeout_seconds=30,
+        ),
+        source_archive=source,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("replies", "expected_status", "expected_reason", "expected_messages"),
+    [
+        (["built", "APPROVE", "summary"], "succeeded", "graph_completed", 4),
+        (["built", "looks fine to me"], "failed", "graph_stalled", 3),
+    ],
+)
+async def test_host_runner_maps_graph_flow_completion_and_stall(
+    tmp_path: Path,
+    replies: list[str],
+    expected_status: str,
+    expected_reason: str,
+    expected_messages: int,
+) -> None:
+    holdout_body = b"Resolve the private support case."
+    job = _job_v3(holdout_body=holdout_body)
+    candidate = _graph_flow_candidate(tmp_path)
+    evidence_store = FilesystemFactoryEvidenceStore(tmp_path / "host-evidence")
+    invocation = _invocation(job)
+    model_client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=invocation,
+        attempt=1,
+        delegate=ReplayChatCompletionClient(
+            replies,
+            model_info=ModelInfo(
+                vision=False,
+                function_calling=True,
+                json_output=True,
+                family=ModelFamily.UNKNOWN,
+                structured_output=True,
+            ),
+        ),
+        budget=InMemoryFactoryBudgetLedger(),
+        evidence_store=evidence_store,
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+
+    class Holdouts:
+        async def resolve(self, reference: object) -> ResolvedFactoryHoldoutCase:
+            return ResolvedFactoryHoldoutCase(
+                reference=job.private_holdout_refs[0],
+                body=holdout_body,
+            )
+
+        async def evaluate(
+            self,
+            reference: object,
+            result: object,
+            assertion_ids: tuple[str, ...],
+        ) -> FactoryHoldoutEvaluationReceiptV1:
+            # The evaluator approves every assertion; a stalled graph must still fail.
+            return FactoryHoldoutEvaluationReceiptV1(
+                schema_name="captain.factory-holdout-evaluation-receipt.v1",
+                holdout_ref=job.private_holdout_refs[0],
+                candidate_ref=candidate.candidate.source_archive_ref,
+                assertion_ids=assertion_ids,
+                decisions=tuple(
+                    FactoryHoldoutAssertionDecisionV1(
+                        assertion_id=assertion_id,
+                        passed=True,
+                        provenance_code="deterministic_rule",
+                    )
+                    for assertion_id in assertion_ids
+                ),
+                evaluator_id="captain_test_evaluator",
+                evaluator_version="1",
+                evaluated_at=NOW,
+            )
+
+    runner = HostAutoGenTeamRunner(
+        model_client=model_client,
+        evaluator=FactoryCandidateEvaluator(),
+        evidence_store=evidence_store,
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={},
+        clock=lambda: NOW,
+    )
+
+    result = await runner.run(
+        job=job,
+        invocation=_invocation(job),
+        candidate=candidate,
+        case_ref=job.private_holdout_refs[0],
+        lease=_invocation(job).lease,
+        allowed_models=job.execution_policy.allowed_models,
+        max_seconds=10,
+    )
+
+    assert result.conversation_pattern == "graph_flow"
+    assert result.termination_reason == expected_reason
+    assert result.status == expected_status
+    assert result.message_count == expected_messages
+    assert result.handoff_count == 0
+    assert (result.runtime_result.status.value == "succeeded") is (
+        expected_status == "succeeded"
+    )
+    assert (result.execution_outcome.status == "succeeded") is (
+        expected_status == "succeeded"
+    )
+
+    # The service-level binding check must accept the graph terminal reasons.
+    with FactoryCandidateEvaluator().verified_team_workspace(candidate) as (_, topology):
+        service = object.__new__(TeamExecutionService)
+        service._job = job  # type: ignore[attr-defined]
+        service._require_run_bindings(  # type: ignore[attr-defined]
+            _invocation(job), candidate, result, topology=topology
+        )
+
+
 def test_n8n_execution_requires_separate_scope_and_matching_digest() -> None:
     command_id = UUID("70000000-0000-0000-0000-000000000026")
     grant = CapabilityGrant(

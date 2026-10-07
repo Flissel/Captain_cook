@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import hashlib
 import json
 import os
@@ -128,6 +129,38 @@ def _validate_graph(graph: "FactoryGraphSpecV1", agents: set[str]) -> None:
             raise ValueError(f"edges from {source} must not mix conditional and unconditional")
     if not agents - set(outgoing):
         raise ValueError("graph needs at least one leaf agent without outgoing edges")
+    always_edges = [edge for edge in graph.edges if edge.when == "always"]
+    always_out: dict[str, list[str]] = {}
+    for edge in always_edges:
+        always_out.setdefault(edge.source, []).append(edge.target)
+    done: set[str] = set()
+    for root in sorted(always_out):
+        if root in done:
+            continue
+        path: list[str] = [root]
+        cursors = [iter(always_out.get(root, ()))]
+        on_path = {root}
+        while path:
+            nxt = next(cursors[-1], None)
+            if nxt is None:
+                finished = path.pop()
+                on_path.discard(finished)
+                done.add(finished)
+                cursors.pop()
+                continue
+            if nxt in on_path:
+                raise ValueError(f"graph has a cycle without a conditional edge: {nxt}")
+            if nxt in done:
+                continue
+            path.append(nxt)
+            on_path.add(nxt)
+            cursors.append(iter(always_out.get(nxt, ())))
+    unconditional_in = Counter(edge.target for edge in always_edges)
+    for target in sorted(unconditional_in):
+        if unconditional_in[target] > 1:
+            raise ValueError(
+                f"graph join at {target}: more than one unconditional incoming edge"
+            )
     reachable, frontier = {graph.entry}, [graph.entry]
     while frontier:
         for edge in outgoing.get(frontier.pop(), ()):

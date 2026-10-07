@@ -47,6 +47,7 @@ from autogen_core.tools import BaseTool, FunctionTool, Tool, ToolSchema
 from agenten.agent_factory.candidate_evaluation import (
     FactoryAutoGenTeamManifestV1,
     FactoryCandidateEvaluator,
+    FactoryGraphSpecV1,
     FactoryCandidateEvaluationResult,
     ResolvedFactoryCandidate,
 )
@@ -1658,7 +1659,8 @@ class HostAutoGenSessionExecutor:
                 max_turns=manifest.max_messages,
             )
         elif manifest.conversation_pattern == "graph_flow":
-            assert manifest.graph is not None
+            if manifest.graph is None:
+                raise ValueError("graph_flow requires a graph")
             team = build_graph_flow(
                 graph=manifest.graph,
                 participants=participants,
@@ -1719,6 +1721,7 @@ class HostAutoGenSessionExecutor:
             dispatch_offset=dispatch_offset,
             unresolved_before=unresolved_before,
             conversation_pattern=manifest.conversation_pattern,
+            graph=manifest.graph,
             max_messages=manifest.max_messages,
             max_handoffs=manifest.max_handoffs,
             max_tool_calls=manifest.max_tool_calls,
@@ -1817,6 +1820,7 @@ class HostAutoGenSessionExecutor:
             "graph_flow",
             "single_agent",
         ],
+        graph: FactoryGraphSpecV1 | None = None,
         max_messages: int,
         max_handoffs: int,
         max_tool_calls: int,
@@ -1867,6 +1871,7 @@ class HostAutoGenSessionExecutor:
             result,
             termination_conditions=termination_conditions,
             max_messages=max_messages,
+            graph=graph if conversation_pattern == "graph_flow" else None,
         )
         usage_receipts = model_client.usage_receipts[receipt_offset:]
         if any(
@@ -2228,8 +2233,11 @@ class HostAutoGenTeamRunner:
             item.assertion_id: item.passed
             for item in holdout_receipt.decisions
         }
-        resolved_status: Literal["succeeded", "unresolved"] = (
-            "succeeded" if all(normalized_results.values()) else "unresolved"
+        graph_stalled = session.termination_reason == "graph_stalled"
+        resolved_status: Literal["succeeded", "failed", "unresolved"] = (
+            "failed"
+            if graph_stalled
+            else "succeeded" if all(normalized_results.values()) else "unresolved"
         )
         observation_ref = session.runtime_evidence_ref
         handoffs = session.handoffs
@@ -2248,7 +2256,11 @@ class HostAutoGenTeamRunner:
         assertions = tuple(
             AssertionOutcome(
                 assertion_id=assertion_id,
-                status="passed" if normalized_results[assertion_id] else "failed",
+                status=(
+                    "passed"
+                    if normalized_results[assertion_id] and not graph_stalled
+                    else "failed"
+                ),
                 integration_intent=IntegrationIntent.NONE,
                 evidence_refs=(observation_ref, decision_ref),
             )
@@ -2275,7 +2287,13 @@ class HostAutoGenTeamRunner:
                 *activity_refs,
                 *n8n_refs,
             ),
-            error=None if succeeded else "Captain holdout assertions unresolved",
+            error=(
+                None
+                if succeeded
+                else "Captain graph stalled before a leaf agent"
+                if graph_stalled
+                else "Captain holdout assertions unresolved"
+            ),
         )
         outcome = ExecutionOutcomeV1(
             schema_name="captain.execution-outcome.v1",
@@ -2652,7 +2670,10 @@ class TeamExecutionService:
                 or run.tool_call_count > topology.max_tool_calls
             ):
                 raise ValueError("team counters do not match the sealed manifest")
-            if run.termination_reason not in topology.termination_conditions:
+            declared_terminations = set(topology.termination_conditions)
+            if topology.conversation_pattern == "graph_flow":
+                declared_terminations |= {"graph_completed", "graph_stalled"}
+            if run.termination_reason not in declared_terminations:
                 raise ValueError("team termination is not declared by the sealed manifest")
             for handoff in run.handoffs:
                 source = agents.get(handoff.from_agent)
@@ -3104,6 +3125,7 @@ def _session_termination_reason(
     *,
     termination_conditions: tuple[str, ...],
     max_messages: int,
+    graph: FactoryGraphSpecV1 | None = None,
 ) -> str:
     stop_reason = result.stop_reason or ""
     if "max_handoffs" in stop_reason:
@@ -3115,6 +3137,17 @@ def _session_termination_reason(
     )
     if message_count >= max_messages or "Maximum number" in stop_reason:
         return "max_messages"
+    if graph is not None:
+        if "task_completed" in termination_conditions and "task_completed" in stop_reason:
+            return "task_completed"
+        chat_messages = [
+            message for message in result.messages if isinstance(message, BaseChatMessage)
+        ]
+        sources = {edge.source for edge in graph.edges}
+        leaves = ({graph.entry} | {edge.target for edge in graph.edges}) - sources
+        if chat_messages and chat_messages[-1].source in leaves:
+            return "graph_completed"
+        return "graph_stalled"
     if "task_completed" in termination_conditions:
         return "task_completed"
     raise ValueError("AutoGen stopped without a declared termination condition")

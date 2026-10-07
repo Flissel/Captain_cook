@@ -1,11 +1,13 @@
 import pytest
 from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.base import TaskResult
 from autogen_agentchat.conditions import MaxMessageTermination
 from autogen_agentchat.messages import TextMessage
 from pydantic import ValidationError
 
 from agenten.agent_factory.candidate_evaluation import FactoryAutoGenTeamManifestV1
 from agenten.agent_factory.graph_flow_team import build_graph_flow, verdict_condition
+from agenten.agent_factory.team_execution import _session_termination_reason
 from agenten.llm.model_client import build_replay_model_client
 
 AGENTS = ("architect", "builder", "tester", "reviewer", "reporter")
@@ -104,3 +106,76 @@ async def test_iterate_loops_back_to_builder_then_approve_exits():
 
     speakers = [m.source for m in result.messages if m.source != "user"]
     assert speakers == ["architect", "builder", "tester", "reviewer", "builder", "tester", "reviewer", "reporter"]
+
+
+@pytest.mark.parametrize(
+    "extra_edges,message",
+    [
+        ([{"source": "architect", "target": "architect"}], "cycle without a conditional edge"),
+        (
+            [
+                {"source": "builder", "target": "architect"},
+            ],
+            "cycle without a conditional edge",
+        ),
+        ([{"source": "architect", "target": "tester"}], "join"),
+    ],
+)
+def test_always_cycles_and_unconditional_joins_are_rejected(extra_edges, message):
+    graph = {"entry": "architect", "edges": LOOP_EDGES + extra_edges}
+    with pytest.raises(ValidationError, match=message):
+        _manifest(graph=graph)
+
+
+def test_conditional_loop_back_edge_is_not_a_cycle_or_join():
+    manifest = _manifest()
+    assert len(manifest.graph.edges) == 5
+
+
+def _result(sources, stop_reason="Digraph execution is complete"):
+    return TaskResult(
+        messages=[TextMessage(content="x", source=name) for name in sources],
+        stop_reason=stop_reason,
+    )
+
+
+def test_natural_graph_completion_at_a_leaf_is_graph_completed():
+    manifest = _manifest()
+    reason = _session_termination_reason(
+        _result(["user", "architect", "builder", "tester", "reviewer", "reporter"]),
+        termination_conditions=manifest.termination_conditions,
+        max_messages=manifest.max_messages,
+        graph=manifest.graph,
+    )
+    assert reason == "graph_completed"
+
+
+def test_natural_graph_completion_away_from_a_leaf_is_graph_stalled():
+    manifest = _manifest()
+    reason = _session_termination_reason(
+        _result(["user", "architect", "builder", "tester", "reviewer"]),
+        termination_conditions=manifest.termination_conditions,
+        max_messages=manifest.max_messages,
+        graph=manifest.graph,
+    )
+    assert reason == "graph_stalled"
+
+
+def test_graph_flow_message_ceiling_takes_precedence_over_graph_reasons():
+    manifest = _manifest()
+    reason = _session_termination_reason(
+        _result(["user", "architect", "builder"], stop_reason="Maximum number of messages 3 reached"),
+        termination_conditions=manifest.termination_conditions,
+        max_messages=3,
+        graph=manifest.graph,
+    )
+    assert reason == "max_messages"
+
+
+def test_non_graph_patterns_keep_the_declared_termination_error():
+    with pytest.raises(ValueError, match="without a declared termination condition"):
+        _session_termination_reason(
+            _result(["user", "a"]),
+            termination_conditions=("max_tool_calls",),
+            max_messages=30,
+        )
