@@ -109,7 +109,7 @@ def test_oversized_stream_is_rejected():
 
 
 def test_result_with_u2028_in_text():
-    """Stream whose result text contains U+2028 (line separator) should not lose result event."""
+    """Stream with result text containing U+2028 must split on \\n only, not on unicode separators."""
     result_with_u2028 = {
         "type": "result",
         "subtype": "success",
@@ -119,16 +119,16 @@ def test_result_with_u2028_in_text():
         "usage": {"input_tokens": 10, "output_tokens": 5},
         "result": "line1 line2",
     }
-    # When split by splitlines(), U+2028 would create extra lines causing parse failures.
-    # With split("\n"), it should parse correctly.
-    stdout = json.dumps(result_with_u2028) + "\n"
+    # Use ensure_ascii=False to emit raw U+2028 character (not escaped).
+    stdout = json.dumps(result_with_u2028, ensure_ascii=False) + "\n"
+    assert " " in stdout  # Verify raw character is present, not escape sequence.
     summary = summarize_claude_stream(stdout)
     assert summary.result_subtype == "success"
     assert summary.warning_count == 0
 
 
 def test_result_with_u0085_in_text():
-    """Stream whose result text contains U+0085 (next line) should not lose result event."""
+    """Stream with result text containing U+0085 must split on \\n only, not on unicode separators."""
     result_with_u0085 = {
         "type": "result",
         "subtype": "success",
@@ -138,7 +138,9 @@ def test_result_with_u0085_in_text():
         "usage": {"input_tokens": 10, "output_tokens": 5},
         "result": "line1\u0085line2",
     }
-    stdout = json.dumps(result_with_u0085) + "\n"
+    # Use ensure_ascii=False to emit raw U+0085 character (not escaped).
+    stdout = json.dumps(result_with_u0085, ensure_ascii=False) + "\n"
+    assert "\u0085" in stdout  # Verify raw character is present, not escape sequence.
     summary = summarize_claude_stream(stdout)
     assert summary.result_subtype == "success"
     assert summary.warning_count == 0
