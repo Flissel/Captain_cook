@@ -37,16 +37,54 @@ def _single_line(value: str, *, limit: int) -> str:
 
 
 def _safe_relative(value: str) -> str:
-    if "\\" in value or ":" in value:
-        raise ValueError("path must use forward slashes and no drive")
-    path = PurePosixPath(value)
-    if value != "." and (path.is_absolute() or ".." in path.parts or not value.strip()):
+    # Check for NUL, newline, CR, backslash, colon (drive), tilde at start
+    if "\\" in value or ":" in value or "~" in value or any(ch in value for ch in "\x00\r\n"):
+        raise ValueError("path must use forward slashes, no drive, no tilde, no special chars")
+
+    # Check for double slashes before normalization
+    if "//" in value:
         raise ValueError("path must be a safe relative path")
-    return value
+
+    # Normalize single leading "./" away
+    normalized = value
+    if value.startswith("./"):
+        normalized = value[2:]
+
+    # Check for empty after normalization
+    if not normalized or not normalized.strip():
+        raise ValueError("path must be a safe relative path")
+
+    # Strip trailing slash for validation (but keep it in returned value for path_allowed)
+    # to allow both "src" and "src/" as valid allowed entries
+    normalized_stripped = normalized.rstrip("/")
+
+    # Check for "." or ".." segments by splitting the path
+    # But allow "." as the entire entry
+    if normalized_stripped != ".":
+        parts = normalized_stripped.split("/")
+        for part in parts:
+            if part == "." or part == ".." or part == "":
+                raise ValueError("path must be a safe relative path")
+
+    # Check for absolute path
+    path = PurePosixPath(normalized_stripped)
+    if path.is_absolute():
+        raise ValueError("path must be a safe relative path")
+
+    # Return original normalized form (may have trailing slash)
+    return normalized
 
 
 def path_allowed(path: str, allowed: Sequence[str]) -> bool:
-    """True when `path` equals an allowed file or lies under an allowed directory."""
+    """True when `path` equals an allowed file or lies under an allowed directory.
+
+    Rejects paths that are empty, absolute, contain backslashes, NUL, newlines,
+    or any ".." segments.
+    """
+    # Validate candidate path first
+    if not path or any(ch in path for ch in "\x00\r\n\\") or path.startswith("/") or ".." in path:
+        return False
+
     for entry in allowed:
         if entry == ".":
             return True
@@ -137,3 +175,15 @@ class AgentGoalResultV1(_Frozen):
     rounds: tuple[AgentGoalRoundV1, ...]
     final_image_id: str = Field(min_length=1)
     failure_reason: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode="after")
+    def _achieved_invariant(self) -> "AgentGoalResultV1":
+        if self.status == "achieved":
+            if not self.rounds:
+                raise ValueError("status achieved requires non-empty rounds")
+            last_round = self.rounds[-1]
+            if last_round.acceptance is None or not last_round.acceptance.passed:
+                raise ValueError("status achieved requires last round's acceptance to be passed")
+            if self.failure_reason is not None:
+                raise ValueError("status achieved must have failure_reason=None")
+        return self

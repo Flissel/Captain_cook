@@ -7,6 +7,7 @@ from agenten.coding_agent.contracts import (
     AcceptanceCheckV1,
     AcceptanceReportV1,
     AgentGoalResultV1,
+    AgentGoalRoundV1,
     AgentGoalV1,
     path_allowed,
 )
@@ -86,3 +87,142 @@ def test_check_passed_must_match_exit_code():
 def test_result_requires_known_status():
     with pytest.raises(ValidationError):
         AgentGoalResultV1(goal_id="g-1", status="done", rounds=(), final_image_id="img", failure_reason=None)
+
+
+# Tests for path_allowed hardening (Issue 1)
+@pytest.mark.parametrize("path", [
+    "src/../etc/x",      # traversal
+    "/etc/passwd",       # absolute
+    "src/a\\b",          # backslash
+    "src/a\x00b",        # NUL
+    "src/a\nb",          # newline
+    "src/a\rb",          # CR
+])
+def test_path_allowed_rejects_unsafe_paths(path):
+    assert not path_allowed(path, ("src/",)), f"Should reject unsafe path: {repr(path)}"
+
+
+# Tests for _safe_relative hardening (Issue 2)
+@pytest.mark.parametrize("path", [
+    "src//x",            # double slash
+    "src/./x",           # dot segment
+    "~/x",               # tilde at start
+    "src/a\x00b",        # NUL
+    "src/a\nb",          # newline
+    "src/a\rb",          # CR
+])
+def test_safe_relative_rejects_unsafe_entries(path):
+    with pytest.raises(ValidationError):
+        _goal(allowed_paths=(path,))
+
+
+def test_safe_relative_normalizes_leading_dotslash():
+    # "./src" should be normalized to "src" and match "src/a.py"
+    goal = _goal(allowed_paths=("./src",))
+    assert goal.allowed_paths == ("src",), "Leading ./ should be normalized away"
+    assert path_allowed("src/a.py", goal.allowed_paths)
+
+
+def _make_round(passed: bool) -> "AgentGoalRoundV1":
+    """Helper to create a round with acceptance."""
+    ok_check = AcceptanceCheckV1(command="test", exit_code=0 if passed else 1, timed_out=False, passed=passed, output_tail="")
+    report = AcceptanceReportV1(checks=(ok_check,))
+    return AgentGoalRoundV1(
+        round=1,
+        input_image_id="img-in",
+        output_image_id="img-out",
+        num_turns=5,
+        tool_call_count=3,
+        exit_code=0,
+        timed_out=False,
+        journal_sha256="a" * 64,
+        acceptance=report,
+    )
+
+
+# Tests for AgentGoalResultV1 achieved invariant (Issue 3)
+def test_achieved_requires_non_empty_rounds():
+    with pytest.raises(ValidationError):
+        AgentGoalResultV1(
+            goal_id="g-1",
+            status="achieved",
+            rounds=(),  # empty rounds
+            final_image_id="img",
+            failure_reason=None,
+        )
+
+
+def test_achieved_requires_passing_last_acceptance():
+    failing_round = _make_round(passed=False)
+    with pytest.raises(ValidationError):
+        AgentGoalResultV1(
+            goal_id="g-1",
+            status="achieved",
+            rounds=(failing_round,),
+            final_image_id="img",
+            failure_reason=None,
+        )
+
+
+def test_achieved_requires_no_failure_reason():
+    passing_round = _make_round(passed=True)
+    with pytest.raises(ValidationError):
+        AgentGoalResultV1(
+            goal_id="g-1",
+            status="achieved",
+            rounds=(passing_round,),
+            final_image_id="img",
+            failure_reason="some reason",  # should be None
+        )
+
+
+def test_achieved_requires_acceptance_not_none():
+    # Create a round without acceptance
+    round_no_accept = AgentGoalRoundV1(
+        round=1,
+        input_image_id="img-in",
+        output_image_id="img-out",
+        num_turns=5,
+        tool_call_count=3,
+        exit_code=0,
+        timed_out=False,
+        journal_sha256="a" * 64,
+        acceptance=None,  # No acceptance
+    )
+    with pytest.raises(ValidationError):
+        AgentGoalResultV1(
+            goal_id="g-1",
+            status="achieved",
+            rounds=(round_no_accept,),
+            final_image_id="img",
+            failure_reason=None,
+        )
+
+
+def test_achieved_with_passing_round_is_valid():
+    passing_round = _make_round(passed=True)
+    result = AgentGoalResultV1(
+        goal_id="g-1",
+        status="achieved",
+        rounds=(passing_round,),
+        final_image_id="img",
+        failure_reason=None,
+    )
+    assert result.status == "achieved"
+    assert result.rounds[0].acceptance is not None
+    assert result.rounds[0].acceptance.passed
+
+
+def test_other_statuses_ignore_achieved_constraints():
+    # Non-achieved statuses should allow empty rounds, failing acceptance, etc.
+    failing_round = _make_round(passed=False)
+
+    # This should NOT raise
+    result = AgentGoalResultV1(
+        goal_id="g-1",
+        status="exhausted",
+        rounds=(failing_round,),
+        final_image_id="img",
+        failure_reason="exhausted budget",
+    )
+    assert result.status == "exhausted"
