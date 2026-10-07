@@ -37,6 +37,10 @@ def _single_line(value: str, *, limit: int) -> str:
 
 
 def _safe_relative(value: str) -> str:
+    # Enforce max length of 500 characters per entry
+    if len(value) > 500:
+        raise ValueError("path must not exceed 500 characters")
+
     # Check for NUL, newline, CR, backslash, colon (drive), tilde at start
     if "\\" in value or ":" in value or "~" in value or any(ch in value for ch in "\x00\r\n"):
         raise ValueError("path must use forward slashes, no drive, no tilde, no special chars")

@@ -226,3 +226,18 @@ def test_other_statuses_ignore_achieved_constraints():
         failure_reason="exhausted budget",
     )
     assert result.status == "exhausted"
+
+
+# Tests for path entry length limit (Issue 2 - Finding 2)
+def test_safe_relative_rejects_entries_longer_than_500_chars():
+    # Entry with 501 characters should be rejected
+    long_path = "a" * 501
+    with pytest.raises(ValidationError):
+        _goal(allowed_paths=(long_path,))
+
+
+def test_safe_relative_accepts_exactly_500_char_entry():
+    # Entry with exactly 500 characters should be accepted
+    path_500 = "a" * 500
+    goal = _goal(allowed_paths=(path_500,))
+    assert goal.allowed_paths == (path_500,)
