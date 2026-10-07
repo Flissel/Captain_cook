@@ -77,7 +77,8 @@ def _tool_result_text(block: Mapping[str, Any]) -> str:
     return f"Error: {text}" if block.get("is_error") else text
 
 
-def _translate_message(message: object, chat_name: Callable[[str], str]) -> list[dict[str, object]]:
+def _translate_message(message: object, chat_name: Callable[[str], str]) -> tuple[list[dict[str, object]], set[str]]:
+    """Translate a message and return (messages, tool_call_ids_produced)."""
     if not isinstance(message, dict):
         raise BridgeError("each message must be an object")
     role = message.get("role")
@@ -85,12 +86,13 @@ def _translate_message(message: object, chat_name: Callable[[str], str]) -> list
     if role not in ("user", "assistant"):
         raise BridgeError("message role must be user or assistant")
     if isinstance(content, str):
-        return [{"role": role, "content": content}]
+        return [{"role": role, "content": content}], set()
     if not isinstance(content, list):
         raise BridgeError("message content must be a string or a list")
     if role == "assistant":
         texts: list[str] = []
         calls: list[dict[str, object]] = []
+        call_ids: set[str] = set()
         for block in content:
             kind = block.get("type") if isinstance(block, dict) else None
             if kind == "text":
@@ -99,8 +101,13 @@ def _translate_message(message: object, chat_name: Callable[[str], str]) -> list
                 input_val = block.get("input")
                 if input_val is not None and not isinstance(input_val, dict):
                     raise BridgeError("tool_use input must be a dict or None")
+                call_id = _require_str(block, "id")
+                # R18: Check for duplicate tool_use ids within this message
+                if call_id in call_ids:
+                    raise BridgeError(f"duplicate tool_use id {call_id!r} in assistant message")
+                call_ids.add(call_id)
                 calls.append({
-                    "id": _require_str(block, "id"),
+                    "id": call_id,
                     "type": "function",
                     "function": {
                         "name": chat_name(_require_str(block, "name")),
@@ -114,11 +121,11 @@ def _translate_message(message: object, chat_name: Callable[[str], str]) -> list
         text_content = "".join(texts) or None
         # Skip empty assistant messages that have no tool_calls
         if text_content is None and not calls:
-            return []
+            return [], set()
         translated: dict[str, object] = {"role": "assistant", "content": text_content}
         if calls:
             translated["tool_calls"] = calls
-        return [translated]
+        return [translated], call_ids
     # User message handling
     if not content:
         raise BridgeError("user content list must not be empty")
@@ -140,7 +147,7 @@ def _translate_message(message: object, chat_name: Callable[[str], str]) -> list
             raise BridgeError(f"unsupported user block: {kind}")
     if texts:
         tool_messages.append({"role": "user", "content": "\n\n".join(texts)})
-    return tool_messages
+    return tool_messages, set()
 
 
 def _translate_tool(tool: object, chat_name: Callable[[str], str]) -> dict[str, object]:
@@ -200,7 +207,7 @@ def anthropic_request_to_chat(request: Mapping[str, object], *, allowed_models: 
     pending_tool_ids: set[str] = set()
 
     for i, message in enumerate(raw_messages):
-        translated = _translate_message(message, chat_name)
+        translated, call_ids = _translate_message(message, chat_name)
 
         # Handle assistant messages: update pending tool IDs
         if isinstance(message, dict) and message.get("role") == "assistant":
@@ -211,13 +218,17 @@ def anthropic_request_to_chat(request: Mapping[str, object], *, allowed_models: 
                     raise BridgeError(f"new assistant message arrived while tool_use_id {pending_tool_ids} still pending")
 
                 # When an assistant message with tool_calls appears, it sets pending set
-                assistant_msg = translated[0]
-                if assistant_msg.get("role") == "assistant" and "tool_calls" in assistant_msg:
-                    pending_tool_ids = {call["id"] for call in assistant_msg["tool_calls"]}  # type: ignore
+                if call_ids:
+                    pending_tool_ids = call_ids
 
         # Handle user messages: validate tool result pairing
         if isinstance(message, dict) and message.get("role") == "user":
             content = message.get("content")
+
+            # Check if pending tool IDs exist with string-content user message
+            if isinstance(content, str) and pending_tool_ids:
+                raise BridgeError(f"string-content user message arrived while tool_use_id {pending_tool_ids} still pending")
+
             if isinstance(content, list):
                 # Collect tool results in this user message
                 seen_results: set[str] = set()

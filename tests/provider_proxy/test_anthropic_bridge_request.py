@@ -322,6 +322,11 @@ def test_stop_sequences_falsy_values_rejected():
     # 0 in stop_sequences should raise
     with pytest.raises(BridgeError):
         anthropic_request_to_chat(_request(stop_sequences=[0]), allowed_models=MODELS)
+    # Falsy non-list values should raise
+    with pytest.raises(BridgeError):
+        anthropic_request_to_chat(_request(stop_sequences={}), allowed_models=MODELS)
+    with pytest.raises(BridgeError):
+        anthropic_request_to_chat(_request(stop_sequences=""), allowed_models=MODELS)
 
 
 def test_strict_tool_pairing_multiple_assistants_with_different_tools():
@@ -439,3 +444,39 @@ def test_strict_tool_pairing_realistic_multi_turn():
     assert non_sys[5]["tool_calls"][0]["id"] == "t3"
     assert non_sys[6]["role"] == "tool"
     assert non_sys[6]["tool_call_id"] == "t3"
+
+
+# Fix round 3: String-content user messages and duplicate tool_use ids
+def test_string_content_user_message_while_pending():
+    # User message with string content (not list) while tools pending → BridgeError
+    with pytest.raises(BridgeError, match="pending"):
+        anthropic_request_to_chat(_request(messages=[
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Write", "input": {}},
+            ]},
+            {"role": "user", "content": "hi"},  # Plain string, not list with tool_result
+        ]), allowed_models=MODELS)
+
+
+def test_string_content_user_probe():
+    # Exact probe from brief: user "go" → assistant tool_use t1 → user string "hi" → user tool_result t1
+    with pytest.raises(BridgeError, match="pending"):
+        anthropic_request_to_chat(_request(messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Write", "input": {}},
+            ]},
+            {"role": "user", "content": "hi"},  # String content while t1 pending
+        ]), allowed_models=MODELS)
+
+
+def test_duplicate_tool_use_ids_in_assistant_message():
+    # R18: Duplicate tool_use ids within one assistant message → BridgeError
+    with pytest.raises(BridgeError, match="duplicate|already"):
+        anthropic_request_to_chat(_request(messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Write", "input": {}},
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},  # Same id
+            ]},
+        ]), allowed_models=MODELS)
