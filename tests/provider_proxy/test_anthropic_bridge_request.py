@@ -480,3 +480,27 @@ def test_duplicate_tool_use_ids_in_assistant_message():
                 {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},  # Same id
             ]},
         ]), allowed_models=MODELS)
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        {"name": "Write", "input_schema": "not-an-object"},
+        {"name": "Write", "input_schema": ["type", "object"]},
+        {"name": "Write", "input_schema": None},
+        {"name": "Write", "description": 42, "input_schema": {"type": "object"}},
+        {"name": "Write", "description": None, "input_schema": {"type": "object"}},
+        {"name": "Write", "description": ["x"], "input_schema": {"type": "object"}},
+    ],
+)
+def test_tool_schema_and_description_types_are_enforced(tool):
+    with pytest.raises(BridgeError):
+        anthropic_request_to_chat(_request(tools=[tool]), allowed_models=MODELS)
+
+
+def test_tool_without_description_gets_an_empty_one():
+    out = anthropic_request_to_chat(
+        _request(tools=[{"name": "Write", "input_schema": {"type": "object"}}]), allowed_models=MODELS
+    )
+    assert out.payload["tools"][0]["function"]["description"] == ""
+    assert out.payload["tools"][0]["function"]["parameters"] == {"type": "object"}

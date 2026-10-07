@@ -153,12 +153,18 @@ def _translate_message(message: object, chat_name: Callable[[str], str]) -> tupl
 def _translate_tool(tool: object, chat_name: Callable[[str], str]) -> dict[str, object]:
     if not isinstance(tool, dict) or "input_schema" not in tool:
         raise BridgeError("only custom tools with input_schema are supported")
+    schema = tool["input_schema"]
+    if not isinstance(schema, dict):
+        raise BridgeError("tool input_schema must be an object")
+    description = tool.get("description", "")
+    if not isinstance(description, str):
+        raise BridgeError("tool description must be a string")
     return {
         "type": "function",
         "function": {
             "name": chat_name(_require_str(tool, "name")),
-            "description": tool.get("description") or "",
-            "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+            "description": description,
+            "parameters": schema or {"type": "object", "properties": {}},
         },
     }
 
