@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 _SHA256 = r"^[0-9a-f]{64}$"
+RESULT_SUBTYPE_PATTERN = r"^(success|error_[a-z_]{1,60})$"
 
 GoalStatus = Literal[
     "achieved",
@@ -158,8 +159,8 @@ class AgentGoalRoundV1(_Frozen):
     round: int = Field(ge=1, strict=True)
     input_image_id: str = Field(min_length=1)
     output_image_id: str = Field(min_length=1)
-    session_id: str | None = None
-    result_subtype: str | None = None
+    session_id: str | None = Field(default=None, max_length=200)
+    result_subtype: str | None = Field(default=None, pattern=RESULT_SUBTYPE_PATTERN)
     num_turns: int = Field(ge=0, strict=True)
     tool_call_count: int = Field(ge=0, strict=True)
     exit_code: int = Field(strict=True)

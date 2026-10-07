@@ -276,7 +276,8 @@ async def test_token_in_stream_result_subtype_is_redacted():
     result = await runner.run(_goal(max_rounds=2), workspace_image_id="img-0", run_token=TOKEN)
     assert TOKEN not in result.model_dump_json()
     assert TOKEN not in repr(result)
-    assert result.rounds[0].result_subtype == "error_<redacted>"
+    # redacted first, then dropped: "error_<redacted>" does not fit the subtype contract
+    assert result.rounds[0].result_subtype is None
 
 
 @pytest.mark.asyncio
@@ -343,3 +344,114 @@ async def test_new_relative_file_symlink_inside_allowed_paths_is_fine():
     result = await runner.run(_goal(), workspace_image_id="img-0", run_token=TOKEN)
     assert result.status == "achieved"
     assert result.rounds[0].changed_paths == ("src/alias.py", "src/app.py")
+
+
+# --- M6: empty run token, bad session branch ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_empty_run_token_is_rejected_before_any_sandbox_call():
+    script = _Script(acceptance_exit_codes=[])
+    runner, sandbox = _runner(script)
+    with pytest.raises(ValueError, match="run_token"):
+        await runner.run(_goal(), workspace_image_id="img-0", run_token="")
+    assert sandbox.calls == []
+
+
+@pytest.mark.asyncio
+async def test_non_identifier_session_fails_and_is_never_resumed():
+    script = _Script(acceptance_exit_codes=[0], claude_stdout=_stream(session="bad session; rm -rf /"))
+    runner, sandbox = _runner(script)
+    result = await runner.run(_goal(), workspace_image_id="img-0", run_token=TOKEN)
+    assert result.status == "failed"
+    assert "plain identifier" in (result.failure_reason or "")
+    assert script.claude_runs == 1
+    assert script.acceptance_images == []
+    assert result.rounds[0].acceptance is None
+    assert all("--resume" not in command.shell for _, command in sandbox.calls)
+
+
+# --- M2: bounded session id and result subtype ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_oversized_session_id_is_a_bad_session_and_not_recorded():
+    script = _Script(acceptance_exit_codes=[0], claude_stdout=_stream(session="s" * 201))
+    runner, _ = _runner(script)
+    result = await runner.run(_goal(), workspace_image_id="img-0", run_token=TOKEN)
+    assert result.status == "failed"
+    assert result.rounds[0].session_id is None
+
+
+@pytest.mark.parametrize(
+    "subtype,recorded",
+    [
+        ("success", "success"),
+        ("error_max_turns", "error_max_turns"),
+        ("error_during_execution", "error_during_execution"),
+        ("Success", None),
+        ("error-max-turns", None),
+        ("error_" + "x" * 61, None),
+        ("x" * 5000, None),
+    ],
+    ids=["success", "error_max_turns", "error_during_execution", "capitalized", "hyphenated", "too_long", "huge"],
+)
+@pytest.mark.asyncio
+async def test_result_subtype_is_recorded_only_when_it_fits(subtype, recorded):
+    script = _Script(acceptance_exit_codes=[0], claude_stdout=_stream(subtype=subtype))
+    runner, _ = _runner(script)
+    result = await runner.run(_goal(), workspace_image_id="img-0", run_token=TOKEN)
+    assert result.rounds[0].result_subtype == recorded
+
+
+# --- I4: per-round evidence hook ------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_on_round_hook_receives_each_round_as_it_happens():
+    script = _Script(acceptance_exit_codes=[1, 0])
+    runner, _ = _runner(script)
+    seen = []
+
+    async def on_round(round_):
+        seen.append((round_.round, script.claude_runs))
+
+    result = await runner.run(_goal(), workspace_image_id="img-0", run_token=TOKEN, on_round=on_round)
+    assert result.status == "achieved"
+    # each round is reported before the next claude run starts
+    assert seen == [(1, 1), (2, 2)]
+
+
+@pytest.mark.asyncio
+async def test_on_round_hook_keeps_rounds_when_a_later_round_raises():
+    class _Crashing(_Script):
+        def __call__(self, image, command):
+            if command.shell.startswith("cd /work && claude ") and self.claude_runs == 1:
+                raise RuntimeError("sandbox lost")
+            return super().__call__(image, command)
+
+    script = _Crashing(acceptance_exit_codes=[1])
+    runner, _ = _runner(script)
+    seen = []
+
+    async def on_round(round_):
+        seen.append(round_)
+
+    with pytest.raises(RuntimeError, match="sandbox lost"):
+        await runner.run(_goal(), workspace_image_id="img-0", run_token=TOKEN, on_round=on_round)
+    assert [r.round for r in seen] == [1]
+    assert seen[0].acceptance is not None and seen[0].acceptance.passed is False
+
+
+@pytest.mark.asyncio
+async def test_on_round_hook_receives_redacted_rounds():
+    script = _Script(acceptance_exit_codes=[], extra_after={"src/" + TOKEN: "c" * 64})
+    runner, _ = _runner(script)
+    seen = []
+
+    async def on_round(round_):
+        seen.append(round_)
+
+    await runner.run(_goal(), workspace_image_id="img-0", run_token=TOKEN, on_round=on_round)
+    assert len(seen) == 1
+    assert TOKEN not in seen[0].model_dump_json()

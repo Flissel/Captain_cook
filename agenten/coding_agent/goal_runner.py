@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 import shlex
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -16,6 +16,7 @@ from agenten.coding_agent.contracts import (
     AgentGoalResultV1,
     AgentGoalRoundV1,
     AgentGoalV1,
+    RESULT_SUBTYPE_PATTERN,
     GoalStatus,
     path_allowed,
 )
@@ -25,6 +26,10 @@ from agenten.coding_agent.sandbox import SandboxCommand, SandboxPort
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _SESSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost"})
+_RESULT_SUBTYPE = re.compile(RESULT_SUBTYPE_PATTERN)
+_SESSION_MAX_CHARS = 200
+
+RoundHook = Callable[[AgentGoalRoundV1], Awaitable[None]]
 
 
 class BudgetGuardPort(Protocol):
@@ -113,7 +118,21 @@ class ClaudeGoalRunner:
         self._budget = budget
         self._clock = clock
 
-    async def run(self, goal: AgentGoalV1, *, workspace_image_id: str, run_token: str) -> AgentGoalResultV1:
+    async def run(
+        self,
+        goal: AgentGoalV1,
+        *,
+        workspace_image_id: str,
+        run_token: str,
+        on_round: RoundHook | None = None,
+    ) -> AgentGoalResultV1:
+        """Run rounds until acceptance passes or a limit ends the goal.
+
+        `on_round` receives each (already redacted) round right after it is recorded, so
+        evidence of spent rounds survives when a later round raises.
+        """
+        if not run_token:
+            raise ValueError("run_token must be non-empty")
         started = self._clock()
         image = workspace_image_id
         session: str | None = None
@@ -172,17 +191,25 @@ class ClaudeGoalRunner:
                     ),
                     redact,
                 )
+            recorded_session = redact(reported_session) if reported_session is not None else None
+            if recorded_session is not None and len(recorded_session) > _SESSION_MAX_CHARS:
+                recorded_session = None
+            recorded_subtype = redact(summary.result_subtype) if summary.result_subtype is not None else None
+            if recorded_subtype is not None and _RESULT_SUBTYPE.fullmatch(recorded_subtype) is None:
+                recorded_subtype = None
             rounds.append(
                 AgentGoalRoundV1(
                     round=number, input_image_id=input_image, output_image_id=image,
-                    session_id=redact(reported_session) if reported_session is not None else None,
-                    result_subtype=redact(summary.result_subtype) if summary.result_subtype is not None else None,
+                    session_id=recorded_session,
+                    result_subtype=recorded_subtype,
                     num_turns=summary.num_turns, tool_call_count=summary.tool_call_count,
                     exit_code=run.exit_code, timed_out=run.timed_out,
                     journal_sha256=summary.journal_sha256, changed_paths=paths,
                     policy_violations=violations, acceptance=acceptance,
                 )
             )
+            if on_round is not None:
+                await on_round(rounds[-1])
             if run.timed_out:
                 return finish("timeout", "claude round timed out")
             if leaked_session:

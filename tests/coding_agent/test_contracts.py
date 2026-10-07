@@ -241,3 +241,24 @@ def test_safe_relative_accepts_exactly_500_char_entry():
     path_500 = "a" * 500
     goal = _goal(allowed_paths=(path_500,))
     assert goal.allowed_paths == (path_500,)
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"session_id": "s" * 201},
+        {"result_subtype": "bogus"},
+        {"result_subtype": "error_" + "x" * 61},
+        {"result_subtype": "error_<redacted>"},
+    ],
+)
+def test_round_bounds_session_id_and_result_subtype(update):
+    base = _make_round(True).model_dump()
+    with pytest.raises(ValidationError):
+        AgentGoalRoundV1(**{**base, **update})
+
+
+def test_round_accepts_bounded_session_id_and_known_subtypes():
+    base = _make_round(True).model_dump()
+    for subtype in ("success", "error_max_turns", None):
+        AgentGoalRoundV1(**{**base, "session_id": "s" * 200, "result_subtype": subtype})
