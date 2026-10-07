@@ -42,3 +42,11 @@ Nebius-Transport, `/v1/messages`-Route) erledigt werden.
 - [ ] Claude Code schreibt `/work/.claude/*` — erscheint heute als geänderter Pfad (Policy-Verstoß außerhalb `allowed_paths`).
 - [ ] Bilder/Dokumente in `tool_result` lassen heute die ganze Anfrage scheitern — Text-Platzhalter erwägen.
 - [ ] Gestreamtes `message_start`-`usage` ist 0 — Auswirkung auf Claude Codes Auto-Compaction prüfen.
+
+## Nachträge aus der Nachprüfung der M1a-Schlussrunde
+- [ ] Basis-Image-Vertrag: GNU `find` (`-printf`) und GNU coreutils (`sha256sum -z`) zusätzlich zu bash festschreiben; Adapter prüft beim Start.
+- [ ] Richtlinie für venvs: neue Verzeichnis-Symlinks (z. B. `.venv/lib64`) gelten heute als Verstoß — venv außerhalb von `/work` anlegen oder gezielte Allowlist definieren.
+- [ ] Wenn `revoke` fehlschlägt, vorher das Endergebnis aufzeichnen (heute ersetzt die Revoke-Exception das Ergebnis und überspringt `record(result)`).
+- [ ] `GoalEvidenceSinkPort.record_round`/`record` bei der Ledger-Anbindung asynchron machen.
+- [ ] Schon vorhandene, nach außen zeigende Verzeichnis-Symlinks und ein `.git`-Symlink sind für das Manifest unsichtbar — im frischen Judge-Image ausschließen.
+- [ ] Prüfen, ob der Sandbox-Adapter stdout kappt — ein gekapptes Manifest an einer Datensatzgrenze würde Änderungen verschlucken; Größe/Abschlussmarker prüfen.
