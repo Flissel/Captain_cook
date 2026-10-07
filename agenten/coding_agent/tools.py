@@ -101,6 +101,12 @@ class ClaudeCodeBuildResult(BaseModel):
 
 
 class ClaudeCodeBuildTool(BaseTool[ClaudeCodeBuildArgs, ClaudeCodeBuildResult]):
+    """Build code with Claude in a sandbox until acceptance commands pass.
+
+    Slot policy: a slot is consumed when reserve succeeds (call counter increments).
+    Only authorization denial returns the slot; other failures (runner, tokens, evidence)
+    keep the slot consumed because budget may already be spent during the goal run.
+    """
     TOOL_NAME = "claude_code_build"
 
     def __init__(
@@ -139,26 +145,29 @@ class ClaudeCodeBuildTool(BaseTool[ClaudeCodeBuildArgs, ClaudeCodeBuildResult]):
         self._limits = limits
         self._clock = clock
         self._goal_prefix = goal_prefix
-        self._calls = 0
+        self._calls = 0  # Count of reserved slots (call ceiling enforcement)
+        self._next_id = 0  # Monotonic counter for unique goal IDs (never decremented)
 
     async def run(self, args: ClaudeCodeBuildArgs, cancellation_token: CancellationToken) -> ClaudeCodeBuildResult:
         # Check ceiling synchronously
         if self._calls >= self._limits.max_calls:
             raise RuntimeError("claude_code_build call ceiling reached")
 
-        # Reserve the slot immediately (before any await) to prevent race conditions
+        # Reserve the slot and capture goal number immediately (before any await) to prevent race conditions
         self._calls += 1
+        goal_number = self._next_id
+        self._next_id += 1
         try:
             await self._authority.authorize(self.TOOL_NAME, now=self._clock())
         except Exception:
-            # Rollback on authorization failure so the slot is not consumed
+            # Only deny returns the slot; other failures keep it consumed (budget may be spent)
             self._calls -= 1
             raise
 
         # Serialize cursor access with lock
         async with self._cursor.lock:
             goal = AgentGoalV1(
-                goal_id=f"{self._goal_prefix}-build-{self._calls}",
+                goal_id=f"{self._goal_prefix}-build-{goal_number}",
                 objective=args.objective,
                 acceptance_commands=tuple(args.acceptance_commands),
                 constraints=tuple(args.constraints),

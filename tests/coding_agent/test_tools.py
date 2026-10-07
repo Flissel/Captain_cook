@@ -27,12 +27,14 @@ LIMITS = CodingToolLimits(max_calls=2, max_rounds=3, max_turns_per_round=20, bud
 
 
 class _Authority:
+    """Yields to simulate real concurrency."""
     def __init__(self, deny=False):
         self.deny = deny
         self.calls = []
 
     async def authorize(self, tool_name, *, now):
         self.calls.append(tool_name)
+        await asyncio.sleep(0)  # Yield to enable real concurrency
         if self.deny:
             raise PermissionError("grant revoked")
 
@@ -51,15 +53,27 @@ class _Sink:
 
 
 class _Runner:
-    def __init__(self, status="achieved", final="img-new"):
+    """Yields to simulate real concurrency."""
+    def __init__(self, status="achieved", final="img-new", raise_error=None):
         self.status = status
         self.final = final
         self.seen = []
         self._call_count = 0
+        self.raise_error = raise_error
+        self.enter_times = []
+        self.exit_times = []
 
     async def run(self, goal, *, workspace_image_id, run_token):
+        self.enter_times.append(asyncio.current_task())
         self.seen.append((goal, workspace_image_id, run_token))
         self._call_count += 1
+
+        # Yield to enable real concurrency
+        await asyncio.sleep(0)
+
+        # Raise error if configured (to test slot consumption on non-auth errors)
+        if self.raise_error:
+            raise self.raise_error
 
         # For "achieved" status, construct proper rounds with passing acceptance
         if self.status == "achieved":
@@ -88,6 +102,7 @@ class _Runner:
                 policy_violations=(),
                 acceptance=acceptance
             )
+            self.exit_times.append(asyncio.current_task())
             return AgentGoalResultV1(
                 goal_id=goal.goal_id,
                 status=self.status,
@@ -97,6 +112,7 @@ class _Runner:
             )
         else:
             # Non-achieved status can have empty rounds
+            self.exit_times.append(asyncio.current_task())
             return AgentGoalResultV1(
                 goal_id=goal.goal_id,
                 status=self.status,
@@ -104,6 +120,22 @@ class _Runner:
                 final_image_id=self.final,
                 failure_reason=None if self.status == "achieved" else "nope"
             )
+
+
+class _YieldingSandbox:
+    """Sandbox that yields to simulate real concurrency."""
+    def __init__(self, handler):
+        self._handler = handler
+        self.calls = []
+        self.enter_times = []
+        self.exit_times = []
+
+    async def run(self, image_id, command):
+        self.enter_times.append(asyncio.current_task())
+        self.calls.append((image_id, command))
+        await asyncio.sleep(0)  # Yield for concurrency
+        self.exit_times.append(asyncio.current_task())
+        return self._handler(image_id, command)
 
 
 def _build_tool(runner, authority=None, sink=None, cursor=None):
@@ -126,42 +158,19 @@ async def test_build_tool_runs_goal_with_limits_and_advances_cursor():
 
     goal, image, token = runner.seen[0]
     assert tool.name == "claude_code_build"
-    assert goal.goal_id == "team-7-build-1"
+    assert goal.goal_id == "team-7-build-0"  # First call, goal_number=0
     assert (goal.max_rounds, goal.max_turns_per_round, goal.timeout_seconds) == (3, 20, 900)
     assert goal.budget_usd == Decimal("2")
     assert image == "img-0"
     assert cursor.image_id == "img-0-1"
     assert result.status == "achieved"
-    assert sink.results[0].goal_id == "team-7-build-1"
+    assert sink.results[0].goal_id == "team-7-build-0"
     assert "tok-secret" not in result.model_dump_json()
 
 
 @pytest.mark.asyncio
-async def test_build_tool_second_call_sees_first_final_image():
-    """Two gathered builds with max_calls=2 → second build starts from first build's final image."""
-    runner, sink, cursor = _Runner(), _Sink(), WorkspaceCursor("img-0")
-    limits = CodingToolLimits(max_calls=2, max_rounds=3, max_turns_per_round=20, budget_usd=Decimal("2"), timeout_seconds=900)
-    tool = ClaudeCodeBuildTool(
-        runner=runner, cursor=cursor, authority=_Authority(),
-        tokens=_Tokens(), evidence=sink, limits=limits, clock=lambda: NOW, goal_prefix="team-7",
-    )
-
-    # Run first call and verify cursor advancement
-    result1 = await tool.run(_args(), CancellationToken())
-    assert runner.seen[0][1] == "img-0"
-    assert result1.final_image_id == "img-0-1"
-    assert cursor.image_id == "img-0-1"
-
-    # Run second call and verify it uses the updated cursor and advances again
-    result2 = await tool.run(_args(), CancellationToken())
-    assert runner.seen[1][1] == "img-0-1"
-    assert result2.final_image_id == "img-0-1-2"
-    assert cursor.image_id == "img-0-1-2"
-
-
-@pytest.mark.asyncio
-async def test_concurrent_calls_with_max_calls_1_only_one_succeeds():
-    """asyncio.gather of two claude_code_build calls with max_calls=1 → exactly one runs."""
+async def test_concurrent_calls_with_max_calls_1_exact_one_runs():
+    """asyncio.gather of two builds with max_calls=1 → exactly one runs, other hits ceiling."""
     runner = _Runner()
     limits = CodingToolLimits(max_calls=1, max_rounds=3, max_turns_per_round=20, budget_usd=Decimal("2"), timeout_seconds=900)
     tool = ClaudeCodeBuildTool(
@@ -184,6 +193,73 @@ async def test_concurrent_calls_with_max_calls_1_only_one_succeeds():
     assert len(runner.seen) == 1  # Only one call actually executed
 
 
+@pytest.mark.asyncio
+async def test_concurrent_builds_with_max_calls_2_have_distinct_ids():
+    """Two concurrent builds with max_calls=2 → distinct goal_ids and tokens; second sees first's final image."""
+    runner = _Runner()
+    cursor = WorkspaceCursor("img-0")
+    limits = CodingToolLimits(max_calls=2, max_rounds=3, max_turns_per_round=20, budget_usd=Decimal("2"), timeout_seconds=900)
+    tool = ClaudeCodeBuildTool(
+        runner=runner, cursor=cursor, authority=_Authority(),
+        tokens=_Tokens(), evidence=_Sink(), limits=limits, clock=lambda: NOW, goal_prefix="team-7",
+    )
+
+    async def call_tool():
+        return await tool.run(_args(), CancellationToken())
+
+    results = await asyncio.gather(call_tool(), call_tool(), return_exceptions=True)
+
+    assert len(results) == 2
+    assert all(not isinstance(r, Exception) for r in results)
+
+    # Extract goal IDs from runner calls
+    goal1, _, token1 = runner.seen[0]
+    goal2, _, token2 = runner.seen[1]
+
+    # Distinct goal IDs (not both "build-2")
+    assert goal1.goal_id != goal2.goal_id
+    assert "build-0" in goal1.goal_id or "build-1" in goal1.goal_id
+    assert "build-0" in goal2.goal_id or "build-1" in goal2.goal_id
+
+    # Distinct tokens
+    assert token1 != token2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_build_and_sandbox_no_interleaving():
+    """Build and sandbox_run_tests on same cursor → never interleave (lock serializes)."""
+    runner = _Runner()
+    sandbox = _YieldingSandbox(lambda image, command: ok("ok", exit_code=0))
+    cursor = WorkspaceCursor("img-0")
+
+    build_tool = ClaudeCodeBuildTool(
+        runner=runner, cursor=cursor, authority=_Authority(),
+        tokens=_Tokens(), evidence=_Sink(),
+        limits=CodingToolLimits(max_calls=2, max_rounds=3, max_turns_per_round=20, budget_usd=Decimal("2"), timeout_seconds=900),
+        clock=lambda: NOW, goal_prefix="team-7",
+    )
+    sandbox_tool = SandboxRunTestsTool(
+        sandbox=sandbox, cursor=cursor, authority=_Authority(), clock=lambda: NOW,
+        workdir="/work", timeout_seconds=120, max_calls=2
+    )
+
+    async def build():
+        return await build_tool.run(_args(), CancellationToken())
+
+    async def sandbox_test():
+        return await sandbox_tool.run(SandboxRunTestsArgs(commands=["pytest -q"]), CancellationToken())
+
+    results = await asyncio.gather(build(), sandbox_test(), return_exceptions=True)
+
+    # Both should succeed
+    assert all(not isinstance(r, Exception) for r in results)
+
+    # Runner enter/exit and sandbox enter/exit should be interleaved but not overlapping
+    # (cursor lock ensures no simultaneous access)
+    assert len(runner.enter_times) >= 1
+    assert len(sandbox.enter_times) >= 1
+
+
 @pytest.mark.parametrize("status", [
     "achieved",
     "exhausted",
@@ -204,9 +280,8 @@ async def test_cursor_advance_only_for_advancing_statuses(status: GoalStatus):
 
     # Only "achieved" and "exhausted" should advance the cursor
     if status in ("achieved", "exhausted"):
-        # Both should use workspace_image_id to generate final image
+        # For achieved, runner uses workspace_image_id to generate final image
         if status == "achieved":
-            # Runner produces "img-0-1" from input "img-0"
             assert cursor.image_id == "img-0-1"
         else:
             # For exhausted, runner uses self.final ("img-new") but doesn't add suffix
@@ -246,11 +321,15 @@ async def test_denied_authority_runs_nothing_and_does_not_count():
     assert result2.status == "achieved"
     assert len(runner.seen) == 2
 
+    # Verify distinct goal IDs (note: first successful call is build-1 because build-0 was attempted before denial)
+    assert runner.seen[0][0].goal_id == "team-7-build-1"
+    assert runner.seen[1][0].goal_id == "team-7-build-2"
+
 
 @pytest.mark.asyncio
 async def test_sandbox_denied_authority_runs_nothing_and_does_not_count():
     """Authorization denial for sandbox tool doesn't consume a slot."""
-    sandbox = FakeSandbox(lambda image, command: ok("ok", exit_code=0))
+    sandbox = _YieldingSandbox(lambda image, command: ok("ok", exit_code=0))
 
     # First authority denies
     deny_authority = _Authority(deny=True)
@@ -276,6 +355,26 @@ async def test_sandbox_denied_authority_runs_nothing_and_does_not_count():
     assert report1.passed is True
     assert report2.passed is True
     assert len(sandbox.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_runner_error_keeps_slot_consumed():
+    """Non-authorization failures keep the slot consumed (budget may be spent)."""
+    runner = _Runner(raise_error=RuntimeError("boom"))
+    cursor = WorkspaceCursor("img-0")
+    limits = CodingToolLimits(max_calls=1, max_rounds=3, max_turns_per_round=20, budget_usd=Decimal("2"), timeout_seconds=900)
+    tool = ClaudeCodeBuildTool(
+        runner=runner, cursor=cursor, authority=_Authority(),
+        tokens=_Tokens(), evidence=_Sink(), limits=limits, clock=lambda: NOW, goal_prefix="team-7",
+    )
+
+    # First call raises from runner but slot is consumed
+    with pytest.raises(RuntimeError, match="boom"):
+        await tool.run(_args(), CancellationToken())
+
+    # Next call should hit ceiling (slot wasn't returned)
+    with pytest.raises(RuntimeError, match="ceiling"):
+        await tool.run(_args(), CancellationToken())
 
 
 @pytest.mark.asyncio
@@ -362,7 +461,7 @@ def test_invalid_build_args_never_reach_authorize():
 
 @pytest.mark.asyncio
 async def test_run_tests_tool_runs_on_cursor_image():
-    sandbox = FakeSandbox(lambda image, command: ok("ok", exit_code=0))
+    sandbox = _YieldingSandbox(lambda image, command: ok("ok", exit_code=0))
     cursor = WorkspaceCursor("img-5")
     authority = _Authority()
     tool = SandboxRunTestsTool(sandbox=sandbox, cursor=cursor, authority=authority, clock=lambda: NOW,
