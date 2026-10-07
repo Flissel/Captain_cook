@@ -42,29 +42,48 @@ class _Authority:
 
 
 class _Tokens:
-    async def issue(self, goal_id):
-        return "tok-secret-" + goal_id
+    def __init__(self, events=None):
+        self.issued = []
+        self.revoked = []
+        self.events = events if events is not None else []
+
+    async def issue(self, goal):
+        self.issued.append(goal)
+        self.events.append(("issue", goal.goal_id))
+        return "tok-secret-" + goal.goal_id
+
+    async def revoke(self, goal_id):
+        self.revoked.append(goal_id)
+        self.events.append(("revoke", goal_id))
 
 
 class _Sink:
-    def __init__(self):
+    def __init__(self, events=None):
         self.results = []
+        self.rounds = []
+        self.events = events if events is not None else []
 
     def record(self, result):
         self.results.append(result)
+        self.events.append(("result", result.goal_id))
+
+    def record_round(self, goal_id, round_):
+        self.rounds.append((goal_id, round_))
+        self.events.append(("round", goal_id, round_.round))
 
 
 class _Runner:
     """Yields to simulate real concurrency."""
-    def __init__(self, status="achieved", final="img-new", raise_error=None, events=None):
+    def __init__(self, status="achieved", final="img-new", raise_error=None, events=None, rounds_before_error=0):
         self.status = status
+        self.rounds_before_error = rounds_before_error
         self.final = final
         self.seen = []
         self._call_count = 0
         self.raise_error = raise_error
         self.events = events if events is not None else []
 
-    async def run(self, goal, *, workspace_image_id, run_token):
+    async def run(self, goal, *, workspace_image_id, run_token, on_round=None):
         self.events.append(("runner", "enter"))
         self.seen.append((goal, workspace_image_id, run_token))
         self._call_count += 1
@@ -75,6 +94,8 @@ class _Runner:
 
         # Raise error if configured (to test slot consumption on non-auth errors)
         if self.raise_error:
+            for number in range(1, self.rounds_before_error + 1):
+                await on_round(_round(number, workspace_image_id))
             raise self.raise_error
 
         # For "achieved" status, construct proper rounds with passing acceptance
@@ -104,6 +125,8 @@ class _Runner:
                 policy_violations=(),
                 acceptance=acceptance
             )
+            if on_round is not None:
+                await on_round(round_result)
             return AgentGoalResultV1(
                 goal_id=goal.goal_id,
                 status=self.status,
@@ -122,6 +145,13 @@ class _Runner:
             )
 
 
+def _round(number, image):
+    return AgentGoalRoundV1(
+        round=number, input_image_id=image, output_image_id=f"{image}-r{number}",
+        num_turns=1, tool_call_count=0, exit_code=0, timed_out=False, journal_sha256="0" * 64,
+    )
+
+
 class _YieldingSandbox:
     """Sandbox that yields to simulate real concurrency."""
     def __init__(self, handler, events=None):
@@ -137,10 +167,10 @@ class _YieldingSandbox:
         return self._handler(image_id, command)
 
 
-def _build_tool(runner, authority=None, sink=None, cursor=None):
+def _build_tool(runner, authority=None, sink=None, cursor=None, tokens=None):
     return ClaudeCodeBuildTool(
         runner=runner, cursor=cursor or WorkspaceCursor("img-0"), authority=authority or _Authority(),
-        tokens=_Tokens(), evidence=sink or _Sink(), limits=LIMITS, clock=lambda: NOW, goal_prefix="team-7",
+        tokens=tokens or _Tokens(), evidence=sink or _Sink(), limits=LIMITS, clock=lambda: NOW, goal_prefix="team-7",
     )
 
 
@@ -513,3 +543,92 @@ async def test_run_tests_tool_runs_on_cursor_image():
     assert authority.calls == ["sandbox_run_tests"]
     with pytest.raises(RuntimeError, match="ceiling"):
         await tool.run(SandboxRunTestsArgs(commands=["pytest -q"]), CancellationToken())
+
+
+# --- I2: token issuer binds the goal and is always revoked ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_token_issue_receives_the_goal_with_its_budget():
+    tokens = _Tokens()
+    runner = _Runner()
+    await _build_tool(runner, tokens=tokens).run(_args(), CancellationToken())
+    assert [goal.goal_id for goal in tokens.issued] == ["team-7-build-0"]
+    assert tokens.issued[0].budget_usd == Decimal("2")
+    assert tokens.issued[0] is runner.seen[0][0]
+
+
+@pytest.mark.parametrize("status", ["achieved", "exhausted", "policy_violation", "failed"])
+@pytest.mark.asyncio
+async def test_token_is_revoked_when_the_goal_ends(status):
+    events = []
+    tokens, sink = _Tokens(events=events), _Sink(events=events)
+    await _build_tool(_Runner(status=status), tokens=tokens, sink=sink).run(_args(), CancellationToken())
+    assert tokens.revoked == ["team-7-build-0"]
+    assert events.index(("revoke", "team-7-build-0")) > events.index(("issue", "team-7-build-0"))
+
+
+@pytest.mark.asyncio
+async def test_token_is_revoked_when_the_runner_raises():
+    tokens = _Tokens()
+    tool = _build_tool(_Runner(raise_error=RuntimeError("boom")), tokens=tokens)
+    with pytest.raises(RuntimeError, match="boom"):
+        await tool.run(_args(), CancellationToken())
+    assert tokens.revoked == ["team-7-build-0"]
+
+
+# --- I4: per-round evidence -------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rounds_are_recorded_as_they_happen_then_the_result():
+    events = []
+    sink = _Sink(events=events)
+    await _build_tool(_Runner(), sink=sink, tokens=_Tokens(events=events)).run(_args(), CancellationToken())
+    assert [(goal_id, r.round) for goal_id, r in sink.rounds] == [("team-7-build-0", 1)]
+    assert events.index(("round", "team-7-build-0", 1)) < events.index(("result", "team-7-build-0"))
+
+
+@pytest.mark.asyncio
+async def test_rounds_are_recorded_even_when_a_later_round_raises():
+    sink, tokens = _Sink(), _Tokens()
+    tool = _build_tool(_Runner(raise_error=RuntimeError("lost"), rounds_before_error=2), sink=sink, tokens=tokens)
+    with pytest.raises(RuntimeError, match="lost"):
+        await tool.run(_args(), CancellationToken())
+    assert [(goal_id, r.round) for goal_id, r in sink.rounds] == [("team-7-build-0", 1), ("team-7-build-0", 2)]
+    assert sink.results == []
+    assert tokens.revoked == ["team-7-build-0"]
+
+
+# --- M1: command length cap -------------------------------------------------------------
+
+
+def test_build_and_run_tests_args_cap_command_length():
+    ClaudeCodeBuildArgs(objective="x", acceptance_commands=["x" * 2000])
+    SandboxRunTestsArgs(commands=["x" * 2000])
+    with pytest.raises(ValueError):
+        ClaudeCodeBuildArgs(objective="x", acceptance_commands=["x" * 2001])
+    with pytest.raises(ValueError):
+        SandboxRunTestsArgs(commands=["x" * 2001])
+
+
+# --- M5: constructor validation ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("prefix", ["", "-team", "team 7", "team/7", "x" * 101])
+def test_build_tool_rejects_goal_prefixes_that_cannot_form_goal_ids(prefix):
+    with pytest.raises(ValueError, match="goal_prefix"):
+        ClaudeCodeBuildTool(
+            runner=_Runner(), cursor=WorkspaceCursor("img-0"), authority=_Authority(), tokens=_Tokens(),
+            evidence=_Sink(), limits=LIMITS, clock=lambda: NOW, goal_prefix=prefix,
+        )
+
+
+@pytest.mark.parametrize("timeout_seconds,max_calls", [(0, 1), (7201, 1), (60, 0), (60, -1)])
+def test_run_tests_tool_validates_timeout_and_max_calls(timeout_seconds, max_calls):
+    with pytest.raises(ValueError):
+        SandboxRunTestsTool(
+            sandbox=_YieldingSandbox(lambda image, command: ok()), cursor=WorkspaceCursor("img-0"),
+            authority=_Authority(), clock=lambda: NOW, workdir="/work",
+            timeout_seconds=timeout_seconds, max_calls=max_calls,
+        )

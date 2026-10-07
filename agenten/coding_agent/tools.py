@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -16,6 +17,7 @@ from agenten.coding_agent.acceptance import run_acceptance
 from agenten.coding_agent.contracts import (
     AcceptanceReportV1,
     AgentGoalResultV1,
+    AgentGoalRoundV1,
     AgentGoalV1,
     GoalStatus,
     _safe_relative,
@@ -24,10 +26,17 @@ from agenten.coding_agent.contracts import (
 from agenten.coding_agent.sandbox import SandboxPort
 
 _ADVANCING: frozenset[GoalStatus] = frozenset({"achieved", "exhausted"})
+# "<prefix>-build-<n>" must stay a valid AgentGoalV1 goal_id (ID_PATTERN, at most 128 chars).
+_GOAL_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$")
+_MAX_COMMAND_CHARS = 2000  # same bound as AgentGoalV1.acceptance_commands
 
 
 class WorkspaceCursor:
-    """The current workspace image of one team run, shared by its coding tools."""
+    """The current workspace image of one team run, shared by its coding tools.
+
+    The lock is held for a whole claude_code_build call, so a concurrent
+    sandbox_run_tests call waits until the running build has finished.
+    """
 
     def __init__(self, image_id: str) -> None:
         self.image_id = image_id
@@ -39,15 +48,37 @@ class CodingToolAuthorityPort(Protocol):
 
 
 class RunTokenIssuerPort(Protocol):
-    async def issue(self, goal_id: str) -> str: ...
+    """Issues the relay token for one goal and revokes it when the goal ends.
+
+    The real control is the token itself: short-lived, bound to the goal's
+    budget_usd and revoked on goal end (M1b implements this at the provider proxy).
+    Redacting the token from recorded text is defense in depth only.
+    """
+
+    async def issue(self, goal: AgentGoalV1) -> str: ...
+
+    async def revoke(self, goal_id: str) -> None: ...
 
 
 class GoalEvidenceSinkPort(Protocol):
-    def record(self, result: AgentGoalResultV1) -> None: ...
+    def record_round(self, goal_id: str, round: AgentGoalRoundV1) -> None:
+        """Record one finished (already redacted) round while the goal is still running."""
+        ...
+
+    def record(self, result: AgentGoalResultV1) -> None:
+        """Record the final goal result."""
+        ...
 
 
 class _GoalRunnerPort(Protocol):
-    async def run(self, goal: AgentGoalV1, *, workspace_image_id: str, run_token: str) -> AgentGoalResultV1: ...
+    async def run(
+        self,
+        goal: AgentGoalV1,
+        *,
+        workspace_image_id: str,
+        run_token: str,
+        on_round: Callable[[AgentGoalRoundV1], Awaitable[None]] | None = None,
+    ) -> AgentGoalResultV1: ...
 
 
 @dataclass(frozen=True)
@@ -61,8 +92,8 @@ class CodingToolLimits:
 
 def _single_lines(values: list[str]) -> list[str]:
     for value in values:
-        if not value.strip() or any(ch in value for ch in "\x00\r\n"):
-            raise ValueError("commands must be non-empty single lines")
+        if not value.strip() or len(value) > _MAX_COMMAND_CHARS or any(ch in value for ch in "\x00\r\n"):
+            raise ValueError(f"commands must be non-empty single lines of at most {_MAX_COMMAND_CHARS} chars")
     return values
 
 
@@ -106,6 +137,10 @@ class ClaudeCodeBuildTool(BaseTool[ClaudeCodeBuildArgs, ClaudeCodeBuildResult]):
     Slot policy: a slot is consumed when reserve succeeds (call counter increments).
     Only authorization denial returns the slot; other failures (runner, tokens, evidence)
     keep the slot consumed because budget may already be spent during the goal run.
+
+    The workspace cursor lock is held for the whole build, so sandbox_run_tests waits
+    for a running build. The run token is revoked when the goal ends, also when the
+    runner raises; each round is recorded as evidence as soon as it finishes.
     """
     TOOL_NAME = "claude_code_build"
 
@@ -136,6 +171,8 @@ class ClaudeCodeBuildTool(BaseTool[ClaudeCodeBuildArgs, ClaudeCodeBuildResult]):
             raise ValueError("budget_usd must be in (0, 50]")
         if not (60 <= limits.timeout_seconds <= 7200):
             raise ValueError("timeout_seconds must be in [60, 7200]")
+        if _GOAL_PREFIX.fullmatch(goal_prefix) is None:
+            raise ValueError("goal_prefix must be a plain identifier of at most 100 chars")
 
         self._runner = runner
         self._cursor = cursor
@@ -177,8 +214,18 @@ class ClaudeCodeBuildTool(BaseTool[ClaudeCodeBuildArgs, ClaudeCodeBuildResult]):
                 budget_usd=self._limits.budget_usd,
                 timeout_seconds=self._limits.timeout_seconds,
             )
-            token = await self._tokens.issue(goal.goal_id)
-            result = await self._runner.run(goal, workspace_image_id=self._cursor.image_id, run_token=token)
+            goal_id = goal.goal_id
+
+            async def record_round(round_: AgentGoalRoundV1) -> None:
+                self._evidence.record_round(goal_id, round_)
+
+            token = await self._tokens.issue(goal)
+            try:
+                result = await self._runner.run(
+                    goal, workspace_image_id=self._cursor.image_id, run_token=token, on_round=record_round
+                )
+            finally:
+                await self._tokens.revoke(goal_id)
             self._evidence.record(result)
             if result.status in _ADVANCING:
                 self._cursor.image_id = result.final_image_id
@@ -209,6 +256,9 @@ class SandboxRunTestsTool(BaseTool[SandboxRunTestsArgs, AcceptanceReportV1]):
 
     Slot policy matches ClaudeCodeBuildTool: a slot is consumed when reserved and only
     authorization denial returns it; other failures keep it consumed.
+
+    Shares the workspace cursor lock with claude_code_build, so a call waits for a
+    running build to finish before it runs.
     """
     TOOL_NAME = "sandbox_run_tests"
 
@@ -229,6 +279,10 @@ class SandboxRunTestsTool(BaseTool[SandboxRunTestsArgs, AcceptanceReportV1]):
             self.TOOL_NAME,
             "Run test commands against the current sandboxed workspace without changing it.",
         )
+        if not (1 <= timeout_seconds <= 7200):
+            raise ValueError("timeout_seconds must be in [1, 7200]")
+        if max_calls < 1:
+            raise ValueError("max_calls must be at least 1")
         self._sandbox = sandbox
         self._cursor = cursor
         self._authority = authority
