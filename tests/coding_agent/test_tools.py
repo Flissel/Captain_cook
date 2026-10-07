@@ -27,15 +27,17 @@ LIMITS = CodingToolLimits(max_calls=2, max_rounds=3, max_turns_per_round=20, bud
 
 
 class _Authority:
-    """Yields to simulate real concurrency."""
-    def __init__(self, deny=False):
+    """Yields to simulate real concurrency; denies every call or only the given 0-based call indexes."""
+    def __init__(self, deny=False, deny_indexes=()):
         self.deny = deny
+        self.deny_indexes = frozenset(deny_indexes)
         self.calls = []
 
     async def authorize(self, tool_name, *, now):
+        index = len(self.calls)
         self.calls.append(tool_name)
         await asyncio.sleep(0)  # Yield to enable real concurrency
-        if self.deny:
+        if self.deny or index in self.deny_indexes:
             raise PermissionError("grant revoked")
 
 
@@ -54,22 +56,22 @@ class _Sink:
 
 class _Runner:
     """Yields to simulate real concurrency."""
-    def __init__(self, status="achieved", final="img-new", raise_error=None):
+    def __init__(self, status="achieved", final="img-new", raise_error=None, events=None):
         self.status = status
         self.final = final
         self.seen = []
         self._call_count = 0
         self.raise_error = raise_error
-        self.enter_times = []
-        self.exit_times = []
+        self.events = events if events is not None else []
 
     async def run(self, goal, *, workspace_image_id, run_token):
-        self.enter_times.append(asyncio.current_task())
+        self.events.append(("runner", "enter"))
         self.seen.append((goal, workspace_image_id, run_token))
         self._call_count += 1
 
         # Yield to enable real concurrency
         await asyncio.sleep(0)
+        self.events.append(("runner", "exit"))
 
         # Raise error if configured (to test slot consumption on non-auth errors)
         if self.raise_error:
@@ -102,7 +104,6 @@ class _Runner:
                 policy_violations=(),
                 acceptance=acceptance
             )
-            self.exit_times.append(asyncio.current_task())
             return AgentGoalResultV1(
                 goal_id=goal.goal_id,
                 status=self.status,
@@ -112,7 +113,6 @@ class _Runner:
             )
         else:
             # Non-achieved status can have empty rounds
-            self.exit_times.append(asyncio.current_task())
             return AgentGoalResultV1(
                 goal_id=goal.goal_id,
                 status=self.status,
@@ -124,17 +124,16 @@ class _Runner:
 
 class _YieldingSandbox:
     """Sandbox that yields to simulate real concurrency."""
-    def __init__(self, handler):
+    def __init__(self, handler, events=None):
         self._handler = handler
         self.calls = []
-        self.enter_times = []
-        self.exit_times = []
+        self.events = events if events is not None else []
 
     async def run(self, image_id, command):
-        self.enter_times.append(asyncio.current_task())
+        self.events.append(("sandbox", "enter"))
         self.calls.append((image_id, command))
         await asyncio.sleep(0)  # Yield for concurrency
-        self.exit_times.append(asyncio.current_task())
+        self.events.append(("sandbox", "exit"))
         return self._handler(image_id, command)
 
 
@@ -224,12 +223,51 @@ async def test_concurrent_builds_with_max_calls_2_have_distinct_ids():
     # Distinct tokens
     assert token1 != token2
 
+    # Image chain: the cursor lock serialized the builds, so the second build started
+    # from the first build's final image rather than from the shared initial image.
+    assert runner.seen[0][1] == "img-0"
+    assert runner.seen[1][1] == results[0].final_image_id == "img-0-1"
+    assert results[1].final_image_id == "img-0-1-2"
+    assert cursor.image_id == "img-0-1-2"
+
+
+@pytest.mark.asyncio
+async def test_gathered_builds_denied_middle_call_returns_slot_and_ids_stay_distinct():
+    """Three gathered builds, max_calls=3, authority denies exactly the second call."""
+    runner = _Runner()
+    authority = _Authority(deny_indexes={1})
+    limits = CodingToolLimits(max_calls=3, max_rounds=3, max_turns_per_round=20, budget_usd=Decimal("2"), timeout_seconds=900)
+    tool = ClaudeCodeBuildTool(
+        runner=runner, cursor=WorkspaceCursor("img-0"), authority=authority,
+        tokens=_Tokens(), evidence=_Sink(), limits=limits, clock=lambda: NOW, goal_prefix="team-7",
+    )
+
+    results = await asyncio.gather(*(tool.run(_args(), CancellationToken()) for _ in range(3)), return_exceptions=True)
+
+    denied = [r for r in results if isinstance(r, PermissionError)]
+    succeeded = [r for r in results if not isinstance(r, BaseException)]
+    assert len(denied) == 1 and len(succeeded) == 2
+    assert isinstance(results[1], PermissionError)
+    assert len(runner.seen) == 2
+    goal_ids = [goal.goal_id for goal, _, _ in runner.seen]
+    assert len(set(goal_ids)) == 2
+    assert goal_ids == ["team-7-build-0", "team-7-build-2"]
+
+    # The denied slot was returned: exactly one more call fits, then the ceiling applies.
+    follow_up = await tool.run(_args(), CancellationToken())
+    assert follow_up.status == "achieved"
+    assert runner.seen[2][0].goal_id == "team-7-build-3"
+    with pytest.raises(RuntimeError, match="ceiling"):
+        await tool.run(_args(), CancellationToken())
+    assert len(runner.seen) == 3
+
 
 @pytest.mark.asyncio
 async def test_concurrent_build_and_sandbox_no_interleaving():
     """Build and sandbox_run_tests on same cursor → never interleave (lock serializes)."""
-    runner = _Runner()
-    sandbox = _YieldingSandbox(lambda image, command: ok("ok", exit_code=0))
+    events = []
+    runner = _Runner(events=events)
+    sandbox = _YieldingSandbox(lambda image, command: ok("ok", exit_code=0), events=events)
     cursor = WorkspaceCursor("img-0")
 
     build_tool = ClaudeCodeBuildTool(
@@ -254,10 +292,10 @@ async def test_concurrent_build_and_sandbox_no_interleaving():
     # Both should succeed
     assert all(not isinstance(r, Exception) for r in results)
 
-    # Runner enter/exit and sandbox enter/exit should be interleaved but not overlapping
-    # (cursor lock ensures no simultaneous access)
-    assert len(runner.enter_times) >= 1
-    assert len(sandbox.enter_times) >= 1
+    # Critical sections never overlap: one side fully enters and exits before the other starts.
+    run_block = [("runner", "enter"), ("runner", "exit")]
+    box_block = [("sandbox", "enter"), ("sandbox", "exit")]
+    assert events in (run_block + box_block, box_block + run_block)
 
 
 @pytest.mark.parametrize("status", [

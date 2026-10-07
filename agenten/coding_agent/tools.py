@@ -205,6 +205,11 @@ class SandboxRunTestsArgs(BaseModel):
 
 
 class SandboxRunTestsTool(BaseTool[SandboxRunTestsArgs, AcceptanceReportV1]):
+    """Run test commands against the current workspace image without advancing it.
+
+    Slot policy matches ClaudeCodeBuildTool: a slot is consumed when reserved and only
+    authorization denial returns it; other failures keep it consumed.
+    """
     TOOL_NAME = "sandbox_run_tests"
 
     def __init__(
