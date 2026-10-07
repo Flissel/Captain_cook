@@ -196,36 +196,71 @@ def anthropic_request_to_chat(request: Mapping[str, object], *, allowed_models: 
     if system:
         messages.append({"role": "system", "content": system})
 
-    # Track tool call IDs to validate tool results
+    # Strict tool_call pairing (R17): pending_tool_ids is cleared and reset per assistant turn
     pending_tool_ids: set[str] = set()
-    answered_ids: set[str] = set()
 
-    for message in raw_messages:
+    for i, message in enumerate(raw_messages):
         translated = _translate_message(message, chat_name)
 
-        # Extract tool IDs from assistant messages for validation
+        # Handle assistant messages: update pending tool IDs
         if isinstance(message, dict) and message.get("role") == "assistant":
-            for t in translated:
-                if t.get("role") == "assistant" and "tool_calls" in t:
-                    for call in t["tool_calls"]:  # type: ignore
-                        pending_tool_ids.add(call["id"])  # type: ignore
+            # If this assistant message emits nothing (skipped thinking-only), leave pending unchanged
+            if translated:  # Non-empty translation
+                # If there are pending tool IDs and a new (non-empty) assistant message arrives, error
+                if pending_tool_ids:
+                    raise BridgeError(f"new assistant message arrived while tool_use_id {pending_tool_ids} still pending")
 
-        # Validate tool results
+                # When an assistant message with tool_calls appears, it sets pending set
+                assistant_msg = translated[0]
+                if assistant_msg.get("role") == "assistant" and "tool_calls" in assistant_msg:
+                    pending_tool_ids = {call["id"] for call in assistant_msg["tool_calls"]}  # type: ignore
+
+        # Handle user messages: validate tool result pairing
         if isinstance(message, dict) and message.get("role") == "user":
             content = message.get("content")
             if isinstance(content, list):
+                # Collect tool results in this user message
+                seen_results: set[str] = set()
+                has_tool_results = False
+                has_text = False
+                text_after_results = False
+
                 for block in content:
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        tool_use_id = block.get("tool_use_id")
-                        if tool_use_id not in pending_tool_ids:
-                            raise BridgeError(f"tool_result references unknown tool_use_id: {tool_use_id!r}")
-                        if tool_use_id in answered_ids:
-                            raise BridgeError(f"tool_use_id {tool_use_id!r} answered multiple times")
-                        answered_ids.add(tool_use_id)
-            # Clear pending IDs after this user message processes all results
-            pending_tool_ids.clear()
+                    if isinstance(block, dict):
+                        if block.get("type") == "tool_result":
+                            has_tool_results = True
+                            if has_text:
+                                text_after_results = True
+                            tool_use_id = block.get("tool_use_id")
+                            if tool_use_id not in pending_tool_ids:
+                                raise BridgeError(f"tool_result references unknown tool_use_id: {tool_use_id!r}")
+                            if tool_use_id in seen_results:
+                                raise BridgeError(f"tool_use_id {tool_use_id!r} answered multiple times in same user message")
+                            seen_results.add(tool_use_id)
+                        elif block.get("type") == "text":
+                            has_text = True
+
+                # If tool results are present, they must come before text
+                if text_after_results:
+                    raise BridgeError("tool_result blocks must appear before text blocks in user message")
+
+                # If there are pending tool IDs but no results, error
+                if pending_tool_ids and not has_tool_results:
+                    raise BridgeError(f"tool_use_id {pending_tool_ids} still pending but user message has no tool results")
+
+                # Verify all pending IDs are answered
+                if has_tool_results and seen_results != pending_tool_ids:
+                    missing = pending_tool_ids - seen_results
+                    raise BridgeError(f"not all pending tool calls answered: {missing} missing")
+
+                # Clear pending after processing user message
+                pending_tool_ids.clear()
 
         messages.extend(translated)
+
+    # After all messages, if pending tool IDs exist, error
+    if pending_tool_ids:
+        raise BridgeError(f"request ended with unanswered tool_use_id: {pending_tool_ids}")
 
     # After translating all messages, ensure there's at least one non-system message
     non_system_messages = [m for m in messages if m.get("role") != "system"]
@@ -269,9 +304,9 @@ def anthropic_request_to_chat(request: Mapping[str, object], *, allowed_models: 
             raise BridgeError("top_p must be a number")
         payload["top_p"] = top_p
 
-    # Validate stop_sequences
+    # Validate stop_sequences using `is not None` to catch falsy values
     stops = request.get("stop_sequences")
-    if stops:
+    if stops is not None:
         if not isinstance(stops, list):
             raise BridgeError("stop_sequences must be a list")
         for stop in stops:

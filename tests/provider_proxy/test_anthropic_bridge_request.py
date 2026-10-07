@@ -160,18 +160,15 @@ def test_empty_list_assistant_message_is_skipped():
     assert len(msgs) == 2
 
 
-def test_tool_calls_without_text_content_none_is_valid():
-    req = _request(messages=[
-        {"role": "user", "content": "go"},
-        {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "t1", "name": "Write", "input": {"x": "y"}},
-        ]},
-    ])
-    out = anthropic_request_to_chat(req, allowed_models=MODELS)
-    msgs = out.payload["messages"]
-    assert msgs[-1]["role"] == "assistant"
-    assert msgs[-1]["content"] is None
-    assert len(msgs[-1]["tool_calls"]) == 1
+def test_tool_calls_without_text_content_none_requires_result():
+    # Assistant with tool_call but no result is invalid (pending tools at request end)
+    with pytest.raises(BridgeError, match="pending|unanswered"):
+        anthropic_request_to_chat(_request(messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Write", "input": {"x": "y"}},
+            ]},
+        ]), allowed_models=MODELS)
 
 
 def test_tool_use_input_must_be_dict_or_none():
@@ -282,10 +279,163 @@ def test_stream_must_be_bool_if_present():
         anthropic_request_to_chat(_request(stream=1), allowed_models=MODELS)
 
 
+# Fix round 2: Strict tool_call pairing and collision detection
 def test_chat_name_collision_is_error():
-    # Create a collision by using two long names that hash to the same short name
-    # This is artificially constructed: we use a tool name and ensure collision
-    # by mocking the short_tool_name behavior (which we can't easily do here)
-    # Instead, we test via tool_choice referring to a tool not in the tools list with same short name
-    # For now, this is tested indirectly; a more complete test would require mocking
-    pass
+    # Two tools: one long name and one whose literal name equals short_tool_name(long_name)
+    long_name = "mcp__captain_artifacts__write_artifact_with_a_really_long_descriptive_name_v2"
+    short = short_tool_name(long_name)
+    # Create a collision: second tool name IS the short form of the first
+    with pytest.raises(BridgeError, match="collision"):
+        anthropic_request_to_chat(_request(
+            tools=[
+                {"name": long_name, "description": "", "input_schema": {"type": "object"}},
+                {"name": short, "description": "", "input_schema": {"type": "object"}},
+            ],
+            messages=[{"role": "user", "content": "go"}],
+        ), allowed_models=MODELS)
+
+
+def test_invalid_tool_choice_type_is_error():
+    with pytest.raises(BridgeError, match="unsupported"):
+        anthropic_request_to_chat(_request(
+            tool_choice={"type": "bogus"},
+        ), allowed_models=MODELS)
+
+
+def test_temperature_string_is_error():
+    with pytest.raises(BridgeError):
+        anthropic_request_to_chat(_request(temperature="hot"), allowed_models=MODELS)
+
+
+def test_top_p_string_is_error():
+    with pytest.raises(BridgeError):
+        anthropic_request_to_chat(_request(top_p="x"), allowed_models=MODELS)
+
+
+def test_stop_sequences_falsy_values_rejected():
+    # Empty string in stop_sequences should raise
+    with pytest.raises(BridgeError):
+        anthropic_request_to_chat(_request(stop_sequences=[""]), allowed_models=MODELS)
+    # False in stop_sequences should raise
+    with pytest.raises(BridgeError):
+        anthropic_request_to_chat(_request(stop_sequences=[False]), allowed_models=MODELS)
+    # 0 in stop_sequences should raise
+    with pytest.raises(BridgeError):
+        anthropic_request_to_chat(_request(stop_sequences=[0]), allowed_models=MODELS)
+
+
+def test_strict_tool_pairing_multiple_assistants_with_different_tools():
+    # Two assistant turns with tool_uses: second assistant message arrives while first tools pending
+    with pytest.raises(BridgeError, match="pending"):
+        anthropic_request_to_chat(_request(messages=[
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Write", "input": {}},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t2", "name": "Bash", "input": {}},
+            ]},
+        ]), allowed_models=MODELS)
+
+
+def test_strict_tool_pairing_partial_answers():
+    # Two tool_uses expected, only one answered
+    with pytest.raises(BridgeError, match="pending"):
+        anthropic_request_to_chat(_request(messages=[
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Write", "input": {}},
+                {"type": "tool_use", "id": "t2", "name": "Bash", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "done"},
+            ]},
+        ]), allowed_models=MODELS)
+
+
+def test_strict_tool_pairing_user_text_only_while_pending():
+    # User message with text only while tools are pending
+    with pytest.raises(BridgeError, match="pending"):
+        anthropic_request_to_chat(_request(messages=[
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Write", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "text", "text": "hello"},
+            ]},
+        ]), allowed_models=MODELS)
+
+
+def test_strict_tool_pairing_request_ends_with_pending_tools():
+    # Request ends with an assistant message that has tool_uses
+    with pytest.raises(BridgeError, match="unanswered|pending"):
+        anthropic_request_to_chat(_request(messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Write", "input": {}},
+            ]},
+        ]), allowed_models=MODELS)
+
+
+def test_strict_tool_pairing_skipped_thinking_only_leaves_pending():
+    # Thinking-only message is skipped (emits nothing), pending still valid
+    req = _request(messages=[
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Write", "input": {}},
+        ]},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hmm"},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "done"},
+        ]},
+    ])
+    out = anthropic_request_to_chat(req, allowed_models=MODELS)
+    # Should succeed: thinking-only is skipped, t1 is still pending and answered
+    msgs = out.payload["messages"]
+    # Verify structure
+    assert any(m.get("role") == "tool" and m.get("tool_call_id") == "t1" for m in msgs)
+
+
+def test_strict_tool_pairing_realistic_multi_turn():
+    # Realistic Claude Code conversation:
+    # User asks → Assistant text + 2 tool_uses → User 2 results + text → Assistant text + 1 tool_use → User 1 result
+    req = _request(messages=[
+        {"role": "user", "content": "Please do two things"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "I'll do them."},
+            {"type": "tool_use", "id": "t1", "name": "Write", "input": {"file_path": "x.py"}},
+            {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "ls"}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "written"},
+            {"type": "tool_result", "tool_use_id": "t2", "content": "files"},
+            {"type": "text", "text": "Great! Now run one more."},
+        ]},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Running it."},
+            {"type": "tool_use", "id": "t3", "name": "Bash", "input": {"command": "python x.py"}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t3", "content": "result"},
+        ]},
+    ])
+    out = anthropic_request_to_chat(req, allowed_models=MODELS)
+    msgs = out.payload["messages"]
+    # Verify exact order (system + user + assistant + tool + tool + user + assistant + tool + user)
+    non_sys = msgs[1:]  # Skip system
+    assert non_sys[0]["role"] == "user"
+    assert non_sys[0]["content"] == "Please do two things"
+    assert non_sys[1]["role"] == "assistant"
+    assert non_sys[1]["content"] == "I'll do them."
+    assert len(non_sys[1]["tool_calls"]) == 2
+    assert non_sys[2]["role"] == "tool"
+    assert non_sys[2]["tool_call_id"] == "t1"
+    assert non_sys[3]["role"] == "tool"
+    assert non_sys[3]["tool_call_id"] == "t2"
+    assert non_sys[4]["role"] == "user"
+    assert non_sys[4]["content"] == "Great! Now run one more."
+    assert non_sys[5]["role"] == "assistant"
+    assert non_sys[5]["content"] == "Running it."
+    assert len(non_sys[5]["tool_calls"]) == 1
+    assert non_sys[5]["tool_calls"][0]["id"] == "t3"
+    assert non_sys[6]["role"] == "tool"
+    assert non_sys[6]["tool_call_id"] == "t3"
