@@ -90,7 +90,8 @@ async def run_acceptance(
     for command in commands:
         # Purge caches and prevent bytecode writing to isolate judge from agent modifications.
         # Wrap user command in subshell to prevent shell operators (;, ||, etc.) from running after purge failure.
-        purged_shell = f"{_acceptance_purge_prefix(workdir)} && ( {command} )"
+        # The newline before ")" keeps a trailing "#" comment from swallowing the closing parenthesis.
+        purged_shell = f"{_acceptance_purge_prefix(workdir)} && ( {command}\n)"
         result = await sandbox.run(
             image_id,
             SandboxCommand(shell=purged_shell, timeout_seconds=timeout_seconds),

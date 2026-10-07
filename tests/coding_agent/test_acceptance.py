@@ -25,7 +25,7 @@ async def test_acceptance_runs_with_cache_purge_and_pythondontwritebytecode():
     expected_shell = (
         "cd /work && find . -path ./.git -prune -o \\( -name __pycache__ -o -name .pytest_cache "
         "-o -name .mypy_cache -o -name .ruff_cache \\) -prune -exec rm -rf {} + && "
-        "export PYTHONDONTWRITEBYTECODE=1 && ( pytest -q a )"
+        "export PYTHONDONTWRITEBYTECODE=1 && ( pytest -q a\n)"
     )
     assert sandbox.calls[0][1].shell == expected_shell
     assert sandbox.calls[0][1].env == {}
@@ -43,7 +43,7 @@ async def test_acceptance_wraps_command_with_semicolon_in_subshell():
     )
 
     # Command with ";" must be wrapped in parentheses
-    assert "( cmd1; cmd2 )" in sandbox.calls[0][1].shell
+    assert "( cmd1; cmd2\n)" in sandbox.calls[0][1].shell
     assert report.checks[0].passed is True
     assert all(img == "img-1" for img, _ in sandbox.calls)
 
@@ -524,3 +524,10 @@ def test_unsafe_symlinks(path, target, kind, unsafe):
 
     entry = SymlinkEntry(path=path, target=target, target_kind=kind)
     assert unsafe_symlinks((entry,)) == ((path,) if unsafe else ())
+
+
+@pytest.mark.asyncio
+async def test_trailing_comment_cannot_swallow_the_subshell_close():
+    sandbox = FakeSandbox(lambda image, command: ok("ok"))
+    await run_acceptance(sandbox, image_id="i", commands=("pytest -q  # all tests",), workdir="/work", timeout_seconds=60)
+    assert sandbox.calls[0][1].shell.endswith("&& ( pytest -q  # all tests\n)")
