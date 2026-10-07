@@ -106,3 +106,76 @@ def test_empty_stream_has_no_session():
 def test_oversized_stream_is_rejected():
     with pytest.raises(ClaudeStreamTooLargeError):
         summarize_claude_stream("x" * 101, max_bytes=100)
+
+
+def test_result_with_u2028_in_text():
+    """Stream whose result text contains U+2028 (line separator) should not lose result event."""
+    result_with_u2028 = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 1,
+        "session_id": "s-1",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+        "result": "line1 line2",
+    }
+    # When split by splitlines(), U+2028 would create extra lines causing parse failures.
+    # With split("\n"), it should parse correctly.
+    stdout = json.dumps(result_with_u2028) + "\n"
+    summary = summarize_claude_stream(stdout)
+    assert summary.result_subtype == "success"
+    assert summary.warning_count == 0
+
+
+def test_result_with_u0085_in_text():
+    """Stream whose result text contains U+0085 (next line) should not lose result event."""
+    result_with_u0085 = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 1,
+        "session_id": "s-1",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+        "result": "line1\u0085line2",
+    }
+    stdout = json.dumps(result_with_u0085) + "\n"
+    summary = summarize_claude_stream(stdout)
+    assert summary.result_subtype == "success"
+    assert summary.warning_count == 0
+
+
+def test_large_integer_becomes_malformed_json_warning():
+    """A JSON line with a 5000-digit integer raises ValueError and becomes malformed_json warning."""
+    large_int = "1" * 5000
+    line = f'{{"type": "mystery", "value": {large_int}}}'
+    (warning,) = parse_claude_stream_line(line)
+    assert isinstance(warning, ClaudeStreamWarning)
+    assert warning.warning_type == "malformed_json"
+
+
+def test_deeply_nested_structure_becomes_malformed_json_warning():
+    """A JSON line with deeply nested structure raises RecursionError and becomes malformed_json warning."""
+    # Create a deeply nested JSON structure that will cause RecursionError
+    nested = '{"a":' * 10000 + '1' + '}' * 10000
+    (warning,) = parse_claude_stream_line(nested)
+    assert isinstance(warning, ClaudeStreamWarning)
+    assert warning.warning_type == "malformed_json"
+
+
+def test_hostile_lines_via_summarize_claude_stream():
+    """Hostile lines (large int, deep nesting) via summarize_claude_stream don't raise, just warn."""
+    large_int = "1" * 5000
+    hostile_line1 = f'{{"type": "mystery", "value": {large_int}}}'
+    hostile_line2 = '{"a":' * 5000 + '1' + '}' * 5000
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 1,
+        "session_id": "s-1",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+    stdout = hostile_line1 + "\n" + hostile_line2 + "\n" + json.dumps(result) + "\n"
+    summary = summarize_claude_stream(stdout)
+    assert summary.result_subtype == "success"
+    assert summary.warning_count == 2

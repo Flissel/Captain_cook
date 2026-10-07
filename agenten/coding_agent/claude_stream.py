@@ -83,7 +83,7 @@ def parse_claude_stream_line(line: str) -> tuple[AgentEventV2 | ClaudeStreamWarn
 
     try:
         record = json.loads(line)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return warn("malformed_json")
     if not isinstance(record, dict):
         return warn("invalid_event")
@@ -125,8 +125,8 @@ def parse_claude_stream_line(line: str) -> tuple[AgentEventV2 | ClaudeStreamWarn
         )
     if kind == "result":
         subtype = _text(record.get("subtype"))
-        usage = record.get("usage") if isinstance(record.get("usage"), dict) else {}
-        assert isinstance(usage, dict)
+        raw_usage = record.get("usage")
+        usage = raw_usage if isinstance(raw_usage, dict) else {}
         failed = bool(record.get("is_error")) or subtype != "success"
         return (
             AgentEventV2(
@@ -148,7 +148,8 @@ def summarize_claude_stream(stdout: str, *, max_bytes: int = 10 * 1024 * 1024) -
     session: str | None = None
     subtype: str | None = None
     num_turns = tool_calls = tool_errors = input_tokens = output_tokens = warnings = 0
-    for line in stdout.splitlines():
+    for line in stdout.split("\n"):
+        line = line.rstrip("\r")
         if not line.strip():
             continue
         for item in parse_claude_stream_line(line):
