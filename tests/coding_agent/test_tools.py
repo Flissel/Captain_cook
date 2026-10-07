@@ -1,10 +1,17 @@
+import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
 from autogen_core import CancellationToken
 
-from agenten.coding_agent.contracts import AgentGoalResultV1, AcceptanceCheckV1, AcceptanceReportV1, AgentGoalRoundV1
+from agenten.coding_agent.contracts import (
+    AcceptanceCheckV1,
+    AcceptanceReportV1,
+    AgentGoalResultV1,
+    AgentGoalRoundV1,
+    GoalStatus,
+)
 from agenten.coding_agent.tools import (
     ClaudeCodeBuildArgs,
     ClaudeCodeBuildTool,
@@ -48,9 +55,11 @@ class _Runner:
         self.status = status
         self.final = final
         self.seen = []
+        self._call_count = 0
 
     async def run(self, goal, *, workspace_image_id, run_token):
         self.seen.append((goal, workspace_image_id, run_token))
+        self._call_count += 1
 
         # For "achieved" status, construct proper rounds with passing acceptance
         if self.status == "achieved":
@@ -62,10 +71,12 @@ class _Runner:
                 output_tail=""
             )
             acceptance = AcceptanceReportV1(checks=(passing_check,))
+            # Use workspace_image_id as base so cursor advancement can be verified
+            final_image = f"{workspace_image_id}-{self._call_count}"
             round_result = AgentGoalRoundV1(
                 round=1,
                 input_image_id=workspace_image_id,
-                output_image_id=self.final,
+                output_image_id=final_image,
                 session_id=None,
                 result_subtype=None,
                 num_turns=0,
@@ -81,7 +92,7 @@ class _Runner:
                 goal_id=goal.goal_id,
                 status=self.status,
                 rounds=(round_result,),
-                final_image_id=self.final,
+                final_image_id=final_image,
                 failure_reason=None
             )
         else:
@@ -119,28 +130,152 @@ async def test_build_tool_runs_goal_with_limits_and_advances_cursor():
     assert (goal.max_rounds, goal.max_turns_per_round, goal.timeout_seconds) == (3, 20, 900)
     assert goal.budget_usd == Decimal("2")
     assert image == "img-0"
-    assert cursor.image_id == "img-new"
+    assert cursor.image_id == "img-0-1"
     assert result.status == "achieved"
     assert sink.results[0].goal_id == "team-7-build-1"
     assert "tok-secret" not in result.model_dump_json()
 
 
 @pytest.mark.asyncio
-async def test_policy_violation_does_not_advance_cursor():
+async def test_build_tool_second_call_sees_first_final_image():
+    """Two gathered builds with max_calls=2 → second build starts from first build's final image."""
+    runner, sink, cursor = _Runner(), _Sink(), WorkspaceCursor("img-0")
+    limits = CodingToolLimits(max_calls=2, max_rounds=3, max_turns_per_round=20, budget_usd=Decimal("2"), timeout_seconds=900)
+    tool = ClaudeCodeBuildTool(
+        runner=runner, cursor=cursor, authority=_Authority(),
+        tokens=_Tokens(), evidence=sink, limits=limits, clock=lambda: NOW, goal_prefix="team-7",
+    )
+
+    # Run first call and verify cursor advancement
+    result1 = await tool.run(_args(), CancellationToken())
+    assert runner.seen[0][1] == "img-0"
+    assert result1.final_image_id == "img-0-1"
+    assert cursor.image_id == "img-0-1"
+
+    # Run second call and verify it uses the updated cursor and advances again
+    result2 = await tool.run(_args(), CancellationToken())
+    assert runner.seen[1][1] == "img-0-1"
+    assert result2.final_image_id == "img-0-1-2"
+    assert cursor.image_id == "img-0-1-2"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_calls_with_max_calls_1_only_one_succeeds():
+    """asyncio.gather of two claude_code_build calls with max_calls=1 → exactly one runs."""
+    runner = _Runner()
+    limits = CodingToolLimits(max_calls=1, max_rounds=3, max_turns_per_round=20, budget_usd=Decimal("2"), timeout_seconds=900)
+    tool = ClaudeCodeBuildTool(
+        runner=runner, cursor=WorkspaceCursor("img-0"), authority=_Authority(),
+        tokens=_Tokens(), evidence=_Sink(), limits=limits, clock=lambda: NOW, goal_prefix="team-7",
+    )
+
+    async def call_tool():
+        return await tool.run(_args(), CancellationToken())
+
+    results = await asyncio.gather(call_tool(), call_tool(), return_exceptions=True)
+
+    # Exactly one should succeed, one should raise ceiling error
+    successes = [r for r in results if not isinstance(r, Exception)]
+    failures = [r for r in results if isinstance(r, Exception)]
+
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert "ceiling" in str(failures[0])
+    assert len(runner.seen) == 1  # Only one call actually executed
+
+
+@pytest.mark.parametrize("status", [
+    "achieved",
+    "exhausted",
+    "timeout",
+    "budget_exhausted",
+    "policy_violation",
+    "failed",
+])
+@pytest.mark.asyncio
+async def test_cursor_advance_only_for_advancing_statuses(status: GoalStatus):
+    """Cursor advances only for 'achieved' and 'exhausted' statuses."""
+    runner = _Runner(status=status)
     cursor = WorkspaceCursor("img-0")
-    tool = _build_tool(_Runner(status="policy_violation", final="img-bad"), cursor=cursor)
+    tool = _build_tool(runner, cursor=cursor)
     result = await tool.run(_args(), CancellationToken())
-    assert cursor.image_id == "img-0"
-    assert result.status == "policy_violation"
+
+    assert result.status == status
+
+    # Only "achieved" and "exhausted" should advance the cursor
+    if status in ("achieved", "exhausted"):
+        # Both should use workspace_image_id to generate final image
+        if status == "achieved":
+            # Runner produces "img-0-1" from input "img-0"
+            assert cursor.image_id == "img-0-1"
+        else:
+            # For exhausted, runner uses self.final ("img-new") but doesn't add suffix
+            assert cursor.image_id == "img-new"
+    else:
+        assert cursor.image_id == "img-0"  # Cursor unchanged
 
 
 @pytest.mark.asyncio
 async def test_denied_authority_runs_nothing_and_does_not_count():
+    """Authorization denial doesn't consume a slot; subsequent allowed calls get full budget."""
     runner = _Runner()
-    tool = _build_tool(runner, authority=_Authority(deny=True))
+
+    # First authority denies
+    deny_authority = _Authority(deny=True)
+    cursor = WorkspaceCursor("img-0")
+    limits = CodingToolLimits(max_calls=2, max_rounds=3, max_turns_per_round=20, budget_usd=Decimal("2"), timeout_seconds=900)
+    tool = ClaudeCodeBuildTool(
+        runner=runner, cursor=cursor, authority=deny_authority,
+        tokens=_Tokens(), evidence=_Sink(), limits=limits, clock=lambda: NOW, goal_prefix="team-7",
+    )
+
+    # First call should be denied and runner should not be called
     with pytest.raises(PermissionError):
         await tool.run(_args(), CancellationToken())
     assert runner.seen == []
+
+    # Now flip authority to allow and verify we still have full budget (2 calls)
+    allow_authority = _Authority(deny=False)
+    tool._authority = allow_authority
+
+    # These two calls should succeed (full budget available)
+    result1 = await tool.run(_args(), CancellationToken())
+    result2 = await tool.run(_args(), CancellationToken())
+
+    assert result1.status == "achieved"
+    assert result2.status == "achieved"
+    assert len(runner.seen) == 2
+
+
+@pytest.mark.asyncio
+async def test_sandbox_denied_authority_runs_nothing_and_does_not_count():
+    """Authorization denial for sandbox tool doesn't consume a slot."""
+    sandbox = FakeSandbox(lambda image, command: ok("ok", exit_code=0))
+
+    # First authority denies
+    deny_authority = _Authority(deny=True)
+    cursor = WorkspaceCursor("img-0")
+    tool = SandboxRunTestsTool(
+        sandbox=sandbox, cursor=cursor, authority=deny_authority, clock=lambda: NOW,
+        workdir="/work", timeout_seconds=120, max_calls=2
+    )
+
+    # First call should be denied and sandbox should not be called
+    with pytest.raises(PermissionError):
+        await tool.run(SandboxRunTestsArgs(commands=["pytest -q"]), CancellationToken())
+    assert sandbox.calls == []
+
+    # Now flip authority to allow and verify we still have full budget (2 calls)
+    allow_authority = _Authority(deny=False)
+    tool._authority = allow_authority
+
+    # These two calls should succeed (full budget available)
+    report1 = await tool.run(SandboxRunTestsArgs(commands=["pytest -q"]), CancellationToken())
+    report2 = await tool.run(SandboxRunTestsArgs(commands=["pytest -q"]), CancellationToken())
+
+    assert report1.passed is True
+    assert report2.passed is True
+    assert len(sandbox.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -155,6 +290,74 @@ async def test_call_ceiling_is_enforced():
 def test_build_args_reject_multiline_commands():
     with pytest.raises(ValueError):
         ClaudeCodeBuildArgs(objective="x", acceptance_commands=["a\nb"])
+
+
+def test_build_args_reject_multiline_constraints():
+    with pytest.raises(ValueError):
+        ClaudeCodeBuildArgs(objective="x", acceptance_commands=["cmd"], constraints=["a\nb"])
+
+
+def test_build_args_reject_unsafe_allowed_paths():
+    with pytest.raises(ValueError):
+        ClaudeCodeBuildArgs(objective="x", acceptance_commands=["cmd"], allowed_paths=["../x"])
+
+
+def test_build_tool_rejects_invalid_limits_in_init():
+    """Tool __init__ validates limits against AgentGoalV1 bounds."""
+    cursor = WorkspaceCursor("img-0")
+
+    # Test max_rounds out of bounds
+    with pytest.raises(ValueError, match="max_rounds"):
+        ClaudeCodeBuildTool(
+            runner=_Runner(), cursor=cursor, authority=_Authority(), tokens=_Tokens(),
+            evidence=_Sink(), limits=CodingToolLimits(max_calls=1, max_rounds=11, max_turns_per_round=20,
+                                                       budget_usd=Decimal("2"), timeout_seconds=900),
+            clock=lambda: NOW, goal_prefix="team-7",
+        )
+
+    # Test max_turns_per_round out of bounds
+    with pytest.raises(ValueError, match="max_turns_per_round"):
+        ClaudeCodeBuildTool(
+            runner=_Runner(), cursor=cursor, authority=_Authority(), tokens=_Tokens(),
+            evidence=_Sink(), limits=CodingToolLimits(max_calls=1, max_rounds=3, max_turns_per_round=201,
+                                                       budget_usd=Decimal("2"), timeout_seconds=900),
+            clock=lambda: NOW, goal_prefix="team-7",
+        )
+
+    # Test budget_usd out of bounds
+    with pytest.raises(ValueError, match="budget_usd"):
+        ClaudeCodeBuildTool(
+            runner=_Runner(), cursor=cursor, authority=_Authority(), tokens=_Tokens(),
+            evidence=_Sink(), limits=CodingToolLimits(max_calls=1, max_rounds=3, max_turns_per_round=20,
+                                                       budget_usd=Decimal("51"), timeout_seconds=900),
+            clock=lambda: NOW, goal_prefix="team-7",
+        )
+
+    # Test timeout_seconds out of bounds
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        ClaudeCodeBuildTool(
+            runner=_Runner(), cursor=cursor, authority=_Authority(), tokens=_Tokens(),
+            evidence=_Sink(), limits=CodingToolLimits(max_calls=1, max_rounds=3, max_turns_per_round=20,
+                                                       budget_usd=Decimal("2"), timeout_seconds=7201),
+            clock=lambda: NOW, goal_prefix="team-7",
+        )
+
+
+def test_invalid_build_args_never_reach_authorize():
+    """Invalid args are rejected before authorization is attempted."""
+    cursor = WorkspaceCursor("img-0")
+    authority = _Authority()  # Will track if authorize is called
+    runner = _Runner()
+
+    tool = _build_tool(runner, authority=authority, cursor=cursor)
+
+    # This should fail at args validation, never reach authorize
+    with pytest.raises(ValueError):
+        ClaudeCodeBuildArgs(objective="x", acceptance_commands=["a\nb"])
+
+    # Verify authorize was never called
+    assert authority.calls == []
+    assert runner.seen == []
 
 
 @pytest.mark.asyncio

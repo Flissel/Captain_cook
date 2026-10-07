@@ -1,6 +1,7 @@
 """Captain-authorized AutoGen tools that let team agents use Claude Code in a sandbox."""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,7 +13,14 @@ from autogen_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agenten.coding_agent.acceptance import run_acceptance
-from agenten.coding_agent.contracts import AcceptanceReportV1, AgentGoalResultV1, AgentGoalV1, GoalStatus
+from agenten.coding_agent.contracts import (
+    AcceptanceReportV1,
+    AgentGoalResultV1,
+    AgentGoalV1,
+    GoalStatus,
+    _safe_relative,
+    _single_line,
+)
 from agenten.coding_agent.sandbox import SandboxPort
 
 _ADVANCING: frozenset[GoalStatus] = frozenset({"achieved", "exhausted"})
@@ -23,6 +31,7 @@ class WorkspaceCursor:
 
     def __init__(self, image_id: str) -> None:
         self.image_id = image_id
+        self.lock = asyncio.Lock()
 
 
 class CodingToolAuthorityPort(Protocol):
@@ -70,6 +79,16 @@ class ClaudeCodeBuildArgs(BaseModel):
     def _commands(cls, value: list[str]) -> list[str]:
         return _single_lines(value)
 
+    @field_validator("constraints")
+    @classmethod
+    def _validate_constraints(cls, value: list[str]) -> list[str]:
+        return [_single_line(item, limit=500) for item in value]
+
+    @field_validator("allowed_paths")
+    @classmethod
+    def _validate_paths(cls, value: list[str]) -> list[str]:
+        return [_safe_relative(item) for item in value]
+
 
 class ClaudeCodeBuildResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -102,6 +121,16 @@ class ClaudeCodeBuildTool(BaseTool[ClaudeCodeBuildArgs, ClaudeCodeBuildResult]):
             self.TOOL_NAME,
             "Build or change code in the sandboxed workspace with Claude Code until the acceptance commands pass.",
         )
+        # Validate limits against AgentGoalV1 bounds early
+        if not (1 <= limits.max_rounds <= 10):
+            raise ValueError("max_rounds must be in [1, 10]")
+        if not (1 <= limits.max_turns_per_round <= 200):
+            raise ValueError("max_turns_per_round must be in [1, 200]")
+        if not (Decimal("0") < limits.budget_usd <= Decimal("50")):
+            raise ValueError("budget_usd must be in (0, 50]")
+        if not (60 <= limits.timeout_seconds <= 7200):
+            raise ValueError("timeout_seconds must be in [60, 7200]")
+
         self._runner = runner
         self._cursor = cursor
         self._authority = authority
@@ -113,26 +142,38 @@ class ClaudeCodeBuildTool(BaseTool[ClaudeCodeBuildArgs, ClaudeCodeBuildResult]):
         self._calls = 0
 
     async def run(self, args: ClaudeCodeBuildArgs, cancellation_token: CancellationToken) -> ClaudeCodeBuildResult:
+        # Check ceiling synchronously
         if self._calls >= self._limits.max_calls:
             raise RuntimeError("claude_code_build call ceiling reached")
-        await self._authority.authorize(self.TOOL_NAME, now=self._clock())
+
+        # Reserve the slot immediately (before any await) to prevent race conditions
         self._calls += 1
-        goal = AgentGoalV1(
-            goal_id=f"{self._goal_prefix}-build-{self._calls}",
-            objective=args.objective,
-            acceptance_commands=tuple(args.acceptance_commands),
-            constraints=tuple(args.constraints),
-            allowed_paths=tuple(args.allowed_paths),
-            max_rounds=self._limits.max_rounds,
-            max_turns_per_round=self._limits.max_turns_per_round,
-            budget_usd=self._limits.budget_usd,
-            timeout_seconds=self._limits.timeout_seconds,
-        )
-        token = await self._tokens.issue(goal.goal_id)
-        result = await self._runner.run(goal, workspace_image_id=self._cursor.image_id, run_token=token)
-        self._evidence.record(result)
-        if result.status in _ADVANCING:
-            self._cursor.image_id = result.final_image_id
+        try:
+            await self._authority.authorize(self.TOOL_NAME, now=self._clock())
+        except Exception:
+            # Rollback on authorization failure so the slot is not consumed
+            self._calls -= 1
+            raise
+
+        # Serialize cursor access with lock
+        async with self._cursor.lock:
+            goal = AgentGoalV1(
+                goal_id=f"{self._goal_prefix}-build-{self._calls}",
+                objective=args.objective,
+                acceptance_commands=tuple(args.acceptance_commands),
+                constraints=tuple(args.constraints),
+                allowed_paths=tuple(args.allowed_paths),
+                max_rounds=self._limits.max_rounds,
+                max_turns_per_round=self._limits.max_turns_per_round,
+                budget_usd=self._limits.budget_usd,
+                timeout_seconds=self._limits.timeout_seconds,
+            )
+            token = await self._tokens.issue(goal.goal_id)
+            result = await self._runner.run(goal, workspace_image_id=self._cursor.image_id, run_token=token)
+            self._evidence.record(result)
+            if result.status in _ADVANCING:
+                self._cursor.image_id = result.final_image_id
+
         last = result.rounds[-1].acceptance if result.rounds else None
         return ClaudeCodeBuildResult(
             status=result.status,
@@ -184,14 +225,25 @@ class SandboxRunTestsTool(BaseTool[SandboxRunTestsArgs, AcceptanceReportV1]):
         self._calls = 0
 
     async def run(self, args: SandboxRunTestsArgs, cancellation_token: CancellationToken) -> AcceptanceReportV1:
+        # Check ceiling synchronously
         if self._calls >= self._max_calls:
             raise RuntimeError("sandbox_run_tests call ceiling reached")
-        await self._authority.authorize(self.TOOL_NAME, now=self._clock())
+
+        # Reserve the slot immediately (before any await) to prevent race conditions
         self._calls += 1
-        return await run_acceptance(
-            self._sandbox,
-            image_id=self._cursor.image_id,
-            commands=args.commands,
-            workdir=self._workdir,
-            timeout_seconds=self._timeout_seconds,
-        )
+        try:
+            await self._authority.authorize(self.TOOL_NAME, now=self._clock())
+        except Exception:
+            # Rollback on authorization failure so the slot is not consumed
+            self._calls -= 1
+            raise
+
+        # Serialize cursor access with lock
+        async with self._cursor.lock:
+            return await run_acceptance(
+                self._sandbox,
+                image_id=self._cursor.image_id,
+                commands=args.commands,
+                workdir=self._workdir,
+                timeout_seconds=self._timeout_seconds,
+            )
