@@ -9,17 +9,21 @@ Nebius-Transport, `/v1/messages`-Route) erledigt werden.
 - [ ] Abnahme in einem **frischen Judge-Image** ausführen: Basis-Image + nur die Workspace-Dateien des Runden-Images; nie im von Claude veränderten Image (Restrisiko R6: Änderungen außerhalb `/work`, z. B. site-packages, sind heute unentdeckt).
 - [ ] Danach Denylist geschützter Dateien (conftest.py, pytest.ini, pyproject.toml, …) auf Defense-in-depth zurückstufen und dokumentieren (R8).
 - [ ] `.git` ist aus dem Manifest ausgenommen und wird nicht bereinigt — im frischen Judge-Image nicht mitkopieren oder explizit prüfen.
-- [ ] Symlink-Retargeting auf inhaltsgleiche Datei erkennen (Manifest hasht heute das Ziel, nicht `readlink`).
+- [x] Symlink-Retargeting auf inhaltsgleiche Datei erkennen — in M1a erledigt: Symlinks werden per Linktext erfasst und nie verfolgt; neue/umgezielte Links, die absolut sind, aus `/work` heraus oder nach `.git` zeigen oder auf ein Verzeichnis zeigen, sind Policy-Verstöße (`unsafe_symlinks`).
+- [ ] Änderungserkennung (Manifeste) ebenfalls mit vertrauenswürdigen Werkzeugen ausführen — frisches Judge-Image oder hostseitiger Export —, nicht über den `PATH` des vom Agenten veränderten Images (`sha256sum`/`find` könnten ersetzt sein).
+- [ ] Reine Modusänderungen (`chmod +x`) erkennt das Manifest nicht.
 - [ ] Annahme „Sandbox-Shell ist bash“ (`set -o pipefail`) im Basis-Image festschreiben und im Adapter prüfen.
 
 ## Budget und Token
 - [ ] Run-Token beim Proxy **an `AgentGoalV1.budget_usd` binden** (harte Obergrenze pro Goal); der Runner prüft `budget_usd` heute nicht selbst (R12).
 - [ ] Run-Token-Ausgabe `POST /v1/captain/run-tokens` über den Runtime-Finalize-Kanal; Proxy speichert nur Hash.
+- [ ] Run-Token-Issuer am Proxy implementieren (Port `RunTokenIssuerPort.issue(goal)`/`revoke(goal_id)` existiert seit M1a): an `goal.budget_usd` gebunden, kurze Gültigkeit, Widerruf bei Goal-Ende. Redaktion des Tokens bleibt nur Defense in depth.
 
 ## Relay-Route
 - [ ] `/v1/messages`-Route: ein `UpstreamFormatError` mitten im Stream muss als terminales Anthropic-`error`-Event bzw. Verbindungsabbruch enden, nie als sauberer SSE-Abschluss.
 - [ ] `BridgeError` → `400 invalid_request_error`, `UpstreamFormatError` → `api_error`; Budget erschöpft → `400 invalid_request_error`.
 - [ ] Live-Spike prüfen, ob die strenge Tool-Paarung (R17) bei Claude-Code-Unterbrechungen (Text ohne tool_result) echte Anfragen ablehnt.
+- [ ] `finish_reason: content_filter` wird heute auf `end_turn` abgebildet — Fehler-/Refusal-Semantik entscheiden.
 
 ## Goal-Schleife
 - [ ] Ausnahmen (ungültige Session-ID, Stream zu groß, Manifest-Protokollfehler) als `failed`-Ergebnis mit erhaltenen Runden statt als Exception.
@@ -30,3 +34,11 @@ Nebius-Transport, `/v1/messages`-Route) erledigt werden.
 ## GraphFlow
 - [ ] Stall-Erkennung für Fan-out-Graphen mit bedingtem Zweig härten (heute: „letzter Sprecher ist Blatt“).
 - [ ] `business_benchmark_candidate_seeds`-Drift-Prüfung um `graph` erweitern.
+
+## Live-Spike (Claude Code im Sandbox-Image)
+- [ ] Mit `--dangerously-skip-permissions` beschränkt `--allowedTools` die Tools möglicherweise nicht — `--disallowedTools`/`--tools` prüfen.
+- [ ] Claude Code verweigert `--dangerously-skip-permissions` evtl. als root ohne `IS_SANDBOX=1` — Konflikt mit der exakten Env-Allowlist klären.
+- [ ] `HOME`/`PATH`-Behandlung des Sandbox-Adapters festlegen (Env ersetzen vs. mergen).
+- [ ] Claude Code schreibt `/work/.claude/*` — erscheint heute als geänderter Pfad (Policy-Verstoß außerhalb `allowed_paths`).
+- [ ] Bilder/Dokumente in `tool_result` lassen heute die ganze Anfrage scheitern — Text-Platzhalter erwägen.
+- [ ] Gestreamtes `message_start`-`usage` ist 0 — Auswirkung auf Claude Codes Auto-Compaction prüfen.
