@@ -353,11 +353,13 @@ def _token_count(value: object, key: str) -> int:
 
 
 def _stop_reason(raw: object, *, has_tool_use: bool) -> str:
-    """Map a chat finish_reason (None counts as "stop") onto an Anthropic stop_reason."""
+    """Map a chat finish_reason onto an Anthropic stop_reason; a missing one is an error."""
     if raw is None:
-        raw = "stop"
+        raise UpstreamFormatError("completion has no finish_reason")
     if not isinstance(raw, str) or raw not in STOP_REASONS:
         raise UpstreamFormatError(f"unsupported finish_reason: {raw!r}")
+    if STOP_REASONS[raw] == "tool_use" and not has_tool_use:
+        raise UpstreamFormatError(f"finish_reason {raw!r} without a tool call")
     if raw == "stop" and has_tool_use:
         return "tool_use"
     return STOP_REASONS[raw]
@@ -400,7 +402,7 @@ def _single_choice(choices: object) -> Mapping[str, object]:
     if not isinstance(choice, Mapping):
         raise UpstreamFormatError("choice must be an object")
     index = choice.get("index")
-    if index is not None and (isinstance(index, bool) or index != 0):
+    if index is not None and (isinstance(index, bool) or not isinstance(index, int) or index != 0):
         raise UpstreamFormatError("only choice index 0 is supported")
     return choice
 

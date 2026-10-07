@@ -194,8 +194,8 @@ def test_delta_for_an_already_closed_tool_index_is_an_upstream_error():
     translator = _translator()
     translator.feed(_tool_chunk(0, id="a", name="Read", arguments="{}"))
     translator.feed(_tool_chunk(1, id="b", name="Bash", arguments="{}"))
-    with pytest.raises(UpstreamFormatError):
-        translator.feed(_tool_chunk(0, arguments=" "))
+    with pytest.raises(UpstreamFormatError, match="already closed"):
+        translator.feed(_tool_chunk(0, id="a", name="Read", arguments=" "))
 
 
 def test_non_stream_tool_arguments_dict_is_an_upstream_error():
@@ -320,3 +320,55 @@ def test_text_tool_text_switching_has_matching_block_indices():
     assert stops == [0, 1, 2]
     kinds = [e["content_block"]["type"] for e in events if e["type"] == "content_block_start"]
     assert kinds == ["text", "tool_use", "text"]
+
+
+@pytest.mark.parametrize("message", [
+    {"content": "cut off"},
+    {"content": "cut off", "finish_reason": None},
+])
+def test_one_shot_without_finish_reason_is_an_upstream_error(message):
+    finish = {k: v for k, v in message.items() if k == "finish_reason"}
+    with pytest.raises(UpstreamFormatError, match="finish_reason"):
+        chat_completion_to_anthropic(
+            {"choices": [{"message": {"content": message["content"]}, **finish}]}, model="m", tool_names={})
+
+
+@pytest.mark.parametrize("reason", ["tool_calls", "function_call"])
+def test_tool_finish_reason_without_tool_block_is_an_upstream_error_in_stream(reason):
+    translator = _translator()
+    translator.feed(_chunk({"content": "no tools here"}, finish=reason))
+    with pytest.raises(UpstreamFormatError, match="without a tool call"):
+        translator.finish()
+
+
+@pytest.mark.parametrize("reason", ["tool_calls", "function_call"])
+def test_tool_finish_reason_without_tool_block_is_an_upstream_error_one_shot(reason):
+    with pytest.raises(UpstreamFormatError, match="without a tool call"):
+        chat_completion_to_anthropic(
+            {"choices": [{"message": {"content": "no tools"}, "finish_reason": reason}]}, model="m", tool_names={})
+
+
+def test_non_string_tool_call_id_is_an_upstream_error_in_stream():
+    translator = _translator()
+    with pytest.raises(UpstreamFormatError, match="id must be a string"):
+        translator.feed(_tool_chunk(0, id=7, name="Bash", arguments="{}"))
+
+
+def test_non_string_tool_call_id_is_an_upstream_error_one_shot():
+    with pytest.raises(UpstreamFormatError, match="id must be a string"):
+        chat_completion_to_anthropic({"choices": [{"message": {"tool_calls": [
+            {"id": 7, "function": {"name": "Bash", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}]},
+            model="m", tool_names={})
+
+
+def test_non_string_stream_tool_arguments_are_an_upstream_error():
+    translator = _translator()
+    with pytest.raises(UpstreamFormatError, match="arguments must be a string"):
+        translator.feed(_tool_chunk(0, id="a", name="Bash", arguments={"command": "ls"}))
+
+
+@pytest.mark.parametrize("index", [0.0, True, "0", 1])
+def test_non_int_or_bool_choice_index_is_an_upstream_error(index):
+    translator = _translator()
+    with pytest.raises(UpstreamFormatError, match="choice index"):
+        translator.feed({"choices": [{"index": index, "delta": {"content": "x"}, "finish_reason": None}]})
