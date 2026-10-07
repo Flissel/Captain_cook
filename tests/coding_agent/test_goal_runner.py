@@ -294,3 +294,52 @@ async def test_token_in_acceptance_output_is_redacted():
     assert result.status == "achieved"
     assert TOKEN not in result.model_dump_json()
     assert "leak <redacted>" in result.rounds[0].acceptance.checks[0].output_tail
+
+
+# --- I1: symlinks in the workspace --------------------------------------------------------
+
+
+class _LinkScript(_Script):
+    """Adds symlink records to the manifests (before: base_links, after: base_links + new_links)."""
+
+    def __init__(self, acceptance_exit_codes, base_links=(), new_links=()):
+        super().__init__(acceptance_exit_codes)
+        self.base_links = tuple(base_links)
+        self.new_links = tuple(new_links)
+
+    def __call__(self, image, command):
+        result = super().__call__(image, command)
+        if "sha256sum" not in command.shell:
+            return result
+        links = self.base_links + (self.new_links if image != "img-0" else ())
+        records = "".join(f"L\0./{path}\0{kind}\0{target}\0" for path, target, kind in links)
+        return ok(result.stdout + records, image="discard")
+
+
+@pytest.mark.asyncio
+async def test_preexisting_directory_symlink_does_not_break_the_goal():
+    script = _LinkScript([0], base_links=[(".venv/lib64", "lib", "d")])
+    runner, _ = _runner(script)
+    result = await runner.run(_goal(), workspace_image_id="img-0", run_token=TOKEN)
+    assert result.status == "achieved"
+    assert result.rounds[0].changed_paths == ("src/app.py",)
+
+
+@pytest.mark.asyncio
+async def test_new_symlink_escaping_the_workdir_is_a_violation():
+    script = _LinkScript([], new_links=[("src/evil", "/usr/lib/python3/site-packages", "d")])
+    runner, _ = _runner(script)
+    result = await runner.run(_goal(), workspace_image_id="img-0", run_token=TOKEN)
+    assert result.status == "policy_violation"
+    assert result.rounds[0].policy_violations == ("src/evil",)
+    assert result.rounds[0].acceptance is None
+    assert script.acceptance_images == []
+
+
+@pytest.mark.asyncio
+async def test_new_relative_file_symlink_inside_allowed_paths_is_fine():
+    script = _LinkScript([0], new_links=[("src/alias.py", "app.py", "f")])
+    runner, _ = _runner(script)
+    result = await runner.run(_goal(), workspace_image_id="img-0", run_token=TOKEN)
+    assert result.status == "achieved"
+    assert result.rounds[0].changed_paths == ("src/alias.py", "src/app.py")

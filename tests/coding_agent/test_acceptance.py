@@ -277,8 +277,9 @@ async def test_changed_paths_manifest_command_exact_with_pipefail():
     # Verify the exact manifest command literal: derived from _manifest_command("/work")
     expected_manifest_cmd = (
         "set -o pipefail; cd /work && "
-        "find . -path ./.git -prune -o \\( -type f -o -type l \\) -print0 "
-        "| sort -z | xargs -0 -r sha256sum -z --"
+        "find . -path ./.git -prune -o -type f -print0 "
+        "| sort -z | xargs -0 -r sha256sum -z -- && "
+        "find . -path ./.git -prune -o -type l -printf 'L\\0%p\\0%Y\\0%l\\0'"
     )
     manifest_calls = [c for c in calls_made if "sha256sum" in c]
     assert len(manifest_calls) == 2
@@ -397,3 +398,129 @@ def test_sandbox_command_repr_hides_env_and_stdin():
     command = SandboxCommand(shell="claude -p", timeout_seconds=60, env={"ANTHROPIC_AUTH_TOKEN": "tok-secret"}, stdin="prompt")
     assert "tok-secret" not in repr(command)
     assert "prompt" not in repr(command)
+
+
+# --- I1: symlinks are recorded by link text, never followed -----------------------------
+
+D1 = "1" * 64
+D2 = "2" * 64
+
+
+def _link(path, target, kind="f"):
+    return f"L\0./{path}\0{kind}\0{target}\0"
+
+
+def test_manifest_command_hashes_regular_files_and_lists_symlinks_without_following():
+    from agenten.coding_agent.acceptance import _manifest_command
+
+    assert _manifest_command("/work") == (
+        "set -o pipefail; cd /work && "
+        "find . -path ./.git -prune -o -type f -print0 "
+        "| sort -z | xargs -0 -r sha256sum -z -- && "
+        "find . -path ./.git -prune -o -type l -printf 'L\\0%p\\0%Y\\0%l\\0'"
+    )
+    # sha256sum (which follows links) is only ever fed regular files
+    hashing_find = _manifest_command("/work").split("| sort -z")[0]
+    assert "-type l" not in hashing_find
+
+
+@pytest.mark.asyncio
+async def test_manifest_records_directory_and_dangling_symlinks_by_link_text():
+    from agenten.coding_agent.acceptance import workspace_manifest
+
+    stdout = f"{D1}  ./src/app.py\0" + _link(".venv/lib64", "lib", "d") + _link("src/gone", "missing.py", "N")
+    sandbox = FakeSandbox(lambda image, command: ok(stdout))
+    manifest = await workspace_manifest(sandbox, image_id="img", workdir="/work")
+    assert manifest == {
+        "src/app.py": D1,
+        ".venv/lib64": "symlink:lib",
+        "src/gone": "symlink:missing.py",
+    }
+
+
+@pytest.mark.asyncio
+async def test_unchanged_directory_symlink_is_not_a_change():
+    stdout = f"{D1}  ./src/app.py\0" + _link(".venv/lib64", "lib", "d")
+    sandbox = FakeSandbox(lambda image, command: ok(stdout))
+    paths = await changed_paths(sandbox, before_image_id="a", after_image_id="b", workdir="/work")
+    assert paths == ()
+
+
+@pytest.mark.asyncio
+async def test_added_removed_and_retargeted_symlinks_are_changed_paths():
+    def handler(image, command):
+        if image == "before":
+            return ok(_link("src/alias.py", "a.py") + _link("src/old", "x.py"))
+        return ok(_link("src/alias.py", "b.py") + _link("src/new", "y.py"))
+
+    paths = await changed_paths(FakeSandbox(handler), before_image_id="before", after_image_id="after", workdir="/work")
+    assert paths == ("src/alias.py", "src/new", "src/old")
+
+
+@pytest.mark.asyncio
+async def test_file_replaced_by_symlink_is_a_changed_path():
+    def handler(image, command):
+        if image == "before":
+            return ok(f"{D1}  ./src/a.py\0")
+        return ok(_link("src/a.py", "b.py"))
+
+    paths = await changed_paths(FakeSandbox(handler), before_image_id="before", after_image_id="after", workdir="/work")
+    assert paths == ("src/a.py",)
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "L\0./x\0f\0",  # truncated link record
+        "L\0./x\0f\0target",  # missing terminator
+        "L\0./x\0f\0\0",  # empty target
+        "L\0x\0f\0t\0",  # path without ./
+        "L\0./a/../b\0f\0t\0",  # dot-dot path
+        "L\0./x\0ff\0t\0",  # bad kind
+        "L\0./x\0f\0t\0" + "L\0./x\0f\0u\0",  # duplicate path
+        f"{D1}  ./x\0" + "L\0./x\0f\0t\0",  # same path as file and link
+        f"{D1}  ./x",  # unterminated file record
+        f"{D1}  ./x\0\0",  # empty record
+    ],
+)
+@pytest.mark.asyncio
+async def test_manifest_parsing_is_strict(stdout):
+    from agenten.coding_agent.acceptance import workspace_manifest
+
+    sandbox = FakeSandbox(lambda image, command: ok(stdout))
+    with pytest.raises(SandboxProtocolError):
+        await workspace_manifest(sandbox, image_id="img", workdir="/work")
+
+
+@pytest.mark.asyncio
+async def test_workspace_changes_exposes_changed_symlinks_of_the_after_image():
+    from agenten.coding_agent.acceptance import SymlinkEntry, workspace_changes
+
+    def handler(image, command):
+        if image == "before":
+            return ok(_link(".venv/lib64", "lib", "d"))
+        return ok(_link(".venv/lib64", "lib", "d") + _link("src/evil", "/etc/passwd", "f"))
+
+    changes = await workspace_changes(FakeSandbox(handler), before_image_id="before", after_image_id="after", workdir="/work")
+    assert changes.paths == ("src/evil",)
+    assert changes.symlinks == (SymlinkEntry(path="src/evil", target="/etc/passwd", target_kind="f"),)
+
+
+@pytest.mark.parametrize(
+    "path,target,kind,unsafe",
+    [
+        ("src/a.py", "b.py", "f", False),
+        ("src/a.py", "../lib/b.py", "f", False),
+        ("src/gone", "missing.py", "N", False),
+        ("src/abs", "/etc/passwd", "f", True),
+        ("src/up", "../../outside", "N", True),
+        ("top", "..", "d", True),
+        ("src/dir", "pkg", "d", True),
+        ("src/git", "../.git/config", "f", True),
+    ],
+)
+def test_unsafe_symlinks(path, target, kind, unsafe):
+    from agenten.coding_agent.acceptance import SymlinkEntry, unsafe_symlinks
+
+    entry = SymlinkEntry(path=path, target=target, target_kind=kind)
+    assert unsafe_symlinks((entry,)) == ((path,) if unsafe else ())

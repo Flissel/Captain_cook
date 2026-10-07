@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlsplit
 
-from agenten.coding_agent.acceptance import changed_paths, protected_paths, run_acceptance
+from agenten.coding_agent.acceptance import protected_paths, run_acceptance, unsafe_symlinks, workspace_changes
 from agenten.coding_agent.claude_stream import summarize_claude_stream
 from agenten.coding_agent.contracts import (
     AcceptanceReportV1,
@@ -152,13 +152,15 @@ class ClaudeGoalRunner:
             if reported_session is not None and not leaked_session and not bad_session:
                 session = reported_session
             input_image, image = image, run.output_image_id
-            paths = await changed_paths(
+            changes = await workspace_changes(
                 self._sandbox, before_image_id=input_image, after_image_id=image, workdir=workdir
             )
+            paths = changes.paths
             outside = {path for path in paths if not path_allowed(path, goal.allowed_paths)}
             judge = set(protected_paths(paths, explicitly_allowed=goal.allowed_paths))
             exfiltrating = {path for path in paths if run_token and run_token in path}
-            violations = tuple(redact(path) for path in sorted(outside | judge | exfiltrating))
+            links = set(unsafe_symlinks(changes.symlinks))
+            violations = tuple(redact(path) for path in sorted(outside | judge | exfiltrating | links))
             paths = tuple(redact(path) for path in paths)
             session_usable = reported_session is not None and not leaked_session and not bad_session
             acceptance = None
