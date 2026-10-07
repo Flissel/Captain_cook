@@ -346,8 +346,71 @@ STOP_REASONS: Mapping[str, str] = {
 }
 
 
-def _count(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+def _token_count(value: object, key: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise UpstreamFormatError(f"usage.{key} must be a non-negative integer")
+    return value
+
+
+def _stop_reason(raw: object, *, has_tool_use: bool) -> str:
+    """Map a chat finish_reason (None counts as "stop") onto an Anthropic stop_reason."""
+    if raw is None:
+        raw = "stop"
+    if not isinstance(raw, str) or raw not in STOP_REASONS:
+        raise UpstreamFormatError(f"unsupported finish_reason: {raw!r}")
+    if raw == "stop" and has_tool_use:
+        return "tool_use"
+    return STOP_REASONS[raw]
+
+
+def _parse_tool_arguments(raw: str) -> dict[str, object]:
+    """Parse concatenated tool arguments; the empty string means no arguments."""
+    if raw == "":
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise UpstreamFormatError("tool call arguments are not JSON") from exc
+    if not isinstance(parsed, dict):
+        raise UpstreamFormatError("tool call arguments must be a JSON object")
+    return parsed
+
+
+def _tool_call_id(call: Mapping[str, object]) -> str:
+    call_id = call.get("id")
+    if call_id is None or call_id == "":
+        return "toolu_" + uuid.uuid4().hex
+    if not isinstance(call_id, str):
+        raise UpstreamFormatError("tool call id must be a string")
+    return call_id
+
+
+def _tool_name(function: Mapping[str, object]) -> str:
+    name = function.get("name")
+    if not isinstance(name, str) or not name:
+        raise UpstreamFormatError("tool call needs a non-empty name")
+    return name
+
+
+def _single_choice(choices: object) -> Mapping[str, object]:
+    """Return the only accepted choice (index 0); anything else is malformed."""
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise UpstreamFormatError("expected exactly one choice")
+    choice = choices[0]
+    if not isinstance(choice, Mapping):
+        raise UpstreamFormatError("choice must be an object")
+    index = choice.get("index")
+    if index is not None and (isinstance(index, bool) or index != 0):
+        raise UpstreamFormatError("only choice index 0 is supported")
+    return choice
+
+
+def _optional_text(value: object, what: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise UpstreamFormatError(f"{what} must be a string")
+    return value
 
 
 def to_sse(event: Mapping[str, object]) -> bytes:
@@ -355,7 +418,12 @@ def to_sse(event: Mapping[str, object]) -> bytes:
 
 
 class ChatStreamToAnthropic:
-    """Turn chat-completion stream chunks into Anthropic Messages stream events."""
+    """Turn chat-completion stream chunks into Anthropic Messages stream events.
+
+    Fails closed: malformed, truncated or inconsistent upstream data raises
+    UpstreamFormatError and leaves the translator permanently failed, so a
+    plausible but wrong event stream is never produced.
+    """
 
     def __init__(self, *, model: str, tool_names: Mapping[str, str]) -> None:
         self._model = model
@@ -363,10 +431,15 @@ class ChatStreamToAnthropic:
         self._message_id = "msg_" + uuid.uuid4().hex
         self._started = False
         self._finished = False
+        self._failed = False
         self._next_index = 0
         self._open_index: int | None = None
-        self._open_kind: str | None = None  # "text" or f"tool:{chat_index}"
-        self._stop_reason = "end_turn"
+        self._open_text = False
+        self._open_tool: int | None = None  # chat tool-call index of the open tool block
+        self._closed_tools: set[int] = set()
+        self._tool_args: list[str] = []
+        self._has_tool_use = False
+        self._finish_reason: str | None = None
         self.input_tokens = 0
         self.output_tokens = 0
 
@@ -386,76 +459,131 @@ class ChatStreamToAnthropic:
     def _close(self) -> list[dict[str, object]]:
         if self._open_index is None:
             return []
+        if self._open_tool is not None:
+            _parse_tool_arguments("".join(self._tool_args))
+            self._closed_tools.add(self._open_tool)
+            self._open_tool = None
+            self._tool_args = []
         event: dict[str, object] = {"type": "content_block_stop", "index": self._open_index}
         self._open_index = None
-        self._open_kind = None
+        self._open_text = False
         return [event]
 
-    def _open(self, kind: str, block: dict[str, object]) -> list[dict[str, object]]:
+    def _open(self, block: dict[str, object]) -> list[dict[str, object]]:
         events = self._close()
         self._open_index = self._next_index
-        self._open_kind = kind
         self._next_index += 1
         events.append({"type": "content_block_start", "index": self._open_index, "content_block": block})
         return events
 
-    def feed(self, chunk: Mapping[str, object]) -> list[dict[str, object]]:
-        if self._finished:
-            raise UpstreamFormatError("stream chunk after finish")
-        events = self._start()
-        usage = chunk.get("usage")
-        if isinstance(usage, Mapping):
-            self.input_tokens = _count(usage.get("prompt_tokens"))
-            self.output_tokens = _count(usage.get("completion_tokens"))
-        choices = chunk.get("choices") or []
-        if not isinstance(choices, list):
-            raise UpstreamFormatError("choices must be a list")
-        for choice in choices:
-            if not isinstance(choice, Mapping):
-                raise UpstreamFormatError("choice must be an object")
-            delta = choice.get("delta") or {}
-            if not isinstance(delta, Mapping):
-                raise UpstreamFormatError("delta must be an object")
-            text = delta.get("content")
-            if isinstance(text, str) and text:
-                if self._open_kind != "text":
-                    events += self._open("text", {"type": "text", "text": ""})
-                events.append({"type": "content_block_delta", "index": self._open_index,
-                               "delta": {"type": "text_delta", "text": text}})
-            for call in delta.get("tool_calls") or []:
-                if not isinstance(call, Mapping):
-                    raise UpstreamFormatError("tool call must be an object")
-                function = call.get("function") or {}
-                if not isinstance(function, Mapping):
-                    raise UpstreamFormatError("tool call function must be an object")
-                kind = f"tool:{call.get('index', 0)}"
-                if self._open_kind != kind:
-                    name = function.get("name")
-                    if not isinstance(name, str) or not name:
-                        raise UpstreamFormatError("new tool call without a name")
-                    events += self._open(kind, {
-                        "type": "tool_use",
-                        "id": call.get("id") or "toolu_" + uuid.uuid4().hex,
-                        "name": self._names.get(name, name),
-                        "input": {},
-                    })
-                arguments = function.get("arguments")
-                if isinstance(arguments, str) and arguments:
-                    events.append({"type": "content_block_delta", "index": self._open_index,
-                                   "delta": {"type": "input_json_delta", "partial_json": arguments}})
-            reason = choice.get("finish_reason")
-            if isinstance(reason, str):
-                self._stop_reason = STOP_REASONS.get(reason, "end_turn")
+    def _update_usage(self, usage: object) -> None:
+        if usage is None:
+            return
+        if not isinstance(usage, Mapping):
+            raise UpstreamFormatError("usage must be an object")
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens")
+        if prompt is not None:
+            self.input_tokens = _token_count(prompt, "prompt_tokens")
+        if completion is not None:
+            self.output_tokens = _token_count(completion, "completion_tokens")
+
+    def _tool_delta(self, call: object) -> list[dict[str, object]]:
+        if not isinstance(call, Mapping):
+            raise UpstreamFormatError("tool call must be an object")
+        function = call.get("function")
+        if function is None:
+            function = {}
+        if not isinstance(function, Mapping):
+            raise UpstreamFormatError("tool call function must be an object")
+        chat_index = call.get("index")
+        if isinstance(chat_index, bool) or not isinstance(chat_index, int) or chat_index < 0:
+            raise UpstreamFormatError("tool call needs a non-negative integer index")
+        events: list[dict[str, object]] = []
+        if self._open_tool != chat_index:
+            if chat_index in self._closed_tools:
+                raise UpstreamFormatError("tool call delta for an already closed tool block")
+            name = _tool_name(function)
+            events += self._open({
+                "type": "tool_use",
+                "id": _tool_call_id(call),
+                "name": self._names.get(name, name),
+                "input": {},
+            })
+            self._open_tool = chat_index
+            self._has_tool_use = True
+        arguments = function.get("arguments")
+        if arguments is not None and not isinstance(arguments, str):
+            raise UpstreamFormatError("tool call arguments must be a string")
+        if arguments:
+            self._tool_args.append(arguments)
+            events.append({"type": "content_block_delta", "index": self._open_index,
+                           "delta": {"type": "input_json_delta", "partial_json": arguments}})
         return events
 
+    def _feed(self, chunk: Mapping[str, object]) -> list[dict[str, object]]:
+        events = self._start()
+        self._update_usage(chunk.get("usage"))
+        choices = chunk.get("choices")
+        if choices is None:
+            choices = []
+        if not isinstance(choices, list):
+            raise UpstreamFormatError("choices must be a list")
+        if not choices:
+            return events
+        choice = _single_choice(choices)
+        delta = choice.get("delta")
+        if delta is None:
+            delta = {}
+        if not isinstance(delta, Mapping):
+            raise UpstreamFormatError("delta must be an object")
+        text = _optional_text(delta.get("content"), "delta.content")
+        if text:
+            if not self._open_text:
+                events += self._open({"type": "text", "text": ""})
+                self._open_text = True
+            events.append({"type": "content_block_delta", "index": self._open_index,
+                           "delta": {"type": "text_delta", "text": text}})
+        calls = delta.get("tool_calls")
+        if calls is not None and not isinstance(calls, list):
+            raise UpstreamFormatError("tool_calls must be a list")
+        for call in calls or []:
+            events += self._tool_delta(call)
+        reason = choice.get("finish_reason")
+        if reason is not None:
+            if not isinstance(reason, str) or reason not in STOP_REASONS:
+                raise UpstreamFormatError(f"unsupported finish_reason: {reason!r}")
+            self._finish_reason = reason
+        return events
+
+    def feed(self, chunk: Mapping[str, object]) -> list[dict[str, object]]:
+        if self._failed:
+            raise UpstreamFormatError("translator failed")
+        if self._finished:
+            raise UpstreamFormatError("stream chunk after finish")
+        try:
+            return self._feed(chunk)
+        except UpstreamFormatError:
+            self._failed = True
+            raise
+
     def finish(self) -> list[dict[str, object]]:
+        if self._failed:
+            raise UpstreamFormatError("translator failed")
         if self._finished:
             return []
-        events = self._start() + self._close()
+        try:
+            if self._finish_reason is None:
+                raise UpstreamFormatError("stream ended without a finish_reason")
+            stop_reason = _stop_reason(self._finish_reason, has_tool_use=self._has_tool_use)
+            events = self._start() + self._close()
+        except UpstreamFormatError:
+            self._failed = True
+            raise
         self._finished = True
         events.append({
             "type": "message_delta",
-            "delta": {"stop_reason": self._stop_reason, "stop_sequence": None},
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
             "usage": {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens},
         })
         events.append({"type": "message_stop"})
@@ -465,41 +593,51 @@ class ChatStreamToAnthropic:
 def chat_completion_to_anthropic(
     response: Mapping[str, object], *, model: str, tool_names: Mapping[str, str]
 ) -> dict[str, object]:
-    choices = response.get("choices")
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
-        raise UpstreamFormatError("response has no choices")
-    choice = choices[0]
-    message = choice.get("message") or {}
+    choice = _single_choice(response.get("choices"))
+    message = choice.get("message")
     if not isinstance(message, Mapping):
         raise UpstreamFormatError("choice message must be an object")
     content: list[dict[str, object]] = []
-    text = message.get("content")
-    if isinstance(text, str) and text:
+    text = _optional_text(message.get("content"), "message.content")
+    if text:
         content.append({"type": "text", "text": text})
-    for call in message.get("tool_calls") or []:
-        function = call.get("function") if isinstance(call, Mapping) else None
-        if not isinstance(function, Mapping) or not isinstance(function.get("name"), str):
-            raise UpstreamFormatError("tool call is malformed")
-        try:
-            arguments = json.loads(function.get("arguments") or "{}")
-        except json.JSONDecodeError as exc:
-            raise UpstreamFormatError("tool call arguments are not JSON") from exc
+    calls = message.get("tool_calls")
+    if calls is not None and not isinstance(calls, list):
+        raise UpstreamFormatError("tool_calls must be a list")
+    for call in calls or []:
+        if not isinstance(call, Mapping):
+            raise UpstreamFormatError("tool call must be an object")
+        function = call.get("function")
+        if not isinstance(function, Mapping):
+            raise UpstreamFormatError("tool call function must be an object")
+        name = _tool_name(function)
+        arguments = function.get("arguments")
+        if arguments is None:
+            arguments = "{}"
+        if not isinstance(arguments, str):
+            raise UpstreamFormatError("tool call arguments must be a string")
         content.append({
             "type": "tool_use",
-            "id": call.get("id") or "toolu_" + uuid.uuid4().hex,
-            "name": tool_names.get(function["name"], function["name"]),
-            "input": arguments if isinstance(arguments, dict) else {"value": arguments},
+            "id": _tool_call_id(call),
+            "name": tool_names.get(name, name),
+            "input": _parse_tool_arguments(arguments),
         })
-    usage = response.get("usage") if isinstance(response.get("usage"), Mapping) else {}
-    assert isinstance(usage, Mapping)
-    reason = choice.get("finish_reason")
+    usage = response.get("usage")
+    if usage is not None and not isinstance(usage, Mapping):
+        raise UpstreamFormatError("usage must be an object")
+    prompt = usage.get("prompt_tokens") if usage is not None else None
+    completion = usage.get("completion_tokens") if usage is not None else None
+    has_tool_use = any(block["type"] == "tool_use" for block in content)
     return {
         "id": "msg_" + uuid.uuid4().hex,
         "type": "message",
         "role": "assistant",
         "model": model,
         "content": content,
-        "stop_reason": STOP_REASONS.get(reason, "end_turn") if isinstance(reason, str) else "end_turn",
+        "stop_reason": _stop_reason(choice.get("finish_reason"), has_tool_use=has_tool_use),
         "stop_sequence": None,
-        "usage": {"input_tokens": _count(usage.get("prompt_tokens")), "output_tokens": _count(usage.get("completion_tokens"))},
+        "usage": {
+            "input_tokens": 0 if prompt is None else _token_count(prompt, "prompt_tokens"),
+            "output_tokens": 0 if completion is None else _token_count(completion, "completion_tokens"),
+        },
     }
