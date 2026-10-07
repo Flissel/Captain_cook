@@ -96,22 +96,32 @@ def _translate_message(message: object, chat_name: Callable[[str], str]) -> list
             if kind == "text":
                 texts.append(_require_str(block, "text"))
             elif kind == "tool_use":
+                input_val = block.get("input")
+                if input_val is not None and not isinstance(input_val, dict):
+                    raise BridgeError("tool_use input must be a dict or None")
                 calls.append({
                     "id": _require_str(block, "id"),
                     "type": "function",
                     "function": {
                         "name": chat_name(_require_str(block, "name")),
-                        "arguments": json.dumps(block.get("input") or {}, separators=(",", ":")),
+                        "arguments": json.dumps(input_val or {}, separators=(",", ":")),
                     },
                 })
             elif kind in ("thinking", "redacted_thinking"):
                 continue
             else:
                 raise BridgeError(f"unsupported assistant block: {kind}")
-        translated: dict[str, object] = {"role": "assistant", "content": "".join(texts) or None}
+        text_content = "".join(texts) or None
+        # Skip empty assistant messages that have no tool_calls
+        if text_content is None and not calls:
+            return []
+        translated: dict[str, object] = {"role": "assistant", "content": text_content}
         if calls:
             translated["tool_calls"] = calls
         return [translated]
+    # User message handling
+    if not content:
+        raise BridgeError("user content list must not be empty")
     tool_messages: list[dict[str, object]] = []
     texts = []
     for block in content:
@@ -176,6 +186,8 @@ def anthropic_request_to_chat(request: Mapping[str, object], *, allowed_models: 
 
     def chat_name(original: str) -> str:
         short = short_tool_name(original)
+        if short in names and names[short] != original:
+            raise BridgeError(f"tool name collision: {original!r} and {names[short]!r} both map to {short!r}")
         names[short] = original
         return short
 
@@ -183,8 +195,42 @@ def anthropic_request_to_chat(request: Mapping[str, object], *, allowed_models: 
     system = _system_text(request.get("system"))
     if system:
         messages.append({"role": "system", "content": system})
+
+    # Track tool call IDs to validate tool results
+    pending_tool_ids: set[str] = set()
+    answered_ids: set[str] = set()
+
     for message in raw_messages:
-        messages.extend(_translate_message(message, chat_name))
+        translated = _translate_message(message, chat_name)
+
+        # Extract tool IDs from assistant messages for validation
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            for t in translated:
+                if t.get("role") == "assistant" and "tool_calls" in t:
+                    for call in t["tool_calls"]:  # type: ignore
+                        pending_tool_ids.add(call["id"])  # type: ignore
+
+        # Validate tool results
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_use_id = block.get("tool_use_id")
+                        if tool_use_id not in pending_tool_ids:
+                            raise BridgeError(f"tool_result references unknown tool_use_id: {tool_use_id!r}")
+                        if tool_use_id in answered_ids:
+                            raise BridgeError(f"tool_use_id {tool_use_id!r} answered multiple times")
+                        answered_ids.add(tool_use_id)
+            # Clear pending IDs after this user message processes all results
+            pending_tool_ids.clear()
+
+        messages.extend(translated)
+
+    # After translating all messages, ensure there's at least one non-system message
+    non_system_messages = [m for m in messages if m.get("role") != "system"]
+    if not non_system_messages:
+        raise BridgeError("messages must result in at least one non-system message")
 
     payload: dict[str, object] = {"model": model, "messages": messages, "max_tokens": max_tokens}
     tools = request.get("tools")
@@ -194,13 +240,52 @@ def anthropic_request_to_chat(request: Mapping[str, object], *, allowed_models: 
         payload["tools"] = [_translate_tool(tool, chat_name) for tool in tools]
         if request.get("tool_choice") is not None:
             payload["tool_choice"] = _translate_tool_choice(request.get("tool_choice"), chat_name)
-    for key in ("temperature", "top_p"):
-        if key in request:
-            payload[key] = request[key]
+    else:
+        # tool_choice without tools is only valid for auto/none
+        tool_choice = request.get("tool_choice")
+        if tool_choice is not None:
+            if isinstance(tool_choice, dict):
+                kind = tool_choice.get("type")
+                if kind not in ("auto", "none"):
+                    raise BridgeError("tool_choice requires tools unless type is auto or none")
+            else:
+                raise BridgeError("tool_choice must be an object")
+
+    # Validate temperature
+    if "temperature" in request:
+        temp = request["temperature"]
+        if isinstance(temp, bool):
+            raise BridgeError("temperature must be a number, not a bool")
+        if not isinstance(temp, (int, float)):
+            raise BridgeError("temperature must be a number")
+        payload["temperature"] = temp
+
+    # Validate top_p
+    if "top_p" in request:
+        top_p = request["top_p"]
+        if isinstance(top_p, bool):
+            raise BridgeError("top_p must be a number, not a bool")
+        if not isinstance(top_p, (int, float)):
+            raise BridgeError("top_p must be a number")
+        payload["top_p"] = top_p
+
+    # Validate stop_sequences
     stops = request.get("stop_sequences")
     if stops:
-        payload["stop"] = list(stops)  # type: ignore[call-overload]
-    if request.get("stream") is True:
-        payload["stream"] = True
-        payload["stream_options"] = {"include_usage": True}
+        if not isinstance(stops, list):
+            raise BridgeError("stop_sequences must be a list")
+        for stop in stops:
+            if not isinstance(stop, str) or not stop:
+                raise BridgeError("stop_sequences must be a list of non-empty strings")
+        payload["stop"] = list(stops)
+
+    # Validate stream
+    if "stream" in request:
+        stream_val = request["stream"]
+        if not isinstance(stream_val, bool):
+            raise BridgeError("stream must be a bool")
+        if stream_val is True:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+
     return ChatTranslation(payload=payload, tool_names=dict(names))
