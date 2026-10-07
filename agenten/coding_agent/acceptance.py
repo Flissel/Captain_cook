@@ -54,8 +54,9 @@ async def run_acceptance(
 ) -> AcceptanceReportV1:
     checks: list[AcceptanceCheckV1] = []
     for command in commands:
-        # Purge caches and prevent bytecode writing to isolate judge from agent modifications
-        purged_shell = f"{_acceptance_purge_prefix(workdir)} && {command}"
+        # Purge caches and prevent bytecode writing to isolate judge from agent modifications.
+        # Wrap user command in subshell to prevent shell operators (;, ||, etc.) from running after purge failure.
+        purged_shell = f"{_acceptance_purge_prefix(workdir)} && ( {command} )"
         result = await sandbox.run(
             image_id,
             SandboxCommand(shell=purged_shell, timeout_seconds=timeout_seconds),
@@ -84,8 +85,8 @@ async def workspace_manifest(sandbox: SandboxPort, *, image_id: str, workdir: st
         digest, sep, path = record.partition("  ")
         if not sep or not path.startswith("./"):
             raise SandboxProtocolError("workspace manifest record is malformed")
-        # Validate digest: must be exactly 64 hex characters
-        if not HEX_SHA256_PATTERN.match(digest):
+        # Validate digest: must be exactly 64 hex characters (fullmatch ensures no trailing chars)
+        if not HEX_SHA256_PATTERN.fullmatch(digest):
             raise SandboxProtocolError("workspace manifest record is malformed")
         # Remove "./" prefix and validate non-empty and no ".." segments
         clean_path = path[2:]

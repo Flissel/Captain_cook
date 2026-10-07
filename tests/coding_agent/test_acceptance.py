@@ -21,33 +21,30 @@ async def test_acceptance_runs_with_cache_purge_and_pythondontwritebytecode():
     assert report.passed is False
     assert len(report.checks[1].output_tail) == 2000
     assert all(img == "img-1" for img, _ in sandbox.calls)
-    # Check exact shell string includes purge + PYTHONDONTWRITEBYTECODE
+    # Check exact shell string includes purge + PYTHONDONTWRITEBYTECODE + subshell wrapping
     expected_shell = (
         "cd /work && find . -path ./.git -prune -o \\( -name __pycache__ -o -name .pytest_cache "
         "-o -name .mypy_cache -o -name .ruff_cache \\) -prune -exec rm -rf {} + && "
-        "export PYTHONDONTWRITEBYTECODE=1 && pytest -q a"
+        "export PYTHONDONTWRITEBYTECODE=1 && ( pytest -q a )"
     )
     assert sandbox.calls[0][1].shell == expected_shell
     assert sandbox.calls[0][1].env == {}
 
 
 @pytest.mark.asyncio
-async def test_each_command_runs_in_workdir_and_is_judged_by_exit_code():
-    # Renamed from old test for clarity; functionality same
+async def test_acceptance_wraps_command_with_semicolon_in_subshell():
+    """Verify that commands containing ';' are wrapped in parentheses to prevent shell injection after purge failure."""
     def handler(image, command):
-        if "fails" in command.shell:
-            return ok("E" * 5000, exit_code=1)
-        return ok("passed")
+        return ok("ok")
 
     sandbox = FakeSandbox(handler)
     report = await run_acceptance(
-        sandbox, image_id="img-1", commands=("pytest -q a",), workdir="/work", timeout_seconds=60
+        sandbox, image_id="img-1", commands=("cmd1; cmd2",), workdir="/app", timeout_seconds=60
     )
 
-    assert [c.passed for c in report.checks] == [True]
-    assert report.passed is True
-    # Output is only 6 chars, so it's not truncated to 2000
-    assert report.checks[0].output_tail == "passed"
+    # Command with ";" must be wrapped in parentheses
+    assert "( cmd1; cmd2 )" in sandbox.calls[0][1].shell
+    assert report.checks[0].passed is True
     assert all(img == "img-1" for img, _ in sandbox.calls)
 
 
@@ -201,6 +198,19 @@ async def test_changed_paths_validates_hash_is_hex():
 
 
 @pytest.mark.asyncio
+async def test_changed_paths_rejects_digest_with_trailing_newline():
+    def handler(image, command):
+        if "sha256sum" in command.shell:
+            # Malformed: valid hex digest followed by newline (fullmatch should reject trailing chars)
+            return ok("abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdef\n  ./file.py\0")
+        return ok()
+
+    sandbox = FakeSandbox(handler)
+    with pytest.raises(SandboxProtocolError):
+        await changed_paths(sandbox, before_image_id="before", after_image_id="after", workdir="/work")
+
+
+@pytest.mark.asyncio
 async def test_changed_paths_validates_hash_length():
     def handler(image, command):
         if "sha256sum" in command.shell:
@@ -264,14 +274,16 @@ async def test_changed_paths_manifest_command_exact_with_pipefail():
     sandbox = FakeSandbox(handler)
     await changed_paths(sandbox, before_image_id="img-1", after_image_id="img-2", workdir="/work")
 
-    # Verify the exact manifest command with set -o pipefail
+    # Verify the exact manifest command literal: derived from _manifest_command("/work")
+    expected_manifest_cmd = (
+        "set -o pipefail; cd /work && "
+        "find . -path ./.git -prune -o \\( -type f -o -type l \\) -print0 "
+        "| sort -z | xargs -0 -r sha256sum -z --"
+    )
     manifest_calls = [c for c in calls_made if "sha256sum" in c]
     assert len(manifest_calls) == 2
     for call in manifest_calls:
-        assert call.startswith("set -o pipefail; cd /work")
-        assert "find . -path ./.git -prune" in call
-        assert "-print0" in call
-        assert "sha256sum -z" in call
+        assert call == expected_manifest_cmd
 
 
 @pytest.mark.asyncio
