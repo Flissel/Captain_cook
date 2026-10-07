@@ -98,6 +98,46 @@ class FactoryAutoGenAgentV1(_FrozenModel):
         return value
 
 
+class FactoryGraphEdgeV1(_FrozenModel):
+    """One declarative edge; conditions are verdict tokens, never code."""
+
+    source: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    target: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    when: Literal["always", "approve", "iterate"] = "always"
+
+
+class FactoryGraphSpecV1(_FrozenModel):
+    entry: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    edges: tuple[FactoryGraphEdgeV1, ...] = Field(min_length=1, max_length=50)
+
+
+def _validate_graph(graph: "FactoryGraphSpecV1", agents: set[str]) -> None:
+    nodes = {graph.entry} | {edge.source for edge in graph.edges} | {edge.target for edge in graph.edges}
+    unknown = nodes - agents
+    if unknown:
+        raise ValueError(f"unknown graph node: {sorted(unknown)[0]}")
+    keys = [(edge.source, edge.target, edge.when) for edge in graph.edges]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate graph edge")
+    outgoing: dict[str, list[FactoryGraphEdgeV1]] = {}
+    for edge in graph.edges:
+        outgoing.setdefault(edge.source, []).append(edge)
+    for source, edges in outgoing.items():
+        kinds = {edge.when == "always" for edge in edges}
+        if len(kinds) > 1:
+            raise ValueError(f"edges from {source} must not mix conditional and unconditional")
+    if not agents - set(outgoing):
+        raise ValueError("graph needs at least one leaf agent without outgoing edges")
+    reachable, frontier = {graph.entry}, [graph.entry]
+    while frontier:
+        for edge in outgoing.get(frontier.pop(), ()):
+            if edge.target not in reachable:
+                reachable.add(edge.target)
+                frontier.append(edge.target)
+    if agents - reachable:
+        raise ValueError(f"unreachable graph agent: {sorted(agents - reachable)[0]}")
+
+
 class FactoryAutoGenTeamManifestV1(_FrozenModel):
     """Strict executable topology read from the candidate's sealed team manifest."""
 
@@ -109,8 +149,10 @@ class FactoryAutoGenTeamManifestV1(_FrozenModel):
         "swarm",
         "selector_group_chat",
         "round_robin_group_chat",
+        "graph_flow",
         "single_agent",
     ]
+    graph: FactoryGraphSpecV1 | None = None
     agents: tuple[FactoryAutoGenAgentV1, ...] = Field(min_length=1)
     memory_policy: str = Field(min_length=1, max_length=64)
     max_messages: int = Field(ge=1, le=100, strict=True)
@@ -201,6 +243,12 @@ class FactoryAutoGenTeamManifestV1(_FrozenModel):
             raise ValueError("handoff topology requires swarm conversation pattern")
         if any(agent.handoffs for agent in self.agents) and self.max_handoffs == 0:
             raise ValueError("handoff topology requires a positive max_handoffs ceiling")
+        if self.conversation_pattern == "graph_flow":
+            if self.graph is None:
+                raise ValueError("graph_flow requires a graph")
+            _validate_graph(self.graph, known_agents)
+        elif self.graph is not None:
+            raise ValueError("graph is only valid with graph_flow")
         return self
 
 

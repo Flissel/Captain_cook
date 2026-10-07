@@ -26,7 +26,12 @@ from autogen_agentchat.messages import (
     TextMessage,
     ToolCallExecutionEvent,
 )
-from autogen_agentchat.teams import RoundRobinGroupChat, SelectorGroupChat, Swarm
+from autogen_agentchat.teams import (
+    GraphFlow,
+    RoundRobinGroupChat,
+    SelectorGroupChat,
+    Swarm,
+)
 from autogen_core import CancellationToken
 from autogen_core.model_context import BufferedChatCompletionContext
 from autogen_core.models import (
@@ -52,6 +57,7 @@ from agenten.agent_factory.execution_budget import (
     FactoryBudgetReservationV1,
     FactoryUsageReceiptV1,
 )
+from agenten.agent_factory.graph_flow_team import build_graph_flow
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference
@@ -868,6 +874,7 @@ class FactoryTeamRunResult(BaseModel):
         "swarm",
         "selector_group_chat",
         "round_robin_group_chat",
+        "graph_flow",
         "single_agent",
     ]
     message_count: int = Field(ge=0, strict=True)
@@ -1189,6 +1196,7 @@ class HostAutoGenSessionResult(BaseModel):
         "swarm",
         "selector_group_chat",
         "round_robin_group_chat",
+        "graph_flow",
         "single_agent",
     ]
     message_count: int = Field(ge=0, strict=True)
@@ -1629,7 +1637,7 @@ class HostAutoGenSessionExecutor:
                 )
                 | termination
             )
-        team: Swarm | SelectorGroupChat | RoundRobinGroupChat | None = None
+        team: Swarm | SelectorGroupChat | RoundRobinGroupChat | GraphFlow | None = None
         if manifest.conversation_pattern == "swarm":
             team = Swarm(
                 participants,
@@ -1647,6 +1655,14 @@ class HostAutoGenSessionExecutor:
             team = RoundRobinGroupChat(
                 participants,
                 termination_condition=termination,
+                max_turns=manifest.max_messages,
+            )
+        elif manifest.conversation_pattern == "graph_flow":
+            assert manifest.graph is not None
+            team = build_graph_flow(
+                graph=manifest.graph,
+                participants=participants,
+                termination=termination,
                 max_turns=manifest.max_messages,
             )
         task = await self._resolve_task(case_ref)
@@ -1795,7 +1811,11 @@ class HostAutoGenSessionExecutor:
         dispatch_offset: int,
         unresolved_before: frozenset[UUID],
         conversation_pattern: Literal[
-            "swarm", "selector_group_chat", "round_robin_group_chat", "single_agent"
+            "swarm",
+            "selector_group_chat",
+            "round_robin_group_chat",
+            "graph_flow",
+            "single_agent",
         ],
         max_messages: int,
         max_handoffs: int,
