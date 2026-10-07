@@ -179,3 +179,20 @@ def test_non_graph_patterns_keep_the_declared_termination_error():
             termination_conditions=("max_tool_calls",),
             max_messages=30,
         )
+
+
+def test_graph_flow_rejects_task_completed_termination():
+    """Any agent saying TERMINATE must not end a verdict-loop graph as task_completed."""
+    with pytest.raises(ValidationError, match="graph_flow"):
+        _manifest(termination_conditions=["task_completed", "max_messages"])
+
+
+def test_graph_flow_termination_reason_never_reports_task_completed():
+    manifest = _manifest()
+    reason = _session_termination_reason(
+        _result(["user", "architect", "builder"], stop_reason="task_completed"),
+        termination_conditions=("task_completed", "max_messages"),
+        max_messages=manifest.max_messages,
+        graph=manifest.graph,
+    )
+    assert reason == "graph_stalled"

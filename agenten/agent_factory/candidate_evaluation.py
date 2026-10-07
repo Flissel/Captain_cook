@@ -280,6 +280,9 @@ class FactoryAutoGenTeamManifestV1(_FrozenModel):
             if self.graph is None:
                 raise ValueError("graph_flow requires a graph")
             _validate_graph(self.graph, known_agents)
+            if "task_completed" in self.termination_conditions:
+                # Any agent's TERMINATE would end the run and bypass the verdict loop.
+                raise ValueError("graph_flow must not declare task_completed termination")
         elif self.graph is not None:
             raise ValueError("graph is only valid with graph_flow")
         return self

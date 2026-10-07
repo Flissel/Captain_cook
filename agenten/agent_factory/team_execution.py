@@ -1631,7 +1631,10 @@ class HostAutoGenSessionExecutor:
             max_tool_calls=manifest.max_tool_calls,
             handoff_tool_names=handoff_tool_names,
         )
-        if "task_completed" in manifest.termination_conditions:
+        if (
+            "task_completed" in manifest.termination_conditions
+            and manifest.conversation_pattern != "graph_flow"
+        ):
             termination = (
                 _FactoryTaskCompletedTermination(
                     require_handoff=any(agent.handoffs for agent in manifest.agents)
@@ -3138,8 +3141,7 @@ def _session_termination_reason(
     if message_count >= max_messages or "Maximum number" in stop_reason:
         return "max_messages"
     if graph is not None:
-        if "task_completed" in termination_conditions and "task_completed" in stop_reason:
-            return "task_completed"
+        # The graph topology is the declared termination; task_completed is never consulted.
         chat_messages = [
             message for message in result.messages if isinstance(message, BaseChatMessage)
         ]
