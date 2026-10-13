@@ -43,6 +43,17 @@ the part documents). Nothing here has been fixed yet.
   `capability-live-adapters`) and draft PR 23 — likely superseded.
 - [x] Pin LF for d11 runtime authority files (`df8665b`); Windows CRLF checkouts
   failed digest attestation.
+- [ ] Upgrade Hermes to upstream v0.21.7: the 20 Captain fork commits are
+  ported on branch `captain/v0.21.7-port` of Flissel/hermes-agent (`c8d8946`;
+  GPT-4.1 workaround dropped, upstream covers it). Blocker: v0.21.7 only
+  supports Python 3.14 (all core deps gated on `python_version >= '3.14'`),
+  while Captain (3.11) launches Hermes with its own interpreter
+  (`python -m hermes_cli.main`). Needs a separate 3.14 Hermes environment,
+  launcher/setup/CI changes, then the ported tests and a live `hermes -z` smoke
+  before the submodule pin moves.
+- [ ] After the hackathon: evaluate CortexDB (liliang-cn/cortexdb) as a scoped,
+  read-only agent memory / ledger projection. Holdouts must never be recallable
+  in generation context; never a second source of truth.
 - [ ] Tests that spawn `<repo>/.venv/Scripts/python.exe` fail in worktrees
   without a local `.venv` (e.g. `test_generate_runtime_adapter_manifest.py`);
   consider `sys.executable` or a documented worktree venv.
