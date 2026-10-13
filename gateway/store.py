@@ -136,6 +136,7 @@ from gateway.contracts import (
     parse_factory_workflow_artifact,
     ReviewDecisionEvent,
     TraceContext,
+    claim_requires_recovery,
     project_batch,
     project_release,
 )
@@ -8149,11 +8150,8 @@ class GatewayStore:
                     for_update=True,
                     now=now,
                 )
-                claim_expired_without_recovery = (
-                    projection.claim_iteration > 0
-                    and projection.claim_expires_at is not None
-                    and projection.claim_expires_at <= now
-                    and not projection.recovery_recorded
+                claim_expired_without_recovery = claim_requires_recovery(
+                    projection, now
                 )
                 if projection.status != "pending" or claim_expired_without_recovery:
                     raise HTTPException(status_code=409, detail="batch is not claimable")

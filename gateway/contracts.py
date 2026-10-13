@@ -1074,6 +1074,19 @@ def _batch_children(
     return children
 
 
+
+def claim_requires_recovery(projection: BatchProjection, now: datetime) -> bool:
+    """True when the current claim expired and has no recovery decision yet."""
+
+    return (
+        projection.claim_iteration > 0
+        and projection.claim_expires_at is not None
+        and projection.claim_expires_at <= _as_utc(now)
+        # A recovery only settles the claim iteration it was recorded for.
+        and projection.recovered_iteration != projection.claim_iteration
+    )
+
+
 def project_batch(
     blocks: Sequence[dict[str, Any]],
     batch_id: str,
@@ -1217,7 +1230,7 @@ def project_batch(
             status = event.outcome
             terminal = True
 
-    if not terminal and claim_iteration and not recovery_recorded:
+    if not terminal and claim_iteration and recovered_iteration != claim_iteration:
         assert claim_expires_at is not None
         status = "claimed" if claim_expires_at > current_time else "pending"
 

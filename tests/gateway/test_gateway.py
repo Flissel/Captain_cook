@@ -1245,6 +1245,33 @@ def test_expired_claim_requires_recovery_before_reclaim_and_lists_as_pending(
     ).status_code == 201
 
 
+def test_second_expired_claim_requires_its_own_recovery_and_is_not_stranded(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gateway import store as store_module
+
+    start = datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(store_module, "_utcnow", lambda: start)
+    create_batch(client)
+    claim(client)
+    monkeypatch.setattr(store_module, "_utcnow", lambda: start + timedelta(minutes=91))
+    requeue_expired_claim(client)
+    claim(client)
+    monkeypatch.setattr(store_module, "_utcnow", lambda: start + timedelta(minutes=183))
+
+    # The second claim expired: the batch must surface as recoverable, not stay "claimed".
+    assert client.get("/batches/batch-1").json()["status"] == "pending"
+    assert client.get("/batches", params={"status": "pending"}).json() == [
+        {"batch_id": "batch-1", "title": "Build the notification workflow"}
+    ]
+    # Iteration 2 still needs its own recovery decision before anyone may reclaim.
+    assert client.post("/batches/batch-1/claim").status_code == 409
+    requeue_expired_claim(client, iteration=2)
+    claim(client)
+    assert client.get("/batches/batch-1").json()["claim_iteration"] == 3
+
+
 def test_approve_is_flag_gated_and_transitions_pending_review(storage: MariaDBStorage) -> None:
     disabled = TestClient(
         legacy_application(storage=storage, mirror=RecordingMirror(), approval_enabled=False)
