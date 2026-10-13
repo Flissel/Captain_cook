@@ -375,7 +375,7 @@ def test_duplicate_batch_ids_are_rejected(client: TestClient) -> None:
 
     response = client.post(
         "/blocks",
-        json={"block_type": "work_batch", "data": batch_payload(title="Duplicate")},
+        json={"block_type": "work_batch", "status": "pending", "data": batch_payload(title="Duplicate")},
     )
 
     assert response.status_code == 409
@@ -387,7 +387,7 @@ def test_identical_canonical_work_batch_replay_returns_existing_block(
 ) -> None:
     first = client.post(
         "/blocks",
-        json={"block_type": "work_batch", "data": batch_payload()},
+        json={"block_type": "work_batch", "status": "pending", "data": batch_payload()},
     )
     assert first.status_code == 201
     existing = first.json()
@@ -421,7 +421,7 @@ def test_concurrent_duplicate_batch_creation_persists_exactly_one_root(
     def create(_: int) -> Any:
         return client.post(
             "/blocks",
-            json={"block_type": "work_batch", "data": batch_payload()},
+            json={"block_type": "work_batch", "status": "pending", "data": batch_payload()},
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -825,7 +825,7 @@ def test_identical_holdout_replay_with_different_parent_remains_conflict(
 def test_work_batch_must_satisfy_the_captain_contract(client: TestClient) -> None:
     response = client.post(
         "/blocks",
-        json={"block_type": "work_batch", "data": {"batch_id": "batch-1", "title": "Incomplete"}},
+        json={"block_type": "work_batch", "status": "pending", "data": {"batch_id": "batch-1", "title": "Incomplete"}},
     )
 
     assert response.status_code == 422
@@ -1186,7 +1186,7 @@ def test_mirror_failure_never_fails_a_ledger_write(storage: MariaDBStorage) -> N
 
     response = client.post(
         "/blocks",
-        json={"block_type": "work_batch", "data": batch_payload(title="T")},
+        json={"block_type": "work_batch", "status": "pending", "data": batch_payload(title="T")},
     )
 
     assert response.status_code == 201
