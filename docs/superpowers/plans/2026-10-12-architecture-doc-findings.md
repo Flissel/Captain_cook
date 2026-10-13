@@ -24,8 +24,28 @@ the part documents). Nothing here has been fixed yet.
 - [ ] Emit `hermes_tool_gap_recorded` and the missing Minibook projection types
   (feed emits 3 of 10).
 - [ ] Wire `agenten/coding_agent/` into the factory (M1b/G1 already plan this).
-- [ ] Capability demo operator: provide `gateway.capability_assembly_bootstrap`
-  and remove the unconditional `DemoConfigurationError` in `start`/`status`.
+- [x] Capability demo operator: provide `gateway.capability_assembly_bootstrap`
+  and remove the unconditional `DemoConfigurationError` in `start`/`status`
+  (landed with the d11 merge `e198a09`, 2026-10-13; offline tests only — the
+  paid live demo has not been run).
+- [ ] Live-run the capability demo operator (`start`/`status`/`run`/`resume`)
+  once a live gate is authorized.
+
+## Integration backlog (2026-10-13)
+- [ ] Factory v3 (`codex/captain-hermes-minibook-factory-v3`, WIP merge on
+  local branch `integrate/d11-factory-v3` at `9ceeb98`) is parked: v3's
+  hermetic semantic verifier (`agenten/agent_factory/hermetic_build_authority.py`)
+  proves only its eight sales-pipeline assertion paths, while the d11 compiler
+  emits 22 generic assertions (`*_integration/_failure/_tool`, `authority_N`,
+  `security_N`, `stop_N`, agent real cases). Decide: generic verifier (preferred)
+  or two assertion profiles; then finish the merge (4 v3 tests + 1 settings fake).
+- [ ] Triage remaining Codex branches from 2026-07-21 (`package-c`,
+  `capability-live-adapters`) and draft PR 23 — likely superseded.
+- [x] Pin LF for d11 runtime authority files (`df8665b`); Windows CRLF checkouts
+  failed digest attestation.
+- [ ] Tests that spawn `<repo>/.venv/Scripts/python.exe` fail in worktrees
+  without a local `.venv` (e.g. `test_generate_runtime_adapter_manifest.py`);
+  consider `sys.executable` or a documented worktree venv.
 
 ## Hardening
 - [ ] Gateway `POST /blocks`: reject `agent_factory_block` under a `work_batch`
