@@ -108,8 +108,10 @@ class CompiledFactorySpecification(_FrozenContract):
             ):
                 raise ValueError("compiled handoffs must bind unique required agents")
             tool_ids = tuple(item.tool_id for item in self.tool_requirements)
-            if not tool_ids or len(tool_ids) != len(set(tool_ids)):
-                raise ValueError("compiled tool requirements must be unique and nonempty")
+            # Inputs without integrations compile to a team with no tools; the
+            # compiler must not invent tool intent, so only uniqueness is enforced.
+            if len(tool_ids) != len(set(tool_ids)):
+                raise ValueError("compiled tool requirements must be unique")
             expected_optional = tuple(
                 item.tool_id for item in self.tool_requirements if not item.required
             )

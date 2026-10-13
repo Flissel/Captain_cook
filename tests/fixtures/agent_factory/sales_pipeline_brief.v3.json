@@ -162,6 +162,26 @@
       "Stop when the required account credential is unavailable.",
       "Stop when generated topology or scoring rules drift from the compiled specification."
     ],
+    "benchmark_policy": {
+      "source_case_keys": [
+        "exact_team",
+        "required_tools",
+        "sales_pipeline",
+        "account_snapshot",
+        "qualified_opportunity",
+        "deal_strategy",
+        "executive_brief",
+        "account_snapshot_reader_integration",
+        "opportunity_scoring_rules_integration",
+        "industry_signal_reader_integration",
+        "account_snapshot_reader_failure",
+        "opportunity_scoring_rules_failure",
+        "industry_signal_reader_failure",
+        "account_snapshot_reader_tool",
+        "opportunity_scoring_rules_tool",
+        "industry_signal_reader_tool"
+      ]
+    },
     "sections": [
       {"heading": "Objective", "heading_path": ["Objective"], "markdown": "Build the exact team."},
       {"heading": "Authority boundaries", "heading_path": ["Authority boundaries"], "markdown": "Captain owns success."},
