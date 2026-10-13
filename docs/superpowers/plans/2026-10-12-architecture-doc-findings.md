@@ -5,16 +5,21 @@ the overview. Each item was checked against code (file:line evidence lives in
 the part documents). Nothing here has been fixed yet.
 
 ## Correctness (fix first)
-- [ ] Stranded batch: `gateway/contracts.py::project_batch` never resets
+- [x] Stranded batch (`7d63dfb`, 2026-10-13): `gateway/contracts.py::project_batch` never resets
   `recovery_recorded` on `batch_claimed`; a second expired claim stays
   `claimed` forever. Reset on claim or compare
   `recovered_iteration == claim_iteration`; add a test that expires the second
   claim (extend `tests/gateway/test_gateway.py:1217`).
-- [ ] Heartbeat shortens lease: `gateway/store.py:6694` sets now + 30 min while
+- [x] Heartbeat shortens lease (`08544d6`, 2026-10-13; renews to claim_ttl): `gateway/store.py:6694` sets now + 30 min while
   claim TTL is 90 min; never move expiry earlier.
-- [ ] Release before review: `AutonomousCaptainPlanner.run` releases batches as
+- [x] Release before review (`e73fdc4`, 2026-10-13; plan published first, review gate holds default releases when approval is on): `AutonomousCaptainPlanner.run` releases batches as
   `pending` before plan publish/review; release as `pending_review` (or publish
   and review first) when a gateway is configured.
+- [ ] Regenerate `gateway/capability_factory_runtime_closure.json` and the
+  factory runtime descriptor (`scripts/generate-capability-factory-closure.py`,
+  `scripts/generate-capability-factory-descriptor.py`): the closure dates from
+  2026-08-17 and no longer matches most of its 174 modules after M0/M1a and the
+  d11 merge, so production capability attestation would fail at startup.
 - [ ] Escalation dead end: recorder has no `EscalateToRedecompose` handler, so
   exhausted subproblems stay in RETRYING; record a terminal outcome when
   re-decomposition yields no children.
