@@ -138,6 +138,7 @@ from gateway.contracts import (
     TraceContext,
     claim_requires_recovery,
     project_batch,
+    renewed_claim_expiry,
     project_release,
 )
 from gateway.release_policy import ReleaseReadiness, evaluate_release_readiness
@@ -8198,7 +8199,9 @@ class GatewayStore:
                     now=now,
                 )
                 self._assert_live_claim(projection, token, now=now)
-                expiry = now + timedelta(minutes=30)
+                expiry = renewed_claim_expiry(
+                    projection.claim_expires_at, now, self._claim_ttl
+                )
                 event = HeartbeatEvent(batch_id=batch_id, claim_expires_at=expiry)
                 block = self._new_block(
                     cursor,

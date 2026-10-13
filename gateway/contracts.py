@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal, Sequence, TypeAlias
 from uuid import UUID
 
@@ -1073,6 +1073,17 @@ def _batch_children(
         children.append(block)
     return children
 
+
+
+def renewed_claim_expiry(
+    current_expiry: datetime | None, now: datetime, claim_ttl: timedelta
+) -> datetime:
+    """Expiry after a heartbeat: renew the full lease, never move it earlier."""
+
+    renewed = _as_utc(now) + claim_ttl
+    if current_expiry is None:
+        return renewed
+    return max(_as_utc(current_expiry), renewed)
 
 
 def claim_requires_recovery(projection: BatchProjection, now: datetime) -> bool:

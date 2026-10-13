@@ -1205,7 +1205,8 @@ def test_heartbeat_extends_a_live_claim(client: TestClient, storage: MariaDBStor
 
     assert response.status_code == 200
     expiry = datetime.fromisoformat(response.json()["claim_expires_at"])
-    assert timedelta(minutes=29) < expiry - datetime.now(timezone.utc) <= timedelta(minutes=30)
+    # A heartbeat renews the full claim TTL (default 90 minutes) and never shortens the lease.
+    assert timedelta(minutes=89) < expiry - datetime.now(timezone.utc) <= timedelta(minutes=90)
     blocks = storage.load()
     assert next(block for block in blocks if block["index"] == parent_index) == parent_before
     lifecycle = [block for block in blocks if block["parent_index"] == parent_index]

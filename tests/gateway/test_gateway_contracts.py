@@ -16,6 +16,7 @@ from gateway.contracts import (
     HeartbeatEvent,
     ReviewDecisionEvent,
     claim_requires_recovery,
+    renewed_claim_expiry,
     project_batch,
 )
 
@@ -377,6 +378,18 @@ def test_second_expired_claim_after_a_recovery_is_not_stranded_as_claimed() -> N
     assert recovered.status == "pending"
     assert recovered.recovered_iteration == 2
     assert claim_requires_recovery(recovered, NOW) is False
+
+
+def test_heartbeat_renews_the_full_lease_and_never_shortens_it() -> None:
+    ttl = timedelta(minutes=90)
+    fresh_claim_expiry = NOW + ttl
+
+    # Right after a 90-minute claim, a heartbeat must not cut the lease to 30 minutes.
+    assert renewed_claim_expiry(fresh_claim_expiry, NOW, ttl) == fresh_claim_expiry
+    # Later heartbeats renew the full configured lease from now.
+    later = NOW + timedelta(minutes=60)
+    assert renewed_claim_expiry(fresh_claim_expiry, later, ttl) == later + ttl
+    assert renewed_claim_expiry(None, NOW, ttl) == NOW + ttl
 
 
 def test_live_or_unclaimed_batches_never_require_recovery() -> None:
