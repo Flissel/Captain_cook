@@ -98,6 +98,8 @@ class FactoryProjection(BaseModel):
     workflow_evaluation_ref: ArtifactRef | None = None
     feedback_ref: ArtifactRef | None = None
     feedback_recommendation: FactoryFeedbackRecommendation | None = None
+    generic_benchmark_suite_ref: ArtifactRef | None = None
+    generic_benchmark_summary_ref: ArtifactRef | None = None
     tool_gaps: tuple[ToolGapMarker, ...] = ()
     technical_revalidation_authorization_ref: ArtifactRef | None = None
     technical_revalidation_supersedes_ref: ArtifactRef | None = None
@@ -176,7 +178,21 @@ def apply_block(
         if not required.issubset(assertions):
             raise FactoryLifecycleError("promotion is missing required assertions")
         status = FactoryLifecycleStatus.READY_TO_USE
-        if isinstance(projection.job, AgentFactoryJobV3):
+        if (
+            isinstance(projection.job, AgentFactoryJobV3)
+            and projection.generic_benchmark_summary_ref is not None
+        ):
+            if (
+                projection.generic_benchmark_summary_ref not in block.artifact_refs
+                or projection.generic_benchmark_summary_ref not in block.evidence_refs
+                or workflow_evaluation is not None
+                or feedback is not None
+                or benchmark_summary is not None
+            ):
+                raise FactoryLifecycleError(
+                    "generic benchmark promotion evidence changed authority"
+                )
+        elif isinstance(projection.job, AgentFactoryJobV3):
             _validate_workflow_feedback(
                 projection,
                 workflow_evaluation=workflow_evaluation,
@@ -220,6 +236,27 @@ def apply_block(
             }
     elif block.phase is FactoryPhase.ESCALATED:
         status = FactoryLifecycleStatus.ESCALATED
+    elif (
+        block.phase is FactoryPhase.QUALITY_REVIEWED
+        and block.generic_benchmark_quality is not None
+    ):
+        quality = block.generic_benchmark_quality
+        if (
+            not isinstance(projection.job, AgentFactoryJobV3)
+            or workflow_evaluation is not None
+            or feedback is not None
+            or benchmark_summary is not None
+            or quality.acceptance_assertion_ids
+            != projection.job.acceptance_assertion_ids
+            or not set(projection.job.acceptance_assertion_ids).issubset(assertions)
+        ):
+            raise FactoryLifecycleError(
+                "generic benchmark quality assertion binding is invalid"
+            )
+        evaluation_update = {
+            "generic_benchmark_suite_ref": quality.suite_ref,
+            "generic_benchmark_summary_ref": quality.summary_ref,
+        }
     elif block.phase is FactoryPhase.QUALITY_REVIEWED and (
         workflow_evaluation is not None or feedback is not None
     ):
@@ -309,6 +346,16 @@ def next_action(
             phase is FactoryPhase.QUALITY_REVIEWED
             and isinstance(projection.job, AgentFactoryJobV3)
         ):
+            if projection.generic_benchmark_summary_ref is not None:
+                required = set(projection.job.acceptance_assertion_ids)
+                if not required.issubset(projection.observed_assertion_ids):
+                    raise FactoryLifecycleError(
+                        "generic benchmark quality is missing Captain assertions"
+                    )
+                return FactoryAction(
+                    kind=FactoryActionKind.VALIDATE_FOR_PROMOTION,
+                    attempt=projection.attempt,
+                )
             _validate_workflow_feedback(
                 projection,
                 workflow_evaluation=workflow_evaluation,

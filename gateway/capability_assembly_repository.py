@@ -14,6 +14,8 @@ from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.capability_assembly_contracts import (
     CapabilityAssemblyCheckpoint,
     CapabilityAssemblyNoEffectRetryAuthorization,
+    CapabilityAssemblyReconciliationOutcome,
+    CapabilityAssemblyReconciliationRequest,
     CapabilityAssemblyWriteConflict,
     canonical_assembly_model_bytes,
 )
@@ -80,6 +82,203 @@ class GatewayCapabilityAssemblyRepository:
                     ) ENGINE=InnoDB
                     """
                 )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_assembly_terminal_readbacks (
+                        assembly_id CHAR(36) NOT NULL,
+                        operation_id CHAR(36) NOT NULL,
+                        request_sha256 CHAR(64) NOT NULL,
+                        slice_ordinal INT NOT NULL,
+                        started_checkpoint_sha256 CHAR(64) NOT NULL,
+                        outcome_sha256 CHAR(64) NOT NULL,
+                        outcome_payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                        PRIMARY KEY (
+                            assembly_id, operation_id, request_sha256,
+                            slice_ordinal, started_checkpoint_sha256
+                        )
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_assembly_effect_receipts (
+                        assembly_id CHAR(36) NOT NULL,
+                        operation_id CHAR(36) NOT NULL,
+                        request_sha256 CHAR(64) NOT NULL,
+                        slice_ordinal INT NOT NULL,
+                        started_checkpoint_sha256 CHAR(64) NOT NULL,
+                        outcome_sha256 CHAR(64) NOT NULL,
+                        outcome_payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                        PRIMARY KEY (
+                            assembly_id, operation_id, request_sha256,
+                            slice_ordinal, started_checkpoint_sha256
+                        )
+                    ) ENGINE=InnoDB
+                    """
+                )
+
+    def record_effect_receipt(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> None:
+        """Persist an adapter-owned receipt before control returns to the controller."""
+
+        self._record_readback(
+            "capability_assembly_effect_receipts", request, outcome,
+            conflict="effect receipt authority conflicts",
+        )
+
+    def effect_receipt(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+    ) -> CapabilityAssemblyReconciliationOutcome | None:
+        return self._readback(
+            "capability_assembly_effect_receipts", request
+        )
+
+    def record_terminal_readback(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> None:
+        """Append one exact typed result after effect validation, before checkpointing."""
+
+        self._record_readback(
+            "capability_assembly_terminal_readbacks", request, outcome,
+            conflict="terminal reconciliation authority conflicts",
+        )
+
+    def _record_readback(
+        self,
+        table: str,
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+        *,
+        conflict: str,
+    ) -> None:
+        self._require_reconciliation_binding(request, outcome)
+        payload = canonical_assembly_model_bytes(outcome)
+        digest = hashlib.sha256(payload).hexdigest()
+        key = self._reconciliation_key(request)
+        with self._store.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT outcome_sha256, outcome_payload
+                    FROM {table}
+                    WHERE assembly_id = %s AND operation_id = %s
+                      AND request_sha256 = %s AND slice_ordinal = %s
+                      AND started_checkpoint_sha256 = %s
+                    FOR UPDATE
+                    """,
+                    key,
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    observed = self._reconciliation_from_row(existing)
+                    if observed == outcome and existing["outcome_sha256"] == digest:
+                        return
+                    raise CapabilityAssemblyWriteConflict(conflict)
+                cursor.execute(
+                    f"""
+                    INSERT INTO {table}
+                        (assembly_id, operation_id, request_sha256, slice_ordinal,
+                         started_checkpoint_sha256, outcome_sha256, outcome_payload)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (*key, digest, payload.decode("utf-8")),
+                )
+
+    def terminal_readback(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+    ) -> CapabilityAssemblyReconciliationOutcome | None:
+        return self._readback("capability_assembly_terminal_readbacks", request)
+
+    def _readback(
+        self,
+        table: str,
+        request: CapabilityAssemblyReconciliationRequest,
+    ) -> CapabilityAssemblyReconciliationOutcome | None:
+        with self._store.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT outcome_sha256, outcome_payload
+                    FROM {table}
+                    WHERE assembly_id = %s AND operation_id = %s
+                      AND request_sha256 = %s AND slice_ordinal = %s
+                      AND started_checkpoint_sha256 = %s
+                    """,
+                    self._reconciliation_key(request),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        outcome = self._reconciliation_from_row(row)
+        self._require_reconciliation_binding(request, outcome)
+        return outcome
+
+    @staticmethod
+    def _reconciliation_key(
+        request: CapabilityAssemblyReconciliationRequest,
+    ) -> tuple[str, str, str, int, str]:
+        return (
+            str(request.assembly_id),
+            str(request.operation_id),
+            request.request_sha256,
+            request.started_slice.ordinal,
+            request.started_checkpoint_ref.sha256,
+        )
+
+    @staticmethod
+    def _require_reconciliation_binding(
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> None:
+        if (
+            outcome.disposition != "terminal_readback"
+            or outcome.assembly_id != request.assembly_id
+            or outcome.operation_id != request.operation_id
+            or outcome.request_sha256 != request.request_sha256
+            or outcome.started_slice != request.started_slice
+            or outcome.started_checkpoint_ref != request.started_checkpoint_ref
+        ):
+            raise CapabilityAssemblyWriteConflict(
+                "terminal reconciliation authority changed its started slice"
+            )
+
+    @staticmethod
+    def _reconciliation_from_row(
+        row: dict[str, Any],
+    ) -> CapabilityAssemblyReconciliationOutcome:
+        payload = row["outcome_payload"]
+        encoded = (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            if isinstance(payload, dict)
+            else payload.decode("utf-8")
+            if isinstance(payload, (bytes, bytearray))
+            else payload
+        )
+        if not isinstance(encoded, str):
+            raise CapabilityAssemblyWriteConflict(
+                "terminal reconciliation payload is malformed"
+            )
+        try:
+            outcome = CapabilityAssemblyReconciliationOutcome.model_validate_json(encoded)
+        except ValueError as exc:
+            raise CapabilityAssemblyWriteConflict(
+                "terminal reconciliation payload is malformed"
+            ) from exc
+        digest = hashlib.sha256(canonical_assembly_model_bytes(outcome)).hexdigest()
+        if digest != row["outcome_sha256"]:
+            raise CapabilityAssemblyWriteConflict(
+                "terminal reconciliation digest does not bind persisted payload"
+            )
+        return outcome
 
     def history(self, assembly_id: UUID) -> tuple[CapabilityAssemblyRecord, ...]:
         with self._store.storage.transaction() as connection:

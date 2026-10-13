@@ -222,6 +222,49 @@ class FactoryLease(_FrozenContract):
         return self
 
 
+class GenericBenchmarkQualityEvidenceV1(_FrozenContract):
+    """Public, immutable bridge from the generic D10 suite into Factory V3."""
+
+    schema_name: Literal["captain.generic-benchmark-quality-evidence.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    authority_id: UUID
+    job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    suite_ref: ArtifactRef
+    summary_ref: ArtifactRef
+    case_ids: tuple[str, ...] = Field(min_length=15, max_length=15)
+    case_digests: tuple[str, ...] = Field(min_length=15, max_length=15)
+    categories: tuple[
+        Literal[
+            "normal", "boundary", "missing", "conflicting",
+            "mandatory_escalation",
+        ], ...
+    ] = Field(min_length=15, max_length=15)
+    acceptance_assertion_ids: tuple[str, ...] = Field(min_length=1)
+    evaluation_refs: tuple[ArtifactRef, ...] = Field(min_length=30, max_length=30)
+    passed: Literal[True]
+
+    @model_validator(mode="after")
+    def require_complete_public_suite(self) -> "GenericBenchmarkQualityEvidenceV1":
+        if (
+            len(set(self.case_ids)) != 15
+            or len(set(self.case_digests)) != 15
+            or len(set(self.evaluation_refs)) != 30
+            or len(set(self.acceptance_assertion_ids))
+            != len(self.acceptance_assertion_ids)
+            or any(not value for value in self.acceptance_assertion_ids)
+            or any(self.categories.count(category) != 3 for category in {
+                "normal", "boundary", "missing", "conflicting",
+                "mandatory_escalation",
+            })
+        ):
+            raise ValueError("generic benchmark quality evidence is incomplete")
+        return self
+
+
 class FactoryEvidenceBlock(_FrozenContract):
     schema_name: Literal["captain.agent-factory-block.v1"] = Field(
         alias="schema",
@@ -242,6 +285,7 @@ class FactoryEvidenceBlock(_FrozenContract):
     evidence_refs: tuple[ArtifactRef, ...] = ()
     assertion_ids: tuple[str, ...] = ()
     lease_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
+    generic_benchmark_quality: GenericBenchmarkQualityEvidenceV1 | None = None
 
     @field_validator("occurred_at")
     @classmethod
@@ -282,6 +326,21 @@ class FactoryEvidenceBlock(_FrozenContract):
                 raise ValueError("capability_promoted requires assertion evidence")
             if not self.evidence_refs:
                 raise ValueError("capability_promoted requires evidence refs")
+        quality = self.generic_benchmark_quality
+        if quality is not None and (
+            self.phase is not FactoryPhase.QUALITY_REVIEWED
+            or self.status is not FactoryBlockStatus.SUCCEEDED
+            or quality.job_id != self.job_id
+            or quality.correlation_id != self.correlation_id
+            or quality.subject_version != self.subject_version
+            or quality.attempt != self.attempt
+            or quality.suite_ref not in self.artifact_refs
+            or quality.summary_ref not in self.artifact_refs
+            or quality.summary_ref not in self.evidence_refs
+            or not set(quality.evaluation_refs).issubset(self.evidence_refs)
+            or quality.acceptance_assertion_ids != self.assertion_ids
+        ):
+            raise ValueError("generic benchmark quality block binding is invalid")
         return self
 
 

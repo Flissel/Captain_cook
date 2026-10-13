@@ -56,7 +56,7 @@ ActorRoleId = Literal["captain_planner", "codex_worker", "captain_gateway"]
 SubjectReference = Annotated[
     str,
     StringConstraints(
-        pattern=r"^subject:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        pattern=r"^subject:[0-9a-f]{8}-[0-9a-f]{4}-[45][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
     ),
 ]
 BatchReference = Annotated[

@@ -121,7 +121,10 @@ class CapabilityAssemblySubmitRequest(_FrozenContract):
     @field_validator("maximum_cost_usd", mode="before")
     @classmethod
     def require_positive_cost(cls, value: object) -> Decimal:
-        return _positive_decimal(value, "maximum_cost_usd")
+        amount = _positive_decimal(value, "maximum_cost_usd")
+        if amount > Decimal("6.00"):
+            raise ValueError("assembly cost ceiling cannot exceed USD 6.00")
+        return amount
 
     @model_validator(mode="after")
     def require_exact_three_input_envelope(self) -> "CapabilityAssemblySubmitRequest":
@@ -211,6 +214,16 @@ class CapabilityAssemblyAdmittedInput(_FrozenContract):
         return CapabilityAssemblyInputRequest.require_repository_relative_input(value)
 
 
+class CapabilityAssemblyEffectReceiptScope(_FrozenContract):
+    """Durably started slice identity handed to an effect adapter."""
+
+    assembly_id: UUID
+    operation_id: UUID
+    request_sha256: str = Field(pattern=SHA256_PATTERN)
+    started_slice: CapabilityAssemblySlice
+    started_checkpoint_ref: ArtifactRef
+
+
 class CapabilityAssemblyStageRequest(_FrozenContract):
     """One compiler-bound assembly stage request, separate from the legacy demo."""
 
@@ -223,6 +236,7 @@ class CapabilityAssemblyStageRequest(_FrozenContract):
     suite_ref: ArtifactRef | None = None
     hermes_result_ref: ArtifactRef | None = None
     retry_number: int = Field(default=0, ge=0, le=5, strict=True)
+    effect_receipt_scope: CapabilityAssemblyEffectReceiptScope | None = None
 
     @model_validator(mode="after")
     def require_plan_binding(self) -> "CapabilityAssemblyStageRequest":

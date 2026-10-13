@@ -60,6 +60,10 @@ def test_generated_codex_home_is_isolated_and_contains_no_upstream_credentials(t
     assert 'model_reasoning_effort = "high"' in text
     assert 'base_url = "http://127.0.0.1:18091/v1"' in text
     assert 'env_key = "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"' in text
+    assert (
+        'env_http_headers = { "X-Captain-Provider-Context-Ref" = '
+        '"CAPTAIN_PROVIDER_CONTEXT_REF" }'
+    ) in text
     assert "request_max_retries = 0" in text
     assert 'wire_api = "responses"' in text
     assert "OPENAI_API_KEY" not in text

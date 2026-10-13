@@ -978,6 +978,10 @@ class PowerShellRuntimeCodexRunner:
                 child_values["CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"] = self._environ[
                     "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN"
                 ]
+                child_values["CAPTAIN_PROVIDER_CONTEXT_REF"] = (
+                    "gateway://provider-budget-contexts/"
+                    + str(invocation.provider_context_sha256)
+                )
             authorized = AuthorizedCodexRun(
                 workspace=invocation.workspace,
                 command=tuple(command_parts),

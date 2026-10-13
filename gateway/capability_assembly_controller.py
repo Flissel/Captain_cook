@@ -33,6 +33,7 @@ from gateway.capability_assembly_contracts import (
     CapabilityAssemblyBusinessBenchmarkPort,
     CapabilityAssemblyCheckpoint,
     CapabilityAssemblyExecutionPort,
+    CapabilityAssemblyEffectReceiptScope,
     CapabilityAssemblyFactoryPort,
     CapabilityAssemblyAdmittedInput,
     CapabilityAssemblyCanonicalInput,
@@ -340,6 +341,30 @@ class CapabilityAssemblyController:
                 restart=restart,
             )
         )
+
+    async def final_evidence_and_publish(
+        self, assembly_id: UUID
+    ) -> CapabilityLiveDemoEvidence:
+        """Persist exact final evidence in Minibook and verify immutable readback."""
+
+        evidence = self.final_evidence(assembly_id)
+        publisher = getattr(self._projection, "publish_assembly_evidence", None)
+        if publisher is None or not inspect.iscoroutinefunction(publisher):
+            raise CapabilityAssemblyIncomplete(
+                "Minibook assembly evidence authority is unavailable"
+            )
+        payload = evidence.model_dump(mode="json", by_alias=True)
+        try:
+            readback = await publisher(assembly_id, payload)
+        except Exception:
+            raise CapabilityAssemblyIncomplete(
+                "Minibook assembly evidence authority is unavailable"
+            ) from None
+        if readback != payload:
+            raise CapabilityAssemblyConflict(
+                "Minibook assembly evidence changed Gateway final evidence"
+            )
+        return evidence
 
     async def _execute_next_slice(
         self,
@@ -660,6 +685,7 @@ class CapabilityAssemblyController:
             suite_ref=self._suite_ref(item),
             hermes_result_ref=self._hermes_ref(item),
             retry_number=0,
+            effect_receipt_scope=self._effect_receipt_scope(current),
         )
         changes: dict[str, object] = {
             "completed_stages": (*item.completed_stages, stage),
@@ -828,6 +854,16 @@ class CapabilityAssemblyController:
         status: CapabilityAssemblyStatus = CapabilityAssemblyStatus.ADVANCING,
         reconciliation_outcome: CapabilityAssemblyReconciliationOutcome | None = None,
     ) -> CapabilityAssemblyCheckpoint:
+        if reconciliation_outcome is None:
+            self._record_terminal_readback(
+                current,
+                items=items,
+                kind=kind,
+                input_id=input_id,
+                resume_authorization=resume_authorization,
+                resume_dispatch=resume_dispatch,
+                resume_readback=resume_readback,
+            )
         completed = _validated_copy(
             current,
             revision=current.revision + 1,
@@ -863,6 +899,84 @@ class CapabilityAssemblyController:
         )
         self._append(completed, expected_revision=current.revision)
         return completed
+
+    def _record_terminal_readback(
+        self,
+        current: CapabilityAssemblyCheckpoint,
+        *,
+        items: tuple[CapabilityAssemblyItemState, ...],
+        kind: CapabilityAssemblySliceKind,
+        input_id: str | None,
+        resume_authorization: CapabilityResumeAuthorization | None,
+        resume_dispatch: CapabilityExecutionAuthority | None,
+        resume_readback: CapabilityExecutionAuthority | None,
+    ) -> None:
+        recorder = getattr(self._reconciliation, "record_terminal", None)
+        if recorder is None:
+            return
+        started = current.started_slice
+        active = current.active_advance
+        if started is None or active is None or started.kind is not kind:
+            raise CapabilityAssemblyConflict(
+                "terminal reconciliation lacks its started slice"
+            )
+        record = self._history(current.assembly_id)[-1]
+        if record.checkpoint != current:
+            raise CapabilityAssemblyConflict(
+                "terminal reconciliation checkpoint changed before readback"
+            )
+        request = CapabilityAssemblyReconciliationRequest(
+            assembly_id=current.assembly_id,
+            operation_id=active.operation_id,
+            request_sha256=current.request_sha256,
+            started_slice=started,
+            started_checkpoint_ref=record.artifact_ref,
+        )
+        authorities: dict[str, object] = {}
+        if input_id is not None:
+            item = next(
+                (candidate for candidate in items if candidate.request.input_id == input_id),
+                None,
+            )
+            if item is None:
+                raise CapabilityAssemblyConflict(
+                    "terminal reconciliation input is unavailable"
+                )
+            if kind in {
+                CapabilityAssemblySliceKind.SCAFFOLD_AND_TEST_HARNESS,
+                CapabilityAssemblySliceKind.CODEX_IMPLEMENTATION,
+                CapabilityAssemblySliceKind.SEAL,
+                CapabilityAssemblySliceKind.PROMOTE,
+            }:
+                authorities["factory_authority"] = (
+                    item.release_authority
+                    if kind is CapabilityAssemblySliceKind.PROMOTE
+                    else item.stage_authority
+                )
+            elif kind is CapabilityAssemblySliceKind.EVALUATE:
+                authorities["benchmark_authority"] = item.benchmark_authority
+            elif kind is CapabilityAssemblySliceKind.EXECUTE:
+                authorities["execution_authority"] = item.execution_authority
+            elif kind is CapabilityAssemblySliceKind.PROJECT:
+                authorities["projection_authority"] = item.projection_authority
+        elif kind is CapabilityAssemblySliceKind.RESUME_AUTHORIZE:
+            authorities["resume_authorization"] = resume_authorization
+        else:
+            authorities["execution_authority"] = (
+                resume_readback
+                if kind is CapabilityAssemblySliceKind.RESUME_READBACK
+                else resume_dispatch
+            )
+        outcome = CapabilityAssemblyReconciliationOutcome(
+            assembly_id=request.assembly_id,
+            operation_id=request.operation_id,
+            request_sha256=request.request_sha256,
+            started_slice=request.started_slice,
+            started_checkpoint_ref=request.started_checkpoint_ref,
+            disposition="terminal_readback",
+            **authorities,
+        )
+        recorder(request, outcome)
 
     def _append(self, checkpoint: CapabilityAssemblyCheckpoint, *, expected_revision: int) -> None:
         try:
@@ -1566,8 +1680,8 @@ class CapabilityAssemblyController:
             checkpoint_refs=(),
         )
 
-    @staticmethod
     def _stage_request(
+        self,
         current: CapabilityAssemblyCheckpoint,
         item: CapabilityAssemblyItemState,
         stage: CapabilityLiveStage,
@@ -1582,6 +1696,25 @@ class CapabilityAssemblyController:
             suite_ref=CapabilityAssemblyController._suite_ref(item),
             hermes_result_ref=CapabilityAssemblyController._hermes_ref(item),
             retry_number=0,
+            effect_receipt_scope=self._effect_receipt_scope(current),
+        )
+
+    def _effect_receipt_scope(
+        self, current: CapabilityAssemblyCheckpoint
+    ) -> CapabilityAssemblyEffectReceiptScope:
+        active = current.active_advance
+        started = current.started_slice
+        if active is None or started is None:
+            raise CapabilityAssemblyConflict("effect receipt lacks a started slice")
+        record = self._history(current.assembly_id)[-1]
+        if record.checkpoint != current:
+            raise CapabilityAssemblyConflict("effect receipt checkpoint changed")
+        return CapabilityAssemblyEffectReceiptScope(
+            assembly_id=current.assembly_id,
+            operation_id=active.operation_id,
+            request_sha256=current.request_sha256,
+            started_slice=started,
+            started_checkpoint_ref=record.artifact_ref,
         )
 
 

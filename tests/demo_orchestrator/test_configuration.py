@@ -32,9 +32,12 @@ def _manifest(**updates: object) -> object:
     credential_names = {
         "gateway": "CAPTAIN_GATEWAY_TOKEN",
         "benchmark": "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN",
+        "tool_host": "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN",
         "runtime": "CAPTAIN_RUNTIME_TOKEN",
+        "factory": "CAPTAIN_FACTORY_RUNTIME_TOKEN",
         "provider_proxy": "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN",
         "minibook": "MINIBOOK_API_KEY",
+        "n8n": "CAPTAIN_N8N_API_KEY",
     }
 
     def binding(service: str, *, execute: bool = False) -> object:
@@ -42,17 +45,33 @@ def _manifest(**updates: object) -> object:
         health_suffix = {
             "gateway": "/v1/capability-assemblies/health",
             "runtime": "/health",
+            "factory": "/healthz",
             "minibook": "/health",
             "provider_proxy": "/v1/healthz",
             "benchmark": "/healthz",
+            "tool_host": "/healthz",
+            "n8n": "/api/v1/workflows?limit=1",
         }[service]
+        prefix = ("python", "-m", "gateway.capability_process_operator", "--service", service)
         return SimpleNamespace(
             service=service,
             base_url=base,
             health_url=f"{base}{health_suffix}",
             execute_url=(f"{base}/v1/execute" if execute else None),
-            authentication="bearer",
+            authentication=("x-n8n-api-key" if service == "n8n" else "bearer"),
             credential_env=credential_names[service],
+            authenticated_health_url=(
+                f"{base}/api/v1/projection-health"
+                if service == "minibook" else f"{base}{health_suffix}"
+            ),
+            authenticated_health_credential_env=(
+                "MINIBOOK_PROJECTION_API_KEY"
+                if service == "minibook" else credential_names[service]
+            ),
+            authenticated_health_header=("X-N8N-API-KEY" if service == "n8n" else "Authorization"),
+            start_argv=(*prefix, "start"),
+            stop_argv=(*prefix, "stop"),
+            restart_argv=(*prefix, "restart"),
         )
 
     values = {
@@ -60,11 +79,21 @@ def _manifest(**updates: object) -> object:
         "provider_supervisor_mode": "dynamic_gateway_context_v1",
         "provider_context_reference_header": "X-Captain-Provider-Context-Ref",
         "manifest_sha256": "a" * 64,
+        "provider_policy_sha256": "1" * 64,
+        "provider_price_card_sha256": "2" * 64,
+        "provider_context_sha256": "3" * 64,
+        "provider_proxy_executable_sha256": "4" * 64,
+        "provider_proxy_code_sha256": "5" * 64,
+        "provider_paid_command_sha256": "6" * 64,
+        "provider_hard_ceiling_enforced": True,
         "gateway": binding("gateway"),
         "benchmark": binding("benchmark", execute=True),
+        "tool_host": binding("tool_host"),
         "runtime": binding("runtime"),
+        "factory": binding("factory", execute=True),
         "provider_proxy": binding("provider_proxy"),
         "minibook": binding("minibook"),
+        "n8n": binding("n8n"),
     }
     values.update(updates)
     return SimpleNamespace(**values)
@@ -109,12 +138,12 @@ def test_init_reuses_existing_root_authority_without_copy_or_overlap(
     assert "CAPTAIN_GATEWAY_TOKEN=" not in private_env.read_text(encoding="utf-8")
 
 
-def test_missing_real_d11_loader_reports_exact_gap(tmp_path: Path) -> None:
+def test_real_d11_loader_reports_incomplete_configuration(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
 
     with pytest.raises(
         DemoConfigurationError,
-        match="D11 operator process bootstrap is unavailable",
+        match="D11 production bundle configuration is incomplete",
     ):
         load_demo_configuration(repository)
 
@@ -162,12 +191,23 @@ def test_real_d11_manifest_builder_is_compatible_with_d12_loader(tmp_path: Path)
         "CAPTAIN_GATEWAY_TOKEN": "gateway-token",
         "CAPTAIN_CAPABILITY_BENCHMARK_URL": "http://127.0.0.1:18081/v1/execute",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-token",
+        "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-token",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_URL": "http://127.0.0.1:18086",
+        "CAPTAIN_CAPABILITY_TOOL_HOST_TOKEN": "tool-host-token",
         "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:18082",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-token",
+        "CAPTAIN_FACTORY_RUNTIME_URL": "http://127.0.0.1:18085",
+        "CAPTAIN_FACTORY_RUNTIME_TOKEN": "factory-runtime-token",
+        "CAPTAIN_FACTORY_RUNTIME_CODE_SHA256": "7" * 64,
         "CAPTAIN_PROVIDER_PROXY_URL": "http://127.0.0.1:18083",
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "proxy-token",
         "CAPTAIN_PROVIDER_POLICY_SHA256": "1" * 64,
         "CAPTAIN_PROVIDER_PRICE_CARD_SHA256": "2" * 64,
+        "CAPTAIN_PROVIDER_CONTEXT_SHA256": "3" * 64,
+        "CAPTAIN_PROVIDER_PROXY_EXECUTABLE_SHA256": "4" * 64,
+        "CAPTAIN_PROVIDER_PROXY_CODE_SHA256": "5" * 64,
+        "CAPTAIN_PROVIDER_PAID_COMMAND_SHA256": "6" * 64,
+        "CAPTAIN_PROVIDER_HARD_CEILING_ENFORCED": "true",
         "MINIBOOK_BACKEND_URL": "http://127.0.0.1:18084",
         "MINIBOOK_API_KEY": "minibook-token",
         "MINIBOOK_PROJECTION_API_KEY": "projection-token",
@@ -285,12 +325,12 @@ def test_missing_d10_configuration_is_reported_only_at_paid_preflight(tmp_path: 
 
     with pytest.raises(
         DemoConfigurationError,
-        match="D10 private benchmark catalog capability is unavailable",
+        match="D10 private benchmark catalog configuration is incomplete",
     ):
         configuration.require_private_benchmark_catalog()
 
 
-def test_missing_minibook_readback_and_process_control_report_exact_d11_gaps(
+def test_process_controls_are_typed_and_minibook_gap_remains_exact(
     tmp_path: Path,
 ) -> None:
     repository = _repository(tmp_path)
@@ -302,8 +342,13 @@ def test_missing_minibook_readback_and_process_control_report_exact_d11_gaps(
 
     with pytest.raises(DemoConfigurationError, match="D11 Minibook assembly evidence readback capability is unavailable"):
         configuration.require_minibook_evidence_readback()
-    with pytest.raises(DemoConfigurationError, match="D11 operator process bootstrap is unavailable"):
-        configuration.require_operator_process_bootstrap()
+    controls = configuration.require_operator_process_bootstrap()
+    assert tuple(control.service for control in controls.services) == (
+        "gateway", "runtime", "factory", "provider_proxy", "benchmark", "tool_host", "minibook", "n8n"
+    )
+    runtime = configuration.require_runtime_restart_control()
+    assert runtime.service == "runtime"
+    assert runtime.restart_argv[-1] == "restart"
 
 
 def test_duplicate_canonical_input_bytes_fail_closed(tmp_path: Path) -> None:

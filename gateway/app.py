@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
+import secrets
+from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path as FileSystemPath
 from threading import Lock
+from collections.abc import Mapping
 from typing import Any, Callable, Literal, Protocol
 from uuid import UUID, uuid4
 
@@ -149,6 +153,26 @@ from gateway.capability_assembly_api import (
     create_production_capability_assembly_router,
     unavailable_capability_assembly_composition,
 )
+from gateway.capability_assembly_production import RepositoryFactoryInputArtifactStore
+from gateway.capability_benchmark_execution_service import (
+    GatewayDurableBenchmarkToolBroker,
+    GatewayBenchmarkExecutionService,
+)
+from gateway.capability_benchmark_process_app import _parse_request as _parse_benchmark_request
+from gateway.capability_benchmark_process_app import _serialize_evidence as _serialize_benchmark_evidence
+from agenten.agent_factory.holdout_store import PrivateHoldoutStore
+from gateway.capability_assembly_bootstrap import (
+    CapabilityAssemblyFactoryRuntime,
+    CapabilityAssemblyFactoryRuntimePlan,
+    CapabilityAssemblyBootstrapSettings,
+    GatewayPrivateHoldoutStore,
+    materialize_capability_assembly_factory_runtime,
+    plan_capability_assembly_factory_runtime_from_environment,
+    plan_production_capability_assembly_from_environment,
+    build_production_capability_assembly_from_environment,
+    close_production_capability_assembly,
+    load_capability_assembly_bootstrap_settings,
+)
 from gateway.portal_live_contracts import (
     PortalLiveEvidenceQueryV1,
     PortalLiveEvidenceV1,
@@ -160,9 +184,65 @@ from gateway.portal_live_contracts import (
     PortalProviderProbeRequestV1,
     PortalRestartReceiptV1,
 )
+from gateway.factory_process_rpc import (
+    FactoryGatewayRpcCommand, FactoryGatewayRpcService,
+)
+from gateway.factory_gateway_store_authority import GatewayStoreFactoryRpcAuthority
+from gateway.capability_factory_process_client import GatewayFactoryProcessClient
+from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
+from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
+from agenten.agent_factory.minibook_forge import (
+    CaptainCreationJobMapper, MinibookForgeHttpClient, MinibookForgeHttpSettings,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, repr=False)
+class GatewayProductionAppPlan:
+    repository_root: FileSystemPath
+    environment: Mapping[str, str]
+    settings: GatewaySettings
+    bootstrap: CapabilityAssemblyBootstrapSettings
+    factory_runtime: CapabilityAssemblyFactoryRuntimePlan
+
+
+def plan_production_app_from_environment(
+    *,
+    environment: Mapping[str, str] | None = None,
+    repository_root: FileSystemPath | None = None,
+) -> GatewayProductionAppPlan:
+    """Validate every local production authority before any materialization."""
+
+    source = dict(os.environ if environment is None else environment)
+    root = (repository_root or FileSystemPath.cwd()).resolve(strict=True)
+    configured = GatewaySettings.from_env(source)
+    bootstrap = load_capability_assembly_bootstrap_settings(
+        environment=source,
+        repository_root=root,
+    )
+    factory_runtime = plan_capability_assembly_factory_runtime_from_environment(
+        repository_root=root,
+        environment=source,
+        artifact_root=bootstrap.artifact_root,
+        authority_root=bootstrap.authority_root,
+        repository_revision=bootstrap.assembly.expected_repository_revision,
+    )
+    if (
+        not source.get("CAPTAIN_FACTORY_RUNTIME_URL", "").strip()
+        or len(source.get("CAPTAIN_FACTORY_RUNTIME_TOKEN", "").strip()) < 16
+    ):
+        raise CapabilityAssemblyBootstrapConfigurationError(
+            "capability assembly bootstrap configuration is incomplete"
+        )
+    return GatewayProductionAppPlan(
+        repository_root=root,
+        environment=source,
+        settings=configured,
+        bootstrap=bootstrap,
+        factory_runtime=factory_runtime,
+    )
 
 
 class Mirror(Protocol):
@@ -317,13 +397,26 @@ def create_app(
     capability_assembly_composition_factory: (
         CapabilityAssemblyCompositionFactory | None
     ) = None,
+    capability_assembly_environment: Mapping[str, str] | None = None,
+    capability_assembly_factory_runtime: CapabilityAssemblyFactoryRuntime | None = None,
+    capability_assembly_private_catalog: PrivateHoldoutStore | None = None,
+    capability_assembly_repository_root: FileSystemPath | None = None,
     runtime_usage_artifacts: ContentAddressedArtifactAdapter | None = None,
     runtime_usage_pricing_snapshots: tuple[
         RuntimeUsagePricingSnapshotV1, ...
     ] = (),
+    capability_benchmark_execution_service: GatewayBenchmarkExecutionService | None = None,
+    capability_benchmark_gateway_token: str | None = None,
+    factory_gateway_rpc_service: FactoryGatewayRpcService | None = None,
+    factory_runtime_token: str | None = None,
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
+    def environment_value(name: str) -> str:
+        source = capability_assembly_environment or os.environ
+        value = source.get(name, "")
+        return value if isinstance(value, str) else ""
+
     def configured_store(
         target_storage: MariaDBStorage,
         configured: GatewaySettings | None,
@@ -353,6 +446,20 @@ def create_app(
             )
             if configured is not None and configured.provider_proxy_url is not None
             else (),
+            runtime_provider_bundle_bindings=(
+                (
+                    configured.provider_proxy_url.removesuffix("/v1"),
+                    configured.provider_policy_sha256,
+                    configured.provider_price_card_sha256,
+                    configured.provider_context_sha256,
+                    configured.provider_proxy_executable_sha256,
+                    configured.provider_proxy_code_sha256,
+                    configured.provider_paid_command_sha256,
+                    configured.provider_hard_ceiling_enforced,
+                ),
+            )
+            if configured is not None and configured.provider_proxy_url is not None
+            else (),
         )
         if (
             configured is not None
@@ -373,16 +480,80 @@ def create_app(
     store: GatewayStore | None = gateway_store or (
         configured_store(storage, settings) if storage else None
     )
+    portal_clock = portal_clock or (lambda: datetime.now(timezone.utc))
+    selected_capability_assembly_factory = capability_assembly_composition_factory
+    production_composition = None
+    benchmark_execution_service = capability_benchmark_execution_service
+    benchmark_tool_broker: GatewayDurableBenchmarkToolBroker | None = None
+    production_requested = selected_capability_assembly_factory is None and all(
+        value is not None
+        for value in (
+            store,
+            capability_assembly_environment,
+            capability_assembly_factory_runtime,
+            capability_assembly_private_catalog,
+            capability_assembly_repository_root,
+        )
+    )
+    if production_requested:
+        def selected_production_composition():
+            if production_composition is None:
+                return unavailable_capability_assembly_composition()
+            return production_composition
+        selected_capability_assembly_factory = selected_production_composition
     resume_service = capability_resume_service
     runtime_http_client: httpx.AsyncClient | None = None
     resume_service_lock = Lock()
-    portal_clock = portal_clock or (lambda: datetime.now(timezone.utc))
     portal_control_boot_id = str(uuid4())
     sink_calls: list[dict[str, Any]] = []
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        nonlocal production_composition, benchmark_execution_service, benchmark_tool_broker, runtime_http_client
         load_gateway_settings(app)
+        if production_requested:
+            assert store is not None
+            assert capability_assembly_environment is not None
+            assert capability_assembly_factory_runtime is not None
+            assert capability_assembly_private_catalog is not None
+            assert capability_assembly_repository_root is not None
+            production_composition = build_production_capability_assembly_from_environment(
+                repository_root=capability_assembly_repository_root,
+                environment=capability_assembly_environment,
+                store=store,
+                runtime=capability_assembly_factory_runtime,
+                private_benchmark_catalog=capability_assembly_private_catalog,
+                clock=portal_clock,
+            )
+            if benchmark_execution_service is None and runtime_usage_artifacts is not None:
+                private_cases, tool_issuer = (
+                    production_composition.benchmark_execution_authorities
+                )
+                benchmark_execution_service = GatewayBenchmarkExecutionService(
+                    store=store, artifacts=runtime_usage_artifacts,
+                    private_cases=private_cases,
+                    executor_authority_id=UUID(environment_value(
+                        "CAPTAIN_CAPABILITY_BENCHMARK_AUTHORITY_ID"
+                    )),
+                    runtime_effect=None,
+                    tool_issuer=tool_issuer,
+                    tool_registry=production_composition.benchmark_tool_registry,
+                    provider_binding={
+                        "provider_proxy_url": configured.provider_proxy_url,
+                        "provider_policy_sha256": configured.provider_policy_sha256,
+                        "provider_price_card_sha256": configured.provider_price_card_sha256,
+                        "provider_context_sha256": configured.provider_context_sha256,
+                        "provider_proxy_executable_sha256": configured.provider_proxy_executable_sha256,
+                        "provider_proxy_code_sha256": configured.provider_proxy_code_sha256,
+                        "provider_paid_command_sha256": configured.provider_paid_command_sha256,
+                        "provider_hard_ceiling_enforced": configured.provider_hard_ceiling_enforced,
+                    },
+                    clock=portal_clock,
+                )
+                benchmark_tool_broker = GatewayDurableBenchmarkToolBroker(
+                    store=store, artifacts=runtime_usage_artifacts,
+                    registry=production_composition.benchmark_tool_registry,
+                )
         start = getattr(mirror, "start", None)
         if start:
             await start()
@@ -391,6 +562,8 @@ def create_app(
         finally:
             if runtime_http_client is not None:
                 await runtime_http_client.aclose()
+            if production_composition is not None:
+                await close_production_capability_assembly(production_composition)
             stop = getattr(mirror, "stop", None)
             if stop:
                 await stop()
@@ -408,8 +581,9 @@ def create_app(
     initialize_portal_auth(app)
     app.include_router(
         create_production_capability_assembly_router(
-            capability_assembly_composition_factory
-            or unavailable_capability_assembly_composition
+            selected_capability_assembly_factory
+            or unavailable_capability_assembly_composition,
+            resolve_lazily=production_requested,
         )
     )
 
@@ -502,6 +676,11 @@ def create_app(
                                 responses_url=configured.provider_proxy_url,
                                 policy_sha256=configured.provider_policy_sha256,
                                 price_card_sha256=configured.provider_price_card_sha256,
+                                context_sha256=configured.provider_context_sha256,
+                                executable_sha256=configured.provider_proxy_executable_sha256,
+                                code_sha256=configured.provider_proxy_code_sha256,
+                                paid_command_sha256=configured.provider_paid_command_sha256,
+                                hard_ceiling_enforced=configured.provider_hard_ceiling_enforced,
                             )
                             if configured.provider_proxy_url is not None
                             else None
@@ -1172,6 +1351,23 @@ def create_app(
             response.status_code = status.HTTP_200_OK
         return receipt
 
+    @app.post(
+        "/v1/capability-benchmark/provider-settlements",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def record_capability_benchmark_provider_settlement(
+        settlement: dict[str, object],
+        _: GatewayRole = Depends(require_provider_receipt_authority),
+    ) -> dict[str, object]:
+        await run_in_threadpool(
+            get_store().record_capability_benchmark_provider_settlement,
+            settlement,
+        )
+        return {
+            "schema": "captain.capability-benchmark-provider-settlement-write.v1",
+            "settlement_id": settlement.get("settlement_id"),
+        }
+
     @app.post("/v1/capability-resumes/provider-authorities/preflight")
     async def preflight_runtime_provider_authority(
         context: ProviderBudgetContextV1,
@@ -1180,6 +1376,17 @@ def create_app(
         return await run_in_threadpool(
             get_store().validate_provider_proxy_authority,
             context,
+            now=datetime.now(timezone.utc),
+        )
+
+    @app.get("/v1/capability-resumes/provider-authorities/by-context/{context_sha256}")
+    async def resolve_runtime_provider_authority(
+        context_sha256: str,
+        _: GatewayRole = Depends(require_provider_receipt_authority),
+    ) -> ProviderBudgetContextV1:
+        return await run_in_threadpool(
+            get_store().resolve_provider_proxy_authority,
+            f"gateway://provider-budget-contexts/{context_sha256}",
             now=datetime.now(timezone.utc),
         )
 
@@ -1494,7 +1701,287 @@ def create_app(
         block, created = get_store().import_legacy_record(request)
         return {"created": created, "block": block}
 
+    @app.post("/v1/capability-benchmark/executions")
+    async def execute_capability_benchmark(
+        payload: dict[str, object],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        expected = (
+            capability_benchmark_gateway_token
+            or environment_value("CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN")
+        )
+        if (
+            len(expected) < 16
+            or authorization is None
+            or not secrets.compare_digest(authorization, "Bearer " + expected)
+        ):
+            raise HTTPException(
+                status_code=401, detail="benchmark Gateway authentication failed"
+            )
+        if benchmark_execution_service is None:
+            raise HTTPException(
+                status_code=503, detail="benchmark execution is unavailable"
+            )
+        try:
+            request = _parse_benchmark_request(payload)
+            evidence = await benchmark_execution_service.execute(request)
+            return _serialize_benchmark_evidence(evidence)
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=409, detail="benchmark execution is unavailable"
+            ) from None
+
+    @app.post("/v1/factory-runtime/store")
+    def execute_factory_runtime_store(
+        command: FactoryGatewayRpcCommand,
+        authorization: str | None = Header(default=None),
+    ) -> object:
+        expected = factory_runtime_token or environment_value(
+            "CAPTAIN_FACTORY_RUNTIME_TOKEN"
+        )
+        if (
+            len(expected) < 16 or authorization is None
+            or not secrets.compare_digest(authorization, "Bearer " + expected)
+        ):
+            raise HTTPException(status_code=401, detail="Factory runtime authentication failed")
+        if factory_gateway_rpc_service is None:
+            raise HTTPException(status_code=503, detail="Factory Gateway operation is unavailable")
+        try:
+            return factory_gateway_rpc_service.execute(command)
+        except Exception:
+            raise HTTPException(status_code=409, detail="Factory Gateway operation is unavailable") from None
+
+    @app.post("/v1/capability-benchmark/sessions/prepare")
+    async def prepare_capability_benchmark(
+        payload: dict[str, object],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        expected = capability_benchmark_gateway_token or environment_value(
+            "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN"
+        )
+        if (
+            len(expected) < 16 or authorization is None
+            or not secrets.compare_digest(authorization, "Bearer " + expected)
+        ):
+            raise HTTPException(status_code=401, detail="benchmark Gateway authentication failed")
+        if benchmark_execution_service is None:
+            raise HTTPException(status_code=503, detail="benchmark execution is unavailable")
+        try:
+            prepared = benchmark_execution_service.prepare(
+                _parse_benchmark_request(payload)
+            )
+            return {
+                "schema": "captain.capability-benchmark-prepared-session.v1",
+                "request_digest": prepared.request.request_digest,
+                "command": prepared.command.model_dump(mode="json", by_alias=True),
+                "trace_id": str(prepared.trace_id), "run_id": str(prepared.run_id),
+                "batch_id": prepared.batch_id,
+                "authorized_tools": [{
+                    "tool_key": item.tool_key, "call_id": item.call_id,
+                    "lease_id": item.lease_id,
+                    "call_ref": item.call_ref.model_dump(mode="json"),
+                    "lease_ref": item.lease_ref.model_dump(mode="json"),
+                    "scoped_token": item.scoped_token.get_secret_value(),
+                    "operation": item.operation,
+                } for item in prepared.authorized_tools],
+                "material": prepared.material,
+            }
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=409, detail="benchmark preparation is unavailable"
+            ) from None
+
+    @app.post("/v1/capability-benchmark/tools/execute")
+    async def execute_capability_benchmark_tool(
+        payload: dict[str, object],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        if benchmark_tool_broker is None or authorization is None or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="benchmark tool authentication failed")
+        try:
+            required = {
+                "schema", "tool_key", "call_id", "lease_id", "call_ref",
+                "lease_ref", "operation", "arguments",
+            }
+            if set(payload) != required or payload.get("schema") != "captain.capability-benchmark-tool-request.v1" or not isinstance(payload.get("arguments"), dict):
+                raise ValueError("shape")
+            from gateway.capability_generic_benchmark import GenericAuthorizedToolCall
+            from pydantic import SecretStr
+            scoped = SecretStr(authorization.removeprefix("Bearer "))
+            authorized = GenericAuthorizedToolCall(
+                tool_key=str(payload["tool_key"]), operation=str(payload["operation"]),
+                call_id=str(payload["call_id"]),
+                lease_id=str(payload["lease_id"]),
+                call_ref=ArtifactRef.model_validate(payload["call_ref"]),
+                lease_ref=ArtifactRef.model_validate(payload["lease_ref"]),
+                scoped_token=scoped,
+            )
+            result = benchmark_tool_broker.execute(
+                authorization=authorized, scoped_token=scoped,
+                operation=str(payload["operation"]),
+                arguments=payload["arguments"],
+            )
+            return {
+                "schema": "captain.capability-benchmark-tool-response.v1",
+                "value": result.value,
+                "result_ref": result.result_ref.model_dump(mode="json"),
+                "receipt_ref": result.receipt_ref.model_dump(mode="json"),
+            }
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=409, detail="benchmark tool execution is unavailable"
+            ) from None
+
+    @app.post("/v1/capability-benchmark/sessions/complete")
+    async def complete_capability_benchmark(
+        payload: dict[str, object],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        expected = capability_benchmark_gateway_token or environment_value(
+            "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN"
+        )
+        if (
+            len(expected) < 16 or authorization is None
+            or not secrets.compare_digest(authorization, "Bearer " + expected)
+        ):
+            raise HTTPException(status_code=401, detail="benchmark Gateway authentication failed")
+        if benchmark_execution_service is None:
+            raise HTTPException(status_code=503, detail="benchmark execution is unavailable")
+        try:
+            if set(payload) != {"schema", "request", "result"} or payload.get("schema") != "captain.capability-benchmark-completion.v1" or not isinstance(payload.get("request"), dict) or not isinstance(payload.get("result"), dict):
+                raise ValueError("shape")
+            request = _parse_benchmark_request(payload["request"])
+            evidence = benchmark_execution_service.complete_process_execution(
+                request, payload["result"],
+            )
+            return _serialize_benchmark_evidence(evidence)
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=409, detail="benchmark completion is unavailable"
+            ) from None
+
     return app
+
+
+def create_production_app_from_environment(
+    *,
+    environment: Mapping[str, str] | None = None,
+    repository_root: FileSystemPath | None = None,
+    runtime_materializer: Callable[..., CapabilityAssemblyFactoryRuntime] = (
+        materialize_capability_assembly_factory_runtime
+    ),
+) -> FastAPI:
+    """Build the shipped production app once after complete, pure validation."""
+
+    plan = plan_production_app_from_environment(
+        environment=environment,
+        repository_root=repository_root,
+    )
+
+    source = plan.environment
+    root = plan.repository_root
+    configured = plan.settings
+    bootstrap = plan.bootstrap
+    clock = lambda: datetime.now(timezone.utc)
+    artifacts = ContentAddressedArtifactAdapter(bootstrap.artifact_root)
+    source_artifacts = RepositoryFactoryInputArtifactStore(artifacts=artifacts)
+    gateway = GatewayStore(
+        MariaDBStorage(configured.ledger_dsn.get_secret_value()),
+        claim_ttl=timedelta(seconds=configured.claim_ttl_seconds),
+        runtime_usage_artifacts=artifacts,
+        runtime_provider_proxy_bindings=((
+            configured.provider_proxy_url,
+            configured.provider_policy_sha256,
+            configured.provider_price_card_sha256,
+        ),) if configured.provider_proxy_url is not None else (),
+        runtime_provider_bundle_bindings=((
+            bootstrap.provider_url,
+            bootstrap.provider_policy_sha256,
+            bootstrap.provider_price_card_sha256,
+            bootstrap.provider_context_sha256,
+            bootstrap.provider_proxy_executable_sha256,
+            bootstrap.provider_proxy_code_sha256,
+            bootstrap.provider_paid_command_sha256,
+            bootstrap.provider_hard_ceiling_enforced,
+        ),),
+    )
+    if configured.portal_n8n_adapters_configured:
+        portal_bundle = build_portal_n8n_adapter_bundle(
+            reader=gateway,
+            settings=configured,
+        )
+        gateway.configure_portal_sources(
+            credential_source=portal_bundle.credential_source,
+            verification_source=portal_bundle.verification_source,
+        )
+    private_catalog = GatewayPrivateHoldoutStore(gateway_store=gateway)
+    runtime = runtime_materializer(
+        plan.factory_runtime,
+        store=gateway,
+        private_benchmark_catalog=private_catalog,
+        clock=clock,
+        source_artifacts=source_artifacts,
+        provider_token=bootstrap.provider_token,
+        minibook_api_key=bootstrap.minibook_api_key,
+        factory_runtime_token=getattr(bootstrap, "factory_runtime_token", None),
+        factory_gateway_capability_key=bootstrap.gateway_token,
+    )
+    plan_production_capability_assembly_from_environment(
+        repository_root=root,
+        environment=source,
+        store=gateway,
+        runtime=runtime,
+        private_benchmark_catalog=private_catalog,
+        clock=clock,
+    )
+    factory_rpc = None
+    if isinstance(getattr(runtime, "factory", None), GatewayFactoryProcessClient):
+        factory_repository = runtime.factory.repository
+        factory_evidence = FilesystemFactoryEvidenceStore(
+            bootstrap.authority_root / "runtime-state" / "factory-evidence"
+        )
+        factory_forge = MinibookForgeHttpClient(
+            mapper=CaptainCreationJobMapper(
+                evidence=CaptainForgeEvidenceBridge(
+                    repository=factory_repository,
+                    evidence_store=factory_evidence,
+                )
+            ),
+            settings=MinibookForgeHttpSettings(
+                base_url=bootstrap.minibook_url,
+                api_key=bootstrap.minibook_api_key.get_secret_value(),
+            ),
+        )
+        factory_rpc = FactoryGatewayRpcService(
+            authority=GatewayStoreFactoryRpcAuthority(
+                store=gateway, forge=factory_forge, n8n=runtime.n8n,
+            ),
+            capability_key=bootstrap.gateway_token.get_secret_value(),
+            clock=clock,
+        )
+    return create_app(
+        settings=configured,
+        gateway_store=gateway,
+        capability_assembly_environment=source,
+        capability_assembly_factory_runtime=runtime,
+        capability_assembly_private_catalog=private_catalog,
+        capability_assembly_repository_root=root,
+        runtime_usage_artifacts=artifacts,
+        portal_clock=clock,
+        factory_gateway_rpc_service=factory_rpc,
+        factory_runtime_token=(
+            bootstrap.factory_runtime_token.get_secret_value()
+            if factory_rpc is not None else None
+        ),
+    )
 
 
 app = create_app()
@@ -1503,9 +1990,9 @@ app = create_app()
 def main() -> None:
     import uvicorn
 
-    settings = GatewaySettings.from_env()
-    app.state.gateway_settings = settings
-    uvicorn.run(app, host=settings.host, port=settings.port, workers=1)
+    production_app = create_production_app_from_environment()
+    settings = production_app.state.gateway_settings
+    uvicorn.run(production_app, host=settings.host, port=settings.port, workers=1)
 
 
 if __name__ == "__main__":

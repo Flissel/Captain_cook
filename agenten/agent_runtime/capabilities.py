@@ -69,6 +69,7 @@ PROFILE_CAPABILITIES: dict[CapabilityProfile, frozenset[str]] = {
     ),
     CapabilityProfile.FACTORY_REAL_CASE_TESTER: frozenset(
         {
+            "autogen.benchmark",
             "workspace.read",
             "tests.run",
             "evidence.write",

@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import os
 import re
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
+from urllib.parse import urlsplit
 from uuid import UUID
 
-from autogen_core.models import ChatCompletionClient
+import httpx
+from autogen_core import FunctionCall
+from autogen_core.models import (
+    ChatCompletionClient, CreateResult, ModelFamily, ModelInfo,
+    RequestUsage,
+)
 from pydantic import BaseModel, ConfigDict, Field
 
 from agenten.agent_factory.benchmark_providers import (
@@ -325,6 +332,210 @@ class OpenAIBusinessBenchmarkModelClientBuilder:
             raise ValueError("benchmark model is not Captain-authorized")
         return self._client_factory(
             provider=self.provider, api_key=self._api_key, model=self.model
+        )
+
+
+class ProxyResponsesChatCompletionClient(ChatCompletionClient):
+    """Minimal AutoGen client over the proxy's real `/v1/responses` surface."""
+
+    def __init__(self, *, endpoint: str, token: str, context_reference: str, model: str,
+                 client: httpx.AsyncClient | None = None) -> None:
+        self._endpoint, self._token = endpoint, token
+        self._context_reference, self._model = context_reference, model
+        self._client = client or httpx.AsyncClient(timeout=30.0)
+        self._actual = RequestUsage(prompt_tokens=0, completion_tokens=0)
+        self._total = RequestUsage(prompt_tokens=0, completion_tokens=0)
+
+    async def create(self, messages: Sequence[Any], *, tools: Sequence[Any] = (),
+                     tool_choice: Any = "auto", json_output: Any = None,
+                     extra_create_args: Mapping[str, Any] = {},
+                     cancellation_token: Any = None) -> CreateResult:
+        inputs = []
+        for message in messages:
+            content = getattr(message, "content", None)
+            kind = type(message).__name__
+            if kind == "AssistantMessage" and isinstance(content, list):
+                inputs.extend({
+                    "type": "function_call", "call_id": call.id,
+                    "name": call.name, "arguments": call.arguments,
+                } for call in content)
+                continue
+            if kind == "FunctionExecutionResultMessage" and isinstance(content, list):
+                inputs.extend({
+                    "type": "function_call_output", "call_id": result.call_id,
+                    "output": result.content,
+                } for result in content)
+                continue
+            if not isinstance(content, str):
+                raise ValueError("proxy Responses message content is invalid")
+            role = "developer" if kind == "SystemMessage" else (
+                "assistant" if kind == "AssistantMessage" else "user"
+            )
+            inputs.append({"role": role, "content": content})
+        tool_payload = []
+        for tool in tools:
+            schema = getattr(tool, "schema", tool)
+            if not isinstance(schema, Mapping):
+                raise ValueError("proxy Responses tool schema is invalid")
+            tool_payload.append({"type": "function", **dict(schema)})
+        extra = dict(extra_create_args)
+        safe_extra_fields = frozenset({"max_output_tokens"})
+        if set(extra).difference(safe_extra_fields):
+            raise ValueError("proxy Responses request authority cannot be overridden")
+        maximum_output_tokens = extra.get("max_output_tokens")
+        if maximum_output_tokens is not None and (
+            type(maximum_output_tokens) is not int
+            or not 1 <= maximum_output_tokens <= 4096
+        ):
+            raise ValueError("proxy Responses safe request arguments are invalid")
+        payload = {
+            "model": self._model, "input": inputs,
+            "reasoning": {"effort": "high"}, **extra,
+        }
+        if tool_payload:
+            selected_choice = tool_choice
+            if not isinstance(tool_choice, str):
+                schema = getattr(tool_choice, "schema", None)
+                if not isinstance(schema, Mapping) or not schema.get("name"):
+                    raise ValueError("proxy Responses tool choice is invalid")
+                selected_choice = {"type": "function", "name": schema["name"]}
+            payload.update({"tools": tool_payload, "tool_choice": selected_choice})
+        if json_output is True:
+            payload["text"] = {"format": {"type": "json_object"}}
+        elif isinstance(json_output, type) and issubclass(json_output, BaseModel):
+            payload["text"] = {"format": {
+                "type": "json_schema", "name": json_output.__name__,
+                "schema": json_output.model_json_schema(), "strict": True,
+            }}
+        pending = asyncio.create_task(
+            self._client.post(
+                self._endpoint,
+                headers={
+                    "Authorization": f"Bearer {self._token}",
+                    "X-Captain-Provider-Context-Ref": self._context_reference,
+                },
+                json=payload,
+            )
+        )
+        if cancellation_token is not None:
+            cancellation_token.link_future(pending)
+        response = await pending
+        response.raise_for_status()
+        value = response.json()
+        usage = value.get("usage", {})
+        current = RequestUsage(
+            prompt_tokens=int(usage.get("input_tokens", 0)),
+            completion_tokens=int(usage.get("output_tokens", 0)),
+        )
+        self._actual = current
+        self._total = RequestUsage(
+            prompt_tokens=self._total.prompt_tokens + current.prompt_tokens,
+            completion_tokens=self._total.completion_tokens + current.completion_tokens,
+        )
+        output = value.get("output", [])
+        if not isinstance(output, list):
+            raise ValueError("proxy Responses output is invalid")
+        calls = [
+            FunctionCall(id=item["call_id"], name=item["name"], arguments=item["arguments"])
+            for item in output if item.get("type") == "function_call"
+        ]
+        texts = [
+            part["text"] for item in output if item.get("type") == "message"
+            for part in item.get("content", []) if part.get("type") == "output_text"
+        ]
+        content: str | list[FunctionCall] = calls or "".join(texts)
+        return CreateResult(
+            finish_reason="function_calls" if calls else "stop",
+            content=content, usage=current, cached=False,
+        )
+
+    async def create_stream(self, messages: Sequence[Any], **kwargs: Any) -> AsyncGenerator[str | CreateResult, None]:
+        yield await self.create(messages, **kwargs)
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    def actual_usage(self) -> RequestUsage:
+        return self._actual
+
+    def total_usage(self) -> RequestUsage:
+        return self._total
+
+    def count_tokens(self, messages: Sequence[Any], *, tools: Sequence[Any] = ()) -> int:
+        return sum(len(str(getattr(item, "content", ""))) // 4 + 1 for item in messages)
+
+    def remaining_tokens(self, messages: Sequence[Any], *, tools: Sequence[Any] = ()) -> int:
+        return max(0, 128_000 - self.count_tokens(messages, tools=tools))
+
+    @property
+    def model_info(self) -> ModelInfo:
+        return ModelInfo(vision=False, function_calling=True, json_output=True,
+                         family=ModelFamily.UNKNOWN, structured_output=True)
+
+    @property
+    def capabilities(self):
+        return self.model_info
+
+
+def _build_proxy_responses_client(**kwargs: object) -> ChatCompletionClient:
+    return ProxyResponsesChatCompletionClient(**kwargs)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class ProxyBoundResponsesModelClientBuilder:
+    """Build AutoGen clients that can reach only the attested Captain proxy."""
+
+    provider: str
+    model: str
+    proxy_url: str
+    context_sha256: str
+    policy_sha256: str
+    price_card_sha256: str
+    executable_sha256: str
+    code_sha256: str
+    paid_command_sha256: str
+    hard_ceiling_enforced: bool
+    _client_token: str = field(repr=False)
+    _client_factory: BenchmarkModelClientFactory = field(
+        default=_build_proxy_responses_client, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        parsed = urlsplit(self.proxy_url)
+        digests = (
+            self.context_sha256, self.policy_sha256, self.price_card_sha256,
+            self.executable_sha256, self.code_sha256, self.paid_command_sha256,
+        )
+        if (
+            self.provider != "openai"
+            or parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost"}
+            or not self._client_token
+            or any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in digests)
+            or self.hard_ceiling_enforced is not True
+        ):
+            raise ValueError("provider proxy model authority is invalid")
+
+    def __call__(
+        self, job: AgentFactoryJobV3, invocation: FactorySkillInvocationV1,
+    ) -> ChatCompletionClient:
+        if (
+            invocation.job_id != job.job_id
+            or invocation.correlation_id != job.correlation_id
+            or invocation.subject_version != job.subject_version
+            or not job.execution_policy.live_execution
+            or self.model not in job.execution_policy.allowed_models
+            or FactoryLiveCapability.MODEL_INVOKE
+            not in job.execution_policy.live_capabilities
+        ):
+            raise ValueError("proxy model invocation is not Captain-authorized")
+        return self._client_factory(
+            endpoint=self.proxy_url.rstrip("/") + "/v1/responses",
+            token=self._client_token,
+            model=self.model,
+            context_reference=(
+                f"gateway://provider-budget-contexts/{self.context_sha256}"
+            ),
         )
 
 

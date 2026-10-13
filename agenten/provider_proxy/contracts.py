@@ -38,6 +38,16 @@ def canonical_bytes(model: BaseModel) -> bytes:
     ).encode("utf-8")
 
 
+def benchmark_provider_settlement_id(
+    command_id: UUID | str, provider_call_id: str,
+) -> UUID:
+    """Canonical identity for one independently settled benchmark provider call."""
+
+    if not provider_call_id or len(provider_call_id) > 128:
+        raise ValueError("benchmark provider call identity is invalid")
+    return uuid5(UUID(str(command_id)), provider_call_id)
+
+
 class OpenAIPriceCardV1(_FrozenContract):
     schema_name: Literal["captain.openai-price-card.v1"] = Field(
         alias="schema", serialization_alias="schema"
@@ -135,6 +145,11 @@ class RuntimeProviderProxyBindingV1(_FrozenContract):
     responses_url: str = Field(pattern=r"^http://127\.0\.0\.1:[0-9]{1,5}/v1$")
     policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     price_card_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    context_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    executable_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    paid_command_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    hard_ceiling_enforced: Literal[True] = True
 
 
 class ProviderBudgetContextV1(_FrozenContract):
@@ -152,7 +167,9 @@ class ProviderBudgetContextV1(_FrozenContract):
     capability_id: str = Field(min_length=1)
     capability_version: int = Field(ge=1, strict=True)
     session_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-    cost_authority_ref: str = Field(pattern=r"^gateway://capability-resume-authorizations/")
+    cost_authority_ref: str = Field(
+        pattern=r"^gateway://capability-(?:resume|benchmark)-authorizations/"
+    )
     ceiling_usd: Decimal
     expires_at: datetime
     policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")

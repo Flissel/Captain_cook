@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+import agenten.agent_factory.input_document as input_document_module
 
 from agenten.agent_factory.input_contracts import CredentialAlias, RequestedAgent
 from agenten.agent_factory.input_document import (
@@ -106,3 +107,291 @@ def test_cyclic_handoffs_and_missing_success_case_fail() -> None:
     )
     with pytest.raises(FactoryInputError, match="success case"):
         parse_factory_input_bytes(missing_case.encode(), logical_name="TO_BE_BUILT.md")
+
+
+@pytest.mark.parametrize("level", (2, 3, 4, 5, 6))
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "Private benchmark cases",
+        "Hidden evaluation fixtures",
+        "Expected outcome answers",
+        "Holdout predicates",
+        "Benchmark outcomes",
+        "Holdout outcome",
+        "Evaluation fixture",
+    ),
+)
+def test_all_nested_reserved_headings_are_rejected_before_section_parsing(
+    level: int,
+    heading: str,
+) -> None:
+    sentinel = "CAPTAIN-NESTED-HELPFUL-PRIVATE-SENTINEL"
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    source = source.replace(
+        "## Helpful resources",
+        f"## Helpful resources\n{'#' * level} {heading}\n{sentinel}",
+    )
+
+    with pytest.raises(FactoryInputError, match="private benchmark cases"):
+        parse_factory_input_bytes(source.encode(), logical_name="TO_BE_BUILT.md")
+
+
+@pytest.mark.parametrize("indent", (" ", "  ", "   "))
+def test_indented_commonmark_private_headings_are_rejected(indent: str) -> None:
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    source = source.replace(
+        "## Helpful resources",
+        f"## Helpful resources\n- Public resource\n{indent}### Hidden evaluation fixtures",
+    )
+
+    with pytest.raises(FactoryInputError, match="private benchmark cases"):
+        parse_factory_input_bytes(source.encode(), logical_name="TO_BE_BUILT.md")
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "Confidential benchmark policy",
+        "Secret holdout policy",
+        "Internal evaluation policy",
+        "Nonpublic benchmark policy",
+    ),
+)
+def test_semantically_hidden_policy_aliases_are_rejected(heading: str) -> None:
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    source += f"\n## {heading}\nCAPTAIN-HIDDEN-POLICY-SENTINEL\n"
+
+    with pytest.raises(FactoryInputError, match="private benchmark cases"):
+        parse_factory_input_bytes(source.encode(), logical_name="TO_BE_BUILT.md")
+
+
+def test_private_heading_alias_matrix_is_rejected_before_parser_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    parser_calls = 0
+    original = input_document_module._level_sections
+
+    def counted_parser(text: str):
+        nonlocal parser_calls
+        parser_calls += 1
+        return original(text)
+
+    monkeypatch.setattr(input_document_module, "_level_sections", counted_parser)
+    for level in range(2, 7):
+        for authority in ("Private", "Confidential", "Hidden"):
+            for semantic in (
+                "expected", "result", "outcome", "answer", "predicate",
+                "benchmark", "holdout", "evaluation", "case", "fixture",
+            ):
+                malformed = source.replace(
+                    "## Helpful resources",
+                    f"## Helpful resources\n{'#' * level} {authority} {semantic}",
+                )
+                with pytest.raises(FactoryInputError, match="private benchmark cases"):
+                    parse_factory_input_bytes(
+                        malformed.encode(), logical_name="TO_BE_BUILT.md",
+                    )
+
+    assert parser_calls == 0
+
+
+def test_every_normalized_privacy_marker_heading_fails_before_parser_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    parser_calls = 0
+    original = input_document_module._level_sections
+
+    def counted_parser(text: str):
+        nonlocal parser_calls
+        parser_calls += 1
+        return original(text)
+
+    monkeypatch.setattr(input_document_module, "_level_sections", counted_parser)
+    markers = (
+        "Private", "Privates", "Hidden", "Hiddens", "Secret", "Secrets",
+        "Confidential", "Confidentials", "Internal", "Internals",
+        "Nonpublic", "Nonpublics", "Non-public", "Ｎｏｎｐｕｂｌｉｃ",
+    )
+    suffixes = ("verdicts", "notes", "appendix", "decisions")
+    for level in range(1, 7):
+        for marker in markers:
+            for suffix in suffixes:
+                malformed = source.replace(
+                    "## Helpful resources",
+                    (
+                        "## Helpful resources\n- Public resource\n"
+                        f"{'#' * level} {marker} {suffix}\nSENTINEL"
+                    ),
+                )
+                with pytest.raises(FactoryInputError, match="private benchmark cases"):
+                    parse_factory_input_bytes(
+                        malformed.encode(), logical_name="TO_BE_BUILT.md",
+                    )
+
+    assert parser_calls == 0
+
+
+@pytest.mark.parametrize("level", range(1, 7))
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "Confidentiality verdicts",
+        "PRIVATELY-maintained notes",
+        "Secretive decisions",
+        "Internally scoped appendix",
+        "Nonpublicly evaluated cases",
+        "hIdDeNs fixtures",
+    ),
+)
+def test_privacy_marker_stem_headings_fail_before_parser_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    level: int,
+    heading: str,
+) -> None:
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    parser_calls = 0
+    original = input_document_module._level_sections
+
+    def counted_parser(text: str):
+        nonlocal parser_calls
+        parser_calls += 1
+        return original(text)
+
+    monkeypatch.setattr(input_document_module, "_level_sections", counted_parser)
+    malformed = source.replace(
+        "## Helpful resources",
+        (
+            "## Helpful resources\n- Public resource\n"
+            f"{'#' * level} {heading}\nSENTINEL"
+        ),
+    )
+
+    with pytest.raises(FactoryInputError, match="private benchmark cases"):
+        parse_factory_input_bytes(
+            malformed.encode(), logical_name="TO_BE_BUILT.md",
+        )
+
+    assert parser_calls == 0
+
+
+@pytest.mark.parametrize("level", range(1, 7))
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "Privacy verdicts",
+        "PRIVACY-verdicts",
+        "Privacies: verdicts",
+        "Secrecy decisions",
+        "sEcReCy-decisions",
+        "Secrecies: decisions",
+    ),
+)
+def test_privacy_and_secrecy_noun_headings_fail_before_parser_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    level: int,
+    heading: str,
+) -> None:
+    sentinel = "CAPTAIN-PRIVACY-NOUN-SENTINEL"
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    parser_calls = 0
+    original = input_document_module._level_sections
+
+    def counted_parser(text: str):
+        nonlocal parser_calls
+        parser_calls += 1
+        return original(text)
+
+    monkeypatch.setattr(input_document_module, "_level_sections", counted_parser)
+    malformed = source.replace(
+        "## Helpful resources",
+        (
+            "## Helpful resources\n- Public resource\n"
+            f"{'#' * level} {heading}\n{sentinel}"
+        ),
+    )
+
+    with pytest.raises(FactoryInputError, match="private benchmark cases"):
+        parse_factory_input_bytes(
+            malformed.encode(), logical_name="TO_BE_BUILT.md",
+        )
+
+    assert parser_calls == 0
+    assert sentinel in malformed
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "Public verdicts", "Customer results", "Release appendix",
+        "Team decisions", "Classification notes", "Secretion controls",
+    ),
+)
+def test_unrelated_public_nested_headings_remain_valid(heading: str) -> None:
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    source = source.replace(
+        "## Helpful resources",
+        f"## Helpful resources\n### {heading}\nPublic content only.",
+    )
+
+    document = parse_factory_input_bytes(source.encode(), logical_name="TO_BE_BUILT.md")
+
+    assert document.title == "Customer Support Triage"
+
+
+@pytest.mark.parametrize(
+    "heading", ("Private benchmark policy", "Private holdout policy"),
+)
+def test_exact_public_policy_heading_is_allowed_only_at_level_two(heading: str) -> None:
+    source = (FIXTURES / "TO_BE_BUILT.valid.md").read_text(encoding="utf-8")
+    source += f"\n## {heading}\nPublic categories and dimensions only.\n"
+    document = parse_factory_input_bytes(source.encode(), logical_name="TO_BE_BUILT.md")
+    assert document.benchmark_policy.public_policy_statement is not None
+
+    for level in (3, 4, 5, 6):
+        nested = source.replace(f"## {heading}", f"{'#' * level} {heading}")
+        with pytest.raises(FactoryInputError, match="private benchmark cases"):
+            parse_factory_input_bytes(nested.encode(), logical_name="TO_BE_BUILT.md")
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "required_tools", "optional_tools"),
+    (
+        (
+            "sales_pipeline_brief/TO_BE_BUILT.md",
+            {"account_snapshot_reader", "opportunity_scoring_rules"},
+            {"industry_signal_reader"},
+        ),
+        (
+            "incident_command/TO_BE_BUILT.md",
+            {"alert_context_reader", "service_dependency_map", "audit_log_query"},
+            {"status_page_draft"},
+        ),
+        (
+            "claims_resolution/TO_BE_BUILT.md",
+            {"policy_lookup", "claim_evidence_reader"},
+            {"ocr_extractor"},
+        ),
+    ),
+)
+def test_tool_policy_is_typed_with_stable_required_and_optional_tools(
+    relative_path: str,
+    required_tools: set[str],
+    optional_tools: set[str],
+) -> None:
+    root = Path(__file__).resolve().parents[2]
+    document = load_factory_input(root / "demo_inputs" / "agent_factory" / relative_path)
+    observed_required = {
+        item.tool_key for item in document.declared_tools if item.requirement == "required"
+    }
+    observed_optional = {
+        item.tool_key for item in document.declared_tools if item.requirement == "optional"
+    }
+    assert observed_required == required_tools
+    assert observed_optional == optional_tools
+    assert all(item.location in {"local", "integration"} for item in document.declared_tools)
+    assert {
+        f"tool_{item.tool_key}" for item in document.declared_tools
+    }.issubset(document.benchmark_policy.source_case_keys)

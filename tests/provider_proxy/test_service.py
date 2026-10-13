@@ -197,6 +197,51 @@ async def test_exact_count_precedes_atomic_reservation_and_caps_output(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_benchmark_call_settles_to_gateway_before_response(tmp_path: Path) -> None:
+    provider, gateway = FakeProvider(input_tokens=1000), FakeGateway()
+    policy, card = _policy(), _card()
+    context = _context(policy=policy, card=card).model_copy(update={
+        "cost_authority_ref": (
+            "gateway://capability-benchmark-authorizations/benchmark"
+        ),
+        "input_id": (
+            "a" * 64 + ":" + str(uuid5(NAMESPACE_URL, "benchmark-run"))
+        ),
+    })
+    proxy = ProviderBudgetProxy(
+        context=context, policy=policy, price_card=card,
+        repository=SQLiteProviderBudgetRepository(tmp_path / "budget.sqlite3"),
+        cas_root=tmp_path / "cas", provider=provider, gateway=gateway,
+        clock=lambda: NOW,
+        provider_binding={
+            "provider_proxy_url": "http://127.0.0.1:8091/v1",
+            "provider_policy_sha256": policy.sha256,
+            "provider_price_card_sha256": card.sha256,
+            "provider_proxy_executable_sha256": "4" * 64,
+            "provider_proxy_code_sha256": "5" * 64,
+            "provider_paid_command_sha256": "6" * 64,
+            "provider_hard_ceiling_enforced": True,
+        },
+    )
+
+    reply = await proxy.create({
+        "model": "gpt-5.6-terra", "input": "build",
+        "reasoning": {"effort": "high"},
+    })
+
+    assert reply.status_code == 200
+    assert len(gateway.settlements) == 1
+    settlement = gateway.settlements[0]
+    assert settlement["command_id"] == str(context.command_id)
+    assert settlement["provider_result_id"] == str(context.result_id)
+    assert settlement["provider_context_sha256"] == context.sha256
+    assert settlement["actual_cost_usd"] == "0.004220"
+    assert settlement["settlement_id"] == str(uuid5(
+        context.command_id, settlement["provider_call_id"]
+    ))
+
+
+@pytest.mark.asyncio
 async def test_rejects_large_input_paid_tools_and_impossible_budget_without_create(tmp_path: Path) -> None:
     provider, gateway = FakeProvider(input_tokens=272000), FakeGateway()
     proxy = _proxy(tmp_path, provider, gateway)

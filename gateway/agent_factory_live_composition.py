@@ -104,7 +104,10 @@ from agenten.agent_factory.team_execution import (
     compose_live_team_execution,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
-from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
+from gateway.agent_factory_dispatch_runner import (
+    GatewayN8nWorkBatchSourcePort,
+    GatewayNextActionLeaseIssuer,
+)
 from gateway.capability_live_pipeline import (
     CapabilityBusinessBenchmarkPort,
     CapabilityFactoryPort,
@@ -140,6 +143,8 @@ class FactoryLiveTeamExecutionPortsProvider(Protocol):
     """Resolve the complete authoritative live port set for one V3 job."""
 
     def __call__(self, job: AgentFactoryJobV3) -> FactoryLiveTeamExecutionPorts: ...
+
+    def candidate_for(self, job: AgentFactoryJobV3) -> ResolvedFactoryCandidate: ...
 
 
 def select_technical_business_holdout(job: AgentFactoryJobV3) -> PrivateHoldoutRef:
@@ -258,7 +263,7 @@ class GatewayTechnicalTeamExecutionPortsProvider:
         )
 
     def __call__(self, job: AgentFactoryJobV3) -> FactoryLiveTeamExecutionPorts:
-        candidate = self._candidate_bindings.candidate_for(job)
+        candidate = self.candidate_for(job)
         if not isinstance(candidate, ResolvedFactoryCandidate):
             raise ValueError("technical team candidate is not resolved")
         holdouts = CaptainTechnicalBusinessHoldoutEvaluator(
@@ -284,6 +289,12 @@ class GatewayTechnicalTeamExecutionPortsProvider:
             clock=self._clock,
             allowed_tools_for=holdouts.allowed_tools_for,
         )
+
+    def candidate_for(self, job: AgentFactoryJobV3) -> ResolvedFactoryCandidate:
+        candidate = self._candidate_bindings.candidate_for(job)
+        if not isinstance(candidate, ResolvedFactoryCandidate):
+            raise ValueError("technical team candidate is not resolved")
+        return candidate
 
 
 class CaptainImprovementAuthorityRequired(FactoryDispatchError):
@@ -433,6 +444,26 @@ class ProductionFactoryTeamExecutionPort(FactoryTeamExecutionPort):
             ]
         )
 
+    def benchmark_authorities(
+        self, job: AgentFactoryJobV3,
+    ) -> tuple[
+        ResolvedFactoryCandidate,
+        FactoryLiveTeamExecutionPorts,
+        FilesystemFactoryEvidenceStore,
+    ]:
+        """Expose the concrete released host graph without creating a new authority."""
+
+        ports = self._ports_for(job)
+        resolver = getattr(self._ports_for, "candidate_for", None)
+        if not isinstance(ports, FactoryLiveTeamExecutionPorts) or not callable(resolver):
+            raise FactoryDispatchError(
+                "benchmark host execution authoritative ports are unavailable"
+            )
+        candidate = resolver(job)
+        if not isinstance(candidate, ResolvedFactoryCandidate):
+            raise FactoryDispatchError("benchmark host candidate is unavailable")
+        return candidate, ports, self._evidence_store
+
     def _adapter(
         self,
         request: FactoryDispatch,
@@ -523,6 +554,9 @@ class AgentFactoryLiveComposition:
     def runtime_operation(self, command_id: UUID):
         return self.repository.runtime_operation(command_id)
 
+    def benchmark_candidate_for(self, job: AgentFactoryJobV3) -> ResolvedFactoryCandidate:
+        return self.candidate_validator.candidate_for(job)
+
     async def run(
         self,
         job_id: UUID,
@@ -540,6 +574,7 @@ class AgentFactoryLiveComposition:
 def compose_agent_factory_live(
     *,
     store: GatewayStore,
+    gateway_repository: GatewayFactoryRepository | None = None,
     forge: MinibookForgePort,
     candidate_bindings: ForgeCandidateBindingPort | None,
     team_execution_ports_for: FactoryLiveTeamExecutionPortsProvider,
@@ -550,6 +585,7 @@ def compose_agent_factory_live(
     hermes_settings: HermesCliSettings,
     clock: Callable[[], datetime],
     n8n_work_batches: Mapping[UUID, str] | None = None,
+    n8n_work_batch_source: GatewayN8nWorkBatchSourcePort | None = None,
     holdout_selector: Callable[[AgentFactoryJobV3], PrivateHoldoutRef] | None = None,
     improvements: FactoryImprovementAuthorizationPort | None = None,
     runtime_retries: FactoryRuntimeRetryAuthorizationPort | None = None,
@@ -571,7 +607,17 @@ def compose_agent_factory_live(
     if not callable(clock):
         raise ValueError("Factory live clock is required")
 
-    repository = GatewayFactoryRepository(
+    if gateway_repository is not None and (
+        type(gateway_repository) is not GatewayFactoryRepository
+        or getattr(gateway_repository, "_store", None) is not store
+        or (
+            runtime_retries is not None
+            and getattr(gateway_repository, "_runtime_retries", None)
+            is not runtime_retries
+        )
+    ):
+        raise ValueError("Factory Gateway repository authority is mismatched")
+    repository = gateway_repository or GatewayFactoryRepository(
         store,
         runtime_retries=runtime_retries,
     )
@@ -580,6 +626,7 @@ def compose_agent_factory_live(
         store=store,
         workspace_namespace=workspace_namespace,
         n8n_work_batches=n8n_work_batches,
+        n8n_work_batch_source=n8n_work_batch_source,
     )
     evidence_store = FilesystemFactoryEvidenceStore(Path(evidence_root))
     hermes = HermesCliFactory(

@@ -84,6 +84,46 @@ def isolated_projection_api(
         yield http, client, minibook_main
 
 
+def test_projector_health_and_assembly_evidence_are_identity_bound_and_immutable(
+    isolated_projection_api: tuple[TestClient, MinibookClient, Any],
+) -> None:
+    http, _, _ = isolated_projection_api
+    headers = {"Authorization": f"Bearer {PROJECTION_API_KEY}"}
+    assembly_id = uuid4()
+    evidence = {
+        "schema": "captain.capability-live-demo-evidence.v1",
+        "run_id": str(assembly_id),
+        "status": "ready_to_use",
+    }
+
+    assert http.get("/api/v1/projection-health").status_code == 403
+    health = http.get("/api/v1/projection-health", headers=headers)
+    first = http.put(
+        f"/api/v1/projection-assemblies/{assembly_id}/evidence",
+        headers=headers,
+        json=evidence,
+    )
+    readback = http.get(
+        f"/api/v1/projection-assemblies/{assembly_id}/evidence",
+        headers=headers,
+    )
+    conflict = http.put(
+        f"/api/v1/projection-assemblies/{assembly_id}/evidence",
+        headers=headers,
+        json={**evidence, "status": "changed"},
+    )
+
+    assert health.json() == {
+        "schema": "minibook.captain-projector-health.v1",
+        "status": "ready",
+        "project_id": PROJECTION_PROJECT_ID,
+        "service_agent_id": "captain-projection-service-v2",
+    }
+    assert first.status_code == 200
+    assert readback.json() == evidence
+    assert conflict.status_code == 409
+
+
 def _event() -> MinibookProjectionEvent:
     import json
 
@@ -891,6 +931,7 @@ def test_mutating_route_inventory_requires_reserved_project_classification() -> 
         "upsert_projection_project",
         "upsert_projection_post",
         "retire_projection_post",
+        "put_projection_assembly_evidence",
     }
     identity_guarded = {
         "register_agent": "_forbid_reserved_projection_service_name",

@@ -10,9 +10,15 @@ from decimal import Decimal
 from enum import Enum
 from typing import Literal, Protocol
 from uuid import UUID
+
+from pydantic import SecretStr
 from uuid import uuid4
 
 from agenten.agent_factory.capability_live_runner import CapabilityLiveStage
+from agenten.agent_factory.candidate_evaluation import (
+    FactoryCandidateEvaluator,
+    ResolvedFactoryCandidate,
+)
 from agenten.agent_factory.input_contracts import (
     BUSINESS_BENCHMARK_PREDICATE_KINDS,
     HANDOFF_BENCHMARK_PREDICATE_KINDS,
@@ -20,6 +26,9 @@ from agenten.agent_factory.input_contracts import (
     SAFETY_BENCHMARK_PREDICATE_KINDS,
     TOOL_BENCHMARK_PREDICATE_KINDS,
     BenchmarkExpectedPredicate,
+    BenchmarkSourceAuthorityType,
+    benchmark_predicate_authority_type,
+    benchmark_source_supports_authority,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.capability_assembly_contracts import (
@@ -41,6 +50,23 @@ class GenericBenchmarkCategory(str, Enum):
 
 
 @dataclass(frozen=True)
+class GenericBoundPredicateSource:
+    source_case_key: str
+    assertion_id: str
+    assertion_sha256: str
+    assertion_kind: str
+    source_path: tuple[str, ...]
+    observable_expected: str
+
+
+@dataclass(frozen=True)
+class GenericPredicateSourceBinding:
+    predicate_key: str
+    authority_type: BenchmarkSourceAuthorityType
+    sources: tuple[GenericBoundPredicateSource, ...]
+
+
+@dataclass(frozen=True)
 class GenericPrivateCaseDefinition:
     category: GenericBenchmarkCategory
     assertion_ids: tuple[str, ...]
@@ -48,6 +74,8 @@ class GenericPrivateCaseDefinition:
     setup: str
     action: str
     expected_predicates: tuple[BenchmarkExpectedPredicate, ...]
+    declared_tool_keys: tuple[str, ...] = ()
+    predicate_source_bindings: tuple[GenericPredicateSourceBinding, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -56,12 +84,16 @@ class GenericExecutionCaseView:
     setup: str
     action: str
     opaque_source_refs: tuple[str, ...]
+    declared_tool_keys: tuple[str, ...]
+    tool_authority_sha256: str
 
 
 @dataclass(frozen=True)
 class GenericEvaluationCaseView:
     case_ref: "GenericPrivateCaseRef"
     expected_predicates: tuple[BenchmarkExpectedPredicate, ...]
+    declared_tool_keys: tuple[str, ...]
+    predicate_source_bindings: tuple[GenericPredicateSourceBinding, ...]
 
 
 @dataclass(frozen=True)
@@ -87,7 +119,42 @@ class GenericToolCallEvidence:
 
 
 @dataclass(frozen=True)
+class GenericAuthorizedToolCall:
+    tool_key: str
+    operation: str
+    call_id: str
+    lease_id: str
+    call_ref: ArtifactRef
+    lease_ref: ArtifactRef
+    scoped_token: SecretStr
+
+
+@dataclass(frozen=True)
+class GenericBenchmarkExecutionPlan:
+    """Public, content-addressed authority for one fair team/baseline pair."""
+
+    candidate_ref: ArtifactRef
+    candidate_manifest_ref: ArtifactRef
+    team_manifest_ref: ArtifactRef
+    baseline_policy_ref: ArtifactRef
+    model_ref: ArtifactRef
+    execution_policy_ref: ArtifactRef
+    team_agent_names: tuple[str, ...]
+    baseline_agent_name: str
+
+    def __post_init__(self) -> None:
+        if (
+            len(self.team_agent_names) < 2
+            or len(self.team_agent_names) != len(set(self.team_agent_names))
+            or not self.baseline_agent_name
+            or self.baseline_agent_name in self.team_agent_names
+        ):
+            raise ValueError("benchmark execution plan topology is invalid")
+
+
+@dataclass(frozen=True)
 class BenchmarkToolEvidenceVerificationRequest:
+    job_id: UUID
     case_ref: GenericPrivateCaseRef
     tool_key: str
     call_ref: ArtifactRef
@@ -130,6 +197,7 @@ class GenericBenchmarkExecutionRequest:
     model_id: str
     model_policy_digest: str
     execution_case: GenericExecutionCaseView
+    execution_plan: GenericBenchmarkExecutionPlan
     request_nonce: UUID
     request_digest: str
 
@@ -175,6 +243,7 @@ class GenericBenchmarkCaseReceipt:
     case_id: str
     category: GenericBenchmarkCategory
     case_digest: str
+    assertion_ids: tuple[str, ...]
     team_trace_id: UUID
     team_run_id: UUID
     baseline_trace_id: UUID
@@ -293,6 +362,15 @@ class GenericPrivateBenchmarkRepository:
             "assertion_ids": definition.assertion_ids,
             "setup": definition.setup,
             "action": definition.action,
+            "declared_tool_keys": definition.declared_tool_keys,
+            "predicate_source_bindings": [
+                {
+                    "predicate_key": binding.predicate_key,
+                    "authority_type": binding.authority_type,
+                    "sources": [source.__dict__ for source in binding.sources],
+                }
+                for binding in definition.predicate_source_bindings
+            ],
             "expected_predicates": sorted([
                 {
                     "kind": item.kind,
@@ -366,6 +444,9 @@ class GenericPrivateBenchmarkRepository:
         if definition is None or self._reference(definition) != case_ref:
             raise CapabilityLiveAuthorityUnavailable("private case reference is stale")
         if purpose == "execution":
+            tool_authority_sha256 = hashlib.sha256(
+                _canonical(list(definition.declared_tool_keys)).encode()
+            ).hexdigest()
             return GenericExecutionCaseView(
                 case_ref=case_ref,
                 setup=definition.setup,
@@ -374,11 +455,41 @@ class GenericPrivateBenchmarkRepository:
                     hashlib.sha256(item.encode()).hexdigest()
                     for item in definition.assertion_ids
                 ),
+                declared_tool_keys=definition.declared_tool_keys,
+                tool_authority_sha256=tool_authority_sha256,
             )
         return GenericEvaluationCaseView(
             case_ref=case_ref,
             expected_predicates=definition.expected_predicates,
+            declared_tool_keys=definition.declared_tool_keys,
+            predicate_source_bindings=definition.predicate_source_bindings,
         )
+
+    def resolve_execution_transport(
+        self, case_ref: GenericPrivateCaseRef, *, authority_id: UUID,
+    ) -> tuple[GenericPrivateCaseRef, GenericExecutionCaseView]:
+        """Restore private assertion identity from the opaque transport key only."""
+
+        self._require_purpose_authority("execution", authority_id)
+        definition = self._definitions.get(case_ref.case_id)
+        if definition is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "private execution case is unavailable"
+            )
+        canonical = self._reference(definition)
+        if (
+            canonical.case_id != case_ref.case_id
+            or canonical.category is not case_ref.category
+            or canonical.case_digest != case_ref.case_digest
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "private execution case identity changed"
+            )
+        view = self.resolve(
+            canonical, purpose="execution", authority_id=authority_id,
+        )
+        assert isinstance(view, GenericExecutionCaseView)
+        return canonical, view
 
     def retire(self, suite: GenericBenchmarkSuite) -> None:
         retired_ids = {case_ref.case_id for case_ref in suite.cases}
@@ -452,6 +563,9 @@ class RuleBasedCapabilityBenchmarkEvaluator:
             request.case_ref, purpose="evaluation", authority_id=self.authority_id
         )
         assert isinstance(case, GenericEvaluationCaseView)
+        _validate_predicate_source_authority(
+            case.expected_predicates, case.predicate_source_bindings,
+        )
         outcome = self._json_evidence(request.execution.outcome_ref, "captain.capability-benchmark-outcome.v1")
         rationale = self._json_evidence(request.execution.rationale_ref, "captain.capability-benchmark-rationale.v1")
         execution = request.execution
@@ -500,6 +614,7 @@ class RuleBasedCapabilityBenchmarkEvaluator:
             try:
                 tool_validity[tool.tool_key] = self._tool_authority.verify(
                     BenchmarkToolEvidenceVerificationRequest(
+                        job_id=request.job_id,
                         case_ref=request.case_ref,
                         tool_key=tool.tool_key,
                         call_ref=tool.call_ref,
@@ -521,6 +636,7 @@ class RuleBasedCapabilityBenchmarkEvaluator:
                 handoffs=handoffs,
                 tool_validity=tool_validity,
                 rationale=rationale["text"],
+                declared_tool_keys=case.declared_tool_keys,
             )
             for predicate in case.expected_predicates
         )
@@ -716,9 +832,21 @@ class GenericCapabilityBenchmarkAdapter:
                                     job: object, case: GenericPrivateCaseRef,
                                     model_id: str,
                                     policy_digest: str) -> GenericBenchmarkPair:
+        execution_plan = self._execution_plan(request, job, model_id, policy_digest)
+        registry = getattr(self._executor, "tool_registry", None)
+        if registry is not None:
+            try:
+                registry.require_declared(tuple(
+                    item.tool_key for item in request.input.document.declared_tools
+                ))
+            except Exception:
+                raise CapabilityLiveAuthorityUnavailable(
+                    "declared generic tool adapter is unavailable"
+                ) from None
         common = dict(job_id=job.job_id, capability_id=job.required_capability,
                       input_ref=request.input.source_ref, case_ref=case,
-                      model_id=model_id, model_policy_digest=policy_digest)
+                      model_id=model_id, model_policy_digest=policy_digest,
+                      execution_plan=execution_plan)
         team_request = self._execution_request(
             authority_id=self._executor.authority_id,
             team_kind="team", **common,
@@ -745,6 +873,76 @@ class GenericCapabilityBenchmarkAdapter:
         _require_evaluation(baseline_eval, baseline)
         return GenericBenchmarkPair(case, team, baseline, team_eval, baseline_eval)
 
+    def _execution_plan(
+        self, request: CapabilityAssemblyStageRequest, job: object,
+        model_id: str, policy_digest: str,
+    ) -> GenericBenchmarkExecutionPlan:
+        direct = getattr(self._bindings, "benchmark_execution_plan", None)
+        if callable(direct):
+            plan = direct(request, model_id, policy_digest)
+            if isinstance(plan, GenericBenchmarkExecutionPlan):
+                return plan
+        resolver = getattr(self._bindings, "benchmark_candidate_for", None)
+        if not callable(resolver):
+            raise CapabilityLiveAuthorityUnavailable(
+                "released benchmark candidate authority is unavailable"
+            )
+        candidate = resolver(request)
+        if not isinstance(candidate, ResolvedFactoryCandidate):
+            raise CapabilityLiveAuthorityUnavailable(
+                "released benchmark candidate authority is invalid"
+            )
+        try:
+            execution_policy_sha256 = hashlib.sha256(_canonical(
+                job.execution_policy.model_dump(mode="json", by_alias=True)
+            ).encode()).hexdigest()
+            with FactoryCandidateEvaluator().verified_team_workspace(candidate) as (_, manifest):
+                names = tuple(agent.name for agent in manifest.agents)
+                if len(names) < 2:
+                    raise ValueError("team")
+                baseline_name = "captain_baseline"
+                baseline_ref = self._evidence.record_evaluation(_canonical({
+                    "schema": "captain.generic-benchmark-baseline-policy.v1",
+                    "candidate_ref": candidate.candidate.source_archive_ref.model_dump(mode="json"),
+                    "source_agent": names[0],
+                    "agent_name": baseline_name,
+                    "system_prompt_ref": manifest.agents[0].system_prompt_ref.model_dump(mode="json"),
+                    "model_id": model_id,
+                    "model_policy_digest": policy_digest,
+                    "execution_policy_sha256": execution_policy_sha256,
+                    "allowed_tools": list(request.input.document.declared_tools),
+                    "conversation_pattern": "single_agent",
+                    "max_messages": manifest.max_messages,
+                    "max_tool_calls": manifest.max_tool_calls,
+                    "max_handoffs": 0,
+                }).encode())
+                model_ref = self._evidence.record_evaluation(_canonical({
+                    "schema": "captain.generic-benchmark-model.v1",
+                    "model_id": model_id,
+                }).encode())
+                policy_ref = self._evidence.record_evaluation(_canonical({
+                    "schema": "captain.generic-benchmark-execution-policy.v1",
+                    "model_policy_digest": policy_digest,
+                    "execution_policy_sha256": execution_policy_sha256,
+                }).encode())
+                candidate_manifest_ref = self._evidence.record_evaluation(
+                    candidate.candidate.model_dump_json(by_alias=True).encode()
+                )
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "released benchmark execution plan is unavailable"
+            ) from None
+        return GenericBenchmarkExecutionPlan(
+            candidate_ref=candidate.candidate.source_archive_ref,
+            candidate_manifest_ref=candidate_manifest_ref,
+            team_manifest_ref=candidate.candidate.team_manifest.reference,
+            baseline_policy_ref=baseline_ref,
+            model_ref=model_ref,
+            execution_policy_ref=policy_ref,
+            team_agent_names=names,
+            baseline_agent_name=baseline_name,
+        )
+
     def _execution_request(
         self, *, authority_id: UUID, team_kind: Literal["team", "single_agent"],
         **common: object,
@@ -762,6 +960,7 @@ class GenericCapabilityBenchmarkAdapter:
             team_kind=team_kind, model_id=common["model_id"],
             model_policy_digest=common["model_policy_digest"],
             execution_case=execution_case, request_nonce=nonce,
+            execution_plan=common["execution_plan"],
         )
         execution_case = self._private_cases.issue_execution(
             case_ref, authority_id=authority_id,
@@ -792,6 +991,12 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
                                   private_cases: GenericPrivateBenchmarkRepository) -> GenericBenchmarkSuite:
     spec = input.compiled_specification
     holdouts = spec.private_holdout_refs
+    public_declared_tool_keys = tuple(sorted(
+        item.tool_key for item in input.document.declared_tools
+    ))
+    assertions_by_id = {
+        assertion.assertion_id: assertion for assertion in spec.assertions
+    }
     if len(holdouts) != 15:
         raise CapabilityLiveAuthorityUnavailable(
             "private benchmark requires exactly fifteen explicit compiler holdouts"
@@ -805,13 +1010,15 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
             raise CapabilityLiveAuthorityUnavailable("structured private holdout is invalid") from None
         required = {
             "case_key", "category", "observable_setup", "observable_action",
-            "source_assertion_ids", "expected_predicates",
+            "source_assertion_ids", "predicate_source_bindings",
+            "declared_tool_keys", "expected_predicates",
         }
         if not isinstance(payload, dict) or set(payload) != required:
             raise CapabilityLiveAuthorityUnavailable("structured private holdout is invalid")
         try:
             category = GenericBenchmarkCategory(payload["category"])
             assertion_ids = tuple(payload["source_assertion_ids"])
+            declared_tool_keys = tuple(payload["declared_tool_keys"])
             predicates = tuple(
                 BenchmarkExpectedPredicate.model_validate(item)
                 for item in payload["expected_predicates"]
@@ -825,10 +1032,28 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
                 or not isinstance(payload["observable_action"], str)
                 or not assertion_ids
                 or not set(assertion_ids).issubset(set(spec.assertion_ids))
+                or not isinstance(payload["declared_tool_keys"], list)
+                or not declared_tool_keys
+                or len(declared_tool_keys) != len(set(declared_tool_keys))
+                or declared_tool_keys != public_declared_tool_keys
+                or any(
+                    not isinstance(item, str)
+                    or re.fullmatch(r"[a-z][a-z0-9_]*", item) is None
+                    for item in declared_tool_keys
+                )
                 or not predicates):
             raise CapabilityLiveAuthorityUnavailable(
                 "explicit private benchmark binding is invalid"
             )
+        predicate_source_bindings = _parse_predicate_source_bindings(
+            payload["predicate_source_bindings"],
+            predicates=predicates,
+            assertions_by_id=assertions_by_id,
+            aggregate_assertion_ids=assertion_ids,
+        )
+        _validate_predicate_source_authority(
+            predicates, predicate_source_bindings,
+        )
         definitions.append(GenericPrivateCaseDefinition(
             category=category,
             assertion_ids=assertion_ids,
@@ -836,6 +1061,8 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
             setup=payload["observable_setup"],
             action=payload["observable_action"],
             expected_predicates=predicates,
+            declared_tool_keys=declared_tool_keys,
+            predicate_source_bindings=predicate_source_bindings,
         ))
     counts = {category: sum(item.category is category for item in definitions)
               for category in GenericBenchmarkCategory}
@@ -857,6 +1084,194 @@ def build_generic_benchmark_suite(input: CapabilityAssemblyCanonicalInput,
                     media_type="application/json"), cases)
 
 
+def _parse_predicate_source_bindings(
+    value: object,
+    *,
+    predicates: tuple[BenchmarkExpectedPredicate, ...],
+    assertions_by_id: dict[str, object],
+    aggregate_assertion_ids: tuple[str, ...],
+) -> tuple[GenericPredicateSourceBinding, ...]:
+    if not isinstance(value, list):
+        raise CapabilityLiveAuthorityUnavailable(
+            "private benchmark predicate source binding is invalid"
+        )
+    bindings: list[GenericPredicateSourceBinding] = []
+    for raw_binding in value:
+        if (
+            not isinstance(raw_binding, dict)
+            or set(raw_binding) != {
+                "predicate_key", "authority_type", "sources",
+            }
+            or not isinstance(raw_binding.get("predicate_key"), str)
+            or not isinstance(raw_binding.get("authority_type"), str)
+            or not isinstance(raw_binding.get("sources"), list)
+            or not raw_binding["sources"]
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "private benchmark predicate source binding is invalid"
+            )
+        sources: list[GenericBoundPredicateSource] = []
+        for raw_source in raw_binding["sources"]:
+            if (
+                not isinstance(raw_source, dict)
+                or set(raw_source) != {
+                    "source_case_key", "assertion_id", "assertion_sha256",
+                }
+                or not all(
+                    isinstance(raw_source.get(key), str)
+                    for key in (
+                        "source_case_key", "assertion_id", "assertion_sha256",
+                    )
+                )
+                or re.fullmatch(r"[0-9a-f]{64}", raw_source["assertion_sha256"])
+                is None
+            ):
+                raise CapabilityLiveAuthorityUnavailable(
+                    "private benchmark predicate source binding is invalid"
+                )
+            assertion = assertions_by_id.get(raw_source["assertion_id"])
+            if (
+                assertion is None
+                or not hasattr(assertion, "source_path")
+                or not hasattr(assertion, "kind")
+                or not hasattr(assertion, "observable_expected")
+                or assertion.source_path[-1] != raw_source["source_case_key"]
+                or _generic_assertion_sha256(assertion)
+                != raw_source["assertion_sha256"]
+            ):
+                raise CapabilityLiveAuthorityUnavailable(
+                    "private benchmark predicate source binding is invalid"
+                )
+            sources.append(GenericBoundPredicateSource(
+                source_case_key=raw_source["source_case_key"],
+                assertion_id=raw_source["assertion_id"],
+                assertion_sha256=raw_source["assertion_sha256"],
+                assertion_kind=assertion.kind,
+                source_path=assertion.source_path,
+                observable_expected=assertion.observable_expected,
+            ))
+        try:
+            expected_authority_type = benchmark_predicate_authority_type(
+                predicates[len(bindings)].kind,
+            )
+        except (IndexError, ValueError):
+            raise CapabilityLiveAuthorityUnavailable(
+                "private benchmark predicate source binding is invalid"
+            ) from None
+        if raw_binding["authority_type"] != expected_authority_type:
+            raise CapabilityLiveAuthorityUnavailable(
+                "private benchmark predicate source binding is invalid"
+            )
+        bindings.append(GenericPredicateSourceBinding(
+            predicate_key=raw_binding["predicate_key"],
+            authority_type=expected_authority_type,
+            sources=tuple(sources),
+        ))
+    predicate_keys = tuple(item.predicate_key for item in predicates)
+    binding_keys = tuple(item.predicate_key for item in bindings)
+    bound_assertion_ids = tuple(dict.fromkeys(
+        source.assertion_id for binding in bindings for source in binding.sources
+    ))
+    if (
+        binding_keys != predicate_keys
+        or len(binding_keys) != len(set(binding_keys))
+        or bound_assertion_ids != aggregate_assertion_ids
+    ):
+        raise CapabilityLiveAuthorityUnavailable(
+            "private benchmark predicate source binding is invalid"
+        )
+    return tuple(bindings)
+
+
+def _generic_assertion_sha256(assertion: object) -> str:
+    return hashlib.sha256(
+        _canonical(assertion.model_dump(mode="json")).encode()
+    ).hexdigest()
+
+
+def _validate_predicate_source_authority(
+    predicates: tuple[BenchmarkExpectedPredicate, ...],
+    bindings: tuple[GenericPredicateSourceBinding, ...],
+) -> None:
+    if tuple(item.predicate_key for item in predicates) != tuple(
+        item.predicate_key for item in bindings
+    ):
+        raise CapabilityLiveAuthorityUnavailable(
+            "private benchmark predicate source binding is invalid"
+        )
+    for predicate, binding in zip(predicates, bindings, strict=True):
+        sources = binding.sources
+        authority_type = benchmark_predicate_authority_type(predicate.kind)
+        if (
+            not sources
+            or binding.authority_type != authority_type
+            or tuple(item.source_case_key for item in sources)
+            != predicate.source_case_keys
+            or any(
+                not benchmark_source_supports_authority(
+                    authority_type,
+                    assertion_kind=item.assertion_kind,
+                    source_path=item.source_path,
+                    observable_expected=item.observable_expected,
+                )
+                for item in sources
+            )
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "private benchmark predicate source binding is invalid"
+            )
+        expected = predicate.expected_value
+        source_expected = tuple(item.observable_expected for item in sources)
+        valid = False
+        if predicate.kind in {"observation_equals", "observation_contains"}:
+            valid = (
+                predicate.observed_key == "business_outcome"
+                and isinstance(expected, str)
+                and expected in source_expected
+            )
+        elif predicate.kind == "rationale_contains":
+            valid = (
+                predicate.observed_key == "business_outcome"
+                and isinstance(expected, str)
+                and expected in source_expected
+            )
+        elif predicate.kind == "forbidden_tool_absent":
+            valid = (
+                predicate.observed_key == "declared_tools"
+                and expected is True
+                and all(item.assertion_kind == "security" for item in sources)
+                and any(
+                    marker in item.observable_expected.casefold()
+                    for item in sources
+                    for marker in (
+                        "tool lease", "integration lease",
+                        "released team manifest",
+                    )
+                )
+            )
+        elif predicate.kind == "tool_receipt":
+            valid = (
+                len(sources) == 1
+                and predicate.observed_key
+                == sources[0].source_case_key.removeprefix("tool_")
+                and sources[0].source_path[0] == "Tool policy"
+                and expected is True
+            )
+        elif predicate.kind == "handoff_event":
+            valid = (
+                predicate.observed_key == "to_agent"
+                and isinstance(expected, str)
+                and any(
+                    expected.casefold() in item.observable_expected.casefold()
+                    for item in sources
+                )
+            )
+        if not valid:
+            raise CapabilityLiveAuthorityUnavailable(
+                "private benchmark predicate source binding is invalid"
+            )
+
+
 def _evaluate_predicate(
     predicate: BenchmarkExpectedPredicate,
     *,
@@ -864,6 +1279,7 @@ def _evaluate_predicate(
     handoffs: tuple[dict[str, object], ...],
     tool_validity: dict[str, bool],
     rationale: str,
+    declared_tool_keys: tuple[str, ...],
 ) -> bool:
     expected = predicate.expected_value
     if predicate.kind == "observation_equals":
@@ -877,9 +1293,12 @@ def _evaluate_predicate(
     if predicate.kind == "tool_receipt":
         return isinstance(expected, bool) and tool_validity.get(predicate.observed_key, False) == expected
     if predicate.kind == "rationale_contains":
-        return isinstance(expected, str) and expected in rationale
+        if not isinstance(expected, str):
+            return False
+        observed = observations.get(predicate.observed_key)
+        return expected in str(observed if observed is not None else "") and expected in rationale
     if predicate.kind == "forbidden_tool_absent":
-        return predicate.observed_key not in tool_validity
+        return set(tool_validity).issubset(set(declared_tool_keys))
     raise CapabilityLiveAuthorityUnavailable("unsupported benchmark predicate")
 
 
@@ -958,6 +1377,7 @@ def generic_execution_request_digest(
     *, job_id: object, capability_id: object, input_ref: object,
     case_ref: GenericPrivateCaseRef, team_kind: object, model_id: object,
     model_policy_digest: object, execution_case: GenericExecutionCaseView,
+    execution_plan: GenericBenchmarkExecutionPlan,
     request_nonce: UUID,
 ) -> str:
     payload = {
@@ -980,6 +1400,18 @@ def generic_execution_request_digest(
             "setup": execution_case.setup,
             "action": execution_case.action,
             "opaque_source_refs": execution_case.opaque_source_refs,
+            "declared_tool_keys": execution_case.declared_tool_keys,
+            "tool_authority_sha256": execution_case.tool_authority_sha256,
+        },
+        "execution_plan": {
+            "candidate_ref": execution_plan.candidate_ref.model_dump(mode="json"),
+            "candidate_manifest_ref": execution_plan.candidate_manifest_ref.model_dump(mode="json"),
+            "team_manifest_ref": execution_plan.team_manifest_ref.model_dump(mode="json"),
+            "baseline_policy_ref": execution_plan.baseline_policy_ref.model_dump(mode="json"),
+            "model_ref": execution_plan.model_ref.model_dump(mode="json"),
+            "execution_policy_ref": execution_plan.execution_policy_ref.model_dump(mode="json"),
+            "team_agent_names": execution_plan.team_agent_names,
+            "baseline_agent_name": execution_plan.baseline_agent_name,
         },
         "request_nonce": str(request_nonce),
     }
@@ -1007,6 +1439,7 @@ def _require_evaluation(value: IndependentBenchmarkOutcome,
 def _case_receipt(pair: GenericBenchmarkPair) -> GenericBenchmarkCaseReceipt:
     return GenericBenchmarkCaseReceipt(
         pair.case_ref.case_id, pair.case_ref.category, pair.case_ref.case_digest,
+        pair.case_ref.assertion_ids,
         pair.team.trace_id, pair.team.run_id, pair.baseline.trace_id, pair.baseline.run_id,
         pair.team_evaluation.evaluation_ref, pair.baseline_evaluation.evaluation_ref)
 

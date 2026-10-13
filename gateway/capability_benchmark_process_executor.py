@@ -113,11 +113,13 @@ class GatewayIsolatedBenchmarkExecutorClient:
     __slots__ = (
         "gateway_store", "authority_id", "_endpoint", "_transport", "_sealed",
         "_allowed_hosts", "_configuration_digest",
+        "tool_registry",
     )
 
     def __init__(self, *, gateway_store: object, authority_id: UUID,
                  endpoint: str, transport: CapabilityBenchmarkProcessTransport,
-                 allowed_hosts: tuple[str, ...] = ()) -> None:
+                 allowed_hosts: tuple[str, ...] = (),
+                 tool_registry: object | None = None) -> None:
         parsed = urlsplit(endpoint)
         if (parsed.scheme not in {"http", "https"} or not parsed.netloc
                 or parsed.username is not None or parsed.password is not None
@@ -139,6 +141,7 @@ class GatewayIsolatedBenchmarkExecutorClient:
         object.__setattr__(self, "_endpoint", endpoint)
         object.__setattr__(self, "_transport", transport)
         object.__setattr__(self, "_allowed_hosts", normalized_allowed)
+        object.__setattr__(self, "tool_registry", tool_registry)
         object.__setattr__(self, "_configuration_digest", self._binding_digest())
         object.__setattr__(self, "_sealed", True)
 
@@ -169,6 +172,7 @@ class GatewayIsolatedBenchmarkExecutorClient:
             "authority_id": str(self.authority_id),
             "allowed_hosts": self._allowed_hosts,
             "transport_digest": transport_digest,
+            "tool_registry_digest": getattr(self.tool_registry, "digest", None),
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def __repr__(self) -> str:
@@ -190,6 +194,7 @@ class GatewayIsolatedBenchmarkExecutorClient:
             team_kind=request.team_kind, model_id=request.model_id,
             model_policy_digest=request.model_policy_digest,
             execution_case=request.execution_case,
+            execution_plan=request.execution_plan,
             request_nonce=request.request_nonce,
         )
         if expected_digest != request.request_digest:
@@ -213,6 +218,20 @@ class GatewayIsolatedBenchmarkExecutorClient:
                 "setup": request.execution_case.setup,
                 "action": request.execution_case.action,
                 "opaque_source_refs": request.execution_case.opaque_source_refs,
+                "declared_tool_keys": request.execution_case.declared_tool_keys,
+                "tool_authority_sha256": (
+                    request.execution_case.tool_authority_sha256
+                ),
+            },
+            "execution_plan": {
+                "candidate_ref": request.execution_plan.candidate_ref.model_dump(mode="json"),
+                "candidate_manifest_ref": request.execution_plan.candidate_manifest_ref.model_dump(mode="json"),
+                "team_manifest_ref": request.execution_plan.team_manifest_ref.model_dump(mode="json"),
+                "baseline_policy_ref": request.execution_plan.baseline_policy_ref.model_dump(mode="json"),
+                "model_ref": request.execution_plan.model_ref.model_dump(mode="json"),
+                "execution_policy_ref": request.execution_plan.execution_policy_ref.model_dump(mode="json"),
+                "team_agent_names": request.execution_plan.team_agent_names,
+                "baseline_agent_name": request.execution_plan.baseline_agent_name,
             },
             "request_nonce": str(request.request_nonce),
             "request_digest": request.request_digest,

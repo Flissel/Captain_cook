@@ -42,6 +42,16 @@ PRICING = RuntimeUsagePricingSnapshotV1(
     effective_at=NOW,
     expires_at=NOW + timedelta(days=1),
 )
+PROVIDER_BINDING = {
+    "provider_proxy_url": "http://127.0.0.1:18091/v1",
+    "provider_policy_sha256": "1" * 64,
+    "provider_price_card_sha256": "2" * 64,
+    "provider_context_sha256": "3" * 64,
+    "provider_proxy_executable_sha256": "4" * 64,
+    "provider_proxy_code_sha256": "5" * 64,
+    "provider_paid_command_sha256": "6" * 64,
+    "provider_hard_ceiling_enforced": True,
+}
 FIXTURE = (
     Path(__file__).parents[1]
     / "fixtures"
@@ -87,6 +97,11 @@ def resume_command_with_cost(*, ceiling: str = "0.75") -> AgentRuntimeCommand:
             "cost_input_id": "input-one",
             "cost_capability_id": "claims-capability",
             "cost_capability_version": 3,
+            **PROVIDER_BINDING,
+            "provider_session_id": "resume-session",
+            "provider_result_id": str(
+                uuid5(UUID(value["event_id"]), "captain.runtime-result")
+            ),
         }
     )
     return AgentRuntimeCommand.model_validate(value)
@@ -299,18 +314,20 @@ class FakeCostAuthority:
         expired: bool = False,
         hard_ceiling_enforced: bool = True,
         metering_mode: str = "provider_usage_receipt",
+        authority_updates: dict[str, object] | None = None,
     ) -> None:
         self.ceiling_usd = ceiling_usd
         self.disposition = disposition
         self.expired = expired
         self.hard_ceiling_enforced = hard_ceiling_enforced
         self.metering_mode = metering_mode
+        self.authority_updates = dict(authority_updates or {})
         self.authorize_calls = 0
         self.settle_calls = 0
 
     async def authorize(self, command: AgentRuntimeCommand):
         self.authorize_calls += 1
-        return RuntimeResumeCostAuthorityV1(
+        values = dict(
             schema_name="captain.runtime-resume-cost-authority.v1",
             authorization_receipt_id=uuid5(NAMESPACE_URL, "authority-one"),
             cost_authority_ref=command.payload.cost_authority_ref,
@@ -326,7 +343,20 @@ class FakeCostAuthority:
             expires_at=(NOW - timedelta(seconds=1) if self.expired else NOW + timedelta(hours=1)),
             hard_ceiling_enforced=self.hard_ceiling_enforced,
             metering_mode=self.metering_mode,
+            provider_proxy_url=command.payload.provider_proxy_url,
+            provider_policy_sha256=command.payload.provider_policy_sha256,
+            provider_price_card_sha256=command.payload.provider_price_card_sha256,
+            provider_context_sha256=command.payload.provider_context_sha256,
+            provider_proxy_executable_sha256=(
+                command.payload.provider_proxy_executable_sha256
+            ),
+            provider_proxy_code_sha256=command.payload.provider_proxy_code_sha256,
+            provider_paid_command_sha256=command.payload.provider_paid_command_sha256,
+            provider_session_id="resume-session",
+            provider_result_id=command.payload.provider_result_id,
         )
+        values.update(self.authority_updates)
+        return RuntimeResumeCostAuthorityV1.model_validate(values)
 
     async def settle(self, command, result, authority):
         self.settle_calls += 1
@@ -555,6 +585,38 @@ async def test_unusable_resume_cost_authority_stops_before_codex_effect(
         ).execute(command)
 
     assert codex.calls == []
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("provider_proxy_url", "http://127.0.0.1:18092/v1"),
+        ("provider_policy_sha256", "a" * 64),
+        ("provider_price_card_sha256", "b" * 64),
+        ("provider_context_sha256", "c" * 64),
+        ("provider_proxy_executable_sha256", "d" * 64),
+        ("provider_proxy_code_sha256", "e" * 64),
+        ("provider_paid_command_sha256", "f" * 64),
+        ("hard_ceiling_enforced", False),
+    ),
+)
+@pytest.mark.asyncio
+async def test_each_command_provider_binding_drift_stops_before_paid_effect(
+    field: str, value: object,
+) -> None:
+    events: list[str] = []
+    command = resume_command_with_cost()
+    state = FakeState(events, batch_for(command))
+    codex = FakeCodex(events)
+    costs = FakeCostAuthority(authority_updates={field: value})
+
+    with pytest.raises(RuntimeContractViolation, match="cost authority binding"):
+        await service_with(
+            state, events, codex, FakeHermes(events), costs
+        ).execute(command)
+
+    assert codex.calls == []
+    assert costs.settle_calls == 0
 
 
 @pytest.mark.asyncio

@@ -4,19 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Callable, Iterator, Protocol, TypeVar
+from typing import Any, Callable, Iterator, Mapping, Protocol, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ValidationError
 from pymysql.err import IntegrityError, OperationalError
 
+from gateway.capability_identity import generic_capability_subject_id
 from agenten.validation.contracts import HoldoutSuite, WorkBatch
 from agenten.agent_runtime.capabilities import CapabilityDenied, validate_grant
 from agenten.agent_runtime.contracts import (
@@ -34,7 +36,10 @@ from agenten.agent_runtime.contracts import (
     RuntimeResumeCostSettlementRequestV1,
     RuntimeResumeCostSettlementV1,
 )
-from agenten.provider_proxy.contracts import ProviderBudgetContextV1
+from agenten.provider_proxy.contracts import (
+    ProviderBudgetContextV1,
+    benchmark_provider_settlement_id,
+)
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
     FactoryBlockStatus,
@@ -43,6 +48,7 @@ from agenten.agent_factory.contracts import (
     FactoryLease,
     FactoryPhase,
     FactoryRole,
+    GenericBenchmarkQualityEvidenceV1,
     parse_factory_job,
 )
 from agenten.delivery.minibook_events import (
@@ -94,6 +100,7 @@ from agenten.agent_factory.state_machine import (
     apply_block,
     next_action,
 )
+from agenten.agent_factory.workflow_promotion import build_release_workflow_promotion
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
@@ -289,6 +296,9 @@ class GatewayStore:
             RuntimeUsagePricingSnapshotV1, ...
         ] = (),
         runtime_provider_proxy_bindings: tuple[tuple[str, str, str], ...] = (),
+        runtime_provider_bundle_bindings: tuple[
+            tuple[str, str, str, str, str, str, str, bool], ...
+        ] = (),
     ):
         if claim_ttl <= timedelta(0):
             raise ValueError("claim_ttl must be positive")
@@ -300,6 +310,9 @@ class GatewayStore:
         self._runtime_usage_pricing_snapshots = runtime_usage_pricing_snapshots
         self._runtime_provider_proxy_bindings = frozenset(
             runtime_provider_proxy_bindings
+        )
+        self._runtime_provider_bundle_bindings = frozenset(
+            runtime_provider_bundle_bindings
         )
         self._ensure_schema()
         self._portal_tickets = PortalTicketStore(storage)
@@ -323,6 +336,21 @@ class GatewayStore:
     def _ensure_schema(self) -> None:
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_runtime_rpc_receipts (
+                        idempotency_key CHAR(64) NOT NULL PRIMARY KEY,
+                        request_id CHAR(36) NOT NULL UNIQUE,
+                        job_id CHAR(36) NOT NULL,
+                        correlation_id CHAR(36) NOT NULL,
+                        operation VARCHAR(64) NOT NULL,
+                        request_sha256 CHAR(64) NOT NULL,
+                        payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                        INDEX idx_factory_rpc_job (job_id, created_at)
+                    ) ENGINE=InnoDB
+                    """
+                )
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS ledger_state (
@@ -2678,6 +2706,17 @@ class GatewayStore:
         """Authenticated exact readback for the proxy immediately before effect."""
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
+                if context.cost_authority_ref.startswith(
+                    "gateway://capability-benchmark-authorizations/"
+                ):
+                    benchmark = self._benchmark_provider_context_with_cursor(
+                        cursor, context.sha256, now=now,
+                    )
+                    if benchmark != context:
+                        raise HTTPException(
+                            status_code=409, detail="provider authority is unavailable"
+                        )
+                    return context
                 command_block = self._runtime_block_by_json_value(
                     cursor,
                     block_type="agent_runtime_command",
@@ -2712,6 +2751,70 @@ class GatewayStore:
                     or context.expires_at != authority.expires_at
                     or context.original_command_id != (command.causation_id or command.event_id)
                 ):
+                    raise HTTPException(status_code=409, detail="provider authority is unavailable")
+                return context
+
+    def resolve_provider_proxy_authority(
+        self,
+        reference: str,
+        *,
+        now: datetime,
+    ) -> ProviderBudgetContextV1:
+        """Resolve one opaque context reference from authoritative command state."""
+
+        prefix = "gateway://provider-budget-contexts/"
+        digest = reference.removeprefix(prefix) if reference.startswith(prefix) else ""
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise HTTPException(status_code=409, detail="provider authority is unavailable")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                benchmark = self._benchmark_provider_context_with_cursor(
+                    cursor, digest, now=now,
+                )
+                if benchmark is not None:
+                    return benchmark
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="payload.provider_context_sha256",
+                    value=digest,
+                    for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=409, detail="provider authority is unavailable")
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                authority = self._validate_capability_resume_cost_authority_with_cursor(
+                    cursor, command, now=now
+                )
+                if (
+                    not authority.hard_ceiling_enforced
+                    or authority.provider_context_sha256 != digest
+                    or authority.provider_session_id is None
+                    or authority.provider_result_id is None
+                    or authority.provider_policy_sha256 is None
+                    or authority.provider_price_card_sha256 is None
+                ):
+                    raise HTTPException(status_code=409, detail="provider authority is unavailable")
+                context = ProviderBudgetContextV1(
+                    schema="captain.provider-budget-context.v1",
+                    command_id=authority.command_id,
+                    original_command_id=command.causation_id or command.event_id,
+                    result_id=authority.provider_result_id,
+                    reservation_id=authority.reservation_id,
+                    job_id=authority.job_id,
+                    run_id=authority.run_id,
+                    input_id=authority.input_id,
+                    correlation_id=authority.correlation_id,
+                    capability_id=authority.capability_id,
+                    capability_version=authority.capability_version,
+                    session_id=authority.provider_session_id,
+                    cost_authority_ref=authority.cost_authority_ref,
+                    ceiling_usd=authority.ceiling_usd,
+                    expires_at=authority.expires_at,
+                    policy_sha256=authority.provider_policy_sha256,
+                    price_card_sha256=authority.provider_price_card_sha256,
+                )
+                if context.sha256 != digest:
                     raise HTTPException(status_code=409, detail="provider authority is unavailable")
                 return context
 
@@ -2795,20 +2898,25 @@ class GatewayStore:
                 status_code=409, detail="runtime resume cost reservation is inactive"
             )
         provider_binding = (
-            payload.provider_proxy_url,
+            (
+                payload.provider_proxy_url.removesuffix("/v1")
+                if payload.provider_proxy_url is not None
+                else None
+            ),
             payload.provider_policy_sha256,
             payload.provider_price_card_sha256,
-        )
-        provider_fields = (
-            *provider_binding,
             payload.provider_context_sha256,
-            payload.provider_session_id,
-            payload.provider_result_id,
+            payload.provider_proxy_executable_sha256,
+            payload.provider_proxy_code_sha256,
+            payload.provider_paid_command_sha256,
+            payload.provider_hard_ceiling_enforced,
         )
+        provider_fields = (*provider_binding, payload.provider_session_id, payload.provider_result_id)
         hard_ceiling_enforced = (
             all(value is not None for value in provider_fields)
             and provider_binding
-            in getattr(self, "_runtime_provider_proxy_bindings", frozenset())
+            in getattr(self, "_runtime_provider_bundle_bindings", frozenset())
+            and payload.provider_hard_ceiling_enforced is True
             and payload.provider_result_id
             == uuid5(command.event_id, "captain.runtime-result")
         )
@@ -2832,6 +2940,9 @@ class GatewayStore:
             provider_policy_sha256=(payload.provider_policy_sha256 if hard_ceiling_enforced else None),
             provider_price_card_sha256=(payload.provider_price_card_sha256 if hard_ceiling_enforced else None),
             provider_context_sha256=(payload.provider_context_sha256 if hard_ceiling_enforced else None),
+            provider_proxy_executable_sha256=(payload.provider_proxy_executable_sha256 if hard_ceiling_enforced else None),
+            provider_proxy_code_sha256=(payload.provider_proxy_code_sha256 if hard_ceiling_enforced else None),
+            provider_paid_command_sha256=(payload.provider_paid_command_sha256 if hard_ceiling_enforced else None),
             provider_session_id=(payload.provider_session_id if hard_ceiling_enforced else None),
             provider_result_id=(payload.provider_result_id if hard_ceiling_enforced else None),
         )
@@ -5083,7 +5194,7 @@ class GatewayStore:
     @staticmethod
     def _reservation_is_closed(cursor: Any, reservation_id: UUID) -> bool:
         cursor.execute(
-            "SELECT 1 FROM factory_budget_events WHERE reservation_id = %s AND event_kind IN ('usage', 'release', 'resume_cost') LIMIT 1 FOR UPDATE",
+            "SELECT 1 FROM factory_budget_events WHERE reservation_id = %s AND event_kind IN ('usage', 'release', 'resume_cost', 'benchmark_cost') LIMIT 1 FOR UPDATE",
             (str(reservation_id),),
         )
         return cursor.fetchone() is not None
@@ -5135,6 +5246,9 @@ class GatewayStore:
                 settlement = RuntimeResumeCostSettlementV1.model_validate(payload)
                 consumed += settlement.accounted_cost_usd
                 active.pop(settlement.reservation_id, None)
+            elif row["event_kind"] == "benchmark_cost":
+                consumed += Decimal(str(payload["actual_cost_usd"]))
+                active.pop(UUID(payload["reservation_id"]), None)
             else:
                 active.pop(UUID(payload["reservation_id"]), None)
         limit = job.execution_policy.max_cost_usd
@@ -5301,10 +5415,66 @@ class GatewayStore:
         source = self.factory_promotion_source(
             acknowledgement.projection_event_id
         )
+        integration_source = (
+            self.integration_setup_source(acknowledgement.projection_event_id)
+            if source is None
+            else None
+        )
+        generic_payload = (
+            self.generic_capability_promotion(acknowledgement.projection_event_id)
+            if source is None and integration_source is None
+            else None
+        )
+        if generic_payload is not None:
+            from agenten.delivery.minibook_events import MinibookProjectionEvent
+            from agenten.delivery.projector import MinibookProjector
+
+            event = MinibookProjectionEvent.model_validate(generic_payload)
+            rendered = MinibookProjector.render(event)
+            expected_post_id = "captain-projection-" + hashlib.sha256(
+                str(event.event_id).encode("utf-8")
+            ).hexdigest()[:32]
+            expected = {
+                "projection_event_id": event.event_id,
+                "correlation_id": event.correlation_id,
+                "subject_id": event.subject_id,
+                "subject_version": event.subject_version,
+                "project_id": MinibookProjector.PROJECTION_PROJECT_ID,
+                "post_id": expected_post_id,
+                "content_sha256": rendered.content_hash,
+                "outcome": "mirrored",
+            }
+            if acknowledgement.model_dump(include=set(expected)) != expected:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Minibook acknowledgement does not match generic promotion",
+                )
+            job_id = UUID(str(event.subject_id).removeprefix("subject:"))
+            job = self.factory_job(job_id).job
+            mirror = DeliveryEventEnvelope.model_validate({
+                "event_id": acknowledgement.acknowledgement_id,
+                "event_type": "registry_mirror",
+                "occurred_at": acknowledgement.acknowledged_at,
+                "actor": "captain-gateway",
+                "trace": {
+                    "project_id": f"factory:{job_id}",
+                    "run_id": "generic-benchmark-promotion",
+                    "trace_id": f"minibook-projection:{event.event_id}",
+                    "artifact_id": acknowledgement.post_id,
+                    "job_id": job_id,
+                    "correlation_id": event.correlation_id,
+                    "subject_version": event.subject_version,
+                },
+                "payload": {
+                    "event_type": "registry_mirror",
+                    "capability_id": job.required_capability,
+                    "capability_version": str(event.subject_version),
+                    "outcome": "mirrored",
+                },
+            })
+            return self.append_delivery_event(mirror)
+
         if source is None:
-            integration_source = self.integration_setup_source(
-                acknowledgement.projection_event_id
-            )
             if integration_source is None:
                 raise HTTPException(
                     status_code=409,
@@ -5544,6 +5714,12 @@ class GatewayStore:
     @staticmethod
     def _decode_json(value: Any) -> Any:
         return json.loads(value) if isinstance(value, (str, bytes, bytearray)) else value
+
+    @staticmethod
+    def _encode_json(value: object) -> str:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), default=str,
+        )
 
     @staticmethod
     def _stored_factory_evaluation(
@@ -6082,6 +6258,1339 @@ class GatewayStore:
                         if case.get("case_id") == case_id:
                             return dict(case)
         raise HTTPException(status_code=404, detail="holdout not found")
+
+    def record_capability_n8n_work_batch(
+        self,
+        *,
+        job: AgentFactoryJobV3,
+        batch: WorkBatch,
+    ) -> str:
+        """Atomically persist the exact Factory n8n root and its job binding."""
+
+        expected = f"n8n-{job.job_id.hex[:24]}"
+        canonical = batch.model_dump(mode="json")
+        if (
+            batch.batch_id != expected
+            or batch.target != "n8n"
+            or batch.runtime != "n8n"
+            or "n8n-builder" not in batch.capability_tags
+            or f"factory-job-id:{job.job_id}" not in batch.constraints
+            or not batch.acceptance_criteria
+            or {item.assertion_id for item in batch.acceptance_criteria}
+            != set(job.acceptance_assertion_ids)
+        ):
+            raise HTTPException(status_code=409, detail="Factory n8n WorkBatch binding mismatch")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_n8n_work_batches (
+                        job_id CHAR(36) NOT NULL PRIMARY KEY,
+                        batch_id VARCHAR(128) NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        block_index BIGINT NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT batch_id, payload, block_index FROM capability_n8n_work_batches "
+                    "WHERE job_id = %s FOR UPDATE",
+                    (str(job.job_id),),
+                )
+                registered = cursor.fetchone()
+                existing_batch = self._batch_row(cursor, batch.batch_id, for_update=True)
+                if registered is not None or existing_batch is not None:
+                    stored_payload = (
+                        None if registered is None else self._decode_json(registered["payload"])
+                    )
+                    if (
+                        registered is not None
+                        and existing_batch is not None
+                        and registered["batch_id"] == batch.batch_id
+                        and int(registered["block_index"]) == int(existing_batch["index"])
+                        and stored_payload == canonical
+                        and existing_batch["data"] == canonical
+                    ):
+                        return batch.batch_id
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Factory n8n WorkBatch persistence is partial or conflicting",
+                    )
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type="work_batch",
+                    data=canonical,
+                    status="pending",
+                    parent_index=None,
+                    metadata={
+                        "factory_job_id": str(job.job_id),
+                        "purpose": "capability_assembly_n8n",
+                    },
+                )
+                try:
+                    project_batch([block], batch.batch_id, now=_utcnow())
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                self._insert(cursor, block)
+                cursor.execute(
+                    "INSERT INTO capability_n8n_work_batches "
+                    "(job_id, batch_id, payload, block_index) VALUES (%s, %s, %s, %s)",
+                    (
+                        str(job.job_id),
+                        batch.batch_id,
+                        json.dumps(canonical, sort_keys=True),
+                        block["index"],
+                    ),
+                )
+        return batch.batch_id
+
+    def put_capability_private_holdouts(
+        self, entries: tuple[tuple[str, str], ...]
+    ) -> None:
+        """Atomically bind each opaque holdout URI to exact private body bytes."""
+
+        if (
+            not entries
+            or len({uri for uri, _ in entries}) != len(entries)
+            or any(
+                re.fullmatch(r"holdout://holdout-[0-9a-f]{12}", uri) is None
+                or not isinstance(body, str)
+                or not body
+                for uri, body in entries
+            )
+        ):
+            raise HTTPException(status_code=409, detail="private holdout binding is invalid")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_private_holdouts (
+                        uri VARCHAR(128) NOT NULL PRIMARY KEY,
+                        body_sha256 CHAR(64) NOT NULL,
+                        body LONGTEXT NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                for uri, body in entries:
+                    digest = hashlib.sha256(body.encode()).hexdigest()
+                    cursor.execute(
+                        "SELECT body_sha256, body FROM capability_private_holdouts "
+                        "WHERE uri = %s FOR UPDATE",
+                        (uri,),
+                    )
+                    existing = cursor.fetchone()
+                    if existing is not None:
+                        if existing["body_sha256"] == digest and existing["body"] == body:
+                            continue
+                        raise HTTPException(status_code=409, detail="private holdout binding conflicts")
+                    cursor.execute(
+                        "INSERT INTO capability_private_holdouts (uri, body_sha256, body) "
+                        "VALUES (%s, %s, %s)",
+                        (uri, digest, body),
+                    )
+
+    def capability_private_holdout(self, uri: str) -> str:
+        if re.fullmatch(r"holdout://holdout-[0-9a-f]{12}", uri) is None:
+            raise HTTPException(status_code=404, detail="private holdout not found")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT body_sha256, body FROM capability_private_holdouts WHERE uri = %s",
+                    (uri,),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="private holdout not found")
+        body = str(row["body"])
+        if hashlib.sha256(body.encode()).hexdigest() != row["body_sha256"]:
+            raise HTTPException(status_code=409, detail="private holdout readback mismatch")
+        return body
+
+    def record_generic_capability_promotion(
+        self,
+        *,
+        job_id: UUID,
+        suite_sha256: str,
+        occurred_at: datetime,
+    ) -> dict[str, Any]:
+        """Atomically gate and issue one generic benchmark promotion event."""
+
+        if (
+            len(suite_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in suite_sha256)
+            or occurred_at.tzinfo is None
+            or occurred_at.utcoffset() != timezone.utc.utcoffset(occurred_at)
+        ):
+            raise HTTPException(status_code=409, detail="generic promotion binding is invalid")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id",
+                    value=str(job_id), for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="generic promotion job is unavailable")
+                job = parse_factory_job(job_block["data"])
+                if type(job) is not AgentFactoryJobV3:
+                    raise HTTPException(status_code=409, detail="generic promotion job is invalid")
+                projection = self._factory_projection(cursor, job)
+                factory_blocks = self._factory_blocks(
+                    cursor, job_id, for_update=True
+                )
+                promotions = tuple(
+                    block for block in factory_blocks
+                    if block.phase is FactoryPhase.CAPABILITY_PROMOTED
+                )
+                if (
+                    projection.status not in {
+                        FactoryLifecycleStatus.RUNNING,
+                        FactoryLifecycleStatus.READY_TO_USE,
+                    }
+                    or projection.phase not in {
+                        FactoryPhase.QUALITY_REVIEWED,
+                        FactoryPhase.CAPABILITY_PROMOTED,
+                    }
+                ):
+                    raise HTTPException(status_code=409, detail="generic promotion is not admissible")
+                cursor.execute(
+                    "SELECT summary_sha256, correlation_id, payload "
+                    "FROM capability_generic_benchmarks "
+                    "WHERE job_id = %s AND suite_sha256 = %s FOR UPDATE",
+                    (str(job_id), suite_sha256),
+                )
+                row = cursor.fetchone()
+                summary = None if row is None else self._decode_json(row["payload"])
+                aggregate = summary.get("aggregate") if isinstance(summary, dict) else None
+                if (
+                    row is None
+                    or not isinstance(summary, dict)
+                    or not isinstance(aggregate, dict)
+                    or summary.get("schema") != "captain.capability-generic-benchmark-summary.v1"
+                    or summary.get("job_id") != str(job_id)
+                    or summary.get("correlation_id") != str(job.correlation_id)
+                    or summary.get("suite_digest") != suite_sha256
+                    or summary.get("passed") is not True
+                    or aggregate.get("case_count") != 15
+                ):
+                    raise HTTPException(status_code=409, detail="generic benchmark promotion gate failed")
+                summary_sha256 = str(row["summary_sha256"])
+                event_id = uuid5(
+                    NAMESPACE_URL,
+                    f"captain:generic-capability-promotion:{job_id}:{suite_sha256}:{summary_sha256}",
+                )
+                event = self._generic_minibook_promotion_event(
+                    event_id=event_id,
+                    job=job,
+                    occurred_at=occurred_at,
+                    summary_sha256=summary_sha256,
+                    aggregate=aggregate,
+                )
+                canonical = event.model_dump(mode="json", by_alias=True)
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_generic_promotions (
+                        event_id CHAR(36) NOT NULL PRIMARY KEY,
+                        job_id CHAR(36) NOT NULL UNIQUE,
+                        suite_sha256 CHAR(64) NOT NULL,
+                        summary_sha256 CHAR(64) NOT NULL,
+                        projection_event JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT suite_sha256, summary_sha256, projection_event "
+                    "FROM capability_generic_promotions WHERE job_id = %s FOR UPDATE",
+                    (str(job_id),),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if (
+                        existing["suite_sha256"] == suite_sha256
+                        and existing["summary_sha256"] == summary_sha256
+                        and self._decode_json(existing["projection_event"]) == canonical
+                        and projection.status is FactoryLifecycleStatus.READY_TO_USE
+                        and projection.phase is FactoryPhase.CAPABILITY_PROMOTED
+                        and len(promotions) == 1
+                    ):
+                        return canonical
+                    raise HTTPException(status_code=409, detail="generic promotion conflicts")
+                if (
+                    projection.status is not FactoryLifecycleStatus.RUNNING
+                    or projection.phase is not FactoryPhase.QUALITY_REVIEWED
+                    or promotions
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="generic promotion is not atomically admissible",
+                    )
+                promotion = build_release_workflow_promotion(
+                    FactoryJobProjection(
+                        job=job,
+                        blocks=factory_blocks,
+                        leases=self._factory_leases(cursor, job_id),
+                        projection=projection,
+                    ),
+                    occurred_at=occurred_at,
+                )
+                (
+                    evaluation,
+                    release_decision,
+                    workflow_evaluation,
+                    feedback,
+                    benchmark_summary,
+                ) = self._factory_block_context(
+                    cursor,
+                    job,
+                    promotion,
+                    for_update=True,
+                )
+                try:
+                    promoted_projection = apply_block(
+                        projection,
+                        promotion,
+                        evaluation=evaluation,
+                        release_decision=release_decision,
+                        workflow_evaluation=workflow_evaluation,
+                        feedback=feedback,
+                        benchmark_summary=benchmark_summary,
+                    )
+                except FactoryLifecycleError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if (
+                    promoted_projection.status is not FactoryLifecycleStatus.READY_TO_USE
+                    or promoted_projection.phase is not FactoryPhase.CAPABILITY_PROMOTED
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="generic promotion did not reach ready_to_use",
+                    )
+                promotion_index = self._next_index(cursor)
+                promotion_block = self._new_block(
+                    cursor,
+                    index=promotion_index,
+                    block_type="agent_factory_block",
+                    data=promotion.model_dump(mode="json", by_alias=True),
+                    status=promotion.status.value,
+                    parent_index=job_block["index"],
+                    metadata={
+                        "schema": "captain.agent-factory-block.v1",
+                        "phase": promotion.phase.value,
+                    },
+                )
+                self._insert(cursor, promotion_block)
+                cursor.execute(
+                    "INSERT INTO capability_generic_promotions "
+                    "(event_id, job_id, suite_sha256, summary_sha256, projection_event) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (
+                        str(event_id), str(job_id), suite_sha256, summary_sha256,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+                return canonical
+
+    def generic_benchmark_quality_evidence(
+        self, job_id: UUID, attempt: int,
+    ) -> GenericBenchmarkQualityEvidenceV1 | None:
+        """Read one passed 15-case generic suite as public Factory evidence."""
+
+        if not isinstance(job_id, UUID) or not isinstance(attempt, int) or attempt < 1:
+            raise HTTPException(status_code=409, detail="generic quality binding is invalid")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id",
+                    value=str(job_id), for_update=False,
+                )
+                if job_block is None:
+                    return None
+                job = parse_factory_job(job_block["data"])
+                cursor.execute(
+                    "SELECT suite_sha256, correlation_id, summary_sha256, payload "
+                    "FROM capability_generic_benchmarks WHERE job_id = %s",
+                    (str(job_id),),
+                )
+                rows = tuple(cursor.fetchall())
+        if len(rows) != 1 or type(job) is not AgentFactoryJobV3:
+            return None
+        row = rows[0]
+        payload = self._decode_json(row["payload"])
+        cases = payload.get("case_receipts") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema")
+            != "captain.capability-generic-benchmark-summary.v1"
+            or payload.get("job_id") != str(job.job_id)
+            or payload.get("correlation_id") != str(job.correlation_id)
+            or payload.get("suite_digest") != row["suite_sha256"]
+            or payload.get("passed") is not True
+            or not isinstance(cases, list)
+            or len(cases) != 15
+        ):
+            raise HTTPException(status_code=409, detail="generic quality evidence is invalid")
+        try:
+            case_ids = tuple(str(item["case_id"]) for item in cases)
+            case_digests = tuple(str(item["case_digest"]) for item in cases)
+            categories = tuple(str(item["category"]) for item in cases)
+            observed_assertions = tuple(dict.fromkeys(
+                assertion
+                for item in cases
+                for assertion in item["assertion_ids"]
+            ))
+            evaluation_refs = tuple(
+                ArtifactRef.model_validate(item[name])
+                for item in cases
+                for name in ("team_evaluation_ref", "baseline_evaluation_ref")
+            )
+            suite_ref = ArtifactRef.model_validate(payload["suite_ref"])
+            summary_sha256 = str(row["summary_sha256"])
+            summary_ref = ArtifactRef(
+                uri=f"artifact://sha256/{summary_sha256}",
+                sha256=summary_sha256,
+                media_type="application/json",
+            )
+        except (KeyError, TypeError, ValueError, ValidationError):
+            raise HTTPException(status_code=409, detail="generic quality evidence is invalid") from None
+        if set(observed_assertions) != set(job.acceptance_assertion_ids):
+            raise HTTPException(
+                status_code=409,
+                detail="generic quality assertion authority is incomplete",
+            )
+        assertions = job.acceptance_assertion_ids
+        try:
+            return GenericBenchmarkQualityEvidenceV1(
+                schema="captain.generic-benchmark-quality-evidence.v1",
+                authority_id=UUID("fefc0e43-6955-4d50-aae2-b2ef5051e9af"),
+                job_id=job.job_id,
+                correlation_id=job.correlation_id,
+                subject_version=job.subject_version,
+                attempt=attempt,
+                suite_ref=suite_ref,
+                summary_ref=summary_ref,
+                case_ids=case_ids,
+                case_digests=case_digests,
+                categories=categories,
+                acceptance_assertion_ids=assertions,
+                evaluation_refs=evaluation_refs,
+                passed=True,
+            )
+        except ValidationError:
+            raise HTTPException(status_code=409, detail="generic quality evidence is invalid") from None
+
+    @staticmethod
+    def _generic_minibook_promotion_event(
+        *, event_id: UUID, job: AgentFactoryJobV3, occurred_at: datetime,
+        summary_sha256: str, aggregate: dict[str, Any],
+    ):
+        from agenten.delivery.minibook_events import MinibookProjectionEvent
+
+        def ratio(left: object, right: object) -> int:
+            denominator = Decimal(str(right))
+            numerator = Decimal(str(left))
+            if denominator == 0:
+                return 10000 if numerator == 0 else 1000000
+            return int((numerator * Decimal(10000)) / denominator)
+
+        return MinibookProjectionEvent.model_validate({
+            "schema": "captain.minibook-projection.v2",
+            "event_id": event_id,
+            "correlation_id": job.correlation_id,
+            "causation_id": job.event_id,
+            "occurred_at": occurred_at,
+            "producer": "captain-gateway",
+            "subject_id": generic_capability_subject_id(job.job_id),
+            "subject_version": job.subject_version,
+            "event_type": "capability.promoted",
+            "payload": {
+                "view": "validation",
+                "template_id": "factory_capability_ready_to_use",
+                "status_id": "ready_to_use",
+                "actor_role_id": "captain_gateway",
+                "benchmark_disposition": "passed",
+                "benchmark_reason_codes": [],
+                "candidate_correctness_bps": int(aggregate["team_quality_count"]) * 10000 // 15,
+                "baseline_correctness_bps": int(aggregate["baseline_quality_count"]) * 10000 // 15,
+                "candidate_completion_bps": int(aggregate["team_quality_count"]) * 10000 // 15,
+                "baseline_completion_bps": int(aggregate["baseline_quality_count"]) * 10000 // 15,
+                "cost_ratio_bps": ratio(aggregate["team_cost_usd"], aggregate["baseline_cost_usd"]),
+                "latency_ratio_bps": ratio(aggregate["team_latency_ms"], aggregate["baseline_latency_ms"]),
+                "unsafe_tool_uses": int(aggregate["unsafe_team_count"]),
+                "mandatory_handoff_misses": int(aggregate["mandatory_handoff_misses"]),
+                "benchmark_summary_digest": f"sha256:{summary_sha256}",
+            },
+        })
+
+    def generic_capability_promotion(self, event_id: UUID) -> dict[str, Any] | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_generic_promotions (
+                        event_id CHAR(36) NOT NULL PRIMARY KEY,
+                        job_id CHAR(36) NOT NULL UNIQUE,
+                        suite_sha256 CHAR(64) NOT NULL,
+                        summary_sha256 CHAR(64) NOT NULL,
+                        projection_event JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT projection_event FROM capability_generic_promotions "
+                    "WHERE event_id = %s",
+                    (str(event_id),),
+                )
+                row = cursor.fetchone()
+        return None if row is None else dict(self._decode_json(row["projection_event"]))
+
+    def capability_n8n_work_batch(self, job_id: UUID) -> str | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_n8n_work_batches (
+                        job_id CHAR(36) NOT NULL PRIMARY KEY,
+                        batch_id VARCHAR(128) NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        block_index BIGINT NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT batch_id, payload, block_index FROM capability_n8n_work_batches "
+                    "WHERE job_id = %s",
+                    (str(job_id),),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                batch = self._batch_row(cursor, str(row["batch_id"]))
+        if (
+            batch is None
+            or int(batch["index"]) != int(row["block_index"])
+            or batch["data"] != self._decode_json(row["payload"])
+        ):
+            raise HTTPException(status_code=409, detail="Factory n8n WorkBatch readback mismatch")
+        return str(row["batch_id"])
+
+    def record_capability_tool_authorization(
+        self, *, job_id: str, case_digest: str, tool_key: str,
+        operation: str, trace_id: str, run_id: str,
+        model_policy_digest: str, batch_id: str, command_id: str,
+        candidate_sha256: str, execution_sha256: str, call_id: str,
+        lease_id: str, call_ref: ArtifactRef, lease_ref: ArtifactRef,
+        scoped_token_sha256: str,
+    ) -> None:
+        """Persist the exact call and lease before the authorized tool effect."""
+
+        payload = {
+            "job_id": job_id, "case_digest": case_digest,
+            "tool_key": tool_key, "operation": operation,
+            "trace_id": trace_id, "run_id": run_id,
+            "model_policy_digest": model_policy_digest,
+            "batch_id": batch_id, "command_id": command_id,
+            "candidate_sha256": candidate_sha256,
+            "execution_sha256": execution_sha256,
+            "call_id": call_id, "lease_id": lease_id,
+            "scoped_token_sha256": scoped_token_sha256,
+            "call_ref": call_ref.model_dump(mode="json"),
+            "lease_ref": lease_ref.model_dump(mode="json"),
+        }
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_authorizations (
+                        call_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        completed_receipt_sha256 CHAR(64) NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT job_id, correlation_id, case_digest, trace_id, run_id, "
+                    "command_id, declared_tool_keys FROM capability_benchmark_work_batches "
+                    "WHERE batch_id = %s FOR UPDATE", (batch_id,),
+                )
+                binding = cursor.fetchone()
+                if (
+                    binding is None
+                    or str(binding["job_id"]) != job_id
+                    or str(binding["case_digest"]) != case_digest
+                    or str(binding["trace_id"]) != trace_id
+                    or str(binding["run_id"]) != run_id
+                    or str(binding["command_id"]) != command_id
+                    or tool_key not in self._decode_json(binding["declared_tool_keys"])
+                ):
+                    raise HTTPException(status_code=409, detail="tool authorization is unavailable")
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_authorizations "
+                    "WHERE call_sha256 = %s FOR UPDATE", (call_ref.sha256,),
+                )
+                existing = cursor.fetchone()
+                if existing is None:
+                    cursor.execute(
+                        "INSERT INTO capability_tool_authorizations "
+                        "(call_sha256, payload) VALUES (%s, %s)",
+                        (call_ref.sha256, self._encode_json(payload)),
+                    )
+                elif self._decode_json(existing["payload"]) != payload:
+                    raise HTTPException(status_code=409, detail="tool authorization conflicts")
+
+    def record_capability_tool_evidence(
+        self,
+        *,
+        job_id: UUID,
+        case_digest: str,
+        tool_key: str,
+        operation: str,
+        trace_id: UUID,
+        run_id: UUID,
+        model_policy_digest: str,
+        call_ref: ArtifactRef,
+        lease_ref: ArtifactRef,
+        receipt_ref: ArtifactRef,
+        batch_id: str,
+        execution_result_id: UUID,
+        result_ref_sha256: str,
+    ) -> None:
+        """Admit only a WorkBatch- and Runtime-result-bound tool receipt chain."""
+
+        refs = (call_ref, lease_ref, receipt_ref)
+        if (
+            len(case_digest) != 64
+            or any(character not in "0123456789abcdef" for character in case_digest)
+            or not tool_key
+            or not operation
+            or len(model_policy_digest) != 64
+            or any(character not in "0123456789abcdef" for character in model_policy_digest)
+            or len({item.sha256 for item in refs}) != 3
+            or any(
+                item.media_type != "application/json"
+                or item.uri != f"artifact://sha256/{item.sha256}"
+                for item in refs
+            )
+            or len(result_ref_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in result_ref_sha256)
+        ):
+            raise HTTPException(status_code=409, detail="capability tool evidence is invalid")
+        payload = {
+            "job_id": str(job_id),
+            "case_digest": case_digest,
+            "tool_key": tool_key,
+            "operation": operation,
+            "trace_id": str(trace_id),
+            "run_id": str(run_id),
+            "model_policy_digest": model_policy_digest,
+            "call_ref": call_ref.model_dump(mode="json"),
+            "lease_ref": lease_ref.model_dump(mode="json"),
+            "receipt_ref": receipt_ref.model_dump(mode="json"),
+            "batch_id": batch_id,
+            "execution_result_id": str(execution_result_id),
+            "result_ref_sha256": result_ref_sha256,
+        }
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_evidence_registry (
+                        receipt_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_authorizations (
+                        call_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        completed_receipt_sha256 CHAR(64) NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT job_id, correlation_id, case_digest, trace_id, run_id, "
+                    "command_id, declared_tool_keys FROM capability_benchmark_work_batches "
+                    "WHERE batch_id = %s FOR UPDATE",
+                    (batch_id,),
+                )
+                batch_binding = cursor.fetchone()
+                cursor.execute(
+                    "SELECT payload, completed_receipt_sha256 FROM "
+                    "capability_tool_authorizations WHERE call_sha256 = %s FOR UPDATE",
+                    (call_ref.sha256,),
+                )
+                authorization = cursor.fetchone()
+                if authorization is not None and "payload" in authorization:
+                    authorization_payload = self._decode_json(authorization["payload"])
+                    if (
+                        authorization_payload.get("job_id") != str(job_id)
+                        or authorization_payload.get("case_digest") != case_digest
+                        or authorization_payload.get("tool_key") != tool_key
+                        or authorization_payload.get("operation") != operation
+                        or authorization_payload.get("trace_id") != str(trace_id)
+                        or authorization_payload.get("run_id") != str(run_id)
+                        or authorization_payload.get("batch_id") != batch_id
+                        or authorization_payload.get("call_ref")
+                        != call_ref.model_dump(mode="json")
+                        or authorization_payload.get("lease_ref")
+                        != lease_ref.model_dump(mode="json")
+                        or authorization["completed_receipt_sha256"] not in {
+                            None, receipt_ref.sha256,
+                        }
+                    ):
+                        raise HTTPException(status_code=409, detail="tool authorization changed")
+                job = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id",
+                    value=str(job_id), for_update=True,
+                )
+                if (
+                    batch_binding is None or job is None
+                    or str(batch_binding["job_id"]) != str(job_id)
+                    or str(batch_binding["correlation_id"])
+                    != str(job["data"].get("correlation_id", ""))
+                    or str(batch_binding["case_digest"]) != case_digest
+                    or str(batch_binding["trace_id"]) != str(trace_id)
+                    or str(batch_binding["run_id"]) != str(run_id)
+                    or tool_key not in self._decode_json(
+                        batch_binding["declared_tool_keys"]
+                    )
+                ):
+                    raise HTTPException(status_code=409, detail="tool WorkBatch is unavailable")
+                correlation_id = str(job["data"].get("correlation_id", ""))
+                result = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_result",
+                    field="event_id",
+                    value=str(execution_result_id),
+                    for_update=True,
+                )
+                result_data = {} if result is None else result["data"]
+                command_id = result_data.get("command_id")
+                command = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_runtime_command", field="event_id",
+                    value=str(command_id), for_update=True,
+                ) if command_id else None
+                command_data = {} if command is None else command["data"]
+                command_payload = command_data.get("payload", {})
+                result_refs = (
+                    *result_data.get("artifact_refs", []),
+                    *result_data.get("evidence_refs", []),
+                )
+                if (
+                    result is None or result_data.get("status") != "succeeded"
+                    or result_data.get("correlation_id") != correlation_id
+                    or result_data.get("operation")
+                    != RuntimeOperation.AUTOGEN_BENCHMARK.value
+                    or command is None
+                    or command_data.get("correlation_id") != correlation_id
+                    or str(command_data.get("event_id"))
+                    != str(batch_binding["command_id"])
+                    or command_payload.get("batch_id") != batch_id
+                    or command_payload.get("operation")
+                    != RuntimeOperation.AUTOGEN_BENCHMARK.value
+                    or not any(ref.get("sha256") == result_ref_sha256 for ref in result_refs)
+                ):
+                    raise HTTPException(status_code=409, detail="tool execution result is unavailable")
+                payload["correlation_id"] = correlation_id
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_evidence_registry "
+                    "WHERE receipt_sha256 = %s FOR UPDATE",
+                    (receipt_ref.sha256,),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) == payload:
+                        return
+                    raise HTTPException(status_code=409, detail="tool evidence conflicts")
+                cursor.execute(
+                    "INSERT INTO capability_tool_evidence_registry "
+                    "(receipt_sha256, payload) VALUES (%s, %s)",
+                    (receipt_ref.sha256, json.dumps(payload, sort_keys=True)),
+                )
+                if authorization is not None and "payload" in authorization:
+                    cursor.execute(
+                        "UPDATE capability_tool_authorizations SET "
+                        "completed_receipt_sha256 = %s WHERE call_sha256 = %s",
+                        (receipt_ref.sha256, call_ref.sha256),
+                    )
+
+    def capability_tool_authorization(self, call_sha256: str) -> dict[str, Any] | None:
+        """Read the exact pre-effect call/lease authority."""
+
+        if len(call_sha256) != 64:
+            return None
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_authorizations (
+                        call_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        completed_receipt_sha256 CHAR(64) NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_authorizations "
+                    "WHERE call_sha256 = %s", (call_sha256,),
+                )
+                row = cursor.fetchone()
+        return None if row is None else dict(self._decode_json(row["payload"]))
+
+    def record_capability_tool_effect(
+        self, *, call_ref: ArtifactRef, lease_ref: ArtifactRef,
+        result_ref: ArtifactRef, receipt_ref: ArtifactRef,
+        arguments_sha256: str, scoped_token_sha256: str,
+    ) -> None:
+        """Persist terminal host readback before it can be returned to AutoGen."""
+
+        payload = {
+            "call_ref": call_ref.model_dump(mode="json"),
+            "lease_ref": lease_ref.model_dump(mode="json"),
+            "result_ref": result_ref.model_dump(mode="json"),
+            "receipt_ref": receipt_ref.model_dump(mode="json"),
+            "arguments_sha256": arguments_sha256,
+            "scoped_token_sha256": scoped_token_sha256,
+        }
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_effects (
+                        call_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_authorizations "
+                    "WHERE call_sha256 = %s FOR UPDATE", (call_ref.sha256,),
+                )
+                row = cursor.fetchone()
+                authority = None if row is None else self._decode_json(row["payload"])
+                if (
+                    not isinstance(authority, dict)
+                    or authority.get("call_ref") != payload["call_ref"]
+                    or authority.get("lease_ref") != payload["lease_ref"]
+                    or authority.get("scoped_token_sha256") != scoped_token_sha256
+                ):
+                    raise HTTPException(status_code=409, detail="tool effect authority changed")
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_effects "
+                    "WHERE call_sha256 = %s FOR UPDATE", (call_ref.sha256,),
+                )
+                existing = cursor.fetchone()
+                if existing is None:
+                    cursor.execute(
+                        "INSERT INTO capability_tool_effects (call_sha256, payload) "
+                        "VALUES (%s, %s)",
+                        (call_ref.sha256, self._encode_json(payload)),
+                    )
+                elif self._decode_json(existing["payload"]) != payload:
+                    raise HTTPException(status_code=409, detail="tool effect conflicts")
+
+    def capability_tool_effect(self, call_sha256: str) -> dict[str, Any] | None:
+        """Read a terminal tool result/receipt for retry reconciliation."""
+
+        if len(call_sha256) != 64:
+            return None
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_effects (
+                        call_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_effects "
+                    "WHERE call_sha256 = %s", (call_sha256,),
+                )
+                row = cursor.fetchone()
+        return None if row is None else dict(self._decode_json(row["payload"]))
+
+    def record_capability_benchmark_provider_settlement(
+        self, payload: Mapping[str, object],
+    ) -> None:
+        """Admit one provider-receipt-role benchmark call settlement."""
+
+        required = {
+            "schema", "settlement_id", "provider_call_id", "job_id",
+            "correlation_id", "case_digest", "trace_id", "run_id",
+            "command_id", "provider_result_id", "provider_session_id",
+            "provider", "model", "input_units", "cached_input_units",
+            "output_units", "actual_cost_usd", "provider_proxy_url",
+            "provider_policy_sha256", "provider_price_card_sha256",
+            "provider_context_sha256", "provider_proxy_executable_sha256",
+            "provider_proxy_code_sha256", "provider_paid_command_sha256",
+            "provider_hard_ceiling_enforced",
+        }
+        try:
+            canonical = dict(payload)
+            cost = Decimal(str(canonical["actual_cost_usd"]))
+            if (
+                set(canonical) != required
+                or canonical["schema"]
+                != "captain.capability-benchmark-provider-settlement.v1"
+                or canonical["provider"] != "openai"
+                or canonical["provider_hard_ceiling_enforced"] is not True
+                or not cost.is_finite() or cost < 0
+                or int(canonical["input_units"]) < 0
+                or int(canonical["cached_input_units"]) < 0
+                or int(canonical["output_units"]) < 0
+                or int(canonical["cached_input_units"]) > int(canonical["input_units"])
+                or UUID(str(canonical["settlement_id"]))
+                != benchmark_provider_settlement_id(
+                    str(canonical["command_id"]),
+                    str(canonical["provider_call_id"]),
+                )
+            ):
+                raise ValueError("shape")
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(
+                status_code=409, detail="benchmark provider settlement is invalid"
+            ) from None
+        binding = (
+            str(canonical["provider_proxy_url"]).removesuffix("/v1"),
+            canonical["provider_policy_sha256"],
+            canonical["provider_price_card_sha256"],
+            canonical["provider_context_sha256"],
+            canonical["provider_proxy_executable_sha256"],
+            canonical["provider_proxy_code_sha256"],
+            canonical["provider_paid_command_sha256"], True,
+        )
+        if not any(
+            configured[:3] == binding[:3]
+            and configured[4:] == binding[4:]
+            for configured in self._runtime_provider_bundle_bindings
+        ):
+            raise HTTPException(
+                status_code=409, detail="benchmark provider authority changed"
+            )
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """CREATE TABLE IF NOT EXISTS capability_benchmark_provider_settlements (
+                    settlement_id CHAR(36) NOT NULL PRIMARY KEY,
+                    provider_call_id VARCHAR(128) NOT NULL UNIQUE,
+                    command_id CHAR(36) NOT NULL,
+                    job_id CHAR(36) NOT NULL,
+                    payload JSON NOT NULL,
+                    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB"""
+                )
+
+                command = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_runtime_command", field="event_id",
+                    value=str(canonical["command_id"]), for_update=True,
+                )
+                cursor.execute(
+                    "SELECT job_id, correlation_id, case_digest, trace_id, run_id, "
+                    "command_id FROM capability_benchmark_work_batches "
+                    "WHERE command_id = %s FOR UPDATE", (canonical["command_id"],),
+                )
+                batch = cursor.fetchone()
+                job = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id",
+                    value=str(canonical["job_id"]), for_update=True,
+                )
+                command_data = {} if command is None else command["data"]
+                command_payload = command_data.get("payload", {})
+                reservation = self._factory_reservation(
+                    cursor,
+                    UUID(str(command_payload.get("budget_reservation_id"))),
+                    for_update=True,
+                ) if command_payload.get("budget_reservation_id") else None
+                if (
+                    command is None or batch is None or job is None
+                    or command_data.get("payload", {}).get("operation")
+                    != RuntimeOperation.AUTOGEN_BENCHMARK.value
+                    or str(batch["job_id"]) != str(canonical["job_id"])
+                    or str(batch["correlation_id"]) != str(canonical["correlation_id"])
+                    or str(batch["case_digest"]) != str(canonical["case_digest"])
+                    or str(batch["trace_id"]) != str(canonical["trace_id"])
+                    or str(batch["run_id"]) != str(canonical["run_id"])
+                    or command_data.get("correlation_id") != canonical["correlation_id"]
+                    or command_payload.get("provider_context_sha256")
+                    != canonical["provider_context_sha256"]
+                    or command_payload.get("provider_session_id")
+                    != canonical["provider_session_id"]
+                    or command_payload.get("provider_result_id")
+                    != canonical["provider_result_id"]
+                    or cost > Decimal(str(command_payload.get("maximum_cost_usd", "0")))
+                    or reservation is None
+                    or reservation.job_id != UUID(str(canonical["job_id"]))
+                    or reservation.requested_usd
+                    != Decimal(str(command_payload.get("maximum_cost_usd")))
+                    or canonical["model"] not in job["data"]["execution_policy"]["allowed_models"]
+                ):
+                    raise HTTPException(
+                        status_code=409, detail="benchmark provider settlement binding is invalid"
+                    )
+                cursor.execute(
+                    "SELECT payload FROM capability_benchmark_provider_settlements "
+                    "WHERE settlement_id = %s OR provider_call_id = %s FOR UPDATE",
+                    (canonical["settlement_id"], canonical["provider_call_id"]),
+                )
+                existing = cursor.fetchone()
+                encoded = self._encode_json(canonical)
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) == canonical:
+                        return
+                    raise HTTPException(
+                        status_code=409, detail="benchmark provider settlement changed"
+                    )
+                if self._reservation_is_closed(cursor, reservation.reservation_id):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="benchmark provider settlement binding is invalid",
+                    )
+                cursor.execute(
+                    "SELECT payload FROM capability_benchmark_provider_settlements "
+                    "WHERE command_id = %s FOR UPDATE", (canonical["command_id"],),
+                )
+                command_total = cost + sum(
+                    (Decimal(str(self._decode_json(row["payload"])["actual_cost_usd"]))
+                     for row in cursor.fetchall()), start=Decimal("0"),
+                )
+                if command_total > reservation.requested_usd:
+                    raise HTTPException(
+                        status_code=409, detail="benchmark provider settlement exceeds Factory budget"
+                    )
+                cursor.execute(
+                    "INSERT INTO capability_benchmark_provider_settlements "
+                    "(settlement_id, provider_call_id, command_id, job_id, payload) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (canonical["settlement_id"], canonical["provider_call_id"],
+                     canonical["command_id"], canonical["job_id"], encoded),
+                )
+
+    def finalize_capability_benchmark_provider_cost(
+        self, command_id: UUID,
+    ) -> Decimal:
+        """Atomically close the command reservation from provider readbacks."""
+
+        event_id = uuid5(command_id, "benchmark-provider-cost")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                command_block = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_runtime_command", field="event_id",
+                    value=str(command_id), for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=409, detail="benchmark provider command is unavailable")
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                reservation_id = command.payload.budget_reservation_id
+                reservation = (
+                    None if reservation_id is None
+                    else self._factory_reservation(cursor, reservation_id, for_update=True)
+                )
+                cursor.execute(
+                    "SELECT payload FROM capability_benchmark_provider_settlements "
+                    "WHERE command_id = %s FOR UPDATE", (str(command_id),),
+                )
+                rows = cursor.fetchall()
+                total = sum(
+                    (Decimal(str(self._decode_json(row["payload"])["actual_cost_usd"]))
+                     for row in rows), start=Decimal("0"),
+                )
+                if (
+                    not rows or reservation is None
+                    or reservation.job_id != command.payload.cost_job_id
+                    or total > reservation.requested_usd
+                ):
+                    raise HTTPException(status_code=409, detail="benchmark provider cost is unavailable")
+                payload = {
+                    "schema": "captain.factory-benchmark-cost.v1",
+                    "reservation_id": str(reservation.reservation_id),
+                    "command_id": str(command_id),
+                    "actual_cost_usd": format(total, "f"),
+                }
+                existing = self._factory_budget_event(cursor, event_id, for_update=True)
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) != payload:
+                        raise HTTPException(status_code=409, detail="benchmark provider cost changed")
+                    return total
+                job, job_block = self._factory_budget_job(cursor, reservation.job_id)
+                self._insert_factory_budget_event(
+                    cursor, event_id=event_id,
+                    reservation_id=reservation.reservation_id,
+                    job_id=reservation.job_id, event_kind="benchmark_cost",
+                    digest=hashlib.sha256(self._encode_json(payload).encode()).hexdigest(),
+                    payload=payload, parent_index=job_block["index"],
+                    schema_name="captain.factory-benchmark-cost.v1",
+                )
+                projection = self._factory_budget_projection(
+                    cursor, job, for_update=True,
+                )
+                if projection.remaining_usd < 0:
+                    raise HTTPException(status_code=409, detail="benchmark provider cost exceeds Factory budget")
+        return total
+
+    def record_capability_benchmark_provider_authority(
+        self, *, context: ProviderBudgetContextV1,
+        provider_binding: Mapping[str, object], case_digest: str,
+        trace_id: UUID, run_id: UUID,
+    ) -> None:
+        """Persist the exact command-bound benchmark ceiling before provider use."""
+
+        payload = {
+            "context": context.model_dump(mode="json", by_alias=True),
+            "provider_binding": dict(provider_binding),
+            "case_digest": case_digest, "trace_id": str(trace_id),
+            "run_id": str(run_id),
+        }
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """CREATE TABLE IF NOT EXISTS capability_benchmark_provider_authorities (
+                    context_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                    command_id CHAR(36) NOT NULL UNIQUE,
+                    payload JSON NOT NULL,
+                    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB"""
+                )
+                command_block = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_runtime_command", field="event_id",
+                    value=str(context.command_id), for_update=True,
+                )
+                cursor.execute(
+                    "SELECT job_id, correlation_id, case_digest, trace_id, run_id "
+                    "FROM capability_benchmark_work_batches WHERE command_id = %s "
+                    "FOR UPDATE", (str(context.command_id),),
+                )
+                batch = cursor.fetchone()
+                command = (
+                    None if command_block is None
+                    else AgentRuntimeCommand.model_validate(command_block["data"])
+                )
+                if (
+                    command is None or batch is None
+                    or command.payload.operation is not RuntimeOperation.AUTOGEN_BENCHMARK
+                    or command.payload.provider_context_sha256 != context.sha256
+                    or command.payload.cost_authority_ref != context.cost_authority_ref
+                    or command.payload.maximum_cost_usd != context.ceiling_usd
+                    or command.payload.budget_reservation_id != context.reservation_id
+                    or command.payload.cost_job_id != context.job_id
+                    or command.payload.cost_run_id != context.run_id
+                    or command.payload.cost_input_id != context.input_id
+                    or command.payload.cost_capability_id != context.capability_id
+                    or command.payload.cost_capability_version != context.capability_version
+                    or command.payload.provider_session_id != context.session_id
+                    or command.payload.provider_result_id != context.result_id
+                    or str(batch["job_id"]) != str(context.job_id)
+                    or str(batch["correlation_id"]) != str(context.correlation_id)
+                    or str(batch["case_digest"]) != case_digest
+                    or str(batch["trace_id"]) != str(trace_id)
+                    or str(batch["run_id"]) != str(run_id)
+                    or context.run_id != trace_id
+                    or context.input_id != f"{case_digest}:{run_id}"
+                ):
+                    raise HTTPException(
+                        status_code=409, detail="benchmark provider authority is invalid"
+                    )
+                cursor.execute(
+                    "SELECT payload FROM capability_benchmark_provider_authorities "
+                    "WHERE context_sha256 = %s OR command_id = %s FOR UPDATE",
+                    (context.sha256, str(context.command_id)),
+                )
+                existing = cursor.fetchone()
+                if existing is None:
+                    cursor.execute(
+                        "INSERT INTO capability_benchmark_provider_authorities "
+                        "(context_sha256, command_id, payload) VALUES (%s, %s, %s)",
+                        (context.sha256, str(context.command_id), self._encode_json(payload)),
+                    )
+                elif self._decode_json(existing["payload"]) != payload:
+                    raise HTTPException(
+                        status_code=409, detail="benchmark provider authority changed"
+                    )
+
+    def _benchmark_provider_context_with_cursor(
+        self, cursor: Any, digest: str, *, now: datetime,
+    ) -> ProviderBudgetContextV1 | None:
+        cursor.execute(
+            """CREATE TABLE IF NOT EXISTS capability_benchmark_provider_authorities (
+            context_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+            command_id CHAR(36) NOT NULL UNIQUE,
+            payload JSON NOT NULL,
+            created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+            ) ENGINE=InnoDB"""
+        )
+        cursor.execute(
+            "SELECT payload FROM capability_benchmark_provider_authorities "
+            "WHERE context_sha256 = %s FOR UPDATE", (digest,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        payload = self._decode_json(row["payload"])
+        if not isinstance(payload, dict) or "context" not in payload:
+            return None
+        context = ProviderBudgetContextV1.model_validate(payload["context"])
+        if context.sha256 != digest:
+            raise HTTPException(status_code=409, detail="provider authority is unavailable")
+        try:
+            context.require_active(now)
+        except ValueError:
+            raise HTTPException(status_code=409, detail="provider authority is unavailable") from None
+        command_block = self._runtime_block_by_json_value(
+            cursor, block_type="agent_runtime_command", field="event_id",
+            value=str(context.command_id), for_update=True,
+        )
+        if command_block is None:
+            raise HTTPException(status_code=409, detail="provider authority is unavailable")
+        command = AgentRuntimeCommand.model_validate(command_block["data"])
+        binding = payload["provider_binding"]
+        exact = (
+            command.payload.provider_proxy_url == binding.get("provider_proxy_url")
+            and command.payload.provider_policy_sha256 == binding.get("provider_policy_sha256")
+            and command.payload.provider_price_card_sha256 == binding.get("provider_price_card_sha256")
+            and command.payload.provider_proxy_executable_sha256 == binding.get("provider_proxy_executable_sha256")
+            and command.payload.provider_proxy_code_sha256 == binding.get("provider_proxy_code_sha256")
+            and command.payload.provider_paid_command_sha256 == binding.get("provider_paid_command_sha256")
+            and command.payload.provider_hard_ceiling_enforced is True
+            and command.payload.provider_context_sha256 == digest
+        )
+        if not exact:
+            raise HTTPException(status_code=409, detail="provider authority is unavailable")
+        return context
+
+    def capability_benchmark_provider_settlements(
+        self, command_id: UUID,
+    ) -> tuple[dict[str, Any], ...]:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """CREATE TABLE IF NOT EXISTS capability_benchmark_provider_settlements (
+                    settlement_id CHAR(36) NOT NULL PRIMARY KEY,
+                    provider_call_id VARCHAR(128) NOT NULL UNIQUE,
+                    command_id CHAR(36) NOT NULL,
+                    job_id CHAR(36) NOT NULL,
+                    payload JSON NOT NULL,
+                    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB"""
+                )
+                cursor.execute(
+                    "SELECT payload FROM capability_benchmark_provider_settlements "
+                    "WHERE command_id = %s ORDER BY created_at, settlement_id",
+                    (str(command_id),),
+                )
+                rows = cursor.fetchall()
+        return tuple(dict(self._decode_json(row["payload"])) for row in rows)
+
+    def record_capability_benchmark_work_batch(
+        self, *, job_id: UUID, correlation_id: UUID, batch_id: str,
+        case_digest: str, trace_id: UUID, run_id: UUID, command_id: UUID,
+        declared_tool_keys: tuple[str, ...], tool_authority_sha256: str,
+    ) -> None:
+        """Persist the exact execution-only benchmark authority before Runtime."""
+
+        if (
+            not batch_id or len(case_digest) != 64
+            or not declared_tool_keys
+            or len(set(declared_tool_keys)) != len(declared_tool_keys)
+            or hashlib.sha256(json.dumps(
+                list(declared_tool_keys), sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest() != tool_authority_sha256
+        ):
+            raise HTTPException(status_code=409, detail="benchmark WorkBatch is invalid")
+        payload = {
+            "job_id": str(job_id), "correlation_id": str(correlation_id),
+            "batch_id": batch_id, "case_digest": case_digest,
+            "trace_id": str(trace_id), "run_id": str(run_id),
+            "command_id": str(command_id),
+            "declared_tool_keys": list(declared_tool_keys),
+            "tool_authority_sha256": tool_authority_sha256,
+        }
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_benchmark_work_batches (
+                        batch_id VARCHAR(96) NOT NULL PRIMARY KEY,
+                        job_id CHAR(36) NOT NULL,
+                        correlation_id CHAR(36) NOT NULL,
+                        case_digest CHAR(64) NOT NULL,
+                        trace_id CHAR(36) NOT NULL,
+                        run_id CHAR(36) NOT NULL,
+                        command_id CHAR(36) NOT NULL,
+                        declared_tool_keys JSON NOT NULL,
+                        tool_authority_sha256 CHAR(64) NOT NULL,
+                        payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                        UNIQUE KEY capability_benchmark_command (command_id)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                job = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id",
+                    value=str(job_id), for_update=True,
+                )
+                if (
+                    job is None
+                    or str(job["data"].get("correlation_id")) != str(correlation_id)
+                ):
+                    raise HTTPException(
+                        status_code=409, detail="benchmark Factory job is unavailable"
+                    )
+                cursor.execute(
+                    "SELECT payload FROM capability_benchmark_work_batches "
+                    "WHERE batch_id = %s FOR UPDATE", (batch_id,),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) == payload:
+                        return
+                    raise HTTPException(
+                        status_code=409, detail="benchmark WorkBatch conflicts"
+                    )
+                cursor.execute(
+                    "INSERT INTO capability_benchmark_work_batches "
+                    "(batch_id, job_id, correlation_id, case_digest, trace_id, run_id, "
+                    "command_id, declared_tool_keys, tool_authority_sha256, payload) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        batch_id, str(job_id), str(correlation_id), case_digest,
+                        str(trace_id), str(run_id), str(command_id),
+                        json.dumps(list(declared_tool_keys)), tool_authority_sha256,
+                        json.dumps(payload, sort_keys=True),
+                    ),
+                )
+
+    def capability_tool_evidence(self, receipt_sha256: str) -> dict[str, Any] | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS capability_tool_evidence_registry (
+                        receipt_sha256 CHAR(64) NOT NULL PRIMARY KEY,
+                        payload JSON NOT NULL,
+                        created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    "SELECT payload FROM capability_tool_evidence_registry "
+                    "WHERE receipt_sha256 = %s",
+                    (receipt_sha256,),
+                )
+                row = cursor.fetchone()
+        return None if row is None else dict(self._decode_json(row["payload"]))
 
     def _batch_row(
         self,
@@ -6951,3 +8460,100 @@ class GatewayStore:
                 )
                 self._insert(cursor, block)
         return block
+
+    def factory_runtime_rpc_receipt(
+        self, idempotency_key: str, *, request_id: UUID, job_id: UUID,
+        correlation_id: UUID, operation: str, request_sha256: str,
+    ) -> dict[str, object] | None:
+        """Read the exact durable Factory-process response, if already committed."""
+
+        if re.fullmatch(r"[0-9a-f]{64}", idempotency_key) is None:
+            raise HTTPException(status_code=422, detail="Factory RPC key is invalid")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT request_id, job_id, correlation_id, operation,
+                           request_sha256, payload
+                    FROM factory_runtime_rpc_receipts
+                    WHERE idempotency_key = %s
+                    """,
+                    (idempotency_key,),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        if (
+            str(row["request_id"]) != str(request_id)
+            or str(row["job_id"]) != str(job_id)
+            or str(row["correlation_id"]) != str(correlation_id)
+            or row["operation"] != operation
+            or row["request_sha256"] != request_sha256
+        ):
+            raise HTTPException(status_code=409, detail="Factory RPC replay changed")
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=409, detail="Factory RPC receipt is invalid")
+        return payload
+
+    def record_factory_runtime_rpc_receipt(
+        self,
+        *,
+        idempotency_key: str,
+        request_id: UUID,
+        job_id: UUID,
+        correlation_id: UUID,
+        operation: str,
+        request_sha256: str,
+        response: dict[str, object],
+    ) -> dict[str, object]:
+        """Persist a post-effect response; identical retries return byte-equivalent data."""
+
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", idempotency_key) is None
+            or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+            or not operation
+        ):
+            raise HTTPException(status_code=422, detail="Factory RPC receipt is invalid")
+        encoded = json.dumps(response, sort_keys=True, separators=(",", ":"))
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT IGNORE INTO factory_runtime_rpc_receipts (
+                        idempotency_key, request_id, job_id, correlation_id,
+                        operation, request_sha256, payload
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        idempotency_key, str(request_id), str(job_id),
+                        str(correlation_id), operation, request_sha256, encoded,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    SELECT request_id, job_id, correlation_id, operation,
+                           request_sha256, payload
+                    FROM factory_runtime_rpc_receipts
+                    WHERE idempotency_key = %s
+                    FOR UPDATE
+                    """,
+                    (idempotency_key,),
+                )
+                row = cursor.fetchone()
+        if row is None or (
+            str(row["request_id"]) != str(request_id)
+            or str(row["job_id"]) != str(job_id)
+            or str(row["correlation_id"]) != str(correlation_id)
+            or row["operation"] != operation
+            or row["request_sha256"] != request_sha256
+        ):
+            raise HTTPException(status_code=409, detail="Factory RPC replay changed")
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if payload != response:
+            raise HTTPException(status_code=409, detail="Factory RPC response changed")
+        return response

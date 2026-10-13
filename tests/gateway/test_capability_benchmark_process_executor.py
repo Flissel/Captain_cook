@@ -19,6 +19,7 @@ from gateway.capability_benchmark_process_executor import (
 )
 from gateway.capability_generic_benchmark import (
     GenericBenchmarkCategory,
+    GenericBenchmarkExecutionPlan,
     GenericBenchmarkExecutionRequest,
     GenericExecutionCaseView,
     GenericPrivateCaseRef,
@@ -54,12 +55,26 @@ def _request(label: str = "request") -> GenericBenchmarkExecutionRequest:
         setup="Redacted customer setup",
         action="Perform the bounded action",
         opaque_source_refs=("b" * 64,),
+        declared_tool_keys=("captain_tool",),
+        tool_authority_sha256=hashlib.sha256(
+            b'["captain_tool"]'
+        ).hexdigest(),
     )
     nonce = _id(label)
     values = dict(
         job_id=_id("job"), capability_id="generic_capability",
         input_ref=_ref("input"), case_ref=case_ref, team_kind="team",
         model_id="fixed-model", model_policy_digest="c" * 64,
+        execution_plan=GenericBenchmarkExecutionPlan(
+            candidate_ref=_ref("candidate"),
+            candidate_manifest_ref=_ref("candidate-manifest"),
+            team_manifest_ref=_ref("team-manifest"),
+            baseline_policy_ref=_ref("baseline-policy"),
+            model_ref=_ref("model"),
+            execution_policy_ref=_ref("execution-policy"),
+            team_agent_names=("planner", "worker"),
+            baseline_agent_name="baseline",
+        ),
         execution_case=execution_case, request_nonce=nonce,
     )
     return GenericBenchmarkExecutionRequest(
@@ -140,10 +155,14 @@ def test_isolated_executor_sends_only_canonical_execution_dto() -> None:
 
     payload = json.loads(transport.requests[0])
     serialized = transport.requests[0].decode()
-    assert set(payload["execution_case"]) == {"setup", "action", "opaque_source_refs"}
+    assert set(payload["execution_case"]) == {
+        "setup", "action", "opaque_source_refs", "declared_tool_keys",
+        "tool_authority_sha256",
+    }
+    assert payload["execution_case"]["declared_tool_keys"] == ["captain_tool"]
     assert all(item not in serialized for item in (
         "expected_predicates", "private_holdout", "repository", "evaluator",
-        "captain-private-assertion",
+        "captain-private-assertion", "CAPTAIN-PRIVATE-EXPECTED-SENTINEL",
     ))
     assert evidence.request_nonce == request.request_nonce
     assert evidence.request_digest == request.request_digest

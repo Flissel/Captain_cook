@@ -29,6 +29,11 @@ from agenten.agent_factory.capability_live_runner import (
 )
 from agenten.agent_factory.holdout_store import PrivateHoldoutStore
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
+from agenten.agent_factory.private_benchmark_catalog import (
+    PrivateBenchmarkCatalogError,
+    VerifiedFilePrivateBenchmarkCatalog,
+    repository_forbidden_roots,
+)
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.delivery.minibook_events import (
     MinibookProjectionAcknowledgementV1,
@@ -36,6 +41,7 @@ from agenten.delivery.minibook_events import (
 )
 from agenten.delivery.projector import MinibookProjector, ProjectionResult
 from gateway.agent_factory_live_composition import AgentFactoryLiveComposition
+from gateway.capability_factory_process_client import GatewayFactoryProcessClient
 from gateway.capability_assembly_admission import (
     RepositoryCapabilityAssemblyInputAdmission,
 )
@@ -45,7 +51,9 @@ from gateway.capability_assembly_contracts import (
     CapabilityAssemblyFactoryPort,
     CapabilityAssemblyInputAdmissionPort,
     CapabilityAssemblyProjectionPort,
+    CapabilityAssemblyReconciliationOutcome,
     CapabilityAssemblyReconciliationPort,
+    CapabilityAssemblyReconciliationRequest,
     CapabilityAssemblyRepositoryPort,
     CapabilityAssemblyStageRequest,
 )
@@ -80,6 +88,7 @@ from gateway.capability_live_pipeline import (
     CapabilityLiveAuthorityUnavailable,
     CapabilityProjectionAuthority,
 )
+from gateway.capability_identity import generic_capability_subject_id
 from gateway.capability_live_runtime_resume import (
     CapabilityResumeGatewayPort,
     GatewayCapabilityResumeExecutionAdapter,
@@ -191,6 +200,17 @@ class _SanitizedReconciliation:
                 "Gateway reconciliation authority is unavailable"
             ) from None
 
+    def record_terminal(self, request: object, outcome: object) -> None:
+        recorder = getattr(self._reconciliation, "record_terminal", None)
+        if recorder is None:
+            return
+        try:
+            recorder(request, outcome)
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway reconciliation authority is unavailable"
+            ) from None
+
 
 class RepositoryFactoryInputArtifactStore:
     """Expose canonical Factory refs over the existing SHA-256 artifact CAS."""
@@ -295,6 +315,29 @@ class AsyncMinibookProjectorAdapter:
             )
         return result
 
+    async def publish_assembly_evidence(
+        self, assembly_id: UUID, evidence: dict[str, object]
+    ) -> dict[str, object]:
+        try:
+            published = await asyncio.to_thread(
+                self._projector.publish_assembly_evidence,
+                str(assembly_id),
+                evidence,
+            )
+            readback = await asyncio.to_thread(
+                self._projector.assembly_evidence,
+                str(assembly_id),
+            )
+        except Exception:
+            raise CapabilityAssemblyProductionConfigurationError(
+                "Minibook assembly evidence authority is unavailable"
+            ) from None
+        if published != evidence or readback != evidence:
+            raise CapabilityAssemblyProductionConfigurationError(
+                "Minibook assembly evidence readback changed bytes"
+            )
+        return readback
+
 
 class GatewayMinibookProjectionEffectsAdapter:
     """Require feed -> project -> acknowledge -> Gateway read-back in order."""
@@ -331,7 +374,7 @@ class GatewayMinibookProjectionEffectsAdapter:
             not isinstance(event, MinibookProjectionEvent)
             or event.event_id != release.release_authority_id
             or event.correlation_id != release.correlation_id
-            or event.subject_id != _factory_subject_reference(release.job_id)
+            or event.subject_id != generic_capability_subject_id(release.job_id)
             or event.subject_version != release.capability_version
             or event.schema_name != "captain.minibook-projection.v2"
             or event.event_type != "capability.promoted"
@@ -446,17 +489,6 @@ class GatewayMinibookProjectionEffectsAdapter:
         return readback
 
 
-def _factory_subject_reference(job_id: UUID) -> str:
-    if job_id.version == 4:
-        return f"subject:{job_id}"
-    subject_digest = bytearray(
-        hashlib.sha256(f"captain-factory-subject:{job_id}".encode()).digest()[:16]
-    )
-    subject_digest[6] = (subject_digest[6] & 0x0F) | 0x40
-    subject_digest[8] = (subject_digest[8] & 0x3F) | 0x80
-    return f"subject:{UUID(bytes=bytes(subject_digest))}"
-
-
 def _release_projection_digest(release: CapabilityFactoryAuthority) -> str:
     if release.release_authority_id is None:
         return "sha256:" + "0" * 64
@@ -510,6 +542,18 @@ class GenericGatewayMinibookCapabilityProjectionAdapter:
             )
         return self._authority(release, execution, event, readback)
 
+    async def publish_assembly_evidence(
+        self, assembly_id: UUID, evidence: dict[str, object]
+    ) -> dict[str, object]:
+        try:
+            return await self._effects._minibook.publish_assembly_evidence(
+                assembly_id, evidence
+            )
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Minibook assembly evidence authority is unavailable"
+            ) from None
+
     @staticmethod
     def _authority(
         release: CapabilityFactoryAuthority,
@@ -540,12 +584,171 @@ class GenericGatewayMinibookCapabilityProjectionAdapter:
         )
 
 
+class GatewayGenericCapabilityExecutionAdapter(
+    RecordedFactoryCapabilityExecutionAdapter
+):
+    """Accept execution only for the exact Gateway-issued generic promotion."""
+
+    def __init__(self, *, gateway_store: GatewayStore, **kwargs: object) -> None:
+        self.gateway_store = gateway_store
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+
+    def _require_released(self, release: CapabilityFactoryAuthority) -> None:
+        event_id = release.release_authority_id
+        summary = release.benchmark_summary_ref
+        if event_id is None or summary is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway generic release authority is unavailable"
+            )
+        try:
+            event = self.gateway_store.generic_capability_promotion(event_id)
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway generic release authority is unavailable"
+            ) from None
+        payload = None if event is None else event.get("payload")
+        if (
+            not isinstance(event, dict)
+            or event.get("event_id") != str(event_id)
+            or event.get("correlation_id") != str(release.correlation_id)
+            or event.get("subject_id") != generic_capability_subject_id(release.job_id)
+            or event.get("subject_version") != release.capability_version
+            or not isinstance(payload, dict)
+            or payload.get("benchmark_summary_digest")
+            != f"sha256:{summary.sha256}"
+            or payload.get("status_id") != "ready_to_use"
+            or payload.get("benchmark_disposition") != "passed"
+        ):
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway generic release authority is unavailable"
+            )
+
+
+class _EffectReceiptRecorderPort(Protocol):
+    def record_effect(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> None: ...
+
+
+def _persist_effect_receipt(
+    recorder: _EffectReceiptRecorderPort,
+    request: CapabilityAssemblyStageRequest,
+    *,
+    authority_field: str,
+    authority: object,
+) -> object:
+    scope = request.effect_receipt_scope
+    if scope is None or authority is None:
+        raise CapabilityLiveAuthorityUnavailable(
+            "effect receipt scope or authority is unavailable"
+        )
+    reconciliation = CapabilityAssemblyReconciliationRequest.model_validate(
+        scope.model_dump(mode="python")
+    )
+    outcome = CapabilityAssemblyReconciliationOutcome(
+        assembly_id=reconciliation.assembly_id,
+        operation_id=reconciliation.operation_id,
+        request_sha256=reconciliation.request_sha256,
+        started_slice=reconciliation.started_slice,
+        started_checkpoint_ref=reconciliation.started_checkpoint_ref,
+        disposition="terminal_readback",
+        **{authority_field: authority},
+    )
+    recorder.record_effect(reconciliation, outcome)
+    return authority
+
+
+class EffectReceiptBoundFactoryAdapter:
+    def __init__(self, delegate: CapabilityAssemblyFactoryPort,
+                 recorder: _EffectReceiptRecorderPort) -> None:
+        self._delegate = delegate
+        self._recorder = recorder
+
+    async def scaffold(self, request: CapabilityAssemblyStageRequest):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="factory_authority",
+            authority=await self._delegate.scaffold(request),
+        )
+
+    async def implement(self, request: CapabilityAssemblyStageRequest):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="factory_authority",
+            authority=await self._delegate.implement(request),
+        )
+
+    async def seal(self, request: CapabilityAssemblyStageRequest):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="factory_authority",
+            authority=await self._delegate.seal(request),
+        )
+
+    async def promote(self, request: CapabilityAssemblyStageRequest):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="factory_authority",
+            authority=await self._delegate.promote(request),
+        )
+
+    async def released(self, request: CapabilityAssemblyStageRequest):
+        return await self._delegate.released(request)
+
+
+class EffectReceiptBoundBenchmarkAdapter:
+    def __init__(self, delegate: CapabilityAssemblyBusinessBenchmarkPort,
+                 recorder: _EffectReceiptRecorderPort) -> None:
+        self._delegate = delegate
+        self._recorder = recorder
+
+    async def evaluate(self, request: CapabilityAssemblyStageRequest):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="benchmark_authority",
+            authority=await self._delegate.evaluate(request),
+        )
+
+
+class EffectReceiptBoundExecutionAdapter:
+    def __init__(self, delegate: CapabilityAssemblyExecutionPort,
+                 recorder: _EffectReceiptRecorderPort) -> None:
+        self._delegate = delegate
+        self._recorder = recorder
+
+    async def execute(self, request: CapabilityAssemblyStageRequest,
+                      release: CapabilityFactoryAuthority):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="execution_authority",
+            authority=await self._delegate.execute(request, release),
+        )
+
+
+class EffectReceiptBoundProjectionAdapter:
+    def __init__(self, delegate: CapabilityAssemblyProjectionPort,
+                 recorder: _EffectReceiptRecorderPort) -> None:
+        self._delegate = delegate
+        self._recorder = recorder
+
+    async def project_and_readback(
+        self, request: CapabilityAssemblyStageRequest,
+        release: CapabilityFactoryAuthority,
+        execution: CapabilityExecutionAuthority,
+    ):
+        return _persist_effect_receipt(
+            self._recorder, request, authority_field="projection_authority",
+            authority=await self._delegate.project_and_readback(
+                request, release, execution
+            ),
+        )
+
+
 @dataclass(frozen=True, repr=False)
 class CapabilityAssemblyProductionSettings:
     expected_repository_revision: str
     expected_sha256_by_path: Mapping[str, str]
     compiled_tool_gaps_by_source_sha256: Mapping[str, tuple[ToolGapMarker, ...]]
     subject_version: int
+    private_benchmark_root: Path
+    private_benchmark_manifest_path: str
+    private_benchmark_manifest_sha256: str
 
     @classmethod
     def from_environment(
@@ -608,18 +811,49 @@ class CapabilityAssemblyProductionSettings:
             raise CapabilityAssemblyProductionConfigurationError(
                 "capability assembly subject version is invalid"
             )
+        private_root_value = environment.get(
+            "CAPTAIN_PRIVATE_BENCHMARK_ROOT", ""
+        ).strip()
+        manifest_path = environment.get(
+            "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_PATH", ""
+        ).strip()
+        manifest_sha256 = environment.get(
+            "CAPTAIN_PRIVATE_BENCHMARK_MANIFEST_SHA256", ""
+        ).strip()
+        if not private_root_value:
+            raise CapabilityAssemblyProductionConfigurationError(
+                "private benchmark root is unavailable"
+            )
+        private_root = Path(private_root_value)
+        if not private_root.is_absolute():
+            raise CapabilityAssemblyProductionConfigurationError(
+                "private benchmark root must be absolute"
+            )
+        relative_manifest = PurePosixPath(manifest_path.replace("\\", "/"))
+        if (relative_manifest.is_absolute() or relative_manifest.name == ""
+                or any(part in {"", ".", ".."} for part in relative_manifest.parts)):
+            raise CapabilityAssemblyProductionConfigurationError(
+                "private benchmark manifest path is invalid"
+            )
+        if _SHA256.fullmatch(manifest_sha256) is None:
+            raise CapabilityAssemblyProductionConfigurationError(
+                "private benchmark manifest digest is invalid"
+            )
         return cls(
             expected_repository_revision=revision,
             expected_sha256_by_path=digests,
             compiled_tool_gaps_by_source_sha256=gaps,
             subject_version=subject_version,
+            private_benchmark_root=private_root,
+            private_benchmark_manifest_path=relative_manifest.as_posix(),
+            private_benchmark_manifest_sha256=manifest_sha256,
         )
 
 
 @dataclass(frozen=True, repr=False)
 class CapabilityAssemblyProductionAuthorities:
     store: GatewayStore
-    factory: AgentFactoryLiveComposition
+    factory: AgentFactoryLiveComposition | GatewayFactoryProcessClient
     provisioning: CapabilityFactoryProvisioningPort
     resume_gateway: CapabilityResumeGatewayPort
     reconciliation: CapabilityAssemblyReconciliationPort
@@ -683,6 +917,19 @@ class CapabilityAssemblyCurrentFactoryAdapter(CurrentCapabilityFactoryAdapter):
         except Exception:
             raise CapabilityLiveAuthorityUnavailable(
                 "Gateway Factory binding authority is unavailable"
+            ) from None
+
+    def benchmark_candidate_for(self, request: CapabilityAssemblyStageRequest):
+        binding = self.binding_for(request)
+        if binding is None:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway Factory binding authority is unavailable"
+            )
+        try:
+            return self._composition.benchmark_candidate_for(binding.job)
+        except Exception:
+            raise CapabilityLiveAuthorityUnavailable(
+                "Gateway released benchmark candidate is unavailable"
             ) from None
 
     async def scaffold(self, request: CapabilityAssemblyStageRequest):
@@ -795,12 +1042,19 @@ class ProductionCapabilityAssemblyComposition:
     __slots__ = (
         "__controller", "__attestation_digest", "__executor_client",
         "__executor_configuration_digest", "__seal", "__sealed", "__weakref__",
+        "__private_catalog", "__private_catalog_configuration_digest",
+        "__private_cases", "__benchmark_tool_authority", "__factory",
     )
 
     def __init__(self, *, controller: CapabilityAssemblyController,
                  attestation_digest: str,
                  executor_client: GatewayIsolatedBenchmarkExecutorClient,
-                 executor_configuration_digest: str, _seal: object) -> None:
+                 executor_configuration_digest: str, _seal: object,
+                 private_catalog: VerifiedFilePrivateBenchmarkCatalog | None = None,
+                 private_catalog_configuration_digest: str | None = None,
+                 private_cases: GenericPrivateBenchmarkRepository | None = None,
+                 factory: AgentFactoryLiveComposition | GatewayFactoryProcessClient | None = None,
+                 benchmark_tool_authority: BenchmarkToolEvidenceAuthorityPort | None = None) -> None:
         if (_seal is not _PRODUCTION_COMPOSITION_SEAL
                 or type(controller) is not CapabilityAssemblyController
                 or type(executor_client) is not GatewayIsolatedBenchmarkExecutorClient
@@ -810,6 +1064,11 @@ class ProductionCapabilityAssemblyComposition:
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__attestation_digest", attestation_digest)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__executor_client", executor_client)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__executor_configuration_digest", executor_configuration_digest)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__private_catalog", private_catalog)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__private_catalog_configuration_digest", private_catalog_configuration_digest)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__private_cases", private_cases)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__factory", factory)
+        object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__benchmark_tool_authority", benchmark_tool_authority)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__seal", _seal)
         object.__setattr__(self, "_ProductionCapabilityAssemblyComposition__sealed", True)
 
@@ -826,11 +1085,46 @@ class ProductionCapabilityAssemblyComposition:
     def attestation_digest(self) -> str:
         return self.__attestation_digest
 
+    @property
+    def private_benchmark_manifest_sha256(self) -> str:
+        if self.__private_catalog is None:
+            raise AttributeError("production private benchmark authority is absent")
+        return self.__private_catalog.manifest_sha256
+
+    @property
+    def private_benchmark_suite_identity_sha256(self) -> str:
+        if self.__private_catalog is None:
+            raise AttributeError("production private benchmark authority is absent")
+        return self.__private_catalog.suite_identity_sha256
+
+    @property
+    def benchmark_execution_authorities(self) -> tuple[object, object]:
+        if self.__private_cases is None or self.__benchmark_tool_authority is None:
+            raise AttributeError("production benchmark execution authority is absent")
+        return self.__private_cases, self.__benchmark_tool_authority
+
+    @property
+    def benchmark_tool_registry(self) -> object:
+        registry = getattr(self.__executor_client, "tool_registry", None)
+        if registry is None:
+            raise AttributeError("production generic tool registry is absent")
+        return registry
+
+    @property
+    def benchmark_host_factory(self) -> AgentFactoryLiveComposition | GatewayFactoryProcessClient:
+        if self.__factory is None:
+            raise AttributeError("production benchmark host Factory is absent")
+        return self.__factory
+
     def is_sealed(self) -> bool:
         try:
             current_executor_digest = (
                 self.__executor_client.sealed_configuration_digest()
             )
+            if self.__private_catalog is None:
+                return False
+            self.__private_catalog.revalidate()
+            current_catalog_digest = self.__private_catalog.configuration_digest
         except Exception:
             return False
         return (
@@ -839,6 +1133,7 @@ class ProductionCapabilityAssemblyComposition:
             and type(self.__controller) is CapabilityAssemblyController
             and re.fullmatch(r"[0-9a-f]{64}", self.__attestation_digest) is not None
             and current_executor_digest == self.__executor_configuration_digest
+            and current_catalog_digest == self.__private_catalog_configuration_digest
         )
 
 
@@ -873,6 +1168,8 @@ def _compose_nonproduction_capability_assembly_controller(
     n8n_work_batches: CapabilityN8nWorkBatchAuthorityPort,
     holdout_store: GenericPrivateHoldoutReader,
     clock: Callable[[], datetime],
+    gateway_store: GatewayStore | None = None,
+    private_cases_sink: list[GenericPrivateBenchmarkRepository] | None = None,
 ) -> CapabilityAssemblyController:
     """Test-only low-level composition; it never carries production attestation."""
 
@@ -902,7 +1199,7 @@ def _compose_nonproduction_capability_assembly_controller(
     resume = GatewayCapabilityResumeExecutionAdapter(
         gateway=cast(CapabilityResumeGatewayPort, _SanitizedResumeGateway(resume_gateway))
     )
-    factory: CapabilityAssemblyFactoryPort = CapabilityAssemblyCurrentFactoryAdapter(
+    factory_delegate: CapabilityAssemblyFactoryPort = CapabilityAssemblyCurrentFactoryAdapter(
         composition=factory_composition,
         provisioning=provisioning,
         clock=clock,
@@ -910,21 +1207,50 @@ def _compose_nonproduction_capability_assembly_controller(
         n8n_work_batches=n8n_work_batches,
         promotion=promotion,
     )
-    benchmark: CapabilityAssemblyBusinessBenchmarkPort = GenericCapabilityBenchmarkAdapter(
-        bindings=factory,
+    benchmark_delegate: CapabilityAssemblyBusinessBenchmarkPort = GenericCapabilityBenchmarkAdapter(
+        bindings=factory_delegate,
         executor=benchmark_executor,
         evidence=benchmark_evidence,
         tool_authority=benchmark_tool_authority,
         recorder=benchmark_recorder,
         private_cases=private_cases,
     )
-    execution: CapabilityAssemblyExecutionPort = RecordedFactoryCapabilityExecutionAdapter(
-        composition=factory_composition,
-        resume_execution=resume,
+    execution_delegate: CapabilityAssemblyExecutionPort = (
+        GatewayGenericCapabilityExecutionAdapter(
+            gateway_store=gateway_store,
+            composition=factory_composition,
+            resume_execution=resume,
+        )
+        if gateway_store is not None
+        else RecordedFactoryCapabilityExecutionAdapter(
+            composition=factory_composition,
+            resume_execution=resume,
+        )
     )
-    projection: CapabilityAssemblyProjectionPort = (
+    projection_delegate: CapabilityAssemblyProjectionPort = (
         GenericGatewayMinibookCapabilityProjectionAdapter(effects=minibook_effects)
     )
+    if private_cases_sink is not None:
+        private_cases_sink.append(private_cases)
+    if gateway_store is not None:
+        receipt_recorder = cast(_EffectReceiptRecorderPort, reconciliation)
+        factory: CapabilityAssemblyFactoryPort = EffectReceiptBoundFactoryAdapter(
+            factory_delegate, receipt_recorder
+        )
+        benchmark: CapabilityAssemblyBusinessBenchmarkPort = (
+            EffectReceiptBoundBenchmarkAdapter(benchmark_delegate, receipt_recorder)
+        )
+        execution: CapabilityAssemblyExecutionPort = EffectReceiptBoundExecutionAdapter(
+            execution_delegate, receipt_recorder
+        )
+        projection: CapabilityAssemblyProjectionPort = EffectReceiptBoundProjectionAdapter(
+            projection_delegate, receipt_recorder
+        )
+    else:
+        factory = factory_delegate
+        benchmark = benchmark_delegate
+        execution = execution_delegate
+        projection = projection_delegate
     return CapabilityAssemblyController(
         repository=repository,
         admission=admission,
@@ -964,6 +1290,16 @@ def build_capability_assembly_controller(
         positional_count=0,
         label="gateway_store.storage.transaction",
     )
+    try:
+        private_catalog = VerifiedFilePrivateBenchmarkCatalog.open(
+            private_root=settings.private_benchmark_root,
+            manifest_path=settings.private_benchmark_manifest_path,
+            expected_sha256=settings.private_benchmark_manifest_sha256,
+            expected_input_sha256s=tuple(settings.expected_sha256_by_path.values()),
+            forbidden_roots=repository_forbidden_roots(root),
+        )
+    except PrivateBenchmarkCatalogError as exc:
+        raise CapabilityAssemblyProductionConfigurationError(str(exc)) from None
     admission = RepositoryCapabilityAssemblyInputAdmission(
         repository_root=root,
         expected_repository_revision=settings.expected_repository_revision,
@@ -974,7 +1310,8 @@ def build_capability_assembly_controller(
         holdout_store=holdout_store,
         subject_version=settings.subject_version,
         source_artifacts=authorities.source_artifacts,
-        require_private_benchmark_cases=True,
+        private_benchmark_catalog=private_catalog,
+        require_private_benchmark_policy=True,
     )
     # Validate every external binding before Gateway repository construction,
     # whose constructor owns the only schema side effect in this builder.
@@ -998,6 +1335,7 @@ def build_capability_assembly_controller(
         require_isolated_executor=True,
     )
     repository = GatewayCapabilityAssemblyRepository(authorities.store)
+    private_cases_sink: list[GenericPrivateBenchmarkRepository] = []
     controller = _compose_nonproduction_capability_assembly_controller(
         repository=repository,
         admission=admission,
@@ -1014,16 +1352,23 @@ def build_capability_assembly_controller(
         n8n_work_batches=authorities.n8n_work_batches,
         holdout_store=cast(GenericPrivateHoldoutReader, holdout_store),
         clock=selected_clock,
+        gateway_store=authorities.store,
+        private_cases_sink=private_cases_sink,
     )
     executor_configuration_digest = (
         authorities.benchmark_executor.sealed_configuration_digest()
     )
+    private_catalog.revalidate()
+    private_catalog_configuration_digest = private_catalog.configuration_digest
     attestation_payload = {
         "schema": "captain.capability-assembly-production-attestation.v1",
         "repository_revision": settings.expected_repository_revision,
         "source_digests": sorted(settings.expected_sha256_by_path.items()),
         "subject_version": settings.subject_version,
         "benchmark_executor_configuration_digest": executor_configuration_digest,
+        "private_benchmark_manifest_sha256": private_catalog.manifest_sha256,
+        "private_benchmark_suite_identity_sha256": private_catalog.suite_identity_sha256,
+        "private_benchmark_configuration_digest": private_catalog_configuration_digest,
     }
     attestation_digest = hashlib.sha256(json.dumps(
         attestation_payload, sort_keys=True, separators=(",", ":"),
@@ -1032,6 +1377,11 @@ def build_capability_assembly_controller(
         controller=controller, attestation_digest=attestation_digest,
         executor_client=authorities.benchmark_executor,
         executor_configuration_digest=executor_configuration_digest,
+        private_catalog=private_catalog,
+        private_catalog_configuration_digest=private_catalog_configuration_digest,
+        private_cases=private_cases_sink[0],
+        factory=authorities.factory,
+        benchmark_tool_authority=authorities.benchmark_tool_authority,
         _seal=_PRODUCTION_COMPOSITION_SEAL,
     )
     _ISSUED_PRODUCTION_COMPOSITIONS.add(composition)
@@ -1115,7 +1465,9 @@ def _preflight_composition(
     clock: object,
     require_isolated_executor: bool,
 ) -> None:
-    if not isinstance(factory_composition, AgentFactoryLiveComposition):
+    if not isinstance(
+        factory_composition, (AgentFactoryLiveComposition, GatewayFactoryProcessClient)
+    ):
         raise CapabilityAssemblyProductionConfigurationError(
             "factory composition is not the current Gateway authority"
         )
@@ -1214,8 +1566,19 @@ def _preflight_composition(
                 "resume_gateway.readback_resume",
             ),
             (reconciliation, "reconcile", True, 1, "reconciliation.reconcile"),
+            *(
+                ((reconciliation, "record_effect", False, 2, "reconciliation.record_effect"),)
+                if require_isolated_executor
+                else ()
+            ),
             (minibook_effects, "project_and_ack", True, 1),
             (minibook_effects, "readback", True, 1),
+            (
+                getattr(minibook_effects, "_minibook", None),
+                "publish_assembly_evidence",
+                True,
+                2,
+            ),
             (benchmark_executor, "execute", True, 1),
             (benchmark_evidence, "resolve", False, 1),
             (benchmark_evidence, "record_evaluation", False, 1),
@@ -1224,6 +1587,7 @@ def _preflight_composition(
             (promotion, "promote_generic_capability", True, 2),
             (n8n_work_batches, "active_n8n_work_batch_id", False, 1),
             (holdout_store, "get", False, 1),
+            (holdout_store, "put_many", False, 1),
             *(
                 (
                     (source_artifacts, "put_factory_input", False, 1),
@@ -1408,6 +1772,7 @@ __all__ = [
     "CapabilityAssemblyProductionSettings",
     "CapabilityProjectionGatewayPort",
     "GatewayMinibookProjectionEffectsAdapter",
+    "GatewayGenericCapabilityExecutionAdapter",
     "GenericGatewayMinibookCapabilityProjectionAdapter",
     "ProductionCapabilityAssemblyComposition",
     "RepositoryFactoryInputArtifactStore",

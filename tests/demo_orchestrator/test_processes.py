@@ -43,6 +43,7 @@ def _configuration(tmp_path: Path) -> DemoConfiguration:
         "CAPTAIN_PROVIDER_PROXY_CLIENT_TOKEN": "proxy-secret",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-secret",
         "CAPTAIN_CAPABILITY_BENCHMARK_TOKEN": "benchmark-secret",
+        "CAPTAIN_CAPABILITY_BENCHMARK_GATEWAY_TOKEN": "benchmark-gateway-secret",
         "MINIBOOK_API_KEY": "minibook-api-secret",
         "MINIBOOK_PROJECTION_API_KEY": "minibook-secret",
         "OPENAI_API_KEY": "provider-secret",

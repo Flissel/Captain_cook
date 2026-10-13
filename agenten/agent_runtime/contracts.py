@@ -40,6 +40,7 @@ class RuntimeOperation(str, Enum):
     CODEX_STATUS = "codex.status"
     CODEX_CANCEL = "codex.cancel"
     CODEX_HEARTBEAT = "codex.heartbeat"
+    AUTOGEN_BENCHMARK = "autogen.benchmark"
 
 
 class IntegrationIntent(str, Enum):
@@ -108,6 +109,10 @@ class AgentRuntimeCommandPayload(_FrozenContract):
     provider_policy_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     provider_price_card_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     provider_context_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_proxy_executable_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_proxy_code_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_paid_command_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_hard_ceiling_enforced: bool | None = Field(default=None, strict=True)
     provider_session_id: str | None = Field(
         default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
     )
@@ -129,10 +134,17 @@ class AgentRuntimeCommandPayload(_FrozenContract):
             RuntimeOperation.CODEX_CANCEL,
             RuntimeOperation.CODEX_HEARTBEAT,
         }
+        benchmark_operations = {RuntimeOperation.AUTOGEN_BENCHMARK}
         if self.operation in codex_operations and not all(
             (self.batch_id, self.subtask_id, self.workspace_ref)
         ):
             raise ValueError("Codex operations require batch, subtask, and workspace refs")
+        if self.operation in benchmark_operations and not all(
+            (self.batch_id, self.subtask_id, self.workspace_ref)
+        ):
+            raise ValueError(
+                "AutoGen benchmark operations require batch, subtask, and workspace refs"
+            )
         planner_profiles = {
             CapabilityProfile.PLANNER,
             CapabilityProfile.FACTORY_ARCHITECT,
@@ -162,6 +174,11 @@ class AgentRuntimeCommandPayload(_FrozenContract):
             CapabilityProfile.FACTORY_TOOL_INTEGRATOR,
         }:
             raise ValueError("Codex operations require a builder profile")
+        if (
+            self.operation in benchmark_operations
+            and self.capability_profile is not CapabilityProfile.FACTORY_REAL_CASE_TESTER
+        ):
+            raise ValueError("autogen.benchmark requires the real-case-tester profile")
         cost_fields = (
             self.maximum_cost_usd,
             self.budget_reservation_id,
@@ -185,6 +202,10 @@ class AgentRuntimeCommandPayload(_FrozenContract):
             self.provider_policy_sha256,
             self.provider_price_card_sha256,
             self.provider_context_sha256,
+            self.provider_proxy_executable_sha256,
+            self.provider_proxy_code_sha256,
+            self.provider_paid_command_sha256,
+            self.provider_hard_ceiling_enforced,
             self.provider_session_id,
             self.provider_result_id,
         )
@@ -320,6 +341,9 @@ class RuntimeResumeCostAuthorityV1(_FrozenContract):
     provider_policy_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     provider_price_card_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     provider_context_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_proxy_executable_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_proxy_code_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    provider_paid_command_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     provider_session_id: str | None = Field(default=None, min_length=1)
     provider_result_id: UUID | None = None
 

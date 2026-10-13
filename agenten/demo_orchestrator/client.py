@@ -42,6 +42,7 @@ class JsonHttpPort(Protocol):
         token: str,
         payload: dict[str, object] | None,
         timeout_seconds: float,
+        auth_header: str = "Authorization",
     ) -> dict[str, object]: ...
 
 
@@ -370,6 +371,7 @@ class CapabilityDemoClient:
         token: str,
         payload: dict[str, object] | None,
         deadline: float,
+        auth_header: str = "Authorization",
     ) -> dict[str, object]:
         remaining = self._remaining(deadline)
         try:
@@ -379,6 +381,7 @@ class CapabilityDemoClient:
                 token=token,
                 payload=payload,
                 timeout_seconds=remaining,
+                auth_header=auth_header,
             )
         except (TimeoutError, DemoTimeout):
             raise DemoTimeout("Captain demo operation timed out") from None
@@ -411,8 +414,12 @@ class CapabilityDemoClient:
                 token=tokens[binding.token_name],
                 payload=None,
                 deadline=deadline,
+                auth_header=binding.header_name,
             )
-            if response.get("status") not in {"ok", "ready"}:
+            if (
+                binding.service != "n8n"
+                and response.get("status") not in {"ok", "ready"}
+            ):
                 raise DemoClientError(
                     f"authenticated {binding.service} health is not ready"
                 )
@@ -452,14 +459,16 @@ class UrllibJsonHttp:
         token: str,
         payload: dict[str, object] | None,
         timeout_seconds: float,
+        auth_header: str = "Authorization",
     ) -> dict[str, object]:
         body = None if payload is None else _canonical_json(payload)
+        authorization_value = token if auth_header == "X-N8N-API-KEY" else f"Bearer {token}"
         request = urllib.request.Request(
             url,
             data=body,
             method=method,
             headers={
-                "Authorization": f"Bearer {token}",
+                auth_header: authorization_value,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
             },

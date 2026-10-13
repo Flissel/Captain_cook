@@ -1328,7 +1328,10 @@ class HermesCliFactory(HermesFactoryPort):
             raise FactoryDispatchError("Hermes cost ceiling is already exhausted")
         command_prefix = [self._settings.executable]
         process_options: dict[str, object] = _async_process_group_options()
-        environment = os.environ.copy()
+        environment = _hermes_subprocess_environment(os.environ)
+        # Child-only endpoint/key overrides (never written to os.environ). They are
+        # applied on top of the strict allowlisted OS environment so no ambient
+        # secret is inherited by the Hermes subprocess.
         environment.update(self._settings.environment_overrides)
         if hermes_home is not None:
             resolved_hermes_home = hermes_home.resolve(strict=True)
@@ -4278,6 +4281,20 @@ def _deadline(max_seconds: float) -> float:
     if max_seconds <= 0:
         raise FactoryDispatchError("Hermes skill evaluation has no remaining lease time")
     return time.monotonic() + max_seconds
+
+
+def _hermes_subprocess_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Build the non-secret OS environment inherited by Hermes subprocesses."""
+
+    allowed = (
+        "PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+        "LANG", "LC_ALL", "PYTHONUTF8",
+    )
+    return {
+        name: value
+        for name in allowed
+        if (value := source.get(name)) is not None
+    }
 
 
 def _remaining_deadline_seconds(deadline: float) -> float:

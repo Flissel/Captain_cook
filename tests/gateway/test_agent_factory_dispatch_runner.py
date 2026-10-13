@@ -303,6 +303,48 @@ def test_gateway_issuer_binds_a_generic_provisioned_n8n_work_batch() -> None:
     assert "mcp.n8n" in lease.capabilities
 
 
+def test_fresh_gateway_issuer_reads_the_durable_generic_n8n_work_batch() -> None:
+    job = workflow_job(mode="demo")
+    batch_id = f"n8n-{job.job_id.hex[:24]}"
+    store = RecordingGatewayStore(
+        job,
+        batch={
+            "batch_id": batch_id,
+            "title": "Provisioned integration",
+            "goal": "Execute the released integration",
+            "subtask_ids": ["n8n-workflow"],
+            "target": "n8n",
+            "runtime": "n8n",
+            "runtime_version": "v1",
+            "interface_schema": "captain-n8n-artifact/v1",
+            "capability_tags": ["n8n-builder"],
+            "constraints": [f"factory-job-id:{job.job_id}"],
+            "acceptance_criteria": [],
+        },
+    )
+
+    class DurableN8nSource:
+        def active_n8n_work_batch_id(self, job_id):
+            assert job_id == job.job_id
+            return batch_id
+
+    restarted = GatewayNextActionLeaseIssuer(
+        store=store,
+        workspace_namespace="business-benchmark-demo",
+        n8n_work_batch_source=DurableN8nSource(),
+    )
+
+    lease = restarted.ensure_for(
+        job,
+        _action(FactoryActionKind.DISPATCH_TOOL_INTEGRATOR),
+        FactoryRole.TOOL_INTEGRATOR,
+        NOW,
+    )
+
+    assert lease.integration_intent is IntegrationIntent.N8N
+    assert "mcp.n8n" in lease.capabilities
+
+
 def test_tool_integrator_leases_are_action_scoped_at_the_same_timestamp() -> None:
     job = workflow_job(mode="demo")
     batch_id = f"renewal-{job.job_id.hex[:24]}"

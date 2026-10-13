@@ -824,6 +824,18 @@ async def test_module_root_runs_only_the_checkout_cli_with_bound_cwd_and_pythonp
     entrypoint.parent.mkdir(parents=True)
     entrypoint.write_text("# checkout entrypoint\n", encoding="utf-8")
     monkeypatch.setenv("PYTHONPATH", "global-hermes-location")
+    for secret_name in (
+        "CAPTAIN_FACTORY_RUNTIME_TOKEN",
+        "CAPTAIN_GATEWAY_TOKEN",
+        "WORKER_GATEWAY_TOKEN",
+        "CAPTAIN_RUNTIME_TOKEN",
+        "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN",
+        "MINIBOOK_API_KEY",
+        "MINIBOOK_CREATION_DB",
+        "LEDGER_DSN",
+        "OPENAI_API_KEY",
+    ):
+        monkeypatch.setenv(secret_name, "must-not-reach-hermes")
     observed_command: tuple[str, ...] = ()
     observed_options: dict[str, object] = {}
 
@@ -869,6 +881,20 @@ async def test_module_root_runs_only_the_checkout_cli_with_bound_cwd_and_pythonp
     assert environment["HERMES_MAX_ITERATIONS"] == "16"
     assert environment["HERMES_MAX_TOKENS"] == "1536"
     assert environment["HERMES_REASONING_EFFORT"] == "high"
+    assert all(
+        name not in environment
+        for name in (
+            "CAPTAIN_FACTORY_RUNTIME_TOKEN",
+            "CAPTAIN_GATEWAY_TOKEN",
+            "WORKER_GATEWAY_TOKEN",
+            "CAPTAIN_RUNTIME_TOKEN",
+            "CAPTAIN_PROVIDER_RECEIPT_GATEWAY_TOKEN",
+            "MINIBOOK_API_KEY",
+            "MINIBOOK_CREATION_DB",
+            "LEDGER_DSN",
+            "OPENAI_API_KEY",
+        )
+    )
 
 
 def test_hermes_output_token_bound_is_strict() -> None:

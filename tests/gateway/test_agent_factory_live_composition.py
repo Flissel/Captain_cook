@@ -137,6 +137,24 @@ def test_composes_real_factory_runner_without_provider_effects(tmp_path: Path) -
     )
 
 
+def test_composition_reuses_the_exact_gateway_repository_authority(
+    tmp_path: Path,
+) -> None:
+    store = _EffectTrap()
+    repository = GatewayFactoryRepository(store)  # type: ignore[arg-type]
+
+    composition = _compose(
+        tmp_path,
+        store=store,
+        gateway_repository=repository,
+    )
+
+    assert composition.repository is repository
+    assert composition.coordinator._repository is repository
+    assert composition.hermes._workflow_artifacts is repository
+    assert composition.candidate_validator._workflow_artifacts is repository
+
+
 def test_gateway_technical_ports_bind_candidate_private_holdout_and_no_tools(
     tmp_path: Path,
 ) -> None:

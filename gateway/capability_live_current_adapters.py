@@ -184,7 +184,6 @@ class RecordedFactoryCapabilityExecutionAdapter:
         release: CapabilityFactoryAuthority,
     ) -> CapabilityExecutionAuthority | None:
         capability = request.capability
-        projection = self._composition.projection(release.job_id)
         if (
             capability.job_id != release.job_id
             or capability.correlation_id != release.correlation_id
@@ -192,11 +191,16 @@ class RecordedFactoryCapabilityExecutionAdapter:
             or capability.capability_version != release.capability_version
             or request.reservation.run_id != request.run_id
             or request.reservation.input_id != capability.input_id
-            or getattr(projection, "phase", None) is not FactoryPhase.CAPABILITY_PROMOTED
         ):
             raise CapabilityLiveAuthorityUnavailable(
                 "restart capability changed the stable release binding"
             )
+        try:
+            self._require_released(release)
+        except CapabilityLiveAuthorityUnavailable:
+            raise CapabilityLiveAuthorityUnavailable(
+                "restart capability changed the stable release binding"
+            ) from None
         if self._resume_execution is None:
             raise CapabilityLiveAuthorityUnavailable(
                 "restart authorization receipt is unavailable"
@@ -365,9 +369,7 @@ class RecordedFactoryCapabilityExecutionAdapter:
         self,
         release: CapabilityFactoryAuthority,
     ) -> CapabilityExecutionAuthority:
-        projection = self._composition.projection(release.job_id)
-        if getattr(projection, "phase", None) is not FactoryPhase.CAPABILITY_PROMOTED:
-            raise CapabilityLiveAuthorityUnavailable("released Factory execution is unavailable")
+        self._require_released(release)
         runs = _successful_runs(self._composition.workflow_artifacts(release.job_id))
         if len(runs) < 3:
             raise CapabilityLiveAuthorityUnavailable("release lacks a third successful run")
@@ -394,6 +396,13 @@ class RecordedFactoryCapabilityExecutionAdapter:
             terminal_status="succeeded",
             replayed=True,
         )
+
+    def _require_released(self, release: CapabilityFactoryAuthority) -> None:
+        projection = self._composition.projection(release.job_id)
+        if getattr(projection, "phase", None) is not FactoryPhase.CAPABILITY_PROMOTED:
+            raise CapabilityLiveAuthorityUnavailable(
+                "released Factory execution is unavailable"
+            )
 
 
 class GatewayMinibookCapabilityProjectionAdapter:

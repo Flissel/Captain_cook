@@ -225,12 +225,20 @@ class CapabilityResumeService:
                 policy_sha256=self._provider_proxy_binding.policy_sha256,
                 price_card_sha256=self._provider_proxy_binding.price_card_sha256,
             )
+            if context.sha256 != self._provider_proxy_binding.context_sha256:
+                raise CapabilityResumeUnavailable(
+                    "provider proxy command context is not configured"
+                )
             resume_command = resume_command.model_copy(update={
                 "payload": resume_command.payload.model_copy(update={
                     "provider_proxy_url": self._provider_proxy_binding.responses_url,
                     "provider_policy_sha256": self._provider_proxy_binding.policy_sha256,
                     "provider_price_card_sha256": self._provider_proxy_binding.price_card_sha256,
                     "provider_context_sha256": context.sha256,
+                    "provider_proxy_executable_sha256": self._provider_proxy_binding.executable_sha256,
+                    "provider_proxy_code_sha256": self._provider_proxy_binding.code_sha256,
+                    "provider_paid_command_sha256": self._provider_proxy_binding.paid_command_sha256,
+                    "provider_hard_ceiling_enforced": self._provider_proxy_binding.hard_ceiling_enforced,
                     "provider_session_id": session_id,
                     "provider_result_id": result_id,
                 })

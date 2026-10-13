@@ -634,6 +634,7 @@ def compose_business_demo_factory_operator(
     }
     return compose_agent_factory_live(
         store=store,
+        gateway_repository=repository,
         forge=forge,
         candidate_bindings=candidate_bindings,
         team_execution_ports_for=technical_ports,

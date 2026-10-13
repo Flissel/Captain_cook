@@ -5,10 +5,11 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
-from agenten.demo_orchestrator.cli import main
+from agenten.demo_orchestrator.cli import DefaultDemoActions, main
 from agenten.demo_orchestrator.client import DemoTimeout
 from agenten.demo_orchestrator.processes import DemoProcessError, DemoProcessTimeout
 
@@ -48,6 +49,102 @@ class FakeActions:
     def stop(self) -> dict[str, object]:
         self.calls.append(("stop", None))
         return {"status": "stopped"}
+
+
+def test_default_actions_executes_all_eight_exact_d11_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "tool_host", "minibook", "n8n")
+    controls = tuple(
+        SimpleNamespace(
+            service=service,
+            start_argv=("python", "-m", "gateway.capability_process_operator", "--service", service, "start"),
+            stop_argv=("python", "-m", "gateway.capability_process_operator", "--service", service, "stop"),
+            restart_argv=("python", "-m", "gateway.capability_process_operator", "--service", service, "restart"),
+        )
+        for service in services
+    )
+    configuration = SimpleNamespace(
+        environment={"CAPTAIN_PROCESS_OPERATOR_BACKEND": "sentinel"},
+        require_operator_process_bootstrap=lambda: SimpleNamespace(services=controls),
+    )
+    monkeypatch.setattr(
+        "agenten.demo_orchestrator.cli.load_demo_configuration", lambda _root: configuration
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def run(argv, **_kwargs):
+        command = tuple(argv)
+        calls.append(command)
+        service = command[-2]
+        action = command[-1]
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                "service": service, "status": "running", "operation": action,
+                "identity_kind": "sentinel", "identity_value": f"{service}-{action}",
+            }),
+        )
+
+    monkeypatch.setattr("agenten.demo_orchestrator.cli.subprocess.run", run)
+
+    result = DefaultDemoActions(tmp_path).start(3)
+
+    assert result["services"] == list(services)
+    assert tuple(command[-2] for command in calls) == services
+    assert all(command[-1] == "start" for command in calls)
+
+
+def test_default_status_revalidates_all_eight_authenticated_health_contracts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = ("gateway", "runtime", "factory", "provider_proxy", "benchmark", "tool_host", "minibook", "n8n")
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    controls = tuple(
+        SimpleNamespace(
+            service=service,
+            authenticated_health_url=f"http://127.0.0.1/{service}/authenticated-health",
+            authenticated_health_credential_env=f"{service.upper()}_TOKEN",
+            authenticated_health_header=("X-N8N-API-KEY" if service == "n8n" else "Authorization"),
+        )
+        for service in services
+    )
+    for service in services:
+        (state_root / f"{service}.json").write_text(
+            json.dumps({
+                "service": service, "status": "running",
+                "identity_kind": "docker_container" if service == "n8n" else "os_process",
+                "identity_value": f"verified-{service}",
+            }),
+            encoding="utf-8",
+        )
+    configuration = SimpleNamespace(
+        environment={"CAPTAIN_PROCESS_STATE_ROOT": str(state_root)},
+        require_operator_process_bootstrap=lambda: SimpleNamespace(services=controls),
+        authority_token=lambda name: f"secret-for-{name}",
+    )
+    calls: list[tuple[str, str, str]] = []
+
+    class Health:
+        def request_json(self, _method, url, *, token, auth_header, **_kwargs):
+            calls.append((url, token, auth_header))
+            return {} if "n8n" in url else {"status": "ready"}
+
+    monkeypatch.setattr("agenten.demo_orchestrator.cli.load_demo_configuration", lambda _root: configuration)
+    monkeypatch.setattr("agenten.demo_orchestrator.cli.UrllibJsonHttp", Health)
+
+    result = DefaultDemoActions(tmp_path).status(3)
+
+    assert result["services"] == list(services)
+    assert calls == [
+        (
+            control.authenticated_health_url,
+            f"secret-for-{control.authenticated_health_credential_env}",
+            control.authenticated_health_header,
+        )
+        for control in controls
+    ]
 
 
 @pytest.mark.parametrize("action", ("init", "start", "status", "stop"))

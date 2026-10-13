@@ -1366,6 +1366,14 @@ class CandidateEvaluationFactory:
         self._team_execution = team_execution
         self._workflow_artifacts = workflow_artifacts
 
+    def candidate_for(self, job: FactoryJob) -> ResolvedFactoryCandidate:
+        """Resolve the exact released candidate through the configured Forge authority."""
+
+        candidate = self._provider.candidate_for(job)
+        if not isinstance(candidate, ResolvedFactoryCandidate):
+            raise FactoryDispatchError("authoritative Forge candidate is invalid")
+        return candidate
+
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
         if request.action.kind is FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE:
             raise FactoryDispatchError(

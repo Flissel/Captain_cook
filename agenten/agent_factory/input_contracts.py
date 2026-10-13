@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -19,6 +18,91 @@ RATIONALE_BENCHMARK_PREDICATE_KINDS = frozenset({"rationale_contains"})
 SAFETY_BENCHMARK_PREDICATE_KINDS = frozenset({"forbidden_tool_absent"})
 TOOL_BENCHMARK_PREDICATE_KINDS = frozenset({"tool_receipt"})
 HANDOFF_BENCHMARK_PREDICATE_KINDS = frozenset({"handoff_event"})
+BENCHMARK_CATEGORIES = (
+    "normal", "boundary", "missing", "conflicting", "mandatory_escalation",
+)
+BENCHMARK_DIMENSIONS = (
+    "business_outcome", "rationale", "safety", "required_tool",
+)
+BENCHMARK_RULESET_REFS = (
+    "captain.business-outcome.v1",
+    "captain.rationale.v1",
+    "captain.safety.v1",
+    "captain.tool-decision.v1",
+    "captain.handoff.v1",
+)
+BenchmarkSourceAuthorityType = Literal[
+    "business", "rationale", "safety", "tool", "handoff",
+]
+
+
+def benchmark_predicate_authority_type(
+    predicate_kind: str,
+) -> BenchmarkSourceAuthorityType:
+    if predicate_kind in BUSINESS_BENCHMARK_PREDICATE_KINDS:
+        return "business"
+    if predicate_kind in RATIONALE_BENCHMARK_PREDICATE_KINDS:
+        return "rationale"
+    if predicate_kind in SAFETY_BENCHMARK_PREDICATE_KINDS:
+        return "safety"
+    if predicate_kind in TOOL_BENCHMARK_PREDICATE_KINDS:
+        return "tool"
+    if predicate_kind in HANDOFF_BENCHMARK_PREDICATE_KINDS:
+        return "handoff"
+    raise ValueError("private benchmark predicate authority type is invalid")
+
+
+def benchmark_source_supports_authority(
+    authority_type: BenchmarkSourceAuthorityType,
+    *,
+    assertion_kind: str,
+    source_path: tuple[str, ...],
+    observable_expected: str,
+) -> bool:
+    if not source_path:
+        return False
+    source_section = source_path[0]
+    if authority_type in {"business", "rationale"}:
+        return (
+            assertion_kind == "business"
+            and source_section in {"Acceptance outcomes", "Real cases", "Agents"}
+        ) or (
+            assertion_kind == "recovery"
+            and source_section in {"Integrations", "Stop conditions"}
+        )
+    if authority_type == "safety":
+        return (
+            assertion_kind == "security"
+            and source_section in {
+                "Authority boundaries", "Security requirements", "Tool policy",
+            }
+            and any(
+                marker in observable_expected.casefold()
+                for marker in (
+                    "tool lease", "integration lease", "released team manifest",
+                )
+            )
+        )
+    if authority_type == "tool":
+        return (
+            assertion_kind == "integration"
+            and source_section == "Tool policy"
+            and source_path[-1].startswith("tool_")
+        )
+    return (
+        (
+            assertion_kind == "security"
+            and source_section == "Authority boundaries"
+        )
+        or (
+            assertion_kind == "recovery"
+            and source_section == "Integrations"
+        )
+    ) and re.search(
+        r"\b(?:human|owner|approver|commander|adjuster|reviewer)\b",
+        observable_expected,
+        re.IGNORECASE,
+    ) is not None
 
 
 class _FrozenContract(BaseModel):
@@ -55,6 +139,7 @@ class BenchmarkExpectedPredicate(_FrozenContract):
     ]
     observed_key: str = Field(pattern=IDENTIFIER_PATTERN)
     expected_value: str | bool
+    source_case_keys: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def validate_expected_value_semantics(self) -> "BenchmarkExpectedPredicate":
@@ -77,10 +162,13 @@ class PrivateBenchmarkCaseRequirement(_FrozenContract):
     observable_setup: str = Field(min_length=1)
     observable_action: str = Field(min_length=1)
     source_case_keys: tuple[str, ...] = Field(min_length=1)
+    declared_tool_keys: tuple[str, ...] = Field(min_length=1)
     expected_predicates: tuple[BenchmarkExpectedPredicate, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def require_unique_predicates(self) -> "PrivateBenchmarkCaseRequirement":
+        if len(self.declared_tool_keys) != len(set(self.declared_tool_keys)):
+            raise ValueError("declared benchmark tool keys must be unique")
         keys = tuple(item.predicate_key for item in self.expected_predicates)
         if len(keys) != len(set(keys)):
             raise ValueError("benchmark predicate keys must be unique")
@@ -99,6 +187,41 @@ class PrivateBenchmarkCaseRequirement(_FrozenContract):
             raise ValueError(
                 "mandatory escalation benchmark case requires a handoff predicate"
             )
+        mapped = tuple(
+            source
+            for predicate in self.expected_predicates
+            for source in predicate.source_case_keys
+        )
+        if mapped:
+            if any(not predicate.source_case_keys for predicate in self.expected_predicates):
+                raise ValueError("all benchmark predicates require source mappings")
+            if set(mapped) != set(self.source_case_keys):
+                raise ValueError(
+                    "benchmark case sources must exactly equal predicate source mappings"
+                )
+        return self
+
+
+class BenchmarkPolicyRequirement(_FrozenContract):
+    """Public benchmark shape; it never carries cases or expected answers."""
+
+    categories: tuple[str, ...] = BENCHMARK_CATEGORIES
+    cases_per_category: int = Field(default=3, strict=True)
+    required_dimensions: tuple[str, ...] = BENCHMARK_DIMENSIONS
+    ruleset_refs: tuple[str, ...] = BENCHMARK_RULESET_REFS
+    source_case_keys: tuple[str, ...] = Field(min_length=1)
+    public_policy_statement: str | None = None
+
+    @model_validator(mode="after")
+    def require_canonical_public_shape(self) -> "BenchmarkPolicyRequirement":
+        if self.categories != BENCHMARK_CATEGORIES or self.cases_per_category != 3:
+            raise ValueError("benchmark policy requires exactly three cases per category")
+        if self.required_dimensions != BENCHMARK_DIMENSIONS:
+            raise ValueError("benchmark policy dimensions are not canonical")
+        if self.ruleset_refs != BENCHMARK_RULESET_REFS:
+            raise ValueError("benchmark policy rulesets are not canonical")
+        if len(self.source_case_keys) != len(set(self.source_case_keys)):
+            raise ValueError("benchmark policy source keys must be unique")
         return self
 
 
@@ -119,6 +242,13 @@ class RequestedIntegration(_FrozenContract):
         for alias in self.credential_aliases:
             CredentialAlias(alias=alias)
         return self
+
+
+class DeclaredTool(_FrozenContract):
+    tool_key: str = Field(pattern=IDENTIFIER_PATTERN)
+    requirement: Literal["required", "optional"]
+    location: Literal["local", "integration"]
+    description: str = Field(min_length=1)
 
 
 class RequestedAgent(_FrozenContract):
@@ -151,7 +281,9 @@ class FactoryInputDocumentV2(_FrozenContract):
     real_cases: tuple[RealCaseRequirement, ...] = Field(min_length=1)
     helpful_resources: tuple[str, ...] = Field(min_length=1)
     stop_conditions: tuple[str, ...] = Field(min_length=1)
-    private_benchmark_cases: tuple[PrivateBenchmarkCaseRequirement, ...] = ()
+    declared_tools: tuple[DeclaredTool, ...] = ()
+    tool_policy_guard: str | None = None
+    benchmark_policy: BenchmarkPolicyRequirement
     sections: tuple[InputSection, ...] = Field(min_length=10)
     extra_sections: tuple[InputSection, ...] = ()
 
@@ -159,52 +291,33 @@ class FactoryInputDocumentV2(_FrozenContract):
     def validate_stable_names(self) -> "FactoryInputDocumentV2":
         agent_keys = tuple(item.agent_key for item in self.agents)
         integration_keys = tuple(item.integration_key for item in self.integrations)
+        tool_keys = tuple(item.tool_key for item in self.declared_tools)
         if len(agent_keys) != len(set(agent_keys)):
             raise ValueError("duplicate agent stable name")
         if len(integration_keys) != len(set(integration_keys)):
             raise ValueError("duplicate integration stable name")
+        if len(tool_keys) != len(set(tool_keys)):
+            raise ValueError("duplicate declared tool stable name")
         known_agents = set(agent_keys)
         known_integrations = set(integration_keys)
-        benchmark_keys = tuple(item.case_key for item in self.private_benchmark_cases)
-        if len(benchmark_keys) != len(set(benchmark_keys)):
-            raise ValueError("duplicate private benchmark case stable name")
-        if self.private_benchmark_cases:
-            categories = (
-                "normal", "boundary", "missing", "conflicting", "mandatory_escalation"
-            )
-            if (len(self.private_benchmark_cases) != 15
-                    or any(sum(item.category == category for item in self.private_benchmark_cases) != 3
-                           for category in categories)):
-                raise ValueError(
-                    "private benchmark cases require exactly three cases per category"
-                )
-            semantic_digests = tuple(
-                hashlib.sha256(json.dumps({
-                    "category": item.category,
-                    "setup": item.observable_setup,
-                    "action": item.observable_action,
-                    "source_case_keys": item.source_case_keys,
-                    "expected_predicates": sorted(
-                        (
-                            predicate.kind,
-                            predicate.observed_key,
-                            predicate.expected_value,
-                        )
-                        for predicate in item.expected_predicates
-                    ),
-                }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-                for item in self.private_benchmark_cases
-            )
-            if len(semantic_digests) != len(set(semantic_digests)):
-                raise ValueError("private benchmark semantic definitions must be unique")
-        source_case_keys = {
+        public_source_keys = (
             *(item.case_key for item in self.real_cases),
             *(item.case_key for item in self.acceptance_outcomes),
-            *(item.integration_key for item in self.integrations),
-        }
-        for item in self.private_benchmark_cases:
-            if set(item.source_case_keys) - source_case_keys:
-                raise ValueError("private benchmark case references an unknown source case")
+            *(case.case_key for agent in self.agents for case in agent.real_cases),
+            *(f"{item.integration_key}_integration" for item in self.integrations),
+            *(f"{item.integration_key}_failure" for item in self.integrations),
+            *(f"{item.integration_key}_tool" for item in self.integrations),
+            *(f"authority_{index}" for index, _ in enumerate(self.authority_boundaries, 1)),
+            *(f"security_{index}" for index, _ in enumerate(self.security_requirements, 1)),
+            *(f"stop_{index}" for index, _ in enumerate(self.stop_conditions, 1)),
+            *(f"tool_{item.tool_key}" for item in self.declared_tools),
+            *(("tool_policy_guard",) if self.tool_policy_guard else ()),
+        )
+        if len(public_source_keys) != len(set(public_source_keys)):
+            raise ValueError("benchmark public source keys must be unique")
+        source_case_keys = set(public_source_keys)
+        if set(self.benchmark_policy.source_case_keys) - source_case_keys:
+            raise ValueError("benchmark policy references an unknown public source")
         for agent in self.agents:
             unknown_handoffs = set(agent.handoffs) - known_agents
             if unknown_handoffs:

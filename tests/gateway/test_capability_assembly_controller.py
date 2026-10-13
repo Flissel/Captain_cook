@@ -47,6 +47,12 @@ from gateway.capability_assembly_controller import (
     CapabilityAssemblyController,
     CapabilityAssemblyIncomplete,
 )
+from gateway.capability_assembly_production import (
+    EffectReceiptBoundBenchmarkAdapter,
+    EffectReceiptBoundExecutionAdapter,
+    EffectReceiptBoundFactoryAdapter,
+    EffectReceiptBoundProjectionAdapter,
+)
 from gateway.capability_assembly_admission import (
     RepositoryCapabilityAssemblyInputAdmission,
 )
@@ -388,6 +394,7 @@ class _Projection:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.requests: list[object] = []
+        self.assembly_evidence: dict[UUID, dict[str, object]] = {}
 
     async def project_and_readback(self, request, release, execution):
         self.requests.append(request)
@@ -403,6 +410,13 @@ class _Projection:
             projection_readback_id=_id(f"readback-{request.input.input_id}"),
             evidence_refs=(_ref(f"projection-{request.input.input_id}"),),
         )
+
+    async def publish_assembly_evidence(self, assembly_id, evidence):
+        existing = self.assembly_evidence.get(assembly_id)
+        if existing is not None and existing != evidence:
+            raise RuntimeError("assembly evidence conflicts")
+        self.assembly_evidence[assembly_id] = evidence
+        return self.assembly_evidence[assembly_id]
 
 
 class _Resume:
@@ -459,6 +473,44 @@ class _Reconciliation:
     async def reconcile(self, request: CapabilityAssemblyReconciliationRequest):
         self.calls.append(request)
         return self.outcome
+
+
+class _TerminalJournalReconciliation(_Reconciliation):
+    def __init__(self) -> None:
+        super().__init__()
+        self.terminal: dict[tuple[UUID, UUID, str, int, str], CapabilityAssemblyReconciliationOutcome] = {}
+
+    @staticmethod
+    def _key(request: CapabilityAssemblyReconciliationRequest):
+        return (
+            request.assembly_id,
+            request.operation_id,
+            request.request_sha256,
+            request.started_slice.ordinal,
+            request.started_checkpoint_ref.sha256,
+        )
+
+    def record_terminal(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> None:
+        key = self._key(request)
+        existing = self.terminal.get(key)
+        if existing is not None and existing != outcome:
+            raise CapabilityAssemblyWriteConflict("terminal authority conflict")
+        self.terminal[key] = outcome
+
+    def record_effect(
+        self,
+        request: CapabilityAssemblyReconciliationRequest,
+        outcome: CapabilityAssemblyReconciliationOutcome,
+    ) -> None:
+        self.record_terminal(request, outcome)
+
+    async def reconcile(self, request: CapabilityAssemblyReconciliationRequest):
+        self.calls.append(request)
+        return self.terminal.get(self._key(request))
 
 
 class _SharedReceiptReconciliation(_Reconciliation):
@@ -564,6 +616,23 @@ def test_submit_admits_exactly_three_repository_inputs_and_replays_without_readm
         "products/customer-c/TO_BE_BUILT.md",
     ]
     assert len(admission.calls) == 3
+
+
+def test_submit_rejects_more_than_usd_six_before_admission_or_effect() -> None:
+    original = _submission()
+    first = original.inputs[0].model_copy(update={
+        "reservation": original.inputs[0].reservation.model_copy(
+            update={"maximum_cost_usd": Decimal("2.01")}
+        )
+    })
+
+    with pytest.raises(ValueError, match="USD 6.00"):
+        CapabilityAssemblySubmitRequest(
+            assembly_id=original.assembly_id,
+            idempotency_key=original.idempotency_key,
+            maximum_cost_usd=Decimal("6.01"),
+            inputs=(first, *original.inputs[1:]),
+        )
 
 
 def test_real_canonical_admission_reaches_every_offline_stage_without_legacy_coercion() -> None:
@@ -992,6 +1061,24 @@ def test_complete_assembly_returns_validated_final_evidence_and_uses_d1_chain() 
     assert evidence.restart.resume_budget_violation is False
 
 
+def test_final_evidence_is_persisted_and_read_back_from_minibook_before_return() -> None:
+    controller, _, _, _, _, _, projection, *_ = _controller()
+    controller.submit(_submission())
+    while controller.projection(ASSEMBLY_ID).completed_slices < ASSEMBLY_TOTAL_SLICES:
+        completed = controller.projection(ASSEMBLY_ID).completed_slices
+        _advance(
+            controller,
+            operation=f"minibook-final-{completed}",
+            maximum_slices=min(8, ASSEMBLY_TOTAL_SLICES - completed),
+        )
+
+    evidence = asyncio.run(controller.final_evidence_and_publish(ASSEMBLY_ID))
+
+    assert projection.assembly_evidence[ASSEMBLY_ID] == evidence.model_dump(
+        mode="json", by_alias=True
+    )
+
+
 def test_missing_d1_authority_fails_closed_without_final_evidence() -> None:
     resume = _Resume(available=False)
     controller, *_ = _controller(resume=resume)
@@ -1124,6 +1211,156 @@ def test_started_slice_without_terminal_never_replays_the_effect_after_restart()
     with pytest.raises(CapabilityAssemblyIncomplete, match="started slice"):
         asyncio.run(restarted.advance(request))
     assert restarted_factory.calls == []
+
+
+def test_validated_terminal_authority_survives_crash_before_checkpoint_append() -> None:
+    reconciliation = _TerminalJournalReconciliation()
+    controller, repo, _, factory, *_ = _controller(reconciliation=reconciliation)
+    controller.submit(_submission())
+    request = CapabilityAssemblyAdvanceRequest(
+        assembly_id=ASSEMBLY_ID,
+        operation_id=_id("journalled-terminal-slice"),
+        request_sha256=controller.projection(ASSEMBLY_ID).request_sha256,
+        maximum_slices=1,
+    )
+    original_append = repo.append
+    failed = False
+
+    def crash_after_terminal(checkpoint, *, expected_revision):
+        nonlocal failed
+        if not failed and checkpoint.last_slice is not None:
+            failed = True
+            raise RuntimeError("simulated checkpoint interruption")
+        return original_append(checkpoint, expected_revision=expected_revision)
+
+    repo.append = crash_after_terminal  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="checkpoint interruption"):
+        asyncio.run(controller.advance(request))
+    assert factory.calls == [("scaffold", "input-1")]
+    assert len(reconciliation.terminal) == 1
+
+    repo.append = original_append  # type: ignore[method-assign]
+    restarted, _, _, restarted_factory, *_ = _controller(
+        repo, reconciliation=reconciliation
+    )
+    receipt = asyncio.run(restarted.advance(request))
+
+    assert receipt.executed_slices == 1
+    assert restarted_factory.calls == []
+    assert len(reconciliation.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("ordinal", "stage", "port_index"),
+    (
+        (0, CapabilityLiveStage.SCAFFOLD_AND_TEST_HARNESS, 3),
+        (1, CapabilityLiveStage.CODEX_IMPLEMENTATION, 3),
+        (2, CapabilityLiveStage.SEAL, 3),
+        (3, CapabilityLiveStage.EVALUATE, 4),
+        (4, CapabilityLiveStage.PROMOTE, 3),
+        (5, CapabilityLiveStage.EXECUTE, 5),
+        (6, CapabilityLiveStage.PROJECT, 6),
+    ),
+)
+def test_every_effectful_input_slice_reconciles_without_duplicate_after_checkpoint_crash(
+    ordinal: int,
+    stage: CapabilityLiveStage,
+    port_index: int,
+) -> None:
+    reconciliation = _TerminalJournalReconciliation()
+    parts = _controller(reconciliation=reconciliation)
+    controller, repo = parts[0], parts[1]
+    controller.submit(_submission())
+    if ordinal:
+        _advance(
+            controller,
+            operation=f"crash-matrix-prior-{ordinal}",
+            maximum_slices=ordinal,
+        )
+    request = CapabilityAssemblyAdvanceRequest(
+        assembly_id=ASSEMBLY_ID,
+        operation_id=_id(f"crash-matrix-{ordinal}"),
+        request_sha256=controller.projection(ASSEMBLY_ID).request_sha256,
+        maximum_slices=1,
+    )
+    original_append = repo.append
+
+    def crash_after_terminal(checkpoint, *, expected_revision):
+        if checkpoint.last_slice is not None and checkpoint.last_slice.ordinal == ordinal:
+            raise RuntimeError("simulated checkpoint interruption")
+        return original_append(checkpoint, expected_revision=expected_revision)
+
+    repo.append = crash_after_terminal  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="checkpoint interruption"):
+        asyncio.run(controller.advance(request))
+    original_port = parts[port_index]
+    original_effect_count = len(original_port.calls)
+    assert len(reconciliation.terminal) == ordinal + 1
+
+    repo.append = original_append  # type: ignore[method-assign]
+    restarted_parts = _controller(repo, reconciliation=reconciliation)
+    receipt = asyncio.run(restarted_parts[0].advance(request))
+
+    assert receipt.executed_slices == 1
+    assert len(original_port.calls) == original_effect_count
+    assert restarted_parts[port_index].calls == []
+    assert restarted_parts[0].projection(ASSEMBLY_ID).items[0].completed_stages[-1] is stage
+
+
+@pytest.mark.parametrize(
+    ("ordinal", "stage", "port_index"),
+    (
+        (0, CapabilityLiveStage.SCAFFOLD_AND_TEST_HARNESS, 3),
+        (1, CapabilityLiveStage.CODEX_IMPLEMENTATION, 3),
+        (2, CapabilityLiveStage.SEAL, 3),
+        (3, CapabilityLiveStage.EVALUATE, 4),
+        (4, CapabilityLiveStage.PROMOTE, 3),
+        (5, CapabilityLiveStage.EXECUTE, 5),
+        (6, CapabilityLiveStage.PROJECT, 6),
+    ),
+)
+def test_adapter_receipt_survives_crash_before_controller_append_slice(
+    ordinal: int,
+    stage: CapabilityLiveStage,
+    port_index: int,
+) -> None:
+    reconciliation = _TerminalJournalReconciliation()
+    parts = _controller(reconciliation=reconciliation)
+    controller, repo = parts[0], parts[1]
+    controller.submit(_submission())
+    if ordinal:
+        _advance(
+            controller,
+            operation=f"adapter-crash-prior-{ordinal}",
+            maximum_slices=ordinal,
+        )
+    controller._factory = EffectReceiptBoundFactoryAdapter(parts[3], reconciliation)
+    controller._benchmark = EffectReceiptBoundBenchmarkAdapter(parts[4], reconciliation)
+    controller._execution = EffectReceiptBoundExecutionAdapter(parts[5], reconciliation)
+    controller._projection = EffectReceiptBoundProjectionAdapter(parts[6], reconciliation)
+    request = CapabilityAssemblyAdvanceRequest(
+        assembly_id=ASSEMBLY_ID,
+        operation_id=_id(f"adapter-crash-{ordinal}"),
+        request_sha256=controller.projection(ASSEMBLY_ID).request_sha256,
+        maximum_slices=1,
+    )
+
+    def crash_before_append(*_args: object, **_kwargs: object):
+        raise RuntimeError("crash before controller append")
+
+    controller._append_slice = crash_before_append  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="before controller append"):
+        asyncio.run(controller.advance(request))
+    original_effect_count = len(parts[port_index].calls)
+    assert len(reconciliation.terminal) == ordinal + 1
+
+    restarted_parts = _controller(repo, reconciliation=reconciliation)
+    receipt = asyncio.run(restarted_parts[0].advance(request))
+
+    assert receipt.executed_slices == 1
+    assert len(parts[port_index].calls) == original_effect_count
+    assert restarted_parts[port_index].calls == []
+    assert restarted_parts[0].projection(ASSEMBLY_ID).items[0].completed_stages[-1] is stage
 
 
 def _scaffold_readback(checkpoint: CapabilityAssemblyCheckpoint) -> CapabilityFactoryAuthority:
