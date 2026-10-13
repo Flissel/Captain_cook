@@ -691,7 +691,8 @@ def test_app_composes_injected_production_bundle_once_at_startup(
         calls.append("close")
     monkeypatch.setattr(gateway_app, "close_production_capability_assembly", close)
     monkeypatch.setattr(
-        gateway_app, "load_gateway_settings", lambda _app: SimpleNamespace()
+        gateway_app, "load_gateway_settings",
+        lambda _app: SimpleNamespace(factory_action_inbox_enabled=False)
     )
     app = gateway_app.create_app(
         gateway_store=SimpleNamespace(),

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+from typing import Iterable, Any
 
 from .contracts import ArtifactRef
 
@@ -64,6 +65,35 @@ class FilesystemCreationArtifactStore:
         if hashlib.sha256(content).hexdigest() != reference.sha256:
             raise CreationArtifactStoreError("creation artifact digest changed")
         return content
+
+    def build_readback_receipt(
+        self, references: Iterable[ArtifactRef]
+    ) -> dict[str, Any]:
+        """Read every reference through the public CAS boundary and attest it."""
+
+        artifacts: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for reference in references:
+            identity = (reference.uri, reference.sha256, reference.media_type)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            content = self.read_bytes(reference)
+            digest = hashlib.sha256(content).hexdigest()
+            artifacts.append(
+                {
+                    "uri": reference.uri,
+                    "sha256": digest,
+                    "media_type": reference.media_type,
+                    "verified": digest == reference.sha256,
+                }
+            )
+        if not artifacts or not all(item["verified"] for item in artifacts):
+            raise CreationArtifactStoreError("creation artifact digest readback failed")
+        return {
+            "schema": "minibook.cas-readback-receipt.v1",
+            "artifacts": artifacts,
+        }
 
     def local_path(self, reference: ArtifactRef) -> Path:
         if not isinstance(reference, ArtifactRef):

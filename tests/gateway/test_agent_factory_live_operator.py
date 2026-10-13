@@ -27,6 +27,11 @@ from agenten.agent_factory.hermes_effect_evidence import (
     FilesystemHermesProviderEffectStore,
 )
 from agenten.agent_factory.minibook_forge import CaptainCreationJobMapper
+from agenten.agent_factory.minibook_forge import FilesystemCaptainCreationJobV3Store
+from agenten.agent_factory.forge_contracts import (
+    FactoryBuildAssignmentV2,
+    FactoryBuildEffectV2,
+)
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
 from agenten.agent_factory.skill_workflow_contracts import CandidateRevisionV1
@@ -53,6 +58,46 @@ JOB_IDS = (
     UUID("71000000-0000-0000-0000-000000000001"),
     UUID("71000000-0000-0000-0000-000000000002"),
 )
+
+
+@pytest.mark.asyncio
+async def test_v3_worker_boundary_persists_assignment_and_effect_for_restart(
+    tmp_path: Path,
+) -> None:
+    fixtures = Path(__file__).parents[1] / "fixtures" / "contracts"
+    assignment = FactoryBuildAssignmentV2.model_validate_json(
+        (fixtures / "hermes_factory_assignment.v2.json").read_bytes()
+    )
+    effect = FactoryBuildEffectV2.model_validate_json(
+        (fixtures / "hermes_factory_build_effect.v2.json").read_bytes()
+    )
+
+    class Minibook:
+        async def next_assignment(self, _scope=None):
+            return assignment
+
+        async def claim(self, _assignment_id, _worker_id):
+            return assignment
+
+        async def accepted_effect(self, _assignment_id):
+            return effect
+
+        async def submit_effect(self, _effect):
+            return effect
+
+    root = tmp_path / ".captain-cook" / "v3-worker-authority"
+    durable = FilesystemCaptainCreationJobV3Store(root)
+    client = live_operator._CaptainDurableV3WorkerClient(
+        delegate=Minibook(),
+        authority=durable,
+    )
+
+    assert await client.next_assignment() == assignment
+    assert await client.submit_effect(effect) == effect
+    restarted = FilesystemCaptainCreationJobV3Store(root)
+    job = SimpleNamespace(job_id=assignment.factory_job_id)
+    assert restarted.assignment_for(job, assignment.attempt) == assignment
+    assert restarted.effect_for(job, effect.attempt) == effect
 
 
 def test_operator_canonical_benchmark_repository_has_stable_receipt_store(

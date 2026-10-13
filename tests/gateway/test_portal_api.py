@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from pathlib import Path
 from threading import Event
 from typing import Any
 from uuid import UUID
@@ -20,6 +21,8 @@ from gateway.portal_contracts import (
     PortalSetupTicketV1,
     PortalTenantBindingV1,
 )
+from agenten.agent_factory.forge_contracts import FactoryActionRequestV1, FactoryActionResponseV1
+from gateway.portal_store import FactoryCredentialReceipt
 from gateway.settings import GatewaySettings
 from tests.gateway.test_integration_setup_api import ready_setup_payload, setup_payload
 from tests.agent_factory.test_state_machine import job
@@ -148,6 +151,12 @@ class FakePortalGatewayStore:
         self.owner = "org-a"
         self.used: list[tuple[str, str]] = []
         self.ticket_principal: PortalPrincipalV1 | None = None
+        fixture_root = Path(__file__).parents[1] / "fixtures" / "contracts"
+        self.factory_action = FactoryActionRequestV1.model_validate_json(
+            (fixture_root / "factory_action_request.v1.json").read_text(encoding="utf-8")
+        )
+        self.factory_answer: FactoryActionResponseV1 | None = None
+        self.factory_answer_calls = 0
 
     def provision_portal_tenant(self, binding):
         if binding.job_id != JOB_ID:
@@ -197,6 +206,110 @@ class FakePortalGatewayStore:
         self.used.append((principal.organization_id, request.action))
         return self.persisted
 
+    def portal_factory_actions(
+        self, *, principal, status, now, after_request_id=None, limit=100
+    ):
+        del after_request_id
+        if principal.organization_id != self.owner:
+            return ()
+        return (self.factory_action,)[:limit] if status == self.factory_action.status else ()
+
+    def portal_factory_action(self, *, request_id, principal, now):
+        if principal.organization_id != self.owner or request_id != self.factory_action.request_id:
+            raise LookupError("factory action not found")
+        return self.factory_action
+
+    def answer_portal_factory_action(self, *, request_id, principal, response, now):
+        self.factory_answer_calls += 1
+        self.portal_factory_action(request_id=request_id, principal=principal, now=now)
+        self.factory_answer = response
+        return response
+
+    def factory_action_resume_consumer(self):
+        return self
+
+    def reserve_credential(self, request_id, *, tenant_id, expected_subject_version, credential_alias, now):
+        del request_id, tenant_id, expected_subject_version, credential_alias, now
+        return "a" * 64
+
+    def complete_credential_reservation(self, request_id, *, tenant_id, reservation_key, credential_ref, now):
+        del request_id, tenant_id, reservation_key, now
+        return credential_ref
+
+    def release_credential_reservation(self, request_id, *, tenant_id, reservation_key):
+        del request_id, tenant_id, reservation_key
+
+    def credential_reference(self, request_id, *, tenant_id):
+        del request_id, tenant_id
+        return None
+
+
+class TestFactoryCredentialAdapter:
+    def lookup_credential(self, reservation_key):
+        del reservation_key
+        return None
+
+    def store_credential(self, *, reservation_key, tenant_id, request_id, expected_subject_version, purpose, secret_value):
+        assert secret_value == "secret-value"
+        reference = "credential://org-a/n8n-crm-read"
+        return FactoryCredentialReceipt(
+            reservation_key, tenant_id, request_id, expected_subject_version, purpose,
+            reference, "d4862ebc87fb0c834eea1ea429df7d9bfaed6922e920dce6e610c3581dc4a746",
+        )
+
+    def revoke_credential(self, *, reservation_key, credential_ref=None):
+        del reservation_key, credential_ref
+
+
+class RecordingResumeDispatcher:
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[UUID, str]] = []
+
+    def enqueue(self, *, request_id: UUID, tenant_id: str) -> None:
+        self.enqueued.append((request_id, tenant_id))
+
+    def recover(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class EnqueueOnlyResumeDispatcher:
+    def enqueue(self, *, request_id: UUID, tenant_id: str) -> None:
+        del request_id, tenant_id
+
+
+class LifecycleResumeDispatcher(RecordingResumeDispatcher):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recovered = 0
+        self.closed = 0
+
+    def recover(self) -> None:
+        self.recovered += 1
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class OrderedLifecycleResumeDispatcher(RecordingResumeDispatcher):
+    def __init__(self, *, fail_recover: bool = False, fail_close: bool = False) -> None:
+        super().__init__()
+        self.events: list[str] = []
+        self.fail_recover = fail_recover
+        self.fail_close = fail_close
+
+    def recover(self) -> None:
+        self.events.append("recover")
+        if self.fail_recover:
+            raise RuntimeError("recover failed")
+
+    def close(self) -> None:
+        self.events.append("close")
+        if self.fail_close:
+            raise RuntimeError("close failed")
+
 
 def settings() -> GatewaySettings:
     return GatewaySettings(
@@ -209,12 +322,25 @@ def settings() -> GatewaySettings:
     )
 
 
-def client_for(principal: PortalPrincipalV1, store: FakePortalGatewayStore) -> TestClient:
+def client_for(
+    principal: PortalPrincipalV1,
+    store: FakePortalGatewayStore,
+    *,
+    resume_dispatcher: RecordingResumeDispatcher | None = None,
+    action_resume_enabled: bool = True,
+) -> TestClient:
+    configured_dispatcher = resume_dispatcher
+    if action_resume_enabled and configured_dispatcher is None:
+        configured_dispatcher = RecordingResumeDispatcher()
     application = create_app(
         gateway_store=store,
         mirror=NullMirror(),
-        settings=settings(),
+        settings=settings().model_copy(
+            update={"factory_action_inbox_enabled": action_resume_enabled}
+        ),
         portal_clock=lambda: NOW,
+        factory_action_resume_dispatcher=configured_dispatcher,
+        factory_credential_adapter=TestFactoryCredentialAdapter(),
     )
     application.state.portal_token_verifier = StaticVerifier(principal)
     return TestClient(application)
@@ -222,6 +348,228 @@ def client_for(principal: PortalPrincipalV1, store: FakePortalGatewayStore) -> T
 
 def auth() -> dict[str, str]:
     return {"Authorization": "Bearer portal-jwt"}
+
+
+def test_factory_action_routes_are_authenticated_tenant_scoped_and_secret_free() -> None:
+    store = FakePortalGatewayStore()
+    dispatcher = RecordingResumeDispatcher()
+    with client_for(
+        PortalPrincipalV1(subject_id="user-a", organization_id="org-a"),
+        store,
+        resume_dispatcher=dispatcher,
+    ) as client:
+        listed = client.get("/v1/portal/factory-actions?status=pending", headers=auth())
+        assert listed.status_code == 200
+        request = listed.json()[0]
+        read = client.get(f"/v1/portal/factory-actions/{request['request_id']}", headers=auth())
+        assert read.status_code == 200
+
+        credential = client.post(
+            f"/v1/portal/factory-actions/{request['request_id']}/credentials",
+            headers=auth(),
+            json={"credential_alias": "n8n-crm-read", "secret_value": "secret-value"},
+        )
+        assert credential.status_code == 201
+        assert credential.json() == {"credential_ref": "credential://org-a/n8n-crm-read"}
+        assert "secret-value" not in credential.text
+        assert store.factory_answer is None
+        assert dispatcher.enqueued == []
+
+        response_payload = FactoryActionResponseV1.model_validate_json(
+            (Path(__file__).parents[1] / "fixtures" / "contracts" / "factory_action_response.v1.json").read_text(encoding="utf-8")
+        ).model_copy(update={"credential_ref": credential.json()["credential_ref"]}).model_dump(mode="json", by_alias=True)
+        answered = client.post(
+            f"/v1/portal/factory-actions/{request['request_id']}/responses",
+            headers=auth(),
+            json=response_payload,
+        )
+        assert answered.status_code == 200
+        assert answered.json()["credential_ref"] == "credential://org-a/n8n-crm-read"
+        assert dispatcher.enqueued == [(store.factory_action.request_id, "org-a")]
+
+    with client_for(PortalPrincipalV1(subject_id="user-b", organization_id="org-b"), store) as client:
+        assert client.get("/v1/portal/factory-actions?status=pending", headers=auth()).json() == []
+        assert client.get(f"/v1/portal/factory-actions/{store.factory_action.request_id}", headers=auth()).status_code == 404
+
+
+def test_factory_action_portal_lists_authoritative_denied_status() -> None:
+    store = FakePortalGatewayStore()
+    store.factory_action = store.factory_action.model_copy(update={"status": "denied"})
+    with client_for(
+        PortalPrincipalV1(subject_id="user-a", organization_id="org-a"),
+        store,
+        resume_dispatcher=RecordingResumeDispatcher(),
+    ) as client:
+        listed = client.get("/v1/portal/factory-actions?status=denied", headers=auth())
+    assert listed.status_code == 200
+    assert listed.json()[0]["status"] == "denied"
+
+
+def test_answer_dispatches_durable_resume_without_running_it_in_http_handler() -> None:
+    store = FakePortalGatewayStore()
+    dispatcher = RecordingResumeDispatcher()
+    principal = PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+    response_payload = FactoryActionResponseV1.model_validate_json(
+        (Path(__file__).parents[1] / "fixtures" / "contracts" / "factory_action_response.v1.json").read_text(encoding="utf-8")
+    ).model_dump(mode="json", by_alias=True)
+    with client_for(principal, store, resume_dispatcher=dispatcher) as client:
+        answered = client.post(
+            f"/v1/portal/factory-actions/{store.factory_action.request_id}/responses",
+            headers=auth(),
+            json=response_payload,
+        )
+    assert answered.status_code == 200
+    assert dispatcher.enqueued == [(store.factory_action.request_id, "org-a")]
+
+
+def test_answer_fails_closed_before_persisting_when_action_resume_is_disabled() -> None:
+    store = FakePortalGatewayStore()
+    principal = PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+    response_payload = FactoryActionResponseV1.model_validate_json(
+        (Path(__file__).parents[1] / "fixtures" / "contracts" / "factory_action_response.v1.json").read_text(encoding="utf-8")
+    ).model_dump(mode="json", by_alias=True)
+
+    with client_for(principal, store, action_resume_enabled=False) as client:
+        answered = client.post(
+            f"/v1/portal/factory-actions/{store.factory_action.request_id}/responses",
+            headers=auth(),
+            json=response_payload,
+        )
+
+    assert answered.status_code == 503
+    assert store.factory_answer is None
+    assert store.factory_answer_calls == 0
+
+
+def test_disabled_action_inbox_fences_injected_dispatcher_before_body_admission() -> None:
+    store = FakePortalGatewayStore()
+    dispatcher = RecordingResumeDispatcher()
+    principal = PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+
+    with client_for(
+        principal,
+        store,
+        resume_dispatcher=dispatcher,
+        action_resume_enabled=False,
+    ) as client:
+        answered = client.post(
+            f"/v1/portal/factory-actions/{store.factory_action.request_id}/responses",
+            headers={**auth(), "Content-Type": "application/json"},
+            content=b"this body must never be parsed",
+        )
+
+    assert answered.status_code == 503
+    assert answered.json() == {"detail": "factory action resume capability is disabled"}
+    assert store.factory_answer is None
+    assert store.factory_answer_calls == 0
+    assert dispatcher.enqueued == []
+
+
+def test_disabled_action_inbox_fences_list_read_and_raw_credential_before_store_or_body() -> None:
+    store = FakePortalGatewayStore()
+    principal = PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+    with client_for(principal, store, action_resume_enabled=False) as client:
+        listed = client.get("/v1/portal/factory-actions?status=pending", headers=auth())
+        read = client.get(
+            f"/v1/portal/factory-actions/{store.factory_action.request_id}", headers=auth()
+        )
+        credential = client.post(
+            f"/v1/portal/factory-actions/{store.factory_action.request_id}/credentials",
+            headers={**auth(), "Content-Type": "application/json"},
+            content=b"this body must never be parsed",
+        )
+
+    assert listed.status_code == read.status_code == credential.status_code == 503
+    assert store.factory_answer_calls == 0
+
+
+def test_disabled_action_inbox_route_fence_precedes_malformed_path_query_and_body() -> None:
+    store = FakePortalGatewayStore()
+    principal = PortalPrincipalV1(subject_id="user-a", organization_id="org-a")
+    with client_for(principal, store, action_resume_enabled=False) as client:
+        malformed_query = client.get(
+            "/v1/portal/factory-actions?status=not-a-status&limit=zero", headers=auth()
+        )
+        malformed_path = client.get(
+            "/v1/portal/factory-actions/not-a-uuid", headers=auth()
+        )
+        malformed_body = client.post(
+            "/v1/portal/factory-actions/not-a-uuid/credentials",
+            headers={**auth(), "Content-Type": "application/json"},
+            content=b"this body must never be parsed",
+        )
+
+    assert [response.status_code for response in (
+        malformed_query, malformed_path, malformed_body
+    )] == [503, 503, 503]
+    assert store.factory_answer_calls == 0
+
+
+def test_enabled_action_inbox_rejects_partial_default_composition() -> None:
+    enabled = settings().model_copy(update={"factory_action_inbox_enabled": True})
+    with pytest.raises(ValueError, match="action inbox.*incomplete"):
+        create_app(
+            gateway_store=FakePortalGatewayStore(),
+            mirror=NullMirror(),
+            settings=enabled,
+        )
+
+
+def test_enabled_action_inbox_rejects_enqueue_only_dispatcher() -> None:
+    enabled = settings().model_copy(update={"factory_action_inbox_enabled": True})
+    with pytest.raises(ValueError, match="resume dispatcher.*lifecycle"):
+        create_app(
+            gateway_store=FakePortalGatewayStore(),
+            mirror=NullMirror(),
+            settings=enabled,
+            factory_action_resume_dispatcher=EnqueueOnlyResumeDispatcher(),
+        )
+
+
+def test_action_resume_recovery_starts_and_stops_with_app_lifecycle() -> None:
+    dispatcher = LifecycleResumeDispatcher()
+    application = create_app(
+        gateway_store=FakePortalGatewayStore(),
+        mirror=NullMirror(),
+        settings=settings().model_copy(update={"factory_action_inbox_enabled": True}),
+        factory_action_resume_dispatcher=dispatcher,
+    )
+    with TestClient(application):
+        assert dispatcher.recovered == 1
+        assert dispatcher.closed == 0
+    assert dispatcher.closed == 1
+
+
+def test_action_resume_close_runs_after_recovery_failure_and_error_propagates() -> None:
+    dispatcher = OrderedLifecycleResumeDispatcher(fail_recover=True)
+    application = create_app(
+        gateway_store=FakePortalGatewayStore(),
+        mirror=NullMirror(),
+        settings=settings().model_copy(update={"factory_action_inbox_enabled": True}),
+        factory_action_resume_dispatcher=dispatcher,
+    )
+
+    with pytest.raises(RuntimeError, match="recover failed"):
+        with TestClient(application):
+            pass
+
+    assert dispatcher.events == ["recover", "close"]
+
+
+def test_action_resume_close_failure_propagates_after_recovery() -> None:
+    dispatcher = OrderedLifecycleResumeDispatcher(fail_close=True)
+    application = create_app(
+        gateway_store=FakePortalGatewayStore(),
+        mirror=NullMirror(),
+        settings=settings().model_copy(update={"factory_action_inbox_enabled": True}),
+        factory_action_resume_dispatcher=dispatcher,
+    )
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        with TestClient(application):
+            pass
+
+    assert dispatcher.events == ["recover", "close"]
 
 
 def test_org_b_cannot_read_org_a_setup_or_issue_org_a_ticket() -> None:

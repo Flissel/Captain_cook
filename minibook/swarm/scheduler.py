@@ -6,8 +6,8 @@ import asyncio
 from collections.abc import Callable
 from uuid import UUID
 
-from .contracts import CreationFailure, CreationResultV1
-from .job_store import CreationJobStore
+from .contracts import CreationFailure, CreationJobV3, CreationResultV1, CreationResultV2
+from .job_store import CreationConflictError, CreationJobStore
 from .runner import CreationRunner
 
 
@@ -81,7 +81,12 @@ class CreationScheduler:
             job_id = await self._queue.get()
             try:
                 runner = self._runner_for(job_id)
-                await runner.run_slice(job_id)
+                result = await runner.run_slice(job_id)
+                # A V3 slice may persist a durable yield (for a build lease or
+                # user action).  It is deliberately not requeued here: another
+                # durable event, or startup recovery, owns the next dispatch.
+                if result is None:
+                    continue
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -94,20 +99,44 @@ class CreationScheduler:
         if self._store.result(job_id) is not None:
             return
         job = self._store.job(job_id)
-        self._store.finish(
-            CreationResultV1(
+        progress = self._store.progress(job_id)
+        if progress.status in {"succeeded", "failed", "blocked", "cancelled"}:
+            return
+        failure = CreationFailure(
+            code="internal_error",
+            summary="creation step failed",
+            exception_type=type(exc).__name__,
+        )
+        result = (
+            CreationResultV2(
+                creation_job_id=job.creation_job_id,
+                factory_job_id=job.factory_job_id,
+                correlation_id=job.correlation_id,
+                subject_version=job.subject_version,
+                attempt=job.attempt,
+                status="failed",
+                failure=failure,
+            )
+            if isinstance(job, CreationJobV3)
+            else CreationResultV1(
                 creation_job_id=job.creation_job_id,
                 correlation_id=job.correlation_id,
                 subject_version=job.subject_version,
                 attempt=job.attempt,
                 status="failed",
-                failure=CreationFailure(
-                    code="internal_error",
-                    summary="creation step failed",
-                    exception_type=type(exc).__name__,
-                ),
+                failure=failure,
             )
         )
+        try:
+            self._store.finish(result, expected_version=progress.version)
+        except CreationConflictError:
+            latest_result = self._store.result(job_id)
+            latest_progress = self._store.progress(job_id)
+            if latest_result is not None or latest_progress.status in {
+                "succeeded", "failed", "blocked", "cancelled"
+            }:
+                return
+            raise
 
 
 __all__ = ["CreationRunnerFactory", "CreationScheduler"]

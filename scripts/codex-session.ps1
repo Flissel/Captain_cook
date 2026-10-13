@@ -179,7 +179,12 @@ $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
-$startInfo.ArgumentList.Add("--dangerously-bypass-approvals-and-sandbox")
+$startInfo.ArgumentList.Add("--sandbox")
+$startInfo.ArgumentList.Add($Sandbox)
+$startInfo.ArgumentList.Add("--ask-for-approval")
+$startInfo.ArgumentList.Add("never")
+$startInfo.ArgumentList.Add("--config")
+$startInfo.ArgumentList.Add("sandbox_workspace_write.network_access=false")
 if ($ProviderProxyUrl) {
     $startInfo.ArgumentList.Add("-c")
     $startInfo.ArgumentList.Add('model="gpt-5.6-terra"')

@@ -9,6 +9,7 @@ import yaml
 import json as json_module
 import hashlib
 import hmac
+import importlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -111,13 +112,51 @@ class LegacyProjectionAdoption:
 SessionLocal = None
 _creation_store = None
 _creation_scheduler = None
+_creation_artifact_store = None
+_creation_v3_validator = None
+_creation_worker_token = None
+_creation_worker_id = None
+_creation_api_key = None
 
 
 def _creation_runner_for(job_id: UUID):
-    """Fail closed until the provider-specific pipeline factory is installed."""
+    """Dispatch only explicitly composed creation contract versions."""
 
-    del job_id
+    if _creation_store is not None:
+        from minibook.swarm.contracts import CreationJobV3
+
+        job = _creation_store.job(job_id)
+        if isinstance(job, CreationJobV3):
+            if (
+                _creation_artifact_store is None
+                or _creation_v3_validator is None
+                or _creation_worker_token is None
+                or _creation_worker_id is None
+            ):
+                raise RuntimeError("V3 creation configuration is incomplete")
+            from minibook.swarm.runner import CreationRunner
+            from minibook.swarm.v3_pipeline import V3CreationPipeline
+
+            return CreationRunner(
+                _creation_store,
+                V3CreationPipeline(
+                    store=_creation_store,
+                    artifact_store=_creation_artifact_store,
+                    validator=_creation_v3_validator,
+                ),
+            )
     raise RuntimeError("Minibook creation pipeline is not configured")
+
+
+def _load_configured_object(reference: str) -> object:
+    module_name, separator, attribute = reference.partition(":")
+    if not separator or not module_name or not attribute:
+        raise RuntimeError("MINIBOOK_CREATION_V3_VALIDATOR must be module:attribute")
+    module = importlib.import_module(module_name)
+    try:
+        return getattr(module, attribute)
+    except AttributeError as exc:
+        raise RuntimeError("configured V3 creation validator is unavailable") from exc
 
 
 # --- App ---
@@ -147,11 +186,47 @@ app = FastAPI(
 _creation_db = os.environ.get("MINIBOOK_CREATION_DB")
 _creation_api_key = os.environ.get("MINIBOOK_API_KEY")
 from minibook.swarm.api import create_creation_router
+_creation_v3_enabled = os.environ.get("MINIBOOK_CREATION_V3_ENABLED", "").casefold() in {
+    "1", "true", "yes"
+}
+if _creation_v3_enabled:
+    required_v3_settings = {
+        "MINIBOOK_CREATION_DB": _creation_db,
+        "MINIBOOK_CREATION_CAS_ROOT": os.environ.get("MINIBOOK_CREATION_CAS_ROOT"),
+        "MINIBOOK_CREATION_V3_VALIDATOR": os.environ.get("MINIBOOK_CREATION_V3_VALIDATOR"),
+        "MINIBOOK_CREATION_WORKER_TOKEN": os.environ.get("MINIBOOK_CREATION_WORKER_TOKEN"),
+        "MINIBOOK_CREATION_WORKER_ID": os.environ.get("MINIBOOK_CREATION_WORKER_ID"),
+        "MINIBOOK_API_KEY": _creation_api_key,
+    }
+    if any(not value for value in required_v3_settings.values()):
+        raise RuntimeError("V3 creation configuration is incomplete")
 if _creation_db:
     from minibook.swarm.job_store import CreationJobStore
     from minibook.swarm.scheduler import CreationScheduler
 
     _creation_store = CreationJobStore(Path(_creation_db))
+    if _creation_v3_enabled:
+        from minibook.swarm.artifact_store import FilesystemCreationArtifactStore
+
+        _creation_artifact_store = FilesystemCreationArtifactStore(
+            Path(required_v3_settings["MINIBOOK_CREATION_CAS_ROOT"])
+        )
+        _creation_v3_validator = _load_configured_object(
+            required_v3_settings["MINIBOOK_CREATION_V3_VALIDATOR"]
+        )
+        required_validator_methods = (
+            "build_assignment",
+            "validate_build_effect",
+            "validate",
+            "assemble_result",
+        )
+        if any(
+            not callable(getattr(_creation_v3_validator, name, None))
+            for name in required_validator_methods
+        ):
+            raise RuntimeError("configured V3 creation validator is invalid")
+        _creation_worker_token = required_v3_settings["MINIBOOK_CREATION_WORKER_TOKEN"]
+        _creation_worker_id = required_v3_settings["MINIBOOK_CREATION_WORKER_ID"]
     _creation_scheduler = CreationScheduler(
         store=_creation_store,
         runner_for=lambda job_id: _creation_runner_for(job_id),
@@ -161,6 +236,10 @@ if _creation_db:
             _creation_store,
             api_key=_creation_api_key,
             schedule=_creation_scheduler.schedule,
+            creation_api_key=_creation_api_key,
+            worker_token=_creation_worker_token,
+            worker_id=_creation_worker_id,
+            artifact_store=_creation_artifact_store,
         )
     )
 else:

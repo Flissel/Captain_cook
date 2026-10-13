@@ -1,0 +1,208 @@
+{
+  "document": {
+    "schema_name": "captain.to-be-built.v1",
+    "input_ref": {
+      "uri": "artifact://factory-input/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "media_type": "text/markdown"
+    },
+    "byte_length": 4096,
+    "source_name": "TO_BE_BUILT.md",
+    "title": "Sales Pipeline Brief",
+    "objective": "Build a deterministic four-agent sales pipeline that produces an executive opportunity brief.",
+    "authority_boundaries": [
+      "Captain alone decides lifecycle success.",
+      "Generated agents may read approved sales inputs but may not mutate external systems."
+    ],
+    "agents": [
+      {
+        "agent_key": "account_researcher",
+        "purpose": "Read the approved account snapshot.",
+        "responsibilities": ["Produce a sourced account summary."],
+        "input_schema_markdown": "{\"account_id\": \"string\"}",
+        "output_schema_markdown": "{\"account_summary\": \"string\"}",
+        "handoffs": ["opportunity_qualifier"],
+        "prompt_requirements": ["Use only the approved account snapshot."],
+        "integration_keys": ["account_snapshot_reader"],
+        "n8n_requirement": "not_required",
+        "success_metrics": ["The account summary is nonempty."],
+        "real_cases": [
+          {
+            "case_key": "account_snapshot",
+            "observable_setup": "Given an approved account identifier",
+            "observable_action": "Read the account snapshot",
+            "observable_expected": "A sourced account summary is produced"
+          }
+        ]
+      },
+      {
+        "agent_key": "opportunity_qualifier",
+        "purpose": "Apply the approved opportunity rules.",
+        "responsibilities": ["Classify the opportunity without inventing weights."],
+        "input_schema_markdown": "{\"account_summary\": \"string\"}",
+        "output_schema_markdown": "{\"qualification\": \"string\"}",
+        "handoffs": ["deal_strategist"],
+        "prompt_requirements": ["Use the published scoring rules exactly."],
+        "integration_keys": ["opportunity_scoring_rules"],
+        "n8n_requirement": "not_required",
+        "success_metrics": ["The qualification cites the applied rule."],
+        "real_cases": [
+          {
+            "case_key": "qualified_opportunity",
+            "observable_setup": "Given a complete account summary",
+            "observable_action": "Apply the opportunity rules",
+            "observable_expected": "A rule-bound qualification is produced"
+          }
+        ]
+      },
+      {
+        "agent_key": "deal_strategist",
+        "purpose": "Turn the qualification into a bounded deal strategy.",
+        "responsibilities": ["Recommend the next sales action."],
+        "input_schema_markdown": "{\"qualification\": \"string\"}",
+        "output_schema_markdown": "{\"strategy\": \"string\"}",
+        "handoffs": ["executive_brief_writer"],
+        "prompt_requirements": ["Keep recommendations within the supplied evidence."],
+        "integration_keys": ["industry_signal_reader"],
+        "n8n_requirement": "not_required",
+        "success_metrics": ["The strategy contains a bounded next action."],
+        "real_cases": [
+          {
+            "case_key": "deal_strategy",
+            "observable_setup": "Given a qualified opportunity",
+            "observable_action": "Create a deal strategy",
+            "observable_expected": "A bounded next action is produced"
+          }
+        ]
+      },
+      {
+        "agent_key": "executive_brief_writer",
+        "purpose": "Produce the final executive opportunity brief.",
+        "responsibilities": ["Combine the upstream evidence into one concise brief."],
+        "input_schema_markdown": "{\"strategy\": \"string\"}",
+        "output_schema_markdown": "{\"executive_brief\": \"string\"}",
+        "handoffs": [],
+        "prompt_requirements": ["Preserve the qualification and next action."],
+        "integration_keys": [],
+        "n8n_requirement": "not_required",
+        "success_metrics": ["The brief names the qualification and next action."],
+        "real_cases": [
+          {
+            "case_key": "executive_brief",
+            "observable_setup": "Given the upstream sales evidence",
+            "observable_action": "Write the executive brief",
+            "observable_expected": "A concise qualification and next action are present"
+          }
+        ]
+      }
+    ],
+    "integrations": [
+      {
+        "integration_key": "account_snapshot_reader",
+        "purpose": "Read an approved account snapshot.",
+        "trigger": "When account research begins.",
+        "operation": "Read account fields by identifier.",
+        "required": true,
+        "credential_aliases": ["CRM_READONLY_KEY"],
+        "success_behavior": "Return the approved account snapshot.",
+        "failure_behavior": "Stop and request the read-only credential."
+      },
+      {
+        "integration_key": "opportunity_scoring_rules",
+        "purpose": "Read the published qualification rules.",
+        "trigger": "When qualification begins.",
+        "operation": "Read the exact published scoring rules.",
+        "required": true,
+        "credential_aliases": [],
+        "success_behavior": "Return the versioned scoring rules.",
+        "failure_behavior": "Fail without inventing scoring weights."
+      },
+      {
+        "integration_key": "industry_signal_reader",
+        "purpose": "Read optional public industry signals.",
+        "trigger": "When deal strategy begins.",
+        "operation": "Read a bounded public industry signal.",
+        "required": false,
+        "credential_aliases": [],
+        "success_behavior": "Return a public signal when available.",
+        "failure_behavior": "Continue with a typed optional gap."
+      }
+    ],
+    "shared_workflows": [
+      "account_researcher hands off to opportunity_qualifier, then deal_strategist, then executive_brief_writer."
+    ],
+    "security_requirements": [
+      "Only opaque credential references may cross the action boundary.",
+      "External writes are forbidden."
+    ],
+    "acceptance_outcomes": [
+      {
+        "case_key": "exact_team",
+        "observable_setup": "Given the authoritative sales pipeline brief",
+        "observable_action": "Build the requested team",
+        "observable_expected": "Exactly four ordered sales agents are materialized"
+      },
+      {
+        "case_key": "required_tools",
+        "observable_setup": "Given the compiled tool policy",
+        "observable_action": "Validate the generated package",
+        "observable_expected": "Both required tools have typed schemas and passing tests"
+      }
+    ],
+    "real_cases": [
+      {
+        "case_key": "sales_pipeline",
+        "observable_setup": "Given an approved account snapshot and scoring rules",
+        "observable_action": "Run the four-agent sales pipeline",
+        "observable_expected": "An executive brief preserves qualification evidence and the next action"
+      }
+    ],
+    "helpful_resources": ["Published sales qualification policy."],
+    "stop_conditions": [
+      "Stop when the required account credential is unavailable.",
+      "Stop when generated topology or scoring rules drift from the compiled specification."
+    ],
+    "sections": [
+      {"heading": "Objective", "heading_path": ["Objective"], "markdown": "Build the exact team."},
+      {"heading": "Authority boundaries", "heading_path": ["Authority boundaries"], "markdown": "Captain owns success."},
+      {"heading": "Agents", "heading_path": ["Agents"], "markdown": "Four ordered agents."},
+      {"heading": "Integrations", "heading_path": ["Integrations"], "markdown": "Three declared readers."},
+      {"heading": "Shared workflows", "heading_path": ["Shared workflows"], "markdown": "One ordered pipeline."},
+      {"heading": "Security requirements", "heading_path": ["Security requirements"], "markdown": "Opaque references only."},
+      {"heading": "Acceptance outcomes", "heading_path": ["Acceptance outcomes"], "markdown": "Exact topology and tools."},
+      {"heading": "Real cases", "heading_path": ["Real cases"], "markdown": "One public sales case."},
+      {"heading": "Helpful resources", "heading_path": ["Helpful resources"], "markdown": "Published policy."},
+      {"heading": "Stop conditions", "heading_path": ["Stop conditions"], "markdown": "Fail closed on drift."}
+    ],
+    "extra_sections": []
+  },
+  "expected": {
+    "required_agent_ids": [
+      "account_researcher",
+      "opportunity_qualifier",
+      "deal_strategist",
+      "executive_brief_writer"
+    ],
+    "ordered_handoffs": [
+      {"from_agent_id": "account_researcher", "to_agent_id": "opportunity_qualifier"},
+      {"from_agent_id": "opportunity_qualifier", "to_agent_id": "deal_strategist"},
+      {"from_agent_id": "deal_strategist", "to_agent_id": "executive_brief_writer"}
+    ],
+    "tool_requirements": [
+      {"tool_id": "account_snapshot_reader", "required": true},
+      {"tool_id": "opportunity_scoring_rules", "required": true},
+      {"tool_id": "industry_signal_reader", "required": false}
+    ],
+    "allowed_optional_tool_gaps": ["industry_signal_reader"],
+    "public_assertion_ids": [
+      "assert-2b1d7c6a3666",
+      "assert-7f77e654f907",
+      "assert-b84ce004c78b",
+      "assert-cc0a96c5fc02",
+      "assert-9e6cdab86303",
+      "assert-9a5995ebfcb8",
+      "assert-3e8de9d245ae",
+      "assert-3153de4c492a"
+    ]
+  }
+}

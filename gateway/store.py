@@ -162,6 +162,7 @@ from agenten.agent_factory.integration_setup import (
     N8nCredentialMetadataV1,
 )
 from gateway.portal_contracts import (
+    PortalFactoryCredentialWriteV1,
     PortalPrincipalV1,
     PortalSetupActionRequestV1,
     PortalSetupSelectionRequestV1,
@@ -171,7 +172,13 @@ from gateway.portal_contracts import (
     PortalTicketFenceV1,
     PortalTicketAction,
 )
-from gateway.portal_store import PortalTicketStore
+from gateway.portal_store import (
+    FactoryCredentialAdapter,
+    FactoryCredentialCoordinator,
+    PortalTicketStore,
+)
+from gateway.factory_action_store import ActionStatus, FactoryActionStore
+from agenten.agent_factory.forge_contracts import FactoryActionRequestV1, FactoryActionResponseV1
 from gateway.portal_live_contracts import (
     PortalLiveEvidenceQueryV1,
     PortalLiveEvidenceV1,
@@ -299,6 +306,7 @@ class GatewayStore:
         runtime_provider_bundle_bindings: tuple[
             tuple[str, str, str, str, str, str, str, bool], ...
         ] = (),
+        factory_credential_adapter: FactoryCredentialAdapter | None = None,
     ):
         if claim_ttl <= timedelta(0):
             raise ValueError("claim_ttl must be positive")
@@ -314,8 +322,67 @@ class GatewayStore:
         self._runtime_provider_bundle_bindings = frozenset(
             runtime_provider_bundle_bindings
         )
+        self._factory_credential_adapter = factory_credential_adapter
         self._ensure_schema()
         self._portal_tickets = PortalTicketStore(storage)
+        self._factory_actions = FactoryActionStore(storage)
+
+    def record_factory_action(
+        self, request: FactoryActionRequestV1, *, tenant_id: str
+    ) -> FactoryActionRequestV1:
+        return self._factory_actions.create(request, tenant_id=tenant_id)
+
+    def factory_action_resume_consumer(self) -> FactoryActionStore:
+        """Expose the durable Action Inbox state machine to the resume worker."""
+        return self._factory_actions
+
+    def recover_factory_credentials(self, *, clock: Callable[[], datetime]) -> None:
+        if self._factory_credential_adapter is None:
+            return
+        FactoryCredentialCoordinator(
+            store=self._factory_actions,
+            adapter=self._factory_credential_adapter,
+            clock=clock,
+        ).recover()
+
+    def portal_factory_actions(
+        self,
+        *,
+        principal: PortalPrincipalV1,
+        status: ActionStatus,
+        now: datetime,
+        after_request_id: UUID | None = None,
+        limit: int = 100,
+    ) -> tuple[FactoryActionRequestV1, ...]:
+        return self._factory_actions.list(
+            tenant_id=principal.organization_id, status=status, now=now,
+            after_request_id=after_request_id, limit=limit,
+        )
+
+    def portal_factory_action(
+        self,
+        *,
+        request_id: UUID,
+        principal: PortalPrincipalV1,
+        now: datetime,
+    ) -> FactoryActionRequestV1:
+        return self._factory_actions.get(
+            request_id, tenant_id=principal.organization_id, now=now
+        )
+
+    def answer_portal_factory_action(
+        self,
+        *,
+        request_id: UUID,
+        principal: PortalPrincipalV1,
+        response: FactoryActionResponseV1,
+        now: datetime,
+    ) -> FactoryActionResponseV1:
+        if response.request_id != request_id:
+            raise ValueError("factory action request_id must match route")
+        return self._factory_actions.answer(
+            response, tenant_id=principal.organization_id, now=now
+        )
 
     def configure_portal_sources(
         self,

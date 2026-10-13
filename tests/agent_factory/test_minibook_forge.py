@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import multiprocessing
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -10,17 +12,23 @@ import pytest
 from agenten.agent_factory.forge_contracts import (
     CreationJobV1,
     CreationJobV2,
+    CreationJobV3,
+    CreationResultV2,
     ForgeBuildSkillUsageReceiptV1,
 )
 from agenten.agent_factory.contracts import AgentFactoryJob
 from agenten.agent_factory.minibook_forge import (
     CaptainCreationJobMapper,
+    CaptainCreationJobV3Authority,
+    CaptainCreationJobV3Mapper,
+    FilesystemCaptainCreationJobV3Store,
     MinibookForgeHttpClient,
     MinibookForgeHttpSettings,
     MinibookForgeSettings,
     MinibookSwarmForge,
 )
-from agenten.agent_factory.orchestration import FactoryDispatch
+from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
+from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_factory.skill_workflow_contracts import (
     CandidateRevisionV1,
@@ -38,6 +46,52 @@ from tests.agent_factory.test_skill_workflow_contracts import (
     inventory_payload,
     revision_payload,
 )
+
+
+def _record_v3_creation_job_process(
+    root: str,
+    payload: str,
+    barrier,
+    outcomes,
+) -> None:
+    store = FilesystemCaptainCreationJobV3Store(Path(root))
+    job = CreationJobV3.model_validate_json(payload)
+    barrier.wait()
+    try:
+        store.record_creation_job(job)
+    except FactoryDispatchError:
+        outcomes.put("conflict")
+    else:
+        outcomes.put("recorded")
+
+
+def _run_creation_job_writers(
+    root: Path, jobs: tuple[CreationJobV3, CreationJobV3]
+) -> tuple[list[str], list[int | None]]:
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Event()
+    outcomes = context.Queue()
+    processes = [
+        context.Process(
+            target=_record_v3_creation_job_process,
+            args=(
+                str(root),
+                job.model_dump_json(by_alias=True, exclude_none=True),
+                barrier,
+                outcomes,
+            ),
+        )
+        for job in jobs
+    ]
+    for process in processes:
+        process.start()
+    barrier.set()
+    for process in processes:
+        process.join(10)
+    return (
+        [outcomes.get(timeout=2) for _ in processes],
+        [process.exitcode for process in processes],
+    )
 from tests.agent_factory.test_state_machine import job_v3
 
 
@@ -724,3 +778,225 @@ async def test_http_forge_returns_typed_submission_status_and_result() -> None:
     assert receipt.status == "queued"
     assert progress.checkpoint == "catalog"
     assert result.status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_http_forge_parses_v3_terminal_result_without_legacy_fallback() -> None:
+    payload = json.loads(
+        Path("tests/fixtures/contracts/minibook_creation_result.v2.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+        client = MinibookForgeHttpClient(
+            mapper=Mapper(),
+            settings=MinibookForgeHttpSettings(
+                base_url="https://minibook.invalid", api_key="injected"
+            ),
+            client=transport,
+        )
+        result = await client.result(
+            __import__("uuid").UUID(payload["creation_job_id"])
+        )
+
+    assert isinstance(result, CreationResultV2)
+    assert result.cas_readback_receipt_ref is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", (b"not-json", b"[]"))
+async def test_http_forge_rejects_malformed_typed_200_result(payload: bytes) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+        client = MinibookForgeHttpClient(
+            mapper=Mapper(),
+            settings=MinibookForgeHttpSettings(
+                base_url="https://minibook.invalid",
+                api_key="injected",
+            ),
+            client=transport,
+        )
+
+        with pytest.raises(FactoryDispatchError, match="result response is invalid"):
+            await client.result(__import__("uuid").uuid4())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("submit", "status"))
+async def test_http_forge_rejects_nonobject_typed_success_responses(
+    operation: str,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+        client = MinibookForgeHttpClient(
+            mapper=Mapper(),
+            settings=MinibookForgeHttpSettings(
+                base_url="https://minibook.invalid",
+                api_key="injected",
+            ),
+            client=transport,
+        )
+        if operation == "submit":
+            request = FactoryDispatch(
+                job=job(),
+                action=FactoryAction(
+                    kind=FactoryActionKind.SUBMIT_FORGE_JOB,
+                    attempt=1,
+                ),
+                role=None,
+                lease=None,
+            )
+            call = client.submit(request)
+        else:
+            call = client.status(__import__("uuid").uuid4())
+
+        with pytest.raises(FactoryDispatchError, match="response is invalid"):
+            await call
+
+
+def test_v3_store_serializes_conflicting_process_writes(tmp_path: Path) -> None:
+    root = tmp_path / ".captain-cook" / "v3-race"
+    first = CreationJobV3.model_validate_json(
+        Path("tests/fixtures/contracts/minibook_creation_job.v3.json").read_bytes()
+    )
+    second = first.model_copy(
+        update={"deadline_at": first.deadline_at + timedelta(seconds=1)}
+    )
+
+    outcomes, exitcodes = _run_creation_job_writers(root, (first, second))
+
+    assert exitcodes == [0, 0]
+    assert sorted(outcomes) == ["conflict", "recorded"]
+    durable = (
+        root
+        / str(first.factory_job_id)
+        / f"attempt-{first.attempt}"
+        / "creation-job.json"
+    ).read_bytes()
+    possible = {
+        json.dumps(
+            job.model_dump(mode="json", by_alias=True, exclude_none=True),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        for job in (first, second)
+    }
+    assert durable in possible
+
+
+def test_v3_store_allows_same_content_process_replay_and_stale_temp(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".captain-cook" / "v3-replay"
+    job = CreationJobV3.model_validate_json(
+        Path("tests/fixtures/contracts/minibook_creation_job.v3.json").read_bytes()
+    )
+    record_dir = root / str(job.factory_job_id) / f"attempt-{job.attempt}"
+    record_dir.mkdir(parents=True)
+    (record_dir / ".creation-job.json.crashed.tmp").write_bytes(b"incomplete")
+
+    outcomes, exitcodes = _run_creation_job_writers(root, (job, job))
+
+    assert exitcodes == [0, 0]
+    assert outcomes == ["recorded", "recorded"]
+    stored = FilesystemCaptainCreationJobV3Store(root).creation_job_for(
+        SimpleNamespace(job_id=job.factory_job_id), job.attempt
+    )
+    assert stored == job
+
+
+def test_v3_mapper_binds_exact_authority_and_never_maps_source_zip(tmp_path: Path) -> None:
+    factory_job = job_v3(mode="demo")
+    action = FactoryAction(kind=FactoryActionKind.SUBMIT_FORGE_JOB, attempt=1)
+    lease = issue_factory_lease(
+        job=factory_job,
+        role=__import__("agenten.agent_factory.contracts", fromlist=["FactoryRole"]).FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/v3",
+        now=factory_job.occurred_at,
+    )
+    lease_bytes = json.dumps(
+        lease.model_dump(mode="json", by_alias=True),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    import hashlib
+    lease_digest = hashlib.sha256(lease_bytes).hexdigest()
+    ref = lambda name, digest: {
+        "uri": f"artifact://captain/{name}/{digest}",
+        "sha256": digest,
+        "media_type": "application/json",
+    }
+    authority = CaptainCreationJobV3Authority.model_validate(
+        {
+            "command_id": str(factory_job.event_id),
+            "capability_resolution": {
+                "kind": "create",
+                "creation_key": "factory-create-" + hashlib.sha256(
+                    "\x1f".join(
+                        (
+                            factory_job.required_capability,
+                            str(factory_job.subject_version),
+                            factory_job.input_ref.sha256,
+                            factory_job.compiled_spec_ref.sha256,
+                            factory_job.dependency_graph_ref.sha256,
+                            *factory_job.acceptance_assertion_ids,
+                        )
+                    ).encode()
+                ).hexdigest(),
+            },
+            "compiled_spec_ref": factory_job.compiled_spec_ref.model_dump(mode="json"),
+            "lease_ref": ref("lease", lease_digest),
+            "blueprint_ref": ref("blueprint", "1" * 64),
+            "tool_plan_ref": ref("tool-plan", "2" * 64),
+            "required_agent_ids": ["planner", "builder"],
+            "ordered_handoffs": [{"from_agent_id": "planner", "to_agent_id": "builder"}],
+            "tool_requirements": [{"tool_id": "crm_reader", "required": True}],
+            "workspace_policy_ref": ref("workspace-policy", "3" * 64),
+            "clarification_policy": {"allowed_request_types": ["clarification"], "max_requests": 1},
+        }
+    )
+    mapper = CaptainCreationJobV3Mapper(
+        authority=lambda _request: authority,
+        released_skill=lambda job, _step: ForgeEvidence(*_workflow_evidence()[1:]).released_for(job, FactorySkillStep.BRIEF_CODEX),
+        store=FilesystemCaptainCreationJobV3Store(tmp_path / ".captain-cook" / "v3-authority"),
+    )
+
+    mapped = mapper.map(FactoryDispatch(factory_job, action, None, lease))
+
+    payload = mapped.model_dump(mode="json", by_alias=True)
+    assert isinstance(mapped, CreationJobV3)
+    assert mapped.lease_sha256 == lease_digest
+    assert mapped.required_agent_ids == ("planner", "builder")
+    assert mapped.required_output_contract == "minibook.creation-result.v2"
+    assert "source_archive_ref" not in payload
+
+    wrong_miss = authority.model_copy(
+        update={
+            "capability_resolution": authority.capability_resolution.model_copy(
+                update={"creation_key": "factory-create-" + "0" * 64}
+            )
+        }
+    )
+    with pytest.raises(RuntimeError, match="capability miss"):
+        CaptainCreationJobV3Mapper(
+            authority=lambda _request: wrong_miss,
+            released_skill=lambda job, _step: ForgeEvidence(
+                *_workflow_evidence()[1:]
+            ).released_for(job, FactorySkillStep.BRIEF_CODEX),
+            store=FilesystemCaptainCreationJobV3Store(tmp_path / ".captain-cook" / "wrong-authority"),
+        ).map(FactoryDispatch(factory_job, action, None, lease))
+
+    restarted = FilesystemCaptainCreationJobV3Store(
+        tmp_path / ".captain-cook" / "v3-authority"
+    )
+    assert restarted.creation_job_for(factory_job, 1) == mapped

@@ -33,6 +33,7 @@ from agenten.agent_factory.contracts import AgentFactoryJobV3
 from agenten.agent_factory.forge_contracts import (
     ArtifactRef,
     CodexBuildReceiptV1,
+    codex_build_receipt_sha256,
 )
 from agenten.agent_factory.skill_workflow_contracts import CodexBuildBriefV1
 
@@ -221,6 +222,26 @@ class CaptainCodexBuildReceiptIssuer:
             namespace="build-receipt",
         )
 
+    def read_receipt(self, reference: ArtifactRef) -> CodexBuildReceiptV1:
+        """Read back a genuine typed receipt through its Captain-owned CAS."""
+
+        if reference.media_type != "application/json":
+            raise CodexBuildProvenanceError(
+                "Codex build receipt reference must be application/json"
+            )
+        content = self._cas.read_bytes(reference)
+        try:
+            receipt = CodexBuildReceiptV1.model_validate_json(content)
+        except ValueError as exc:
+            raise CodexBuildProvenanceError(
+                "Codex build receipt content is invalid"
+            ) from exc
+        if codex_build_receipt_sha256(receipt) != reference.sha256:
+            raise CodexBuildProvenanceError(
+                "Codex build receipt digest does not match its reference"
+            )
+        return receipt
+
     def issue(
         self,
         *,
@@ -384,9 +405,19 @@ class CaptainCodexBuildReceiptIssuer:
             raise CodexBuildProvenanceError(
                 "assignment attempt does not match the Codex build brief"
             )
-        if tuple(brief.authorized_path_roots) != (assignment.workspace_ref,):
+        authorized = tuple(brief.authorized_path_roots)
+        workspace = assignment.workspace_ref.rstrip("/")
+        legacy_workspace_authority = authorized == (assignment.workspace_ref,)
+        confined_subroot_authority = bool(authorized) and len(authorized) == len(
+            set(authorized)
+        ) and all(
+            item.startswith(f"{workspace}/")
+            and _is_safe_authority_subroot(item[len(workspace) + 1 :])
+            for item in authorized
+        )
+        if not (legacy_workspace_authority or confined_subroot_authority):
             raise CodexBuildProvenanceError(
-                "Codex build brief must authorize exactly the assigned workspace"
+                "Codex build brief path authority is outside the assigned workspace"
             )
 
 
@@ -414,6 +445,13 @@ def _resolve_workspace_file(root: Path, relative_path: str) -> Path:
     if candidate.is_symlink():
         raise CodexBuildProvenanceError("workspace artifact must not be a symbolic link")
     return resolved
+
+
+def _is_safe_authority_subroot(value: str) -> bool:
+    pure = PurePosixPath(value)
+    return bool(value) and not pure.is_absolute() and all(
+        part not in {"", ".", ".."} for part in pure.parts
+    ) and _WINDOWS_DRIVE_PATTERN.match(value) is None
 
 
 def _deterministic_workspace_zip(root: Path) -> tuple[bytes, dict[str, bytes]]:

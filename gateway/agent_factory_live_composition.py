@@ -51,6 +51,7 @@ from agenten.agent_factory.candidate_evaluation import (
     CandidateEvaluationFactory,
     FactoryCandidateProvider,
     FactoryTeamExecutionPort,
+    GatewayForgeCandidateProvider,
     ResolvedFactoryCandidate,
 )
 from agenten.agent_factory.codex_brief import CodexPromptArtifactStore
@@ -69,6 +70,17 @@ from agenten.agent_factory.hermes_cli import (
     HermesCliFactory,
     HermesCliSettings,
     ReleasedFactorySkillCatalog,
+)
+from agenten.agent_factory.hermes_factory_worker import (
+    HermesFactoryAssignmentScope,
+    HermesFactoryWorker,
+)
+from agenten.agent_factory.hermes_factory_worker import (
+    FilesystemHermesFactoryWorkerCheckpointStore,
+    HermesFactoryCodexPort,
+    HermesFactoryCodexReceiptReaderPort,
+    HermesFactoryMinibookPort,
+    HermesFactoryRetryAuthorityPort,
 )
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.orchestration import (
@@ -511,6 +523,18 @@ class ProductionFactoryTeamExecutionPort(FactoryTeamExecutionPort):
 
 
 @dataclass(frozen=True)
+class HermesFactoryWorkerRuntime:
+    minibook: HermesFactoryMinibookPort
+    codex: HermesFactoryCodexPort
+    checkpoint_store: FilesystemHermesFactoryWorkerCheckpointStore
+    codex_receipts: HermesFactoryCodexReceiptReaderPort
+    worker_id: str
+    released_skill_name: str
+    released_skill_sha256: str
+    retry_authority: HermesFactoryRetryAuthorityPort | None = None
+
+
+@dataclass(frozen=True)
 class AgentFactoryLiveComposition:
     """Inspectable graph; Captain-only transitions remain outside ``run``."""
 
@@ -525,6 +549,7 @@ class AgentFactoryLiveComposition:
     runner: ProductionFactoryDispatchRunner
     improvement_authority: FactoryImprovementAuthorizationPort
     runtime_retry_authority: FactoryRuntimeRetryAuthorizationPort | None
+    hermes_factory_worker: HermesFactoryWorker | None = None
 
     def projection(self, job_id: UUID) -> FactoryProjection:
         """Expose Captain's derived state without recreating lifecycle decisions."""
@@ -564,6 +589,22 @@ class AgentFactoryLiveComposition:
         maximum_dispatches: int = 12,
         stop_before_action: FactoryActionKind | None = None,
     ) -> ProductionFactoryDispatchResult:
+        dispatched = await self.runner.run(
+            job_id,
+            maximum_dispatches=maximum_dispatches,
+            stop_before_action=stop_before_action,
+        )
+        if self.hermes_factory_worker is None:
+            return dispatched
+        job = self.repository.job(job_id)
+        effect = await self.hermes_factory_worker.run_once(
+            HermesFactoryAssignmentScope(
+                factory_job_id=job.job_id,
+                correlation_id=job.correlation_id,
+            )
+        )
+        if effect is None:
+            return dispatched
         return await self.runner.run(
             job_id,
             maximum_dispatches=maximum_dispatches,
@@ -593,6 +634,9 @@ def compose_agent_factory_live(
     codex_build_sealer: CaptainCodexBuildSealerPort | None = None,
     codex_prompt_artifact_store: CodexPromptArtifactStore | None = None,
     technical_revalidation_validator: Callable[[FactoryDispatch], None] | None = None,
+    factory_v3_enabled: bool = False,
+    hermes_factory_worker: HermesFactoryWorker | None = None,
+    hermes_factory_worker_runtime: HermesFactoryWorkerRuntime | None = None,
 ) -> AgentFactoryLiveComposition:
     """Wire production ports without executing Hermes, providers, n8n, or Forge."""
 
@@ -606,6 +650,18 @@ def compose_agent_factory_live(
         raise ValueError("business benchmark production inputs are required")
     if not callable(clock):
         raise ValueError("Factory live clock is required")
+    configured_v3_workers = sum(
+        item is not None
+        for item in (hermes_factory_worker, hermes_factory_worker_runtime)
+    )
+    if factory_v3_enabled != (configured_v3_workers == 1):
+        raise ValueError("Factory V3 worker configuration is incomplete")
+    if (
+        factory_v3_enabled
+        and isinstance(candidate_bindings, GatewayForgeCandidateProvider)
+        and not candidate_bindings.v3_readback_configured
+    ):
+        raise ValueError("Factory V3 Captain creation-job readback authority is incomplete")
 
     if gateway_repository is not None and (
         type(gateway_repository) is not GatewayFactoryRepository
@@ -639,6 +695,18 @@ def compose_agent_factory_live(
         workflow_artifacts=repository,
         clock=clock,
     )
+    if hermes_factory_worker_runtime is not None:
+        runtime = hermes_factory_worker_runtime
+        hermes_factory_worker = hermes.factory_worker(
+            minibook=runtime.minibook,
+            codex=runtime.codex,
+            worker_id=runtime.worker_id,
+            released_skill_name=runtime.released_skill_name,
+            released_skill_sha256=runtime.released_skill_sha256,
+            checkpoint_store=runtime.checkpoint_store,
+            codex_receipts=runtime.codex_receipts,
+            retry_authority=runtime.retry_authority,
+        )
     team_execution = ProductionFactoryTeamExecutionPort(
         evidence_store=evidence_store,
         ports_for=team_execution_ports_for,
@@ -703,6 +771,7 @@ def compose_agent_factory_live(
         runner=runner,
         improvement_authority=improvement_authority,
         runtime_retry_authority=runtime_retries,
+        hermes_factory_worker=hermes_factory_worker,
     )
 
 
@@ -845,6 +914,7 @@ __all__ = [
     "ForgeCandidateBindingPort",
     "GatewayTechnicalTeamExecutionPortsProvider",
     "GatewayCapabilityLiveCompositionError",
+    "HermesFactoryWorkerRuntime",
     "GatewayBoundBusinessBenchmarkInputPort",
     "ProductionFactoryTeamExecutionPort",
     "compose_agent_factory_live",

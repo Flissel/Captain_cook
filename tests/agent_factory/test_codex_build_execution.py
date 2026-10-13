@@ -14,6 +14,8 @@ import pytest
 from agenten.agent_factory import codex_build_execution
 from agenten.agent_factory.codex_build_execution import (
     CaptainCodexBuildSealer,
+    CaptainCodexAssignmentBuilder,
+    CaptainV3CodexRequestMapper,
     CaptainFactoryCodexResumeAuthorizer,
     CodexCliFactoryBuildExecutor,
     CodexCliFactoryBuildSettings,
@@ -23,6 +25,7 @@ from agenten.agent_factory.codex_build_execution import (
     FactoryCodexCleanupUnresolved,
     FactoryCodexEvidenceFailure,
     FactoryCodexProcessState,
+    FactoryCodexRuntimeAuthority,
     GitDetachedFactoryWorkspacePreparer,
     PreparedFactoryWorkspace,
     _evidence_failure_receipt,
@@ -40,13 +43,19 @@ from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
     CodexBuildArtifactCas,
 )
+from agenten.agent_factory.hermes_factory_worker import (
+    FilesystemHermesFactoryWorkerCheckpointStore,
+    HermesFactoryWorker,
+)
 from agenten.agent_factory.forge_contracts import ArtifactRef as ForgeArtifactRef
+from agenten.agent_factory.forge_contracts import FactoryBuildAssignmentV2
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_sequence import FactoryRuntimeRetryAuthorizationV1
 from agenten.agent_factory.skill_workflow_contracts import (
     CodexBuildBriefV1,
     CodexBuildEvidenceV1,
     FactorySkillInvocationV1,
+    FactorySkillStep,
     factory_runtime_retry_evidence_binding,
     factory_runtime_retry_evidence_binding_sha256,
 )
@@ -65,6 +74,58 @@ from tests.agent_factory.test_codex_build_provenance_contracts import (
 
 
 NOW = datetime(2026, 7, 21, 10, 5, tzinfo=timezone.utc)
+
+
+def test_codex_settings_are_only_narrowed_by_v3_assignment() -> None:
+    assignment = FactoryBuildAssignmentV2.model_validate_json(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "contracts"
+            / "hermes_factory_assignment.v2.json"
+        ).read_text()
+    )
+    defaults = CodexCliFactoryBuildSettings(
+        state_root=Path("state"),
+        maximum_runtime_seconds=900,
+        maximum_files=25,
+        maximum_provider_cost_usd=5.0,
+        supported_output_roots=("output",),
+        supported_commands=(("python", "-m", "pytest"),),
+    )
+
+    narrowed = defaults.narrowed_for_assignment(assignment)
+
+    assert (
+        narrowed.maximum_runtime_seconds
+        == assignment.limits.max_wall_clock_seconds
+    )
+    assert narrowed.maximum_candidate_archive_bytes == defaults.maximum_candidate_archive_bytes
+    assert narrowed.maximum_json_artifact_bytes == defaults.maximum_json_artifact_bytes
+    assert narrowed.maximum_output_bytes == defaults.maximum_output_bytes
+    assert narrowed.maximum_files == 25
+    assert narrowed.maximum_provider_cost_usd == 5.0
+    assert narrowed.supported_output_roots == assignment.allowed_output_roots
+    assert narrowed.supported_commands == assignment.allowed_commands
+
+
+def test_codex_settings_reject_assignment_outside_existing_confinement() -> None:
+    assignment = FactoryBuildAssignmentV2.model_validate_json(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "contracts"
+            / "hermes_factory_assignment.v2.json"
+        ).read_text()
+    )
+    defaults = CodexCliFactoryBuildSettings(
+        state_root=Path("state"),
+        supported_output_roots=("different-root",),
+        supported_commands=(("python", "-m", "compileall", "different-root"),),
+    )
+
+    with pytest.raises(ValueError, match="output roots|commands"):
+        defaults.narrowed_for_assignment(assignment)
 
 
 class FakeBuildExecutor:
@@ -153,7 +214,14 @@ class SuccessfulRunner:
                 archive.writestr(info, content)
         (self.workspace / "candidate.zip").write_bytes(output.getvalue())
         (self.workspace / "test-evidence.json").write_text(
-            json.dumps({"status": "passed", "command_ids": ["pytest.not-live"]}),
+            json.dumps(
+                {
+                    "status": "passed",
+                    "command_ids": ["pytest.not-live"],
+                    "executed_commands": [["python", "-m", "pytest"]],
+                    "provider_cost_usd": 1.0,
+                }
+            ),
             encoding="utf-8",
         )
         jsonl_lines = (
@@ -177,6 +245,157 @@ class SuccessfulRunner:
             artifact_references=(),
             jsonl_lines=jsonl_lines,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attack",
+    (
+        "forbidden_command",
+        "forbidden_write",
+        "network",
+        "cost",
+        "unattested",
+        "echoing",
+    ),
+)
+async def test_v3_runner_rejects_unenforced_capabilities_before_launch(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    launched = 0
+    forbidden = tmp_path / "forbidden-side-effect"
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class AdversarialRunner:
+        def bind_factory_authority(self, authority: FactoryCodexRuntimeAuthority):
+            if attack == "echoing":
+                return authority
+            if attack == "forbidden_command":
+                return replace(authority, allowed_commands=(("cmd", "/c", "whoami"),))
+            if attack == "forbidden_write":
+                return replace(authority, writable_roots=(tmp_path,))
+            if attack == "network":
+                return replace(authority, network_allowed=True)
+            if attack == "cost":
+                return replace(authority, maximum_provider_cost_usd=999.0)
+            return None
+
+        async def run(self, _authorized):
+            nonlocal launched
+            launched += 1
+            forbidden.write_text("launched")
+            raise AssertionError("unattested runner launched")
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=tmp_path / "state",
+            supported_output_roots=("output",),
+            supported_commands=(("python", "-m", "pytest"),),
+            maximum_provider_cost_usd=1.0,
+            enforce_assignment_budgets=True,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=lambda **_kwargs: AdversarialRunner(),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FactoryDispatchError, match="cannot enforce"):
+        await executor.execute(_dispatch(job, invocation), invocation, brief)
+
+    assert launched == 0
+    assert not forbidden.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("evidence", "message"),
+    (
+        (
+            {"executed_commands": [["python", "-m", "ruff"]], "provider_cost_usd": 1.0},
+            "command evidence",
+        ),
+        (
+            {"executed_commands": [["python", "-m", "pytest"]], "provider_cost_usd": 5.01},
+            "provider cost",
+        ),
+        (
+            {"executed_commands": [["C:\\tools\\python.exe", "-m", "pytest"]], "provider_cost_usd": 1.0},
+            "command evidence",
+        ),
+    ),
+)
+async def test_assignment_execution_evidence_fails_closed_before_sealing(
+    tmp_path: Path,
+    evidence: dict[str, object],
+    message: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = SuccessfulRunner(workspace, tmp_path / "journal.jsonl")
+    await runner.run(
+        AuthorizedCodexRun(
+            workspace=workspace,
+            command=("codex",),
+            environment=FrozenEnvironment({}),
+        )
+    )
+    (workspace / "test-evidence.json").write_text(json.dumps(evidence))
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=tmp_path / "state",
+            maximum_files=25,
+            maximum_provider_cost_usd=5.0,
+            supported_commands=(("python", "-m", "pytest"),),
+            enforce_assignment_budgets=True,
+        ),
+        workspace_preparer=None,  # type: ignore[arg-type]
+        artifact_reader=None,  # type: ignore[arg-type]
+        authorizer=None,  # type: ignore[arg-type]
+        runner_factory=None,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(FactoryDispatchError, match=message):
+        executor._scan_output_artifacts(workspace)
+
+
+@pytest.mark.asyncio
+async def test_assignment_file_budget_counts_root_and_archive_members(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = SuccessfulRunner(workspace, tmp_path / "journal.jsonl")
+    await runner.run(
+        AuthorizedCodexRun(
+            workspace=workspace,
+            command=("codex",),
+            environment=FrozenEnvironment({}),
+        )
+    )
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=tmp_path / "state",
+            maximum_files=4,
+            enforce_assignment_budgets=True,
+        ),
+        workspace_preparer=None,  # type: ignore[arg-type]
+        artifact_reader=None,  # type: ignore[arg-type]
+        authorizer=None,  # type: ignore[arg-type]
+        runner_factory=None,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(FactoryDispatchError, match="file-count"):
+        executor._scan_output_artifacts(workspace)
 
 
 class StaticArtifactReader:
@@ -274,6 +493,168 @@ def _dispatch(job, invocation: FactorySkillInvocationV1) -> FactoryDispatch:
         role=invocation.lease.role,
         lease=invocation.lease,
     )
+
+
+@pytest.mark.asyncio
+async def test_concrete_v3_mapper_binds_lease_and_propagates_confinement(
+    tmp_path: Path,
+) -> None:
+    job, existing_brief = _bound_job_and_brief()
+    seal_invocation = _seal_invocation(job, existing_brief)
+    lease = seal_invocation.lease
+    lease_sha256 = hashlib.sha256(
+        canonical_factory_codex_model(lease)
+    ).hexdigest()
+    assignment = FactoryBuildAssignmentV2.model_validate_json(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "contracts"
+            / "hermes_factory_assignment.v2.json"
+        ).read_text()
+    ).model_copy(
+        update={
+            "assignment_id": existing_brief.build_assignment.assignment_id,
+            "creation_job_id": existing_brief.build_assignment.creation_job_id,
+            "factory_job_id": job.job_id,
+            "correlation_id": job.correlation_id,
+            "subject_version": job.subject_version,
+            "attempt": existing_brief.attempt,
+            "effect_key": existing_brief.build_assignment.idempotency_key,
+            "workspace_ref": lease.workspace_ref,
+            "lease_ref": ForgeArtifactRef(
+                uri=f"artifact://captain/lease/{lease_sha256}",
+                sha256=lease_sha256,
+                media_type="application/json",
+            ),
+            "deadline_at": lease.expires_at,
+        }
+    )
+
+    class PromptStore:
+        def __init__(self) -> None:
+            self.content = b""
+
+        def persist(self, _job_id, content: bytes) -> ArtifactRef:
+            self.content = content
+            digest = hashlib.sha256(content).hexdigest()
+            return ArtifactRef(
+                uri=f"artifact://factory/prompt/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
+
+    prompt_store = PromptStore()
+    mapper = CaptainV3CodexRequestMapper(
+        job_for=lambda _job_id: job,
+        lease_for=lambda _job, _attempt, _now: lease,
+        released_skill_for=lambda _job, step: (
+            existing_brief.invocation.released_skill
+            if step is FactorySkillStep.BRIEF_CODEX
+            else seal_invocation.released_skill
+        ),
+        prompt_store=prompt_store,
+        artifact_cas=CodexBuildArtifactCas(tmp_path / "cas"),
+        worker_id="hermes-factory-v3",
+        runtime_skill_sha256="a" * 64,
+        clock=lambda: NOW,
+    )
+    settings = CodexCliFactoryBuildSettings(
+        state_root=tmp_path / "state",
+        maximum_runtime_seconds=900,
+        maximum_files=25,
+        maximum_provider_cost_usd=5.0,
+        supported_output_roots=("output",),
+        supported_commands=(("python", "-m", "pytest"),),
+    )
+
+    mapped = mapper.map_assignment(assignment, settings=settings)
+
+    policy = json.loads(prompt_store.content)
+    assert policy["allowed_output_roots"] == ["output"]
+    assert policy["allowed_commands"] == [["python", "-m", "pytest"]]
+    assert policy["limits"] == {
+        "max_files": 25,
+        "max_provider_cost_usd": 5.0,
+        "max_wall_clock_seconds": 600,
+    }
+    assert mapped.request.lease == lease
+    assert mapped.invocation.lease == lease
+    assert mapped.brief.authorized_path_roots == (
+        f"{assignment.workspace_ref}/output",
+    )
+
+    cas = CodexBuildArtifactCas(tmp_path / "receipt-cas")
+    workspace = _workspace(tmp_path / "sealed", cas)
+    completed = CompletedCodexBuild(
+        workspace_root=workspace,
+        codex_session_receipt=b'{"session_id":"opaque-session"}',
+        candidate_manifest_path="factory-candidate.json",
+        source_archive_path="candidate.zip",
+        test_evidence_paths=("test-evidence.json",),
+        completed_at=NOW,
+        output_snapshot_root=workspace,
+    )
+    executor = FakeBuildExecutor(completed)
+    evidence = await CaptainCodexBuildSealer(
+        executor=executor,
+        issuer=CaptainCodexBuildReceiptIssuer(cas),
+    ).seal(mapped.request, mapped.invocation, mapped.brief)
+
+    assert evidence.build_receipt.assignment_id == assignment.assignment_id
+    assert CaptainCodexBuildReceiptIssuer(cas).read_receipt(
+        evidence.build_receipt_ref
+    ) == evidence.build_receipt
+
+    class Minibook:
+        def __init__(self) -> None:
+            self.effect = None
+
+        async def next_assignment(self):
+            return assignment
+
+        async def claim(self, _assignment_id, _worker_id):
+            return assignment
+
+        async def accepted_effect(self, _assignment_id):
+            return self.effect
+
+        async def submit_effect(self, effect):
+            self.effect = effect
+            return effect
+
+    class SkillVerifier:
+        def validate_runtime_skill(self, **_kwargs):
+            return None
+
+    minibook = Minibook()
+    builder = CaptainCodexAssignmentBuilder(
+        sealer=CaptainCodexBuildSealer(
+            executor=executor,
+            issuer=CaptainCodexBuildReceiptIssuer(cas),
+        ),
+        mapper=mapper,
+        settings=settings,
+    )
+    effect = await HermesFactoryWorker(
+        minibook=minibook,
+        codex=builder,
+        skill_verifier=SkillVerifier(),
+        worker_id="hermes-factory-v3",
+        released_skill_name="captain-agent-factory-loop",
+        released_skill_sha256="a" * 64,
+        checkpoint_store=FilesystemHermesFactoryWorkerCheckpointStore(
+            tmp_path / "worker"
+        ),
+        codex_receipts=CaptainCodexBuildReceiptIssuer(cas),
+        clock=lambda: NOW,
+    ).run_once()
+
+    assert effect is not None
+    assert effect.codex_build_receipt_ref.model_dump(mode="json") == (
+        evidence.build_receipt_ref.model_dump(mode="json")
+    )
+    assert minibook.effect == effect
 
 
 def _authorized_runtime_retry_dispatch(

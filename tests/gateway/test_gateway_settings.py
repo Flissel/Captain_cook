@@ -5,6 +5,7 @@ from collections.abc import Mapping
 import pytest
 from pydantic import SecretStr, ValidationError
 
+from gateway.app import create_production_app, main
 from gateway.settings import GatewayConfigurationError, GatewaySettings
 
 
@@ -100,11 +101,50 @@ def test_settings_reject_ambiguous_role_tokens_without_echoing_them() -> None:
         ("GATEWAY_CLAIM_TTL_SECONDS", "0"),
         ("GATEWAY_CLAIM_TTL_SECONDS", "not-a-duration"),
         ("CAPTAIN_N8N_URL", "http://user:secret@localhost:5679"),
+        ("CAPTAIN_FACTORY_ACTION_INBOX_ENABLED", "yes"),
     ),
 )
 def test_settings_fail_closed_on_invalid_explicit_values(name: str, value: str) -> None:
     with pytest.raises(GatewayConfigurationError):
         GatewaySettings.from_env(valid_environment(**{name: value}))
+
+
+def test_settings_require_explicit_action_inbox_enablement() -> None:
+    assert GatewaySettings.from_env(valid_environment()).factory_action_inbox_enabled is False
+    assert GatewaySettings.from_env(
+        valid_environment(CAPTAIN_FACTORY_ACTION_INBOX_ENABLED="true")
+    ).factory_action_inbox_enabled is True
+
+
+def test_production_app_factory_validates_environment_before_composition() -> None:
+    application = create_production_app(environ=valid_environment())
+
+    assert application.state.gateway_settings.factory_action_inbox_enabled is False
+
+
+def test_production_app_factory_rejects_enabled_inbox_without_concrete_adapters() -> None:
+    with pytest.raises(ValueError, match="action inbox.*incomplete"):
+        create_production_app(
+            environ=valid_environment(CAPTAIN_FACTORY_ACTION_INBOX_ENABLED="true")
+        )
+
+
+def test_main_rejects_enabled_inbox_before_starting_uvicorn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name, value in valid_environment(
+        CAPTAIN_FACTORY_ACTION_INBOX_ENABLED="true"
+    ).items():
+        monkeypatch.setenv(name, value)
+
+    def forbidden_run(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("uvicorn must not start before validated composition")
+
+    monkeypatch.setattr("uvicorn.run", forbidden_run)
+
+    with pytest.raises(ValueError, match="action inbox.*incomplete"):
+        main()
 
 
 def test_settings_model_is_frozen_and_strict() -> None:

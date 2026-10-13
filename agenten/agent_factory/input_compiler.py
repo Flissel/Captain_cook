@@ -10,6 +10,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
+from agenten.agent_factory.forge_contracts import (
+    AgentHandoffV1,
+    FactoryToolRequirementV1,
+)
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.holdout_store import PrivateHoldoutStore
 from agenten.agent_factory.input_contracts import (
@@ -57,6 +61,11 @@ class CompiledFactorySpecification(_FrozenContract):
     work_nodes: tuple[FactoryWorkNode, ...] = Field(min_length=1)
     dependency_order: tuple[str, ...] = Field(min_length=1)
     compilation_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    required_agent_ids: tuple[str, ...] = ()
+    ordered_handoffs: tuple[AgentHandoffV1, ...] = ()
+    tool_requirements: tuple[FactoryToolRequirementV1, ...] = ()
+    allowed_optional_tool_gaps: tuple[str, ...] = ()
+    public_assertion_ids: tuple[str, ...] = ()
 
     @computed_field
     @property
@@ -76,6 +85,38 @@ class CompiledFactorySpecification(_FrozenContract):
         ):
             if len(values) != len(set(values)):
                 raise ValueError(f"duplicate {label} ID")
+        authority_present = any(
+            (
+                self.required_agent_ids,
+                self.ordered_handoffs,
+                self.tool_requirements,
+                self.allowed_optional_tool_gaps,
+                self.public_assertion_ids,
+            )
+        )
+        if authority_present:
+            agents = set(self.required_agent_ids)
+            if not agents or len(agents) != len(self.required_agent_ids):
+                raise ValueError("compiled required agents must be unique and nonempty")
+            handoff_pairs = tuple(
+                (item.from_agent_id, item.to_agent_id)
+                for item in self.ordered_handoffs
+            )
+            if len(handoff_pairs) != len(set(handoff_pairs)) or any(
+                left not in agents or right not in agents
+                for left, right in handoff_pairs
+            ):
+                raise ValueError("compiled handoffs must bind unique required agents")
+            tool_ids = tuple(item.tool_id for item in self.tool_requirements)
+            if not tool_ids or len(tool_ids) != len(set(tool_ids)):
+                raise ValueError("compiled tool requirements must be unique and nonempty")
+            expected_optional = tuple(
+                item.tool_id for item in self.tool_requirements if not item.required
+            )
+            if self.allowed_optional_tool_gaps != expected_optional:
+                raise ValueError("compiled optional tool gaps must match optional tools")
+            if self.public_assertion_ids != self.assertion_ids:
+                raise ValueError("compiled public assertions must match Captain assertions")
         return self
 
 
@@ -91,6 +132,26 @@ class FactoryInputCompiler:
         assertions = self._assertions(document)
         holdouts = self._holdouts(document, assertions)
         nodes = self._nodes(document)
+        required_agent_ids = tuple(agent.agent_key for agent in document.agents)
+        ordered_handoffs = tuple(
+            AgentHandoffV1(
+                from_agent_id=agent.agent_key,
+                to_agent_id=target,
+            )
+            for agent in document.agents
+            for target in agent.handoffs
+        )
+        tool_requirements = tuple(
+            FactoryToolRequirementV1(
+                tool_id=integration.integration_key,
+                required=integration.required,
+            )
+            for integration in document.integrations
+        )
+        optional_tool_gaps = tuple(
+            item.tool_id for item in tool_requirements if not item.required
+        )
+        public_assertion_ids = tuple(item.assertion_id for item in assertions)
         dependencies = {node.node_id: set(node.dependencies) for node in nodes}
         sorter = TopologicalSorter(dependencies)
         try:
@@ -103,9 +164,32 @@ class FactoryInputCompiler:
             "assertions": [item.model_dump(mode="json") for item in assertions],
             "holdouts": [item.model_dump(mode="json") for item in holdouts],
             "nodes": [item.model_dump(mode="json") for item in nodes],
+            "required_agent_ids": required_agent_ids,
+            "ordered_handoffs": [
+                item.model_dump(mode="json") for item in ordered_handoffs
+            ],
+            "tool_requirements": [
+                item.model_dump(mode="json") for item in tool_requirements
+            ],
+            "allowed_optional_tool_gaps": optional_tool_gaps,
+            "public_assertion_ids": public_assertion_ids,
         }
         compilation_digest = hashlib.sha256(_canonical_json(digest_payload).encode()).hexdigest()
-        return CompiledFactorySpecification(source_ref=document.input_ref, subject_version=subject_version, capability_key=_capability_key(document.title), assertions=assertions, private_holdout_refs=holdouts, work_nodes=nodes, dependency_order=order, compilation_digest=compilation_digest)
+        return CompiledFactorySpecification(
+            source_ref=document.input_ref,
+            subject_version=subject_version,
+            capability_key=_capability_key(document.title),
+            assertions=assertions,
+            private_holdout_refs=holdouts,
+            work_nodes=nodes,
+            dependency_order=order,
+            compilation_digest=compilation_digest,
+            required_agent_ids=required_agent_ids,
+            ordered_handoffs=ordered_handoffs,
+            tool_requirements=tool_requirements,
+            allowed_optional_tool_gaps=optional_tool_gaps,
+            public_assertion_ids=public_assertion_ids,
+        )
 
     def _assertions(self, document: FactoryInputDocumentV2) -> tuple[AcceptanceAssertion, ...]:
         result = []

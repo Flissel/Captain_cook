@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 import hashlib
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -13,6 +14,7 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import time
+import unicodedata
 from typing import Any, Literal, Protocol
 from uuid import NAMESPACE_URL, uuid5
 import zipfile
@@ -43,14 +45,26 @@ from agenten.agent_factory.forge_contracts import (
     CodexBuildReceiptV1,
     CreationPackageManifestV1,
     CreationPackageManifestV2,
+    CreationJobV3,
     CreationResultV1,
+    CreationResultV2,
+    FactoryBuildAssignmentV2,
+    FactoryBuildEffectV2,
     ForgeBuildSkillUsageReceiptV1,
+    PackageBuildEvidenceV1,
+    PackageRealCaseEvidenceV1,
     codex_build_receipt_sha256,
+    validate_build_effect_binding,
 )
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
 from agenten.agent_factory.business_decision_tool import TOOL_NAME as BUSINESS_DECISION_TOOL
-from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
+from agenten.agent_factory.orchestration import (
+    FactoryCasReadbackRejected,
+    FactoryCreationResultRejected,
+    FactoryDispatch,
+    FactoryDispatchError,
+)
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationRequest,
     ReleasedHermesSkill,
@@ -944,7 +958,7 @@ class FactoryCandidateProvider:
     def accept_creation_result(
         self,
         job: FactoryJob,
-        result: CreationResultV1,
+        result: CreationResultV1 | CreationResultV2,
     ) -> ResolvedFactoryCandidate:
         raise NotImplementedError
 
@@ -986,7 +1000,30 @@ class ForgeCandidateArtifactStore(Protocol):
 
     def read_bytes(self, reference: ArtifactRef) -> bytes: ...
 
+    def read_bytes_bounded(
+        self,
+        reference: ArtifactRef,
+        *,
+        max_bytes: int,
+    ) -> bytes: ...
+
     def local_path(self, reference: ArtifactRef) -> Path: ...
+
+
+class CaptainCreationJobV3Source(Protocol):
+    """Resolve the exact Captain-mapped V3 authority, never Minibook status."""
+
+    def creation_job_for(self, job: FactoryJob, attempt: int) -> CreationJobV3: ...
+
+    def record_accepted_result(self, result: CreationResultV2) -> CreationResultV2: ...
+
+    def accepted_result_for(self, job: FactoryJob, attempt: int) -> CreationResultV2: ...
+
+    def assignment_for(
+        self, job: FactoryJob, attempt: int
+    ) -> FactoryBuildAssignmentV2: ...
+
+    def effect_for(self, job: FactoryJob, attempt: int) -> FactoryBuildEffectV2: ...
 
 
 class FactoryBlockSource(Protocol):
@@ -1007,15 +1044,25 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
         *,
         repository: FactoryBlockSource,
         artifacts: ForgeCandidateArtifactStore,
+        v3_jobs: CaptainCreationJobV3Source | None = None,
     ) -> None:
         self._repository = repository
         self._artifacts = artifacts
+        self._v3_jobs = v3_jobs
+
+    @property
+    def v3_readback_configured(self) -> bool:
+        return self._v3_jobs is not None
 
     def accept_creation_result(
         self,
         job: FactoryJob,
-        result: CreationResultV1,
+        result: CreationResultV1 | CreationResultV2,
     ) -> ResolvedFactoryCandidate:
+        if isinstance(result, CreationResultV2):
+            return self._accept_v3(job, result)
+        if isinstance(job, AgentFactoryJobV3) and self._v3_jobs is not None:
+            raise FactoryDispatchError("Captain V3 job rejects V1/V2 creation evidence")
         if result.package_manifest_ref is None:
             raise FactoryDispatchError("Forge package manifest reference is missing")
         if result.skill_usage_receipt_ref is None:
@@ -1040,7 +1087,657 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             )
         return resolved
 
+    def _accept_v3(
+        self,
+        job: FactoryJob,
+        result: CreationResultV2,
+    ) -> ResolvedFactoryCandidate:
+        if not isinstance(job, AgentFactoryJobV3) or self._v3_jobs is None:
+            raise FactoryDispatchError("Captain V3 creation authority is unavailable")
+        try:
+            authority = self._v3_jobs.creation_job_for(job, result.attempt)
+            assignment = self._v3_jobs.assignment_for(job, result.attempt)
+            effect = self._v3_jobs.effect_for(job, result.attempt)
+        except (AttributeError, FileNotFoundError) as exc:
+            raise FactoryDispatchError(
+                "Captain V3 assignment or effect authority is unavailable"
+            ) from exc
+        if not isinstance(authority, CreationJobV3):
+            raise FactoryDispatchError("Captain V3 creation authority is invalid")
+        if (
+            result.status != "succeeded"
+            or result.factory_job_id != job.job_id
+            or result.creation_job_id != authority.creation_job_id
+            or result.correlation_id != job.correlation_id
+            or result.subject_version != job.subject_version
+            or result.attempt != authority.attempt
+            or authority.factory_job_id != job.job_id
+            or authority.correlation_id != job.correlation_id
+            or authority.subject_version != job.subject_version
+            or authority.compiled_spec_ref.sha256 != job.compiled_spec_ref.sha256
+            or authority.public_assertion_ids != job.acceptance_assertion_ids
+        ):
+            raise FactoryDispatchError("Captain V3 result identity is stale or mixed")
+        try:
+            validate_build_effect_binding(assignment, effect)
+        except ValueError as exc:
+            raise FactoryDispatchError(
+                "Captain V3 assignment or effect authority is invalid"
+            ) from exc
+        if (
+            assignment.assignment_id != authority.command_id
+            or assignment.creation_job_id != authority.creation_job_id
+            or assignment.factory_job_id != authority.factory_job_id
+            or assignment.correlation_id != authority.correlation_id
+            or assignment.subject_version != authority.subject_version
+            or assignment.attempt != authority.attempt
+            or assignment.required_agent_ids != authority.required_agent_ids
+            or assignment.ordered_handoffs != authority.ordered_handoffs
+            or assignment.tool_requirements != authority.tool_requirements
+            or assignment.workspace_policy_sha256 != authority.workspace_policy_ref.sha256
+            or assignment.lease_ref != authority.lease_ref
+            or assignment.deadline_at != authority.deadline_at
+            or not _same_artifact_content(
+                effect.hermes_usage_receipt_ref,
+                result.hermes_usage_receipt_ref,
+            )
+            or not _same_artifact_content(
+                effect.codex_build_receipt_ref,
+                result.codex_build_receipt_ref,
+            )
+            or not _same_artifact_sequence_content(
+                effect.build_evidence_refs,
+                result.build_evidence_refs,
+            )
+            or not _same_artifact_sequence_content(
+                effect.test_evidence_refs,
+                result.real_case_evidence_refs,
+            )
+            or effect.tool_gaps != result.tool_gaps
+        ):
+            raise FactoryDispatchError(
+                "Captain V3 assignment or effect authority differs from the result"
+            )
+
+        required_refs = (
+            result.source_archive_ref,
+            result.package_manifest_ref,
+            result.team_manifest_ref,
+            result.candidate_manifest_ref,
+            result.hermes_usage_receipt_ref,
+            result.codex_build_receipt_ref,
+            *result.build_evidence_refs,
+            *result.real_case_evidence_refs,
+            result.cas_readback_receipt_ref,
+        )
+        if any(reference is None for reference in required_refs):
+            raise FactoryDispatchError("Captain V3 result is missing independent readback inputs")
+        typed_refs = tuple(_runtime_ref(reference) for reference in required_refs if reference is not None)
+        contents = { _artifact_identity(ref): self._read_v3_exact(ref) for ref in typed_refs }
+        source_ref = _runtime_ref(result.source_archive_ref)
+        source_bytes = contents[_artifact_identity(source_ref)]
+        try:
+            files = self._safe_v3_package_zip_files(
+                source_bytes,
+                maximum_files=min(4096, assignment.limits.max_files),
+            )
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            raise FactoryDispatchError("Captain V3 sealed ZIP is unavailable or invalid") from exc
+
+        package_ref = _runtime_ref(result.package_manifest_ref)
+        package_bytes = contents[_artifact_identity(package_ref)]
+        try:
+            package = json.loads(package_bytes)
+            if (
+                not isinstance(package, dict)
+                or package.get("schema") != "minibook.team-package-manifest.v1"
+                or package_bytes
+                != json.dumps(
+                    package,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+                + b"\n"
+                or files.get(PurePosixPath("package-manifest.json")) != package_bytes
+            ):
+                raise ValueError
+            entries = package["files"]
+            if [entry.get("path") for entry in entries if isinstance(entry, dict)] != sorted(
+                entry.get("path") for entry in entries if isinstance(entry, dict)
+            ):
+                raise ValueError
+            children: dict[PurePosixPath, ArtifactRef] = {}
+            for entry in entries:
+                path = PurePosixPath(entry["path"])
+                ref = ArtifactRef.model_validate(
+                    {key: entry[key] for key in ("uri", "sha256", "media_type")}
+                )
+                child_content = self._read_v3_exact(ref)
+                if path in children or files.get(path) != child_content:
+                    raise ValueError
+                children[path] = ref
+                contents[_artifact_identity(ref)] = child_content
+            if set(files) != {*children, PurePosixPath("package-manifest.json")}:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise FactoryDispatchError("Captain V3 package manifest or ZIP binding is invalid") from exc
+
+        top_level = {
+            PurePosixPath("team_manifest.json"): _runtime_ref(result.team_manifest_ref),
+            PurePosixPath("factory-candidate.json"): _runtime_ref(result.candidate_manifest_ref),
+            PurePosixPath("evidence/hermes-factory-skill-usage-receipt.json"): _runtime_ref(result.hermes_usage_receipt_ref),
+            PurePosixPath("evidence/codex-build-receipt.json"): _runtime_ref(result.codex_build_receipt_ref),
+        }
+        if any(children.get(path) != reference for path, reference in top_level.items()):
+            raise FactoryDispatchError("Captain V3 result refs differ from sealed package")
+        packaged_build_refs = tuple(
+            reference
+            for path, reference in children.items()
+            if str(path).startswith("evidence/build")
+        )
+        packaged_case_refs = tuple(
+            reference
+            for path, reference in children.items()
+            if str(path).startswith("evidence/real-case")
+        )
+        if (
+            packaged_build_refs
+            != tuple(_runtime_ref(ref) for ref in result.build_evidence_refs)
+            or packaged_case_refs
+            != tuple(_runtime_ref(ref) for ref in result.real_case_evidence_refs)
+        ):
+            raise FactoryDispatchError(
+                "Captain V3 result evidence refs differ from the canonical package"
+            )
+
+        try:
+            team = json.loads(contents[_artifact_identity(top_level[PurePosixPath("team_manifest.json")])])
+            agents = tuple(item["agent_id"] if isinstance(item, dict) else item for item in team["agents"])
+            handoffs = tuple(
+                (item["from_agent_id"], item["to_agent_id"])
+                for item in team["handoffs"]
+            )
+            expected_handoffs = tuple(
+                (item.from_agent_id, item.to_agent_id) for item in authority.ordered_handoffs
+            )
+            tools = {item["tool_id"]: item for item in team["tools"]}
+            if agents != authority.required_agent_ids or handoffs != expected_handoffs:
+                raise ValueError
+            for requirement in authority.tool_requirements:
+                if requirement.required and (
+                    requirement.tool_id not in tools
+                    or not isinstance(tools[requirement.tool_id].get("input_schema"), dict)
+                    or not isinstance(tools[requirement.tool_id].get("output_schema"), dict)
+                ):
+                    raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise FactoryDispatchError("Captain V3 team topology or required tools are invalid") from exc
+
+        codex = self._validate_v3_receipts(
+            job,
+            authority,
+            assignment,
+            effect,
+            result,
+            contents,
+            tuple(team["test_files"]),
+        )
+        candidate_source_ref = _runtime_ref(codex.source_archive_ref)
+        candidate_source_bytes = self._read_v3_exact(candidate_source_ref)
+
+        candidate_ref = _runtime_ref(result.candidate_manifest_ref)
+        try:
+            candidate_payload = json.loads(contents[_artifact_identity(candidate_ref)])
+            if contents[_artifact_identity(candidate_ref)] != json.dumps(
+                candidate_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8") + b"\n":
+                raise ValueError
+            expected_authority = {
+                "compiled_spec_ref": authority.compiled_spec_ref.model_dump(mode="json"),
+                "required_agent_ids": list(authority.required_agent_ids),
+                "ordered_handoffs": [item.model_dump(mode="json") for item in authority.ordered_handoffs],
+                "tool_requirements": [item.model_dump(mode="json") for item in authority.tool_requirements],
+                "public_assertion_ids": list(authority.public_assertion_ids),
+                "allowed_optional_tool_gaps": [item.tool_id for item in authority.tool_requirements if not item.required],
+            }
+            if any(candidate_payload.get(key) != value for key, value in expected_authority.items()):
+                raise ValueError
+            if candidate_payload.get("team_manifest_sha256") != top_level[PurePosixPath("team_manifest.json")].sha256:
+                raise ValueError
+            declared_artifacts = candidate_payload.get("artifacts")
+            if not isinstance(declared_artifacts, list):
+                raise ValueError
+            actual_artifacts = {
+                (item.get("path"), item.get("sha256"))
+                for item in declared_artifacts
+                if isinstance(item, dict) and set(item) == {"path", "sha256"}
+            }
+            expected_artifacts = {
+                (str(path), reference.sha256)
+                for path, reference in children.items()
+                if path != PurePosixPath("factory-candidate.json")
+            }
+            if len(actual_artifacts) != len(declared_artifacts) or actual_artifacts != expected_artifacts:
+                raise ValueError
+            runtime_payload = dict(candidate_payload)
+            for key in (
+                "team_manifest_sha256",
+                "compiled_spec_ref",
+                "required_agent_ids",
+                "ordered_handoffs",
+                "tool_requirements",
+                "public_assertion_ids",
+                "allowed_optional_tool_gaps",
+                "artifacts",
+            ):
+                runtime_payload.pop(key)
+            if runtime_payload.get("source_archive_ref") != candidate_source_ref.model_dump(
+                mode="json"
+            ):
+                raise ValueError
+            candidate = FactoryCandidateManifest.model_validate(runtime_payload)
+            declared = (
+                candidate.team_manifest,
+                *candidate.workflow_artifacts,
+                *candidate.tool_schema_artifacts,
+            )
+            for artifact in declared:
+                path = PurePosixPath(artifact.relative_path)
+                if children.get(path) != artifact.reference:
+                    raise ValueError
+                if files.get(path) != contents.get(_artifact_identity(artifact.reference)):
+                    raise ValueError
+            source_files = self._safe_v3_zip_files(candidate_source_bytes)
+            declared_source_paths = tuple(team["source_files"])
+            declared_test_paths = tuple(team["test_files"])
+            declared_paths = (*declared_source_paths, *declared_test_paths)
+            if (
+                any(not isinstance(path, str) for path in declared_paths)
+                or len(declared_paths) != len(set(declared_paths))
+                or set(source_files)
+                != {PurePosixPath(path) for path in declared_paths}
+                | {PurePosixPath("factory-candidate.json")}
+            ):
+                raise ValueError
+            declared_digests = {
+                item["path"]: item["sha256"] for item in declared_artifacts
+            }
+            for declared_path in declared_paths:
+                path = PurePosixPath(declared_path)
+                content = source_files[path]
+                reference = children.get(path)
+                if (
+                    reference is None
+                    or files.get(path) != content
+                    or hashlib.sha256(content).hexdigest() != reference.sha256
+                    or declared_digests.get(declared_path) != reference.sha256
+                ):
+                    raise ValueError
+            preseal_payload = dict(runtime_payload)
+            preseal_payload.pop("source_archive_ref")
+            expected_preseal = json.dumps(
+                preseal_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8") + b"\n"
+            if source_files[PurePosixPath("factory-candidate.json")] != expected_preseal:
+                raise ValueError
+        except (OSError, TypeError, ValueError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+            raise FactoryDispatchError("Captain V3 candidate binding is invalid") from exc
+        try:
+            candidate_source_path = self._artifacts.local_path(candidate_source_ref)
+            local_source_bytes = self._read_bound_v3_source_path(
+                candidate_source_path,
+                maximum_bytes=len(candidate_source_bytes),
+            )
+            if (
+                local_source_bytes != candidate_source_bytes
+                or hashlib.sha256(local_source_bytes).hexdigest()
+                != candidate_source_ref.sha256
+            ):
+                raise ValueError
+        except (OSError, ValueError) as exc:
+            raise FactoryDispatchError(
+                "Captain V3 candidate source archive binding is invalid"
+            ) from exc
+
+        receipt_ref = _runtime_ref(result.cas_readback_receipt_ref)
+        try:
+            receipt = json.loads(contents[_artifact_identity(receipt_ref)])
+            if contents[_artifact_identity(receipt_ref)] != json.dumps(
+                receipt,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8") + b"\n":
+                raise ValueError
+            actual = tuple(receipt["artifacts"])
+            expected = tuple(
+                {
+                    "uri": reference.uri,
+                    "sha256": reference.sha256,
+                    "media_type": reference.media_type,
+                    "verified": True,
+                }
+                for reference in (*children.values(), package_ref, source_ref)
+            )
+            if (
+                receipt.get("schema") != "minibook.cas-readback-receipt.v1"
+                or any(
+                    not isinstance(item, dict)
+                    or set(item) != {"uri", "sha256", "media_type", "verified"}
+                    for item in actual
+                )
+                or actual != expected
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise FactoryDispatchError("Captain V3 Minibook readback receipt is invalid") from exc
+        resolved = ResolvedFactoryCandidate(
+            candidate=candidate,
+            source_archive=candidate_source_path,
+        )
+        self._v3_jobs.record_accepted_result(result)
+        return resolved
+
+    def _read_v3_exact(self, reference: ArtifactRef) -> bytes:
+        maximum_bytes = (
+            16 * 1024 * 1024
+            if reference.media_type == "application/zip"
+            else 2 * 1024 * 1024
+        )
+        try:
+            content = self._artifacts.read_bytes_bounded(
+                reference,
+                max_bytes=maximum_bytes,
+            )
+        except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+            raise FactoryCasReadbackRejected() from exc
+        if (
+            not content
+            or len(content) > maximum_bytes
+            or hashlib.sha256(content).hexdigest() != reference.sha256
+        ):
+            raise FactoryCasReadbackRejected()
+        return content
+
+    @staticmethod
+    def _safe_v3_package_zip_files(
+        content: bytes,
+        *,
+        maximum_files: int,
+    ) -> dict[PurePosixPath, bytes]:
+        if not content or len(content) > 16 * 1024 * 1024:
+            raise ValueError("candidate package ZIP size is invalid")
+        windows_reserved = {
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            *(f"COM{index}" for index in range(1, 10)),
+            *(f"LPT{index}" for index in range(1, 10)),
+        }
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            infos = archive.infolist()
+            if not infos or len(infos) > maximum_files:
+                raise ValueError("candidate package ZIP member count is invalid")
+            files: dict[PurePosixPath, bytes] = {}
+            normalized_names: set[str] = set()
+            total_size = 0
+            for info in infos:
+                # ZipInfo.filename normalizes the host separator on Windows;
+                # orig_filename preserves the signed archive member spelling.
+                raw = info.orig_filename
+                raw_parts = raw.split("/")
+                path = PurePosixPath(raw)
+                mode = info.external_attr >> 16
+                normalized = unicodedata.normalize("NFC", raw).casefold()
+                if (
+                    info.is_dir()
+                    or info.flag_bits & 1
+                    or info.compress_type
+                    not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+                    or "\\" in raw
+                    or "\x00" in raw
+                    or len(raw.encode("utf-8")) > 512
+                    or path.is_absolute()
+                    or any(part in {"", ".", ".."} for part in raw_parts)
+                    or ":" in raw_parts[0]
+                    or stat.S_ISLNK(mode)
+                    or path in files
+                    or normalized in normalized_names
+                    or any(
+                        part.endswith((" ", "."))
+                        or part.split(".", 1)[0].upper() in windows_reserved
+                        for part in raw_parts
+                    )
+                    or info.file_size > 2 * 1024 * 1024
+                    or (info.file_size > 0 and info.compress_size == 0)
+                    or (
+                        info.compress_size > 0
+                        and info.file_size / info.compress_size > 200
+                    )
+                ):
+                    raise ValueError("candidate package ZIP member is unsafe")
+                total_size += info.file_size
+                if total_size > 8 * 1024 * 1024:
+                    raise ValueError("candidate package ZIP expands beyond its limit")
+                member = archive.read(info)
+                if len(member) != info.file_size:
+                    raise ValueError("candidate package ZIP member size changed")
+                files[path] = member
+                normalized_names.add(normalized)
+        return files
+
+    @staticmethod
+    def _read_bound_v3_source_path(path: Path, *, maximum_bytes: int) -> bytes:
+        descriptor: int | None = None
+        try:
+            before = os.stat(path, follow_symlinks=False)
+            reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or path.is_symlink()
+                or (
+                    reparse_flag
+                    and getattr(before, "st_file_attributes", 0) & reparse_flag
+                )
+            ):
+                raise OSError
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            opened = os.fstat(descriptor)
+            if (
+                (opened.st_dev, opened.st_ino, stat.S_IFMT(opened.st_mode))
+                != (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode))
+                or opened.st_size != before.st_size
+            ):
+                raise OSError
+            content = bytearray()
+            while len(content) <= maximum_bytes:
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, maximum_bytes + 1 - len(content)),
+                )
+                if not chunk:
+                    break
+                content.extend(chunk)
+            after_open = os.fstat(descriptor)
+            after_path = os.stat(path, follow_symlinks=False)
+            if (
+                len(content) != maximum_bytes
+                or (
+                    after_open.st_dev,
+                    after_open.st_ino,
+                    after_open.st_size,
+                    after_open.st_mtime_ns,
+                )
+                != (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_size,
+                    opened.st_mtime_ns,
+                )
+                or (
+                    after_path.st_dev,
+                    after_path.st_ino,
+                    after_path.st_size,
+                    after_path.st_mtime_ns,
+                )
+                != (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_size,
+                    opened.st_mtime_ns,
+                )
+            ):
+                raise OSError
+            return bytes(content)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @staticmethod
+    def _safe_v3_zip_files(content: bytes) -> dict[PurePosixPath, bytes]:
+        if not content or len(content) > 16 * 1024 * 1024:
+            raise ValueError("candidate source ZIP size is invalid")
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            infos = archive.infolist()
+            if not infos or len(infos) > 4096:
+                raise ValueError("candidate source ZIP member count is invalid")
+            files: dict[PurePosixPath, bytes] = {}
+            total_size = 0
+            for info in infos:
+                path = PurePosixPath(info.filename)
+                mode = info.external_attr >> 16
+                if (
+                    info.is_dir()
+                    or info.flag_bits & 1
+                    or "\\" in info.filename
+                    or "\x00" in info.filename
+                    or path.is_absolute()
+                    or not path.parts
+                    or ".." in path.parts
+                    or ":" in path.parts[0]
+                    or stat.S_ISLNK(mode)
+                    or path in files
+                    or info.file_size > 2 * 1024 * 1024
+                    or (
+                        info.compress_size > 0
+                        and info.file_size / info.compress_size > 200
+                    )
+                ):
+                    raise ValueError("candidate source ZIP member is unsafe")
+                total_size += info.file_size
+                if total_size > 8 * 1024 * 1024:
+                    raise ValueError("candidate source ZIP expands beyond its limit")
+                files[path] = archive.read(info)
+        return files
+
+    def _validate_v3_receipts(
+        self,
+        job: AgentFactoryJobV3,
+        authority: CreationJobV3,
+        assignment: FactoryBuildAssignmentV2,
+        effect: FactoryBuildEffectV2,
+        result: CreationResultV2,
+        contents: dict[tuple[str, str, str], bytes],
+        declared_test_paths: tuple[str, ...],
+    ) -> CodexBuildReceiptV1:
+        try:
+            hermes_ref = _runtime_ref(result.hermes_usage_receipt_ref)
+            hermes = ForgeBuildSkillUsageReceiptV1.model_validate_json(contents[_artifact_identity(hermes_ref)])
+            codex_ref = _runtime_ref(result.codex_build_receipt_ref)
+            codex = CodexBuildReceiptV1.model_validate_json(contents[_artifact_identity(codex_ref)])
+            builds = tuple(
+                PackageBuildEvidenceV1.model_validate_json(contents[_artifact_identity(_runtime_ref(ref))])
+                for ref in result.build_evidence_refs
+            )
+            cases = tuple(
+                PackageRealCaseEvidenceV1.model_validate_json(contents[_artifact_identity(_runtime_ref(ref))])
+                for ref in result.real_case_evidence_refs
+            )
+            preliminary_team = json.loads(
+                self._read_v3_exact(_runtime_ref(codex.candidate_manifest_ref))
+            )
+            final_team = json.loads(
+                contents[_artifact_identity(_runtime_ref(result.team_manifest_ref))]
+            )
+        except (KeyError, ValueError) as exc:
+            raise FactoryDispatchError("Captain V3 build or test evidence is invalid") from exc
+        common = (authority.creation_job_id, job.job_id, job.correlation_id, job.subject_version, result.attempt)
+        assignment_identity = (
+            assignment.assignment_id,
+            assignment.checkpoint_version,
+            assignment.effect_key,
+            effect.source_archive_ref,
+            effect.codex_session_ref,
+        )
+        if (
+            (hermes.creation_job_id, hermes.factory_job_id, hermes.correlation_id, hermes.subject_version, hermes.attempt) != common
+            or (codex.creation_job_id, codex.factory_job_id, codex.correlation_id, codex.subject_version, codex.attempt) != common
+            or hermes.public_assertion_ids != job.acceptance_assertion_ids
+            or hermes.idempotency_key != authority.idempotency_key
+            or hermes.released_skill != authority.released_skill
+            or codex.acceptance_assertion_ids != job.acceptance_assertion_ids
+            or any((item.creation_job_id, item.factory_job_id, item.correlation_id, item.subject_version, item.attempt) != common for item in (*builds, *cases))
+            or any(item.outcome != "passed" for item in (*builds, *cases))
+            or any(item.assertion_ids != job.acceptance_assertion_ids for item in cases)
+            or any(
+                (
+                    item.assignment_id,
+                    item.checkpoint_version,
+                    item.effect_key,
+                    item.source_archive_ref,
+                    item.codex_session_ref,
+                )
+                != assignment_identity
+                for item in (*builds, *cases)
+            )
+            or any(item.workspace_snapshot_ref != effect.workspace_snapshot_ref for item in builds)
+            or any(
+                not _same_artifact_sequence_content(
+                    item.evidence_refs,
+                    result.build_evidence_refs,
+                )
+                for item in cases
+            )
+            or any(item.declared_test_paths != declared_test_paths for item in cases)
+            or hermes.evidence_refs
+            != (
+                authority.compiled_spec_ref,
+                authority.blueprint_ref,
+                authority.tool_plan_ref,
+            )
+            or codex.assignment_id != assignment.assignment_id
+            or codex.idempotency_key != assignment.effect_key
+            or codex.build_brief_ref != authority.blueprint_ref
+            or codex.workspace_ref != assignment.workspace_ref
+            or codex.codex_session_ref != effect.codex_session_ref
+            or codex.workspace_snapshot_ref != effect.workspace_snapshot_ref
+            or codex.source_archive_ref != effect.source_archive_ref
+            or codex.candidate_manifest_ref != effect.preliminary_team_manifest_ref
+            or preliminary_team != final_team
+            or codex.test_evidence_refs != effect.test_evidence_refs
+        ):
+            raise FactoryDispatchError("Captain V3 build or test evidence is stale or failed")
+        return codex
+
     def candidate_for(self, job: FactoryJob) -> ResolvedFactoryCandidate:
+        if self._v3_jobs is not None and isinstance(job, AgentFactoryJobV3):
+            block = self._authoritative_block(job)
+            result = self._v3_jobs.accepted_result_for(job, block.attempt)
+            return self._accept_v3(job, result)
         block = self._authoritative_block(job)
         resolved, _ = self._resolve_block(job, block)
         return resolved
@@ -1050,6 +1747,13 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
         job: FactoryJob,
         attempt: int,
     ) -> ArtifactRef | None:
+        if self._v3_jobs is not None and isinstance(job, AgentFactoryJobV3):
+            try:
+                self._authoritative_block(job, attempt=attempt)
+                result = self._v3_jobs.accepted_result_for(job, attempt)
+            except (FactoryDispatchError, FileNotFoundError):
+                return None
+            return self._accept_v3(job, result).candidate.source_archive_ref
         try:
             block = self._authoritative_block(job, attempt=attempt)
         except FileNotFoundError:
@@ -1324,6 +2028,27 @@ def _artifact_identity(reference: ArtifactRef) -> tuple[str, str, str]:
     return reference.uri, reference.sha256, reference.media_type
 
 
+def _same_artifact_content(left: object, right: object) -> bool:
+    if left is None or right is None:
+        return False
+    left_ref = _runtime_ref(left)
+    right_ref = _runtime_ref(right)
+    return (
+        left_ref.sha256 == right_ref.sha256
+        and left_ref.media_type == right_ref.media_type
+    )
+
+
+def _same_artifact_sequence_content(
+    left: tuple[object, ...],
+    right: tuple[object, ...],
+) -> bool:
+    return len(left) == len(right) and all(
+        _same_artifact_content(left_ref, right_ref)
+        for left_ref, right_ref in zip(left, right, strict=True)
+    )
+
+
 class FactoryTeamExecutionPort(Protocol):
     """Production real-case boundary, implemented with TeamExecutionService."""
 
@@ -1556,7 +2281,7 @@ class CandidateEvaluationFactory:
     async def record_creation_result(
         self,
         request: FactoryDispatch,
-        result: CreationResultV1,
+        result: CreationResultV1 | CreationResultV2,
     ) -> FactoryEvidenceBlock:
         if request.action.kind is not FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE:
             raise FactoryDispatchError(
@@ -1583,16 +2308,13 @@ class CandidateEvaluationFactory:
                 "Minibook CreationResultV1 does not match the factory dispatch"
             )
         if result.status != "succeeded":
-            raise FactoryDispatchError(
-                "Minibook CreationResultV1 did not produce successful agent code"
-            )
-        if not result.artifact_refs:
+            raise FactoryCreationResultRejected(result)
+        if isinstance(result, CreationResultV1) and not result.artifact_refs:
             raise FactoryDispatchError(
                 "successful Minibook CreationResultV1 has no generated code artifacts"
             )
         self._provider.accept_creation_result(request.job, result)
         assert result.package_manifest_ref is not None
-        assert result.skill_usage_receipt_ref is not None
         content = json.dumps(
             result.model_dump(mode="json", by_alias=True, exclude_none=True),
             sort_keys=True,
@@ -1603,17 +2325,41 @@ class CandidateEvaluationFactory:
         package_manifest_ref = ArtifactRef.model_validate(
             result.package_manifest_ref.model_dump(mode="json")
         )
-        artifact_refs = tuple(
-            ArtifactRef.model_validate(reference.model_dump(mode="json"))
-            for reference in result.artifact_refs
-        )
-        forge_evidence_refs = tuple(
-            ArtifactRef.model_validate(reference.model_dump(mode="json"))
-            for reference in result.evidence_refs
-        )
-        skill_usage_receipt_ref = ArtifactRef.model_validate(
-            result.skill_usage_receipt_ref.model_dump(mode="json")
-        )
+        if isinstance(result, CreationResultV2):
+            artifact_refs = tuple(
+                ArtifactRef.model_validate(reference.model_dump(mode="json"))
+                for reference in (
+                    result.team_manifest_ref,
+                    result.candidate_manifest_ref,
+                    result.source_archive_ref,
+                )
+                if reference is not None
+            )
+            forge_evidence_refs = tuple(
+                ArtifactRef.model_validate(reference.model_dump(mode="json"))
+                for reference in (
+                    result.hermes_usage_receipt_ref,
+                    result.codex_build_receipt_ref,
+                    *result.build_evidence_refs,
+                    *result.real_case_evidence_refs,
+                    result.cas_readback_receipt_ref,
+                )
+                if reference is not None
+            )
+        else:
+            assert result.skill_usage_receipt_ref is not None
+            artifact_refs = tuple(
+                ArtifactRef.model_validate(reference.model_dump(mode="json"))
+                for reference in result.artifact_refs
+            )
+            forge_evidence_refs = tuple(
+                ArtifactRef.model_validate(reference.model_dump(mode="json"))
+                for reference in result.evidence_refs
+            ) + (
+                ArtifactRef.model_validate(
+                    result.skill_usage_receipt_ref.model_dump(mode="json")
+                ),
+            )
         return FactoryEvidenceBlock(
             schema_name="captain.agent-factory-block.v1",
             event_id=uuid5(
@@ -1631,7 +2377,7 @@ class CandidateEvaluationFactory:
             role=role,
             status=FactoryBlockStatus.SUCCEEDED,
             artifact_refs=(package_manifest_ref, *artifact_refs),
-            evidence_refs=(sealed, *forge_evidence_refs, skill_usage_receipt_ref),
+            evidence_refs=(sealed, *forge_evidence_refs),
             assertion_ids=(),
             lease_id=request.lease.lease_id,
         )

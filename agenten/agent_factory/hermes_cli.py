@@ -62,6 +62,14 @@ from agenten.agent_factory.skill_sequence import (
     validate_factory_hermes_replay_retry_authorization,
 )
 from agenten.agent_factory.skill_store import reject_sensitive_data
+from agenten.agent_factory.hermes_factory_worker import (
+    FilesystemHermesFactoryWorkerCheckpointStore,
+    HermesFactoryCodexPort,
+    HermesFactoryCodexReceiptReaderPort,
+    HermesFactoryMinibookPort,
+    HermesFactoryRetryAuthorityPort,
+    HermesFactoryWorker,
+)
 from agenten.agent_factory.state_machine import FactoryActionKind
 from agenten.agent_factory.skill_workflow_contracts import (
     FACTORY_SKILL_ID_BY_STEP,
@@ -413,6 +421,33 @@ class HermesCliFactory(HermesFactoryPort):
             raise FactoryDispatchError(
                 "released runtime skill digest does not match Captain's release"
             )
+
+    def factory_worker(
+        self,
+        *,
+        minibook: HermesFactoryMinibookPort,
+        codex: HermesFactoryCodexPort,
+        worker_id: str,
+        released_skill_name: str,
+        released_skill_sha256: str,
+        checkpoint_store: FilesystemHermesFactoryWorkerCheckpointStore,
+        codex_receipts: HermesFactoryCodexReceiptReaderPort,
+        retry_authority: HermesFactoryRetryAuthorityPort | None = None,
+    ) -> HermesFactoryWorker:
+        """Compose the opt-in V3 coordinator around this exact skill verifier."""
+
+        return HermesFactoryWorker(
+            minibook=minibook,
+            codex=codex,
+            skill_verifier=self,
+            worker_id=worker_id,
+            released_skill_name=released_skill_name,
+            released_skill_sha256=released_skill_sha256,
+            checkpoint_store=checkpoint_store,
+            codex_receipts=codex_receipts,
+            retry_authority=retry_authority,
+            clock=self._clock,
+        )
 
     def prepare_runtime_skill_snapshot(
         self,

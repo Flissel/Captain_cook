@@ -4,7 +4,19 @@ import asyncio
 import json
 import os
 import re
+from typing import TypeVar
+from uuid import UUID
 import aiohttp
+from pydantic import BaseModel
+
+from .contracts import (
+    CreationJobV3,
+    CreationProgressV1,
+    CreationResultV2,
+    CreationSubmissionReceipt,
+    FactoryBuildAssignmentV2,
+    FactoryBuildEffectV2,
+)
 
 from .constants import MINIBOOK_URL, CREDS_FILE
 
@@ -22,6 +34,8 @@ async def _request_with_retry(method: str, session: aiohttp.ClientSession,
                 if resp.status >= 400:
                     body = await resp.text()
                     raise Exception(f"API {resp.status} {method.upper()} {path}: {body}")
+                if resp.status == 204:
+                    return None
                 return await resp.json()
         except (aiohttp.ClientOSError, aiohttp.ServerDisconnectedError,
                 aiohttp.ClientConnectorError, ConnectionResetError) as e:
@@ -50,6 +64,131 @@ async def api_get(session: aiohttp.ClientSession, path: str, api_key: str = None
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     return await _request_with_retry("get", session, path, headers, params=params)
+
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+class CreationArtifactMetadata(BaseModel):
+    sha256: str
+    size_bytes: int
+
+
+def _require_json_object(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise ValueError("Minibook response must be a JSON object")
+    return value
+
+
+def _require_model(value: object, model: type[ModelT]) -> ModelT:
+    if isinstance(value, model):
+        return value
+    if isinstance(value, BaseModel):
+        raise TypeError(f"expected {model.__name__}")
+    if not isinstance(value, dict):
+        raise TypeError(f"expected {model.__name__}")
+    return model.model_validate(_require_json_object(value))
+
+
+async def submit_creation_job_v3(
+    session: aiohttp.ClientSession,
+    job: CreationJobV3,
+    *,
+    api_key: str,
+) -> CreationSubmissionReceipt:
+    typed_job = _require_model(job, CreationJobV3)
+    payload = await api_post(
+        session,
+        "/v3/creation/jobs",
+        typed_job.model_dump(mode="json", by_alias=True),
+        api_key=api_key,
+    )
+    return CreationSubmissionReceipt.model_validate(_require_json_object(payload))
+
+
+async def creation_status_v3(
+    session: aiohttp.ClientSession, job_id: UUID, *, api_key: str
+) -> CreationProgressV1:
+    payload = await api_get(session, f"/v3/creation/jobs/{job_id}", api_key=api_key)
+    return CreationProgressV1.model_validate(_require_json_object(payload))
+
+
+async def creation_result_v3(
+    session: aiohttp.ClientSession, job_id: UUID, *, api_key: str
+) -> CreationResultV2:
+    payload = await api_get(session, f"/v3/creation/jobs/{job_id}/result", api_key=api_key)
+    return CreationResultV2.model_validate(_require_json_object(payload))
+
+
+async def cancel_creation_v3(
+    session: aiohttp.ClientSession,
+    job_id: UUID,
+    *,
+    expected_version: int,
+    api_key: str,
+) -> CreationProgressV1:
+    payload = await api_post(
+        session,
+        f"/v3/creation/jobs/{job_id}/cancel",
+        {"expected_version": expected_version},
+        api_key=api_key,
+    )
+    return CreationProgressV1.model_validate(_require_json_object(payload))
+
+
+async def next_build_assignment(
+    session: aiohttp.ClientSession, *, worker_token: str
+) -> FactoryBuildAssignmentV2 | None:
+    payload = await api_get(
+        session, "/v3/creation/assignments/next", api_key=worker_token
+    )
+    if payload is None:
+        return None
+    return FactoryBuildAssignmentV2.model_validate(_require_json_object(payload))
+
+
+async def claim_build_assignment(
+    session: aiohttp.ClientSession,
+    assignment_id: UUID,
+    *,
+    worker_id: str,
+    worker_token: str,
+) -> FactoryBuildAssignmentV2:
+    payload = await api_post(
+        session,
+        f"/v3/creation/assignments/{assignment_id}/claim",
+        {"worker_id": worker_id},
+        api_key=worker_token,
+    )
+    return FactoryBuildAssignmentV2.model_validate(_require_json_object(payload))
+
+
+async def submit_build_effect(
+    session: aiohttp.ClientSession,
+    effect: FactoryBuildEffectV2,
+    *,
+    worker_token: str,
+) -> CreationProgressV1:
+    typed_effect = _require_model(effect, FactoryBuildEffectV2)
+    payload = await api_post(
+        session,
+        f"/v3/creation/assignments/{typed_effect.assignment_id}/effect",
+        typed_effect.model_dump(mode="json", by_alias=True),
+        api_key=worker_token,
+    )
+    return CreationProgressV1.model_validate(_require_json_object(payload))
+
+
+async def creation_artifact_metadata(
+    session: aiohttp.ClientSession, sha256: str, *, worker_token: str
+) -> CreationArtifactMetadata:
+    return CreationArtifactMetadata.model_validate(_require_json_object(
+        await api_get(
+            session,
+            f"/v3/creation/artifacts/{sha256}/metadata",
+            api_key=worker_token,
+        )
+    ))
 
 
 # --- Credential Storage ---

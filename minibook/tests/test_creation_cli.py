@@ -7,6 +7,9 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
+import importlib
+import sys
+import types
 
 from agenten.agent_factory.forge_contracts import (
     CodexBuildReceiptV1 as CaptainCodexBuildReceiptV1,
@@ -16,9 +19,18 @@ from minibook.swarm.contracts import (
     CodexBuildReceiptV1,
     CreationJobV1,
     CreationJobV2,
+    CreationJobV3,
     CreationPackageManifestV2,
     CreationResultV1,
+    CreationResultV2,
+    CreationFailure,
+    FactoryBuildAssignmentV2,
+    FactoryBuildEffectV2,
 )
+from minibook.swarm.v3_pipeline import V3CreationPipeline
+from minibook.swarm.runner import CreationRunner, StepOutcome
+from minibook.swarm.job_store import CreationJobStore
+from uuid import uuid4
 from minibook.swarm.creation_cli import (
     install_creation_skill_receipt,
     load_creation_job,
@@ -473,3 +485,225 @@ def test_creation_cli_reads_legacy_v1_and_new_v2_jobs(tmp_path: Path) -> None:
         load_creation_job(FIXTURE_ROOT / "minibook_creation_job.v1.json"),
         CreationJobV1,
     )
+
+
+def _reload_main() -> object:
+    sys.modules.pop("minibook.src.main", None)
+    return importlib.import_module("minibook.src.main")
+
+
+def test_v3_startup_fails_closed_when_required_composition_is_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINIBOOK_CREATION_DB", str(tmp_path / "creation.sqlite3"))
+    monkeypatch.setenv("MINIBOOK_CREATION_V3_ENABLED", "1")
+    monkeypatch.delenv("MINIBOOK_CREATION_CAS_ROOT", raising=False)
+    monkeypatch.delenv("MINIBOOK_CREATION_V3_VALIDATOR", raising=False)
+    monkeypatch.delenv("MINIBOOK_CREATION_WORKER_TOKEN", raising=False)
+    monkeypatch.delenv("MINIBOOK_CREATION_WORKER_ID", raising=False)
+    monkeypatch.delenv("MINIBOOK_CREATION_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="V3 creation configuration is incomplete"):
+        _reload_main()
+
+
+def test_v3_startup_constructs_pipeline_only_with_all_explicit_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Validator:
+        def build_assignment(self, *_args: object) -> object:
+            raise NotImplementedError
+
+        async def validate_build_effect(self, *_args: object) -> object:
+            raise NotImplementedError
+
+        async def validate(self, *_args: object) -> object:
+            raise NotImplementedError
+
+        def assemble_result(self, *_args: object) -> object:
+            raise NotImplementedError
+
+    validator_module = types.ModuleType("test_v3_validator")
+    validator_module.validator = Validator()
+    monkeypatch.setitem(sys.modules, "test_v3_validator", validator_module)
+    monkeypatch.setenv("MINIBOOK_CREATION_DB", str(tmp_path / "creation.sqlite3"))
+    monkeypatch.setenv("MINIBOOK_CREATION_V3_ENABLED", "1")
+    monkeypatch.setenv("MINIBOOK_CREATION_CAS_ROOT", str(tmp_path / "cas"))
+    monkeypatch.setenv("MINIBOOK_CREATION_V3_VALIDATOR", "test_v3_validator:validator")
+    monkeypatch.setenv("MINIBOOK_CREATION_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setenv("MINIBOOK_CREATION_WORKER_ID", "hermes-factory")
+    monkeypatch.setenv("MINIBOOK_CREATION_API_KEY", "captain-secret")
+    module = _reload_main()
+    job_payload = json.loads(
+        (FIXTURE_ROOT / "minibook_creation_job.v3.json").read_text(encoding="utf-8")
+    )
+    job_payload["deadline_at"] = "2099-08-09T12:00:00Z"
+    job = CreationJobV3.model_validate(job_payload)
+    module._creation_store.submit(job)
+    runner = module._creation_runner_for(job.creation_job_id)
+    assert isinstance(runner.pipeline, V3CreationPipeline)
+
+
+def test_v3_startup_fails_closed_when_creation_caller_credential_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Validator:
+        def build_assignment(self, *_args: object) -> object:
+            raise NotImplementedError
+
+        async def validate_build_effect(self, *_args: object) -> object:
+            raise NotImplementedError
+
+        async def validate(self, *_args: object) -> object:
+            raise NotImplementedError
+
+        def assemble_result(self, *_args: object) -> object:
+            raise NotImplementedError
+
+    validator_module = types.ModuleType("test_v3_missing_caller_validator")
+    validator_module.validator = Validator()
+    monkeypatch.setitem(sys.modules, "test_v3_missing_caller_validator", validator_module)
+    monkeypatch.setenv("MINIBOOK_CREATION_DB", str(tmp_path / "creation.sqlite3"))
+    monkeypatch.setenv("MINIBOOK_CREATION_V3_ENABLED", "1")
+    monkeypatch.setenv("MINIBOOK_CREATION_CAS_ROOT", str(tmp_path / "cas"))
+    monkeypatch.setenv(
+        "MINIBOOK_CREATION_V3_VALIDATOR",
+        "test_v3_missing_caller_validator:validator",
+    )
+    monkeypatch.setenv("MINIBOOK_CREATION_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setenv("MINIBOOK_CREATION_WORKER_ID", "hermes-factory")
+    monkeypatch.delenv("MINIBOOK_CREATION_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="V3 creation configuration is incomplete"):
+        _reload_main()
+
+
+def test_disabled_creation_does_not_import_forge_docker_or_llm_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MINIBOOK_CREATION_DB", raising=False)
+    monkeypatch.delenv("MINIBOOK_CREATION_V3_ENABLED", raising=False)
+    before = set(sys.modules)
+    _reload_main()
+    imported = set(sys.modules) - before
+    assert not any(name in imported for name in {
+        "minibook.swarm.pipeline", "minibook.swarm.docker_ops", "anthropic", "openai",
+    })
+
+
+class RecordingV3Validator:
+    def __init__(self) -> None:
+        self.accepted_effects: list[FactoryBuildEffectV2] = []
+        self.validation_calls = 0
+
+    def build_assignment(
+        self, job: CreationJobV3, checkpoint_version: int, effect_key: str
+    ) -> FactoryBuildAssignmentV2:
+        return FactoryBuildAssignmentV2.model_validate({
+            "assignment_id": str(uuid4()), "creation_job_id": str(job.creation_job_id),
+            "factory_job_id": str(job.factory_job_id), "correlation_id": str(job.correlation_id),
+            "subject_version": job.subject_version, "checkpoint_version": checkpoint_version,
+            "attempt": job.attempt, "effect_key": effect_key,
+            "workspace_ref": "workspace://captain/codex",
+            "workspace_policy_sha256": job.workspace_policy_ref.sha256,
+            "required_agent_ids": list(job.required_agent_ids),
+            "ordered_handoffs": [value.model_dump(mode="json") for value in job.ordered_handoffs],
+            "tool_requirements": [value.model_dump(mode="json") for value in job.tool_requirements],
+            "allowed_output_roots": ["out"], "allowed_commands": [["python", "-m", "pytest"]],
+            "limits": {"max_wall_clock_seconds": 30, "max_provider_cost_usd": 1.0, "max_retries": 0, "max_files": 10},
+            "lease_ref": job.lease_ref.model_dump(mode="json"), "deadline_at": job.deadline_at.isoformat(),
+        })
+
+    async def validate_build_effect(
+        self,
+        _job: CreationJobV3,
+        _assignment: FactoryBuildAssignmentV2,
+        effect: FactoryBuildEffectV2,
+        _artifact_store: FilesystemCreationArtifactStore,
+        snapshot: dict[str, object],
+    ) -> StepOutcome:
+        self.accepted_effects.append(effect)
+        return StepOutcome(snapshot=snapshot | {"accepted_effect_key": effect.effect_key})
+
+    async def validate(
+        self,
+        _job: CreationJobV3,
+        snapshot: dict[str, object],
+        _artifact_store: FilesystemCreationArtifactStore,
+    ) -> StepOutcome:
+        self.validation_calls += 1
+        return StepOutcome(snapshot=snapshot | {"validated": True})
+
+    def assemble_result(
+        self, job: CreationJobV3, _snapshot: dict[str, object]
+    ) -> CreationResultV2:
+        return CreationResultV2(
+            creation_job_id=job.creation_job_id, factory_job_id=job.factory_job_id,
+            correlation_id=job.correlation_id, subject_version=job.subject_version,
+            attempt=job.attempt, status="failed",
+            failure=CreationFailure(code="validation_failed", summary="Task 4 not configured"),
+        )
+
+
+def _v3_effect(assignment: FactoryBuildAssignmentV2) -> FactoryBuildEffectV2:
+    def ref(digit: str, media_type: str = "application/json") -> dict[str, str]:
+        return {"uri": f"artifact://worker/{digit * 64}", "sha256": digit * 64, "media_type": media_type}
+
+    return FactoryBuildEffectV2.model_validate({
+        "assignment_id": str(assignment.assignment_id), "creation_job_id": str(assignment.creation_job_id),
+        "factory_job_id": str(assignment.factory_job_id), "correlation_id": str(assignment.correlation_id),
+        "subject_version": assignment.subject_version, "checkpoint_version": assignment.checkpoint_version,
+        "attempt": assignment.attempt, "effect_key": assignment.effect_key,
+        "hermes_usage_receipt_ref": ref("1"), "codex_build_receipt_ref": ref("2"),
+        "codex_session_ref": ref("3"), "workspace_snapshot_ref": ref("4", "application/zip"),
+        "source_archive_ref": ref("5", "application/zip"), "preliminary_team_manifest_ref": ref("6"),
+        "build_evidence_refs": [ref("7")], "test_evidence_refs": [ref("8")],
+    })
+
+
+@pytest.mark.asyncio
+async def test_production_v3_pipeline_yields_assignment_then_consumes_exact_durable_effect(
+    tmp_path: Path,
+) -> None:
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    artifact_store = FilesystemCreationArtifactStore(tmp_path / "cas")
+    validator = RecordingV3Validator()
+    job_payload = json.loads(
+        (FIXTURE_ROOT / "minibook_creation_job.v3.json").read_text(encoding="utf-8")
+    )
+    job_payload["deadline_at"] = "2099-08-09T12:00:00Z"
+    job = CreationJobV3.model_validate(job_payload)
+    store.submit(job)
+    pipeline = V3CreationPipeline(
+        store=store, artifact_store=artifact_store, validator=validator
+    )
+    runner = CreationRunner(store, pipeline)
+
+    assert await runner.run_slice(job.creation_job_id) is None
+    assert store.progress(job.creation_job_id).status == "awaiting_build"
+    assignment = store.build_assignment_for_job(job.creation_job_id)
+    assert assignment is not None
+    assert validator.accepted_effects == []
+    assert validator.validation_calls == 0
+
+    waiting = store.progress(job.creation_job_id)
+    assert await runner.run_slice(job.creation_job_id) is None
+    assert store.progress(job.creation_job_id) == waiting
+
+    store.claim_build_assignment(assignment.assignment_id, "hermes-factory")
+    accepted = store.accept_build_effect(_v3_effect(assignment))
+    changed_receipt = accepted.model_copy(
+        update={"build_evidence_refs": accepted.test_evidence_refs}
+    )
+    with pytest.raises(ValueError, match="differs from durable effect"):
+        await pipeline.run_step(
+            job,
+            "build_handoff",
+            store.snapshot(job.creation_job_id),
+            assignment.effect_key,
+            changed_receipt.model_dump(mode="json", by_alias=True),
+        )
+    await runner.run_slice(job.creation_job_id)
+
+    assert validator.accepted_effects == [accepted]
+    assert validator.validation_calls == 1
+    assert store.snapshot(job.creation_job_id)["accepted_effect_key"] == accepted.effect_key

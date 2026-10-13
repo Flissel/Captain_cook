@@ -1,6 +1,14 @@
 import {
   integrationSetupStatuses,
   type CredentialMetadata,
+  factoryActionDecisions,
+  factoryActionRequestTypes,
+  factoryActionStatuses,
+  type FactoryActionDecision,
+  type FactoryActionRequest,
+  type FactoryActionRequestType,
+  type FactoryActionResponseDraft,
+  type FactoryActionStatus,
   type IntegrationSetupAction,
   type IntegrationSetupStatus,
   type PortalSetupSurface,
@@ -17,11 +25,19 @@ const CREDENTIAL_ALIAS_PATTERN = /^[A-Z][A-Z0-9_]*$/;
 const NON_WHITESPACE_PATTERN = /^\S+$/;
 const CREDENTIAL_TYPE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,127}$/;
 const PORTAL_API_PREFIX = "/v1/portal";
+const OPAQUE_TOKEN_PATTERN = /[A-Za-z0-9_+/-]{32,}={0,2}/g;
+const OPAQUE_TOKEN_SHAPE = /^[A-Za-z0-9_+/-]{32,}={0,2}$/;
+const HUMAN_READABLE_IDENTIFIER_PATTERN = /^[a-z]+(?:[_-](?:[a-z]+|v\d{1,3}|\d{1,8}))+$/;
+const UUID_VALUE_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+const KNOWN_SECRET_PATTERN = /\b(?:sk_(?:live|test)_[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|gh[pours]_[A-Za-z0-9_-]+|xox[a-z]-[A-Za-z0-9-]+|AIza[A-Za-z0-9_-]+|(?:AKIA|ASIA)[A-Z0-9]{16}|[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,})/i;
 
 export class PortalPublicError extends Error {
-  constructor(message: string) {
+  readonly status!: number | null;
+
+  constructor(message: string, status: number | null = null) {
     super(message);
     this.name = "PortalPublicError";
+    Object.defineProperty(this, "status", { value: status, enumerable: false });
   }
 }
 
@@ -65,6 +81,27 @@ function statusValue(value: unknown): IntegrationSetupStatus {
   return value as IntegrationSetupStatus;
 }
 
+function factoryActionStatusValue(value: unknown): FactoryActionStatus {
+  if (typeof value !== "string" || !factoryActionStatuses.includes(value as FactoryActionStatus)) {
+    throw new Error("invalid factory action status");
+  }
+  return value as FactoryActionStatus;
+}
+
+function factoryActionRequestTypeValue(value: unknown): FactoryActionRequestType {
+  if (typeof value !== "string" || !factoryActionRequestTypes.includes(value as FactoryActionRequestType)) {
+    throw new Error("invalid factory action request type");
+  }
+  return value as FactoryActionRequestType;
+}
+
+function factoryActionDecisionValue(value: unknown): FactoryActionDecision {
+  if (typeof value !== "string" || !factoryActionDecisions.includes(value as FactoryActionDecision)) {
+    throw new Error("invalid factory action decision");
+  }
+  return value as FactoryActionDecision;
+}
+
 function safeHttpUrl(value: unknown): string {
   const raw = stringValue(value);
   const parsed = new URL(raw);
@@ -78,6 +115,120 @@ function safeHttpUrl(value: unknown): string {
     throw new Error("unsafe URL");
   }
   return raw;
+}
+
+function utcTimestamp(value: unknown): string {
+  const timestamp = stringValue(value, undefined, 64);
+  if (!timestamp.endsWith("Z") || Number.isNaN(Date.parse(timestamp))) {
+    throw new Error("invalid UTC timestamp");
+  }
+  return timestamp;
+}
+
+function safeFactoryText(value: unknown, maximumLength: number): string {
+  const text = stringValue(value, undefined, maximumLength);
+  if (/\b(?:bearer|basic)\s+|(?:api[_ -]?key|password|secret|token|credential)\s*=|credential:\/\/|private.?key|system.?prompt|provider.?response|holdout/i.test(text) || knownOrOpaqueSecret(text, false)) {
+    throw new Error("unsafe factory display text");
+  }
+  return text;
+}
+
+function tokenEntropy(token: string): number {
+  return -Array.from(new Set(token), (character) => {
+    const probability = token.split(character).length - 1;
+    const ratio = probability / token.length;
+    return ratio * Math.log2(ratio);
+  }).reduce((total, value) => total + value, 0);
+}
+
+function humanReadableIdentifier(token: string): boolean {
+  return /^[a-z]+$/.test(token) || /^[A-Z][a-z]+$/.test(token) || HUMAN_READABLE_IDENTIFIER_PATTERN.test(token);
+}
+
+function knownOrOpaqueSecret(value: string, allowDigest: boolean, uriSegments = false): boolean {
+  if (KNOWN_SECRET_PATTERN.test(value)) return true;
+  const tokens = uriSegments
+    ? value.replace("artifact://", "").split("/")
+    : value.match(OPAQUE_TOKEN_PATTERN) ?? [];
+  for (const token of tokens) {
+    if (UUID_VALUE_PATTERN.test(token)) continue;
+    if (/^[0-9a-f]{64}$/i.test(token)) {
+      if (!allowDigest) return true;
+      continue;
+    }
+    if (!OPAQUE_TOKEN_SHAPE.test(token) || humanReadableIdentifier(token)) continue;
+    const hasOpaqueAlphabet = /[0-9_+/-=]/.test(token) || (/[a-z]/.test(token) && /[A-Z]/.test(token));
+    if (/^[0-9a-f]{32,}$/i.test(token) || (hasOpaqueAlphabet && tokenEntropy(token) >= 3.5)) return true;
+  }
+  return false;
+}
+
+function parseFactoryArtifactReference(value: unknown) {
+  const item = exact(value, ["uri", "sha256", "media_type"]);
+  const uri = stringValue(item.uri, /^artifact:\/\/[A-Za-z0-9._:/-]+$/, 512);
+  if (knownOrOpaqueSecret(uri, true, true)) throw new Error("unsafe checkpoint reference");
+  const sha256 = stringValue(item.sha256, SHA256_PATTERN);
+  if (item.media_type !== "application/json") throw new Error("invalid checkpoint media type");
+  return { uri, sha256, mediaType: "application/json" as const };
+}
+
+export function parseFactoryAction(value: unknown): FactoryActionRequest {
+  const item = exact(value, [
+    "schema", "request_id", "factory_job_id", "creation_job_id", "correlation_id",
+    "expected_subject_version", "request_type", "safe_checkpoint_ref", "safe_checkpoint_sha256",
+    "required_scope", "allowed_decisions", "message", "deadline_at", "status",
+  ]);
+  if (item.schema !== "captain.factory-action-request.v1" || !Number.isInteger(item.expected_subject_version) || Number(item.expected_subject_version) < 1 || !Array.isArray(item.allowed_decisions)) {
+    throw new Error("invalid factory action");
+  }
+  const allowedDecisions = item.allowed_decisions.map(factoryActionDecisionValue);
+  if (allowedDecisions.length === 0 || new Set(allowedDecisions).size !== allowedDecisions.length) {
+    throw new Error("invalid factory action decisions");
+  }
+  const safeCheckpointRef = parseFactoryArtifactReference(item.safe_checkpoint_ref);
+  const safeCheckpointSha256 = stringValue(item.safe_checkpoint_sha256, SHA256_PATTERN);
+  if (safeCheckpointSha256 !== safeCheckpointRef.sha256) throw new Error("checkpoint mismatch");
+  return {
+    requestId: stringValue(item.request_id, UUID_PATTERN),
+    factoryJobId: stringValue(item.factory_job_id, UUID_PATTERN),
+    creationJobId: stringValue(item.creation_job_id, UUID_PATTERN),
+    correlationId: stringValue(item.correlation_id, UUID_PATTERN),
+    expectedSubjectVersion: Number(item.expected_subject_version),
+    requestType: factoryActionRequestTypeValue(item.request_type),
+    safeCheckpointRef,
+    safeCheckpointSha256,
+    requiredScope: safeFactoryText(item.required_scope, 200),
+    allowedDecisions,
+    message: safeFactoryText(item.message, 500),
+    deadlineAt: utcTimestamp(item.deadline_at),
+    status: factoryActionStatusValue(item.status),
+  };
+}
+
+function parseFactoryCredentialReference(value: unknown): string {
+  const item = exact(value, ["credential_ref"]);
+  return stringValue(item.credential_ref, /^credential:\/\/[A-Za-z0-9._/-]+$/, 512);
+}
+
+function parseFactoryActionResponse(value: unknown, requestId: string): void {
+  const item = exact(value, [
+    "schema", "request_id", "expected_subject_version", "decision", "approved_scope",
+    "credential_ref", "answer_metadata", "answered_at", "idempotency_key",
+  ]);
+  if (
+    item.schema !== "captain.factory-action-response.v1" ||
+    stringValue(item.request_id, UUID_PATTERN) !== requestId ||
+    !Number.isInteger(item.expected_subject_version) ||
+    Number(item.expected_subject_version) < 1 ||
+    item.credential_ref !== null && !/^credential:\/\/[A-Za-z0-9._/-]+$/.test(stringValue(item.credential_ref, undefined, 512))
+  ) {
+    throw new Error("invalid factory action response");
+  }
+  factoryActionDecisionValue(item.decision);
+  safeFactoryText(item.approved_scope, 200);
+  record(item.answer_metadata);
+  utcTimestamp(item.answered_at);
+  stringValue(item.idempotency_key, SHA256_PATTERN);
 }
 
 function parseCredential(value: unknown): CredentialMetadata {
@@ -172,7 +323,7 @@ function publicStatusError(status: number): PortalPublicError {
     409: "The setup changed. Refresh and try again.",
     503: "The integration service is temporarily unavailable.",
   };
-  return new PortalPublicError(messages[status] ?? "The integration request could not be completed.");
+  return new PortalPublicError(messages[status] ?? "The integration request could not be completed.", status);
 }
 
 async function rawRequest(
@@ -211,11 +362,16 @@ export interface PortalApi {
   verifyCredential(jobId: string, alias: string, accessToken: string): Promise<PortalSetupSurface>;
   requestRotation(jobId: string, alias: string, accessToken: string): Promise<PortalSetupSurface>;
   revokeCredential(jobId: string, alias: string, accessToken: string): Promise<PortalSetupSurface>;
+  getFactoryActions(accessToken: string, status?: FactoryActionStatus): Promise<FactoryActionRequest[]>;
+  storeFactoryCredential(requestId: string, credentialAlias: string, secretValue: string, accessToken: string): Promise<string>;
+  respondToFactoryAction(requestId: string, response: FactoryActionResponseDraft, accessToken: string): Promise<void>;
 }
 
 export function createPortalApi(fetcher: Fetcher = fetch): PortalApi {
   const setupPath = (jobId: string) =>
     `${PORTAL_API_PREFIX}/integration-setups/${encodeURIComponent(jobId)}`;
+  const factoryActionPath = (requestId: string) =>
+    `${PORTAL_API_PREFIX}/factory-actions/${encodeURIComponent(requestId)}`;
 
   const surfaceRequest = async (
     url: string,
@@ -285,6 +441,47 @@ export function createPortalApi(fetcher: Fetcher = fetch): PortalApi {
       }),
     revokeCredential: (jobId, alias, accessToken) =>
       consume(jobId, alias, "revoked", "actions", accessToken, { action: "revoked" }),
+    getFactoryActions: async (accessToken, status = "pending") => {
+      const value = await rawRequest(fetcher, `${PORTAL_API_PREFIX}/factory-actions?status=${encodeURIComponent(status)}`, accessToken, { method: "GET" });
+      try {
+        if (!Array.isArray(value)) throw new Error("factory action list must be an array");
+        return value.map(parseFactoryAction);
+      } catch {
+        throw new PortalPublicError("The integration service returned an invalid response.");
+      }
+    },
+    storeFactoryCredential: async (requestId, credentialAlias, secretValue, accessToken) => {
+      const value = await rawRequest(fetcher, `${factoryActionPath(requestId)}/credentials`, accessToken, {
+        method: "POST",
+        body: JSON.stringify({ credential_alias: credentialAlias, secret_value: secretValue }),
+      });
+      try {
+        return parseFactoryCredentialReference(value);
+      } catch {
+        throw new PortalPublicError("The integration service returned an invalid response.");
+      }
+    },
+    respondToFactoryAction: async (requestId, response, accessToken) => {
+      const value = await rawRequest(fetcher, `${factoryActionPath(requestId)}/responses`, accessToken, {
+        method: "POST",
+        body: JSON.stringify({
+          schema: "captain.factory-action-response.v1",
+          request_id: requestId,
+          expected_subject_version: response.expectedSubjectVersion,
+          decision: response.decision,
+          approved_scope: response.approvedScope,
+          credential_ref: response.credentialRef,
+          answer_metadata: response.answerMetadata,
+          answered_at: response.answeredAt,
+          idempotency_key: response.idempotencyKey,
+        }),
+      });
+      try {
+        parseFactoryActionResponse(value, requestId);
+      } catch {
+        throw new PortalPublicError("The integration service returned an invalid response.");
+      }
+    },
   };
 }
 

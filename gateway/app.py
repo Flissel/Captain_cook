@@ -6,12 +6,12 @@ import logging
 import os
 import secrets
 from dataclasses import dataclass
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path as FileSystemPath
 from threading import Lock
-from collections.abc import Mapping
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 import httpx
@@ -20,8 +20,30 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Reques
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
+from starlette.types import Receive, Scope, Send
+
+
+class FactoryActionInboxRoute(APIRoute):
+    """Reject disabled inbox traffic before FastAPI validates path, query or body."""
+
+    def get_route_handler(self):  # type: ignore[override]
+        handler = super().get_route_handler()
+
+        async def fenced(request: Request):
+            enabled = request.app.state.factory_action_inbox_enabled
+            if enabled is None:
+                enabled = load_gateway_settings(request.app).factory_action_inbox_enabled
+            if not enabled:
+                return JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={"detail": "factory action resume capability is disabled"},
+                )
+            return await handler(request)
+
+        return fenced
 
 from blockchain.mariadb_storage import MariaDBStorage
 from agenten.agent_runtime.contracts import (
@@ -96,7 +118,10 @@ from gateway.portal_control_auth import (
     require_restart_control,
 )
 from gateway.portal_n8n_composition import build_portal_n8n_adapter_bundle
+from gateway.portal_store import FactoryCredentialCoordinator
 from gateway.portal_contracts import (
+    PortalFactoryCredentialReferenceV1,
+    PortalFactoryCredentialWriteV1,
     PortalPrincipalV1,
     PortalSetupActionRequestV1,
     PortalSetupSelectionRequestV1,
@@ -104,6 +129,13 @@ from gateway.portal_contracts import (
     PortalSetupTicketUseV1,
     PortalSetupTicketV1,
     PortalTenantBindingV1,
+)
+from agenten.agent_factory.forge_contracts import FactoryActionRequestV1, FactoryActionResponseV1
+from agenten.agent_factory.action_resume import (
+    FactoryContinuationScheduler,
+    FactoryActionProjection,
+    FactoryActionResumeCoordinator,
+    FactoryActionResumeService,
 )
 from gateway.registry_feed import mirror_captain_projection
 from gateway.registry_feed import (
@@ -118,6 +150,7 @@ from gateway.store import (
     GatewayStore,
     PortalCredentialMetadataSource,
     PortalCredentialVerificationSource,
+    FactoryCredentialAdapter,
 )
 from gateway.integration_setup_contracts import (
     IntegrationSetupMutationV1,
@@ -196,6 +229,15 @@ from agenten.agent_factory.minibook_forge import (
 )
 
 
+@runtime_checkable
+class FactoryActionResumeDispatcher(Protocol):
+    def enqueue(self, *, request_id: UUID, tenant_id: str) -> None: ...
+
+    def recover(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -218,6 +260,10 @@ def plan_production_app_from_environment(
     source = dict(os.environ if environment is None else environment)
     root = (repository_root or FileSystemPath.cwd()).resolve(strict=True)
     configured = GatewaySettings.from_env(source)
+    if configured.factory_action_inbox_enabled:
+        # The shipped production composition wires no action-inbox adapters, so
+        # an enabled inbox can never be complete here; fail before any effect.
+        raise ValueError("factory action inbox default composition is incomplete")
     bootstrap = load_capability_assembly_bootstrap_settings(
         environment=source,
         repository_root=root,
@@ -409,7 +455,36 @@ def create_app(
     capability_benchmark_gateway_token: str | None = None,
     factory_gateway_rpc_service: FactoryGatewayRpcService | None = None,
     factory_runtime_token: str | None = None,
+    factory_credential_adapter: FactoryCredentialAdapter | None = None,
+    factory_action_resume_dispatcher: FactoryActionResumeDispatcher | None = None,
+    factory_action_projection: FactoryActionProjection | None = None,
+    factory_continuation_scheduler: FactoryContinuationScheduler | None = None,
 ) -> FastAPI:
+    if factory_action_resume_dispatcher is not None and not isinstance(
+        factory_action_resume_dispatcher, FactoryActionResumeDispatcher
+    ):
+        raise ValueError("factory action resume dispatcher lifecycle is incomplete")
+    if (factory_action_projection is None) != (factory_continuation_scheduler is None):
+        raise ValueError("factory action projection and continuation scheduler must be configured together")
+    if factory_action_projection is not None and not isinstance(
+        factory_action_projection, FactoryActionProjection
+    ):
+        raise ValueError("factory action projection receipt protocol is incomplete")
+    if factory_continuation_scheduler is not None and not isinstance(
+        factory_continuation_scheduler, FactoryContinuationScheduler
+    ):
+        raise ValueError("factory action continuation receipt protocol is incomplete")
+    if factory_credential_adapter is not None and not isinstance(
+        factory_credential_adapter, FactoryCredentialAdapter
+    ):
+        raise ValueError("factory credential adapter protocol is incomplete")
+    if (
+        settings is not None
+        and settings.factory_action_inbox_enabled
+        and factory_action_resume_dispatcher is None
+        and factory_action_projection is None
+    ):
+        raise ValueError("factory action inbox default composition is incomplete")
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
     def environment_value(name: str) -> str:
@@ -460,6 +535,7 @@ def create_app(
             )
             if configured is not None and configured.provider_proxy_url is not None
             else (),
+            factory_credential_adapter=factory_credential_adapter,
         )
         if (
             configured is not None
@@ -506,6 +582,8 @@ def create_app(
     resume_service_lock = Lock()
     portal_control_boot_id = str(uuid4())
     sink_calls: list[dict[str, Any]] = []
+
+    owned_resume_service: FactoryActionResumeService | None = None
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -557,13 +635,23 @@ def create_app(
         start = getattr(mirror, "start", None)
         if start:
             await start()
+        resume_dispatcher = get_factory_action_resume_dispatcher()
         try:
+            if resume_dispatcher is not None:
+                recover_credentials = getattr(
+                    get_store(), "recover_factory_credentials", None
+                )
+                if recover_credentials is not None:
+                    recover_credentials(clock=portal_clock)
+                resume_dispatcher.recover()
             yield
         finally:
             if runtime_http_client is not None:
                 await runtime_http_client.aclose()
             if production_composition is not None:
                 await close_production_capability_assembly(production_composition)
+            if resume_dispatcher is not None:
+                resume_dispatcher.close()
             stop = getattr(mirror, "stop", None)
             if stop:
                 await stop()
@@ -578,6 +666,9 @@ def create_app(
     )
     app.state.gateway_settings = settings
     app.state.gateway_settings_lock = Lock()
+    app.state.factory_action_inbox_enabled = (
+        None if settings is None else settings.factory_action_inbox_enabled
+    )
     initialize_portal_auth(app)
     app.include_router(
         create_production_capability_assembly_router(
@@ -706,6 +797,38 @@ def create_app(
                 },
             )
         return HTTPException(status_code=503, detail="capability resume unavailable")
+    def get_factory_action_resume_dispatcher() -> FactoryActionResumeDispatcher | None:
+        nonlocal owned_resume_service
+        if not load_gateway_settings(app).factory_action_inbox_enabled:
+            return None
+        if factory_action_resume_dispatcher is not None:
+            return factory_action_resume_dispatcher
+        if factory_action_projection is None or factory_continuation_scheduler is None:
+            return None
+        with resume_service_lock:
+            if owned_resume_service is None:
+                consumer = get_store().factory_action_resume_consumer()
+                owned_resume_service = FactoryActionResumeService(
+                    coordinator=FactoryActionResumeCoordinator(
+                        store=consumer,
+                        projection=factory_action_projection,
+                        scheduler=factory_continuation_scheduler,
+                        clock=portal_clock,
+                    ),
+                    recovery_source=lambda: consumer.iter_resume_candidates(
+                        now=portal_clock()
+                    ),
+                )
+        return owned_resume_service
+
+    def require_factory_action_inbox_dispatcher() -> FactoryActionResumeDispatcher:
+        dispatcher = get_factory_action_resume_dispatcher()
+        if dispatcher is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="factory action resume capability is disabled",
+            )
+        return dispatcher
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -1004,6 +1127,138 @@ def create_app(
         return build_integration_setup_surface(
             persisted,
             n8n_ui_base_url=configured.captain_n8n_ui_url,
+        )
+
+    action_route_class = app.router.route_class
+    app.router.route_class = FactoryActionInboxRoute
+
+    @app.get("/v1/portal/factory-actions")
+    async def list_portal_factory_actions(
+        status_filter: Literal["pending", "answered", "denied", "expired", "consumed"] = Query(
+            default="pending", alias="status"
+        ),
+        cursor: UUID | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=100),
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> tuple[FactoryActionRequestV1, ...]:
+        require_factory_action_inbox_dispatcher()
+        return await run_in_threadpool(
+            get_store().portal_factory_actions,
+            principal=principal,
+            status=status_filter,
+            now=portal_clock(),
+            after_request_id=cursor,
+            limit=limit,
+        )
+
+    @app.get("/v1/portal/factory-actions/{request_id}")
+    async def read_portal_factory_action(
+        request_id: UUID,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> FactoryActionRequestV1:
+        try:
+            require_factory_action_inbox_dispatcher()
+            return await run_in_threadpool(
+                get_store().portal_factory_action,
+                request_id=request_id,
+                principal=principal,
+                now=portal_clock(),
+            )
+        except LookupError:
+            raise HTTPException(status_code=404, detail="factory action not found") from None
+
+    @app.post("/v1/portal/factory-actions/{request_id}/responses")
+    async def answer_portal_factory_action(
+        request_id: UUID,
+        request: Request,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> FactoryActionResponseV1:
+        try:
+            resume_dispatcher = require_factory_action_inbox_dispatcher()
+            try:
+                response = FactoryActionResponseV1.model_validate(await request.json())
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="invalid portal request",
+                ) from None
+            answered = await run_in_threadpool(
+                get_store().answer_portal_factory_action,
+                request_id=request_id,
+                principal=principal,
+                response=response,
+                now=portal_clock(),
+            )
+            resume_dispatcher.enqueue(
+                request_id=request_id,
+                tenant_id=principal.organization_id,
+            )
+            return answered
+        except LookupError:
+            raise HTTPException(status_code=404, detail="factory action not found") from None
+        except (ValueError, TimeoutError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+
+    @app.post(
+        "/v1/portal/factory-actions/{request_id}/credentials",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def store_portal_factory_credential(
+        request_id: UUID,
+        request: Request,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> PortalFactoryCredentialReferenceV1:
+        try:
+            require_factory_action_inbox_dispatcher()
+            try:
+                credential = PortalFactoryCredentialWriteV1.model_validate(
+                    await request.json()
+                )
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="invalid portal request",
+                ) from None
+            reference = await run_in_threadpool(
+                _store_factory_credential,
+                request_id=request_id,
+                principal=principal,
+                credential=credential,
+                reserved_at=portal_clock(),
+            )
+            return PortalFactoryCredentialReferenceV1(credential_ref=reference)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="factory action not found") from None
+        except RuntimeError:
+            raise HTTPException(status_code=503, detail="credential store unavailable") from None
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+
+    app.router.route_class = action_route_class
+
+    def _store_factory_credential(
+        *,
+        request_id: UUID,
+        principal: PortalPrincipalV1,
+        credential: PortalFactoryCredentialWriteV1,
+        reserved_at: datetime,
+    ) -> str:
+        if factory_credential_adapter is None:
+            raise RuntimeError("factory credential store unavailable")
+        action = get_store().portal_factory_action(
+            request_id=request_id, principal=principal, now=reserved_at
+        )
+        return FactoryCredentialCoordinator(
+            store=get_store().factory_action_resume_consumer(),
+            adapter=factory_credential_adapter,
+            clock=portal_clock,
+        ).store_and_link(
+            request_id=request_id,
+            tenant_id=principal.organization_id,
+            expected_subject_version=action.expected_subject_version,
+            credential_alias=credential.credential_alias,
+            secret_value=credential.secret_value.get_secret_value(),
+            reserved_at=reserved_at,
         )
 
     @app.post("/v1/factory/budget/reservations", status_code=status.HTTP_201_CREATED)
@@ -1984,7 +2239,28 @@ def create_production_app_from_environment(
     )
 
 
-app = create_app()
+
+def create_production_app(
+    *, environ: Mapping[str, str] | None = None
+) -> FastAPI:
+    """Load and validate effective production settings before composition."""
+
+    return create_app(settings=GatewaySettings.from_env(environ))
+
+
+_production_app: FastAPI | None = None
+_production_app_lock = Lock()
+
+
+async def app(scope: Scope, receive: Receive, send: Send) -> None:
+    """Lazy ASGI entrypoint whose first composition uses validated settings."""
+
+    global _production_app
+    if _production_app is None:
+        with _production_app_lock:
+            if _production_app is None:
+                _production_app = create_production_app()
+    await _production_app(scope, receive, send)
 
 
 def main() -> None:

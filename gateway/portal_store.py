@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Final
+from typing import Callable, Final, Iterator, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from blockchain.mariadb_storage import MariaDBStorage
@@ -19,6 +20,326 @@ from gateway.portal_contracts import (
 
 
 _INVALID_TICKET: Final = "invalid portal setup ticket"
+
+
+class FactoryCredentialAmbiguousError(RuntimeError):
+    """The credential boundary cannot yet authoritatively settle a reservation."""
+
+
+@runtime_checkable
+class FactoryCredentialAdapter(Protocol):
+    """Dedicated idempotent and reversible credential boundary."""
+
+    def store_credential(
+        self,
+        *,
+        reservation_key: str,
+        tenant_id: str,
+        request_id: UUID,
+        expected_subject_version: int,
+        purpose: str,
+        secret_value: str,
+    ) -> "FactoryCredentialReceipt": ...
+
+    def lookup_credential(
+        self, reservation_key: str
+    ) -> "FactoryCredentialReceipt | None": ...
+
+    def revoke_credential(
+        self, *, reservation_key: str, credential_ref: str | None = None
+    ) -> None: ...
+
+
+@dataclass(frozen=True)
+class FactoryCredentialReceipt:
+    """Secret-free binding for one idempotent external credential effect."""
+
+    reservation_key: str
+    tenant_id: str
+    request_id: UUID
+    request_version: int
+    purpose: str
+    opaque_reference: str
+    reference_sha256: str
+
+    def __post_init__(self) -> None:
+        if len(self.reservation_key) != 64:
+            raise ValueError("credential receipt reservation key is invalid")
+        expected = hashlib.sha256(self.opaque_reference.encode("utf-8")).hexdigest()
+        if not secrets.compare_digest(self.reference_sha256, expected):
+            raise ValueError("credential receipt reference digest conflicts")
+
+
+class FactoryCredentialReservationStore(Protocol):
+    def iter_credential_reservations(
+        self,
+    ) -> Iterator[tuple[UUID, str, int, str, str]]: ...
+
+    def reserve_credential(
+        self, request_id: UUID, *, tenant_id: str,
+        expected_subject_version: int, credential_alias: str, now: datetime,
+    ) -> str: ...
+
+    def complete_credential_reservation(
+        self, request_id: UUID, *, tenant_id: str, reservation_key: str,
+        credential_ref: str, now: datetime,
+    ) -> str: ...
+
+    def credential_reference(
+        self, request_id: UUID, *, tenant_id: str
+    ) -> str | None: ...
+
+    def release_credential_reservation(
+        self, request_id: UUID, *, tenant_id: str, reservation_key: str
+    ) -> None: ...
+
+    def credential_revoke_pending(
+        self, request_id: UUID, *, tenant_id: str, reservation_key: str
+    ) -> bool: ...
+
+    def mark_credential_revoke_pending(
+        self, request_id: UUID, *, tenant_id: str, reservation_key: str, now: datetime
+    ) -> None: ...
+
+    def clear_credential_revocation(
+        self, request_id: UUID, *, tenant_id: str, reservation_key: str
+    ) -> None: ...
+
+
+class FactoryCredentialCoordinator:
+    """Fence, write, revalidate, and clean up one credential effect."""
+
+    def __init__(
+        self, *, store: FactoryCredentialReservationStore,
+        adapter: FactoryCredentialAdapter, clock: Callable[[], datetime],
+    ) -> None:
+        self._store = store
+        self._adapter = adapter
+        self._clock = clock
+
+    def store_and_link(
+        self, *, request_id: UUID, tenant_id: str, expected_subject_version: int,
+        credential_alias: str, secret_value: str, reserved_at: datetime,
+    ) -> str:
+        reservation_key = self._store.reserve_credential(
+            request_id, tenant_id=tenant_id,
+            expected_subject_version=expected_subject_version,
+            credential_alias=credential_alias, now=reserved_at,
+        )
+        receipt: FactoryCredentialReceipt | None = None
+        validated_reference: str | None = None
+        try:
+            receipt = self._adapter.lookup_credential(reservation_key)
+            if receipt is None:
+                try:
+                    receipt = self._adapter.store_credential(
+                        reservation_key=reservation_key, tenant_id=tenant_id,
+                        request_id=request_id,
+                        expected_subject_version=expected_subject_version,
+                        purpose=credential_alias,
+                        secret_value=secret_value,
+                    )
+                except Exception:
+                    receipt = self._adapter.lookup_credential(reservation_key)
+                    if receipt is None:
+                        raise FactoryCredentialAmbiguousError(
+                            "credential receipt is unresolved"
+                        ) from None
+            if not isinstance(receipt, FactoryCredentialReceipt):
+                raise FactoryCredentialAmbiguousError("credential receipt is unresolved")
+            self._validate_receipt(
+                receipt,
+                reservation_key=reservation_key, tenant_id=tenant_id,
+                request_id=request_id, expected_subject_version=expected_subject_version,
+                purpose=credential_alias,
+            )
+            validated_reference = receipt.opaque_reference
+            self._store.complete_credential_reservation(
+                request_id, tenant_id=tenant_id, reservation_key=reservation_key,
+                credential_ref=receipt.opaque_reference, now=self._clock(),
+            )
+            return receipt.opaque_reference
+        except FactoryCredentialAmbiguousError:
+            # A timeout or malformed read is not proof the external write did not commit.
+            # Keep the durable key for an authoritative later lookup/reconciliation.
+            raise
+        except Exception:
+            try:
+                linked_reference = self._store.credential_reference(
+                    request_id, tenant_id=tenant_id
+                )
+                if (
+                    validated_reference is not None
+                    and linked_reference == validated_reference
+                ):
+                    return linked_reference
+                if isinstance(receipt, FactoryCredentialReceipt):
+                    self._store.mark_credential_revoke_pending(
+                        request_id, tenant_id=tenant_id,
+                        reservation_key=reservation_key, now=self._clock(),
+                    )
+                    self._adapter.revoke_credential(
+                        reservation_key=reservation_key,
+                        credential_ref=validated_reference,
+                    )
+                    self._store.clear_credential_revocation(
+                        request_id, tenant_id=tenant_id, reservation_key=reservation_key
+                    )
+                # An unknown or untyped receipt is not authority to revoke or release.
+                # Its original durable reservation is left for a later lookup.
+            except Exception:
+                raise
+            else:
+                if not isinstance(receipt, FactoryCredentialReceipt):
+                    raise FactoryCredentialAmbiguousError(
+                        "credential receipt is unresolved"
+                    )
+            finally:
+                # The original operation failure must be preserved after successful cleanup.
+                pass
+            raise
+
+    def _revoke_pending(
+        self, *, request_id: UUID, tenant_id: str, reservation_key: str,
+        credential_ref: str | None,
+    ) -> None:
+        self._store.mark_credential_revoke_pending(
+            request_id, tenant_id=tenant_id, reservation_key=reservation_key,
+            now=self._clock(),
+        )
+        self._adapter.revoke_credential(
+            reservation_key=reservation_key, credential_ref=credential_ref,
+        )
+        self._store.clear_credential_revocation(
+            request_id, tenant_id=tenant_id, reservation_key=reservation_key
+        )
+
+    def store_and_answer(
+        self,
+        *,
+        request_id: UUID,
+        tenant_id: str,
+        expected_subject_version: int,
+        credential_alias: str,
+        secret_value: str,
+        reserved_at: datetime,
+    ) -> str:
+        """Compatibility name; this only links a credential and never answers."""
+
+        return self.store_and_link(
+            request_id=request_id,
+            tenant_id=tenant_id,
+            expected_subject_version=expected_subject_version,
+            credential_alias=credential_alias,
+            secret_value=secret_value,
+            reserved_at=reserved_at,
+        )
+
+    def recover(self) -> None:
+        """Reconcile secret-free durable reservations after process restart."""
+
+        for request_id, tenant_id, version, purpose, reservation_key in (
+            self._store.iter_credential_reservations()
+        ):
+            receipt = self._adapter.lookup_credential(reservation_key)
+            pending_revoke = self._store.credential_revoke_pending(
+                request_id, tenant_id=tenant_id, reservation_key=reservation_key
+            )
+            if receipt is None and pending_revoke:
+                # Once revocation is pending, a none lookup is authoritative absence.
+                self._store.clear_credential_revocation(
+                    request_id, tenant_id=tenant_id, reservation_key=reservation_key
+                )
+                continue
+            if not isinstance(receipt, FactoryCredentialReceipt):
+                # Preserve ambiguous reservations until the adapter can make an
+                # authoritative lookup; deleting the key could duplicate a write.
+                continue
+            if pending_revoke:
+                # Validate the typed receipt for audit/binding purposes, but a
+                # previously committed revoke decision is terminal: it can only
+                # clean up, never complete or link a credential on restart.
+                validated_reference: str | None = None
+                try:
+                    self._validate_receipt(
+                        receipt,
+                        reservation_key=reservation_key,
+                        tenant_id=tenant_id,
+                        request_id=request_id,
+                        expected_subject_version=version,
+                        purpose=purpose,
+                    )
+                    validated_reference = receipt.opaque_reference
+                except Exception:
+                    pass
+                try:
+                    self._revoke_pending(
+                        request_id=request_id, tenant_id=tenant_id,
+                        reservation_key=reservation_key,
+                        credential_ref=validated_reference,
+                    )
+                except Exception:
+                    # Do not retry in the same startup pass: durable state
+                    # records the failure for the next reconciliation.
+                    continue
+                continue
+            validated_reference = None
+            try:
+                self._validate_receipt(
+                    receipt,
+                    reservation_key=reservation_key,
+                    tenant_id=tenant_id,
+                    request_id=request_id,
+                    expected_subject_version=version,
+                    purpose=purpose,
+                )
+                validated_reference = receipt.opaque_reference
+                self._store.complete_credential_reservation(
+                    request_id,
+                    tenant_id=tenant_id,
+                    reservation_key=reservation_key,
+                    credential_ref=receipt.opaque_reference,
+                    now=self._clock(),
+                )
+            except Exception:
+                try:
+                    if isinstance(receipt, FactoryCredentialReceipt):
+                        self._revoke_pending(
+                            request_id=request_id, tenant_id=tenant_id,
+                            reservation_key=reservation_key,
+                            credential_ref=validated_reference,
+                        )
+                except Exception:
+                    # Leave the durable revoke-pending record for startup retry.
+                    continue
+
+    @staticmethod
+    def _validate_receipt(
+        receipt: FactoryCredentialReceipt,
+        *,
+        reservation_key: str,
+        tenant_id: str,
+        request_id: UUID,
+        expected_subject_version: int,
+        purpose: str,
+    ) -> None:
+        if not isinstance(receipt, FactoryCredentialReceipt):
+            raise ValueError("credential receipt conflicts with reservation")
+        expected_reference_sha256 = hashlib.sha256(
+            receipt.opaque_reference.encode("utf-8")
+        ).hexdigest()
+        if (
+            receipt.reservation_key != reservation_key
+            or receipt.tenant_id != tenant_id
+            or receipt.request_id != request_id
+            or receipt.request_version != expected_subject_version
+            or receipt.purpose != purpose
+            or not receipt.opaque_reference.startswith(f"credential://{tenant_id}/")
+            or not secrets.compare_digest(
+                receipt.reference_sha256, expected_reference_sha256
+            )
+        ):
+            raise ValueError("credential receipt conflicts with reservation")
 
 
 class PortalTicketStore:
