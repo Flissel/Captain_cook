@@ -32,3 +32,16 @@ config/authority-adapter-bundle.v1.json text eol=lf
 # CRLF, the two digests can never match, and the live-demo health check fails
 # before any service starts. Do not remove this line as "noise".
 agenten/agent_runtime/captain_production_adapters.py text eol=lf
+
+# D11 capability factory runtime authority: the bootstrap and the generic tool
+# registry hash these files' working-tree bytes against digests pinned from LF
+# blobs (capability_factory_runtime_descriptor.json, generic_tool_registry.json).
+# A Windows CRLF checkout breaks attestation and the production app refuses to
+# compose. Do not remove these lines as "noise".
+gateway/capability_factory_runtime_adapter.py text eol=lf
+gateway/capability_factory_runtime_internal.py text eol=lf
+gateway/capability_factory_runtime_descriptor.json text eol=lf
+gateway/capability_factory_runtime_closure.json text eol=lf
+gateway/capability_tool_host_app.py text eol=lf
+config/generic_tool_registry.json text eol=lf
+config/demo_tool_data/*.json text eol=lf
