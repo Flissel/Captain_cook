@@ -31,7 +31,7 @@ _FENCED_BLOCK_RE = re.compile(
     r"```[A-Za-z0-9_-]*[ \t]*\r?\n?\s*(<tool_calls>.*?</tool_calls>)\s*```", re.DOTALL
 )
 _LEADING_FENCE_RE = re.compile(r"\s*```[A-Za-z0-9_-]*[ \t]*\r?\n?")
-_LINE_START_OPEN_RE = re.compile(r"(?m)^[ 	]*<tool_calls>")
+_LINE_START_OPEN_RE = re.compile(r"(?m)^[ \t]*<tool_calls>")
 _INNER_FENCE_RE = re.compile(r"^```[A-Za-z0-9_-]*[ \t]*\r?\n?(.*?)\s*```$", re.DOTALL)
 _EMPTY_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
 
