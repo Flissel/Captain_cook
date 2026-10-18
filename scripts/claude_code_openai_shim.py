@@ -183,6 +183,26 @@ def run_claude(
             "mcp__captain__get_contract_schema",
         ]
 
+    # Zusaetzliche MCP-Server aus einer Datei -- env-gated, Vorgabe: keine.
+    #
+    # WARUM. Dieser Shim reicht die `tools` des Aufrufers NICHT als tool_calls
+    # zurueck; er protokolliert sie nur. Ein Aufrufer mit eigener Agenten-
+    # schleife (marketing-claw ueber openclaw) bekommt seine Werkzeuge deshalb
+    # nie gerufen. Loesung ohne Aenderung an der Antwortform: die Werkzeuge in
+    # die CLI-Schleife hineinreichen, wo sie tatsaechlich benutzt werden.
+    # Ohne SHIM_EXTRA_MCP_CONFIG aendert sich fuer bestehende Verbraucher
+    # (Hermes, Captain) nichts -- das ist der Sinn des Tors.
+    extra_pfad = os.environ.get("SHIM_EXTRA_MCP_CONFIG", "").strip()
+    if extra_pfad and os.path.isfile(extra_pfad):
+        try:
+            extra = json.loads(pathlib.Path(extra_pfad).read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001 -- eine kaputte Datei darf den Dienst nicht kippen
+            sys.stderr.write(f"extra mcp config unreadable ({extra_pfad}): {exc}\n")
+        else:
+            for name, spec in (extra.get("mcpServers") or {}).items():
+                mcp_servers[name] = spec
+            allowed_tools += [t for t in (extra.get("allowedTools") or []) if isinstance(t, str)]
+
     argv += ["--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": mcp_servers})]
     argv += ["--setting-sources", ""]
     if allowed_tools:
@@ -218,6 +238,18 @@ def run_claude(
     # agent system prompt runs to tens of thousands of characters and Windows
     # caps a whole command line at 32767, where the CLI aborts before it reads
     # any input (observed: is_error with 0 input tokens after ~800ms).
+    # Entschaerfung fuer openclaw-Prompts (env-gated, Vorgabe: aus). GEMESSEN
+    # 03.09.2026 durch Bisektion eines 1:1 nachgespielten openclaw-Aufrufs: die
+    # Zeilen "first token [[reply_to_current]]; use [[reply_to:<id>]] ..." und
+    # "Supported directives are stripped before rendering ..." ZUSAMMEN lassen
+    # die CLI mit "API Error: 400 You're out of extra usage" abbrechen -- bei
+    # vollem Kontingent, 0 Tokens, duration_api_ms 0; jede Zeile allein und
+    # jeder Marker allein laufen durch. Das Ersetzen von "[[" durch "[ [" heilt
+    # es deterministisch. Ohne SHIM_NEUTRALIZE_DOUBLE_BRACKETS=1 bleibt der
+    # Prompt unveraendert (Hermes, Captain).
+    if system_prompt and os.environ.get("SHIM_NEUTRALIZE_DOUBLE_BRACKETS", "").strip() == "1":
+        system_prompt = system_prompt.replace("[[", "[ [").replace("]]", "] ]")
+
     system_prompt_file: str | None = None
     if system_prompt:
         handle, system_prompt_file = tempfile.mkstemp(
@@ -421,6 +453,20 @@ class Handler(BaseHTTPRequestHandler):
             )
         )
         sys.stderr.flush()
+
+        # Diagnose-Tor (env-gated, Vorgabe: aus): jede Anfrage als Datei ablegen,
+        # damit ein fehlschlagender Aufruf 1:1 nachgespielt werden kann. Ohne
+        # SHIM_DUMP_DIR passiert nichts.
+        dump_dir = os.environ.get("SHIM_DUMP_DIR", "").strip()
+        if dump_dir:
+            try:
+                os.makedirs(dump_dir, exist_ok=True)
+                dump_path = os.path.join(dump_dir, "request-%d.json" % int(time.time() * 1000))
+                with open(dump_path, "w", encoding="utf-8") as dump:
+                    json.dump(body, dump, ensure_ascii=False)
+                sys.stderr.write("request dumped to %s\n" % dump_path)
+            except Exception as exc:  # noqa: BLE001 -- Diagnose darf den Dienst nicht kippen
+                sys.stderr.write("request dump failed: %s\n" % exc)
 
         try:
             payload = run_claude(
