@@ -350,23 +350,44 @@ def test_error_paths_do_not_leak_payload_or_tags():
     _clean(mixed)
 
 
-def test_prose_mentioning_tag_is_plain_text():
+def test_prose_mentioning_tag_never_reaches_text():
     tools = _tools()
-    for reply in (
-        "Ich nutze das Tag <tool_calls> nur bei Bedarf.",
-        "Der Block endet mit </tool_calls> und beginnt mit <tool_calls> mitten im Satz.",
-        'Siehe <tool_calls>[{"name":"ping","arguments":{}}]</tool_calls> im Satz.',
-    ):
+    expected = {
+        "Ich nutze das Tag <tool_calls> nur bei Bedarf.": "Ich nutze das Tag",
+        "Der Block endet mit </tool_calls> und beginnt mit <tool_calls> mitten im Satz.": "Der Block endet mit",
+        'Siehe <tool_calls>[{"name":"ping","arguments":{}}]</tool_calls> im Satz.': "Siehe",
+    }
+    for reply, text in expected.items():
         parsed = tools_mod.parse_reply(reply, tools)
-        assert parsed.had_block is False and parsed.calls == [] and parsed.errors == []
-        assert parsed.text == reply
+        assert parsed.had_block is True and parsed.calls == [] and parsed.errors
+        assert parsed.text == text
+    plain = tools_mod.parse_reply("Nur Prosa ohne Tag.", tools)
+    assert plain.had_block is False and plain.errors == [] and plain.text == "Nur Prosa ohne Tag."
 
 
-def test_fenced_example_inside_prose_is_plain_text():
+def test_fenced_example_inside_prose_never_reaches_text():
     reply = "So sieht ein Aufruf aus:\n```\n" + _block([{"name": "ping", "arguments": {}}]) + "\n```\nFertig."
     parsed = tools_mod.parse_reply(reply, _tools())
-    assert parsed.had_block is False and parsed.calls == [] and parsed.errors == []
-    assert parsed.text == reply
+    assert parsed.had_block is True and parsed.calls == [] and parsed.errors
+    assert parsed.text == "So sieht ein Aufruf aus:"
+
+
+def test_unbalanced_opening_fence_is_wrapper():
+    tools = _tools()
+    closed_block = '```json\n<tool_calls>[{"name":"ping","arguments":{}}]</tool_calls>'
+    ok = tools_mod.parse_reply(closed_block, tools)
+    assert ok.errors == [] and len(ok.calls) == 1 and ok.text == ""
+    truncated = tools_mod.parse_reply('```json\n<tool_calls>[{"name":"ping"', tools)
+    assert truncated.had_block and truncated.calls == [] and truncated.errors
+    assert truncated.text == ""
+    _clean(truncated)
+
+
+def test_midline_mention_before_later_error_block():
+    reply = 'Siehe <tool_calls>[{"name":"ping","arguments":{}}]</tool_calls> im Satz.\n<tool_calls>[bad'
+    parsed = tools_mod.parse_reply(reply, _tools())
+    assert parsed.had_block and parsed.calls == [] and parsed.errors
+    _clean(parsed)
 
 
 def test_prompt_forbids_tag_in_prose_and_history_copying():

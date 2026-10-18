@@ -30,6 +30,7 @@ _BLOCK_RE = re.compile(r"<tool_calls>(.*?)</tool_calls>", re.DOTALL)
 _FENCED_BLOCK_RE = re.compile(
     r"```[A-Za-z0-9_-]*[ \t]*\r?\n?\s*(<tool_calls>.*?</tool_calls>)\s*```", re.DOTALL
 )
+_LEADING_FENCE_RE = re.compile(r"\s*```[A-Za-z0-9_-]*[ \t]*\r?\n?")
 _LINE_START_OPEN_RE = re.compile(r"(?m)^[ 	]*<tool_calls>")
 _INNER_FENCE_RE = re.compile(r"^```[A-Za-z0-9_-]*[ \t]*\r?\n?(.*?)\s*```$", re.DOTALL)
 _EMPTY_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
@@ -260,7 +261,27 @@ def _validate_call(index: int, item: Any, by_name: dict[str, dict]) -> tuple[dic
     return {"id": f"call_{uuid.uuid4().hex[:24]}", "name": name, "arguments": arguments}, []
 
 
+def _cut_at_tag(text: str) -> str:
+    """Text vor dem ersten Tag; ein dabei offen gebliebener Code-Zaun faellt weg."""
+
+    positions = [i for i in (text.find(_OPEN_TAG), text.find(_CLOSE_TAG)) if i >= 0]
+    head = text[: min(positions)] if positions else text
+    if head.count("```") % 2 == 1:
+        head = head[: head.rfind("```")]
+    return head.strip()
+
+
 def parse_reply(text: str, tools: list[dict]) -> ParsedReply:
+    """Wie ``_parse_reply``, plus Endwache: kein Tag erreicht je den Text."""
+
+    parsed = _parse_reply(text, tools)
+    if _OPEN_TAG in parsed.text or _CLOSE_TAG in parsed.text:
+        errors = parsed.errors or ["Ein <tool_calls>-Tag stand ausserhalb eines gueltigen Blocks"]
+        return ParsedReply(calls=[], text=_cut_at_tag(parsed.text), errors=errors, had_block=True)
+    return parsed
+
+
+def _parse_reply(text: str, tools: list[dict]) -> ParsedReply:
     """Sucht genau einen ``<tool_calls>``-Block, prueft ihn und trennt den Begleittext ab.
 
     Bei jedem Fehler bleibt ``calls`` leer: ein Teil-Plan wird nie weitergegeben.
@@ -271,6 +292,13 @@ def parse_reply(text: str, tools: list[dict]) -> ParsedReply:
     fenced = _FENCED_BLOCK_RE.search(source)
     if fenced and not source[: fenced.start()].strip():
         source = fenced.group(1) + source[fenced.end():]
+    else:
+        # Ein Zaun, der die Antwort eroeffnet, ist deren Huelle - auch ungeschlossen.
+        opener = _LEADING_FENCE_RE.match(source)
+        if opener and _OPEN_TAG in source[opener.end():]:
+            source = source[opener.end():]
+            if source.rstrip().endswith("```"):
+                source = source.rstrip()[:-3]
 
     first = -1
     for m in _LINE_START_OPEN_RE.finditer(source):
@@ -279,7 +307,7 @@ def parse_reply(text: str, tools: list[dict]) -> ParsedReply:
             first = start
             break
     if first < 0:
-        return ParsedReply(text=source.strip())
+        return ParsedReply(text=source.strip())  # Endwache in parse_reply prueft Tags
 
     head, rest = source[:first], source[first:]
     matches = list(_BLOCK_RE.finditer(rest))
