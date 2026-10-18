@@ -137,6 +137,16 @@ def correction_prompt(errors: list[str]) -> str:
     )
 
 
+def required_correction_prompt(forced: str | None) -> str:
+    """Korrektursatz, wenn ``tool_choice`` einen Aufruf verlangt, aber Text kam."""
+
+    target = f"Ein Werkzeugaufruf an \"{forced}\"" if forced else "Ein Werkzeugaufruf"
+    return (
+        f"{target} ist hier Pflicht: antworte ausschliesslich mit dem <tool_calls>-Block, "
+        "ohne Text davor oder danach."
+    )
+
+
 # ------------------------------------------------------------------ Verlauf
 def _content_text(content: Any) -> str:
     if content is None:

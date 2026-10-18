@@ -415,3 +415,10 @@ def test_missing_arguments_key_is_empty_dict():
 
 def test_tool_choice_type_none():
     assert tools_mod.tool_choice_mode({"type": "none"}) == ("none", None)
+
+
+def test_required_correction_prompt_names_tool():
+    generic = tools_mod.required_correction_prompt(None)
+    named = tools_mod.required_correction_prompt("file-list")
+    assert generic.startswith("Ein Werkzeugaufruf ist hier Pflicht: antworte ausschliesslich mit dem <tool_calls>-Block")
+    assert named.startswith('Ein Werkzeugaufruf an "file-list" ist hier Pflicht')

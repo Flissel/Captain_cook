@@ -414,6 +414,104 @@ def _openai_usage(payloads: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+SSE_KEEPALIVE_S = 15.0
+
+
+def _keepalive_interval() -> float:
+    """Abstand der SSE-Kommentare; SHIM_SSE_KEEPALIVE_S ueberschreibt (Tests)."""
+    raw = os.environ.get("SHIM_SSE_KEEPALIVE_S", "").strip()
+    try:
+        value = float(raw) if raw else SSE_KEEPALIVE_S
+    except ValueError:
+        value = SSE_KEEPALIVE_S
+    return value if value > 0 else SSE_KEEPALIVE_S
+
+
+def _stream_error_chunk(model: str, detail: str) -> dict[str, Any]:
+    """Fehler nach gesendeten Headern: als letzter Chunk, kein zweiter Status."""
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": f"Fehler im Claude-Shim: {detail[:300]}"},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+class _KeepaliveStream:
+    """SSE-Antwort, deren Header sofort rausgehen; bis zum Ergebnis Kommentare.
+
+    Ein Hilfsthread schreibt alle ``interval`` Sekunden ``: keepalive``. Vor den
+    letzten Chunks wird er gestoppt und abgewartet; ein Lock verhindert, dass
+    sich zwei Schreiber mischen. Legt der Client auf, endet der Thread und es
+    gibt genau eine Logzeile.
+    """
+
+    def __init__(self, handler: BaseHTTPRequestHandler, interval: float) -> None:
+        self._handler = handler
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.gone = False
+
+    def open(self) -> bool:
+        handler = self._handler
+        try:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Cache-Control", "no-cache")
+            handler.end_headers()
+            handler.wfile.flush()
+        except _CLIENT_GONE as exc:
+            self._mark_gone(exc)
+            return False
+        self._thread = threading.Thread(target=self._run, name="sse-keepalive", daemon=True)
+        self._thread.start()
+        return True
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            with self._lock:
+                if self.gone or self._stop.is_set():
+                    return
+                try:
+                    self._handler.wfile.write(b": keepalive\n\n")
+                    self._handler.wfile.flush()
+                except _CLIENT_GONE as exc:
+                    self._mark_gone(exc)
+                    return
+
+    def _mark_gone(self, exc: BaseException) -> None:
+        if self.gone:
+            return
+        self.gone = True
+        self._handler.close_connection = True
+        sys.stderr.write(f"client disconnected before the answer was sent ({type(exc).__name__})\n")
+        sys.stderr.flush()
+
+    def finish(self, events: list[dict[str, Any]]) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        with self._lock:
+            if self.gone:
+                return
+            try:
+                for item in events:
+                    self._handler.wfile.write(f"data: {json.dumps(item)}\n\n".encode("utf-8"))
+                self._handler.wfile.write(b"data: [DONE]\n\n")
+                self._handler.wfile.flush()
+            except _CLIENT_GONE as exc:
+                self._mark_gone(exc)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ClaudeCodeOpenAIShim/1.0"
     timeout_seconds = 600.0
@@ -439,6 +537,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
+        for item in self._text_stream_chunks(completion):
+            self.wfile.write(f"data: {json.dumps(item)}\n\n".encode("utf-8"))
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    @staticmethod
+    def _text_stream_chunks(completion: dict[str, Any]) -> list[dict[str, Any]]:
         content = completion["choices"][0]["message"]["content"]
         chunk = {
             "id": completion["id"],
@@ -455,10 +560,7 @@ class Handler(BaseHTTPRequestHandler):
         }
         final = dict(chunk)
         final["choices"] = [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-        for item in (chunk, final):
-            self.wfile.write(f"data: {json.dumps(item)}\n\n".encode("utf-8"))
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        return [chunk, final]
 
     def _send_tool_stream(self, tools_mod: Any, completion: dict[str, Any]) -> None:
         """Werkzeugaufrufe als SSE: Delta(s) mit ``index``, ``finish_reason: tool_calls``, [DONE]."""
@@ -493,107 +595,39 @@ class Handler(BaseHTTPRequestHandler):
             section = tools_mod.tools_prompt_section(tools, mode, forced)
             system_prompt = f"{system_prompt}\n\n{section}" if system_prompt else section
 
-        budget = float(self.timeout_seconds)
-        started = time.monotonic()
-        payloads: list[dict[str, Any]] = []
-        parsed: Any = None
-        raw_text = ""
-        round_no = 0
-        try:
-            while True:
-                round_no += 1
-                prompt = transcript
-                if round_no > 1:
-                    prompt = f"{transcript}\n\n{tools_mod.correction_prompt(parsed.errors)}"
-                remaining = budget - (time.monotonic() - started)
-                round_started = time.monotonic()
-                try:
-                    payload = run_claude(
-                        system_prompt=system_prompt,
-                        transcript=prompt,
-                        model=model,
-                        timeout=budget if round_no == 1 else remaining,
-                        response_format=body.get("response_format"),
-                        disable_builtin_tools=True,
-                    )
-                except ShimError as exc:
-                    if round_no == 1:
-                        raise
-                    # Die Korrektur scheiterte an der CLI: es bleibt beim Fehlerfall
-                    # aus Runde 1 (Resttext bzw. feste Meldung), kein HTTP-Fehler.
-                    sys.stderr.write(f"round: n={round_no} cli error, keeping round 1 result: {exc}\n")
-                    break
-                text = payload.get("result")
-                if not isinstance(text, str):
-                    raise ShimError("Claude Code result did not contain text")
-                payloads.append(payload)
-                raw_text = text
-                parsed = tools_mod.parse_reply(text, tools)
-
-                retry = (
-                    offered
-                    and bool(parsed.errors)
-                    and round_no == 1
-                    and budget - (time.monotonic() - started) >= budget * 0.5
+        if body.get("stream") and offered:
+            # Rowboat streamt (ai-sdk streamText); Node/undici bricht nach ~300 s
+            # ohne Header ab, eine Runde mit Korrektur kann laenger dauern. Darum
+            # gehen Header sofort raus, waehrend der Runden SSE-Kommentare.
+            stream = _KeepaliveStream(self, _keepalive_interval())
+            if not stream.open():
+                return
+            try:
+                completion = self._tool_rounds(
+                    tools_mod, body, model, system_prompt, transcript, tools, mode, forced, offered
                 )
-                if offered and parsed.calls:
-                    outcome = "tool_calls"
-                elif retry:
-                    outcome = "retry"
-                elif offered and parsed.errors:
-                    outcome = "fail"
-                else:
-                    outcome = "text"
-                usage = payload.get("usage") or {}
-                sys.stderr.write(
-                    "round: n=%d wall_ms=%d api_ms=%s cache_read=%s outcome=%s\n"
-                    % (
-                        round_no,
-                        int((time.monotonic() - round_started) * 1000),
-                        payload.get("duration_api_ms", "?"),
-                        usage.get("cache_read_input_tokens", "?"),
-                        outcome,
-                    )
-                )
-                if parsed.errors:
-                    sys.stderr.write("tool block invalid: %s\n" % "; ".join(parsed.errors)[:1000])
+            except Exception as exc:  # noqa: BLE001 -- nach den Headern nur noch im Stream melden
+                detail = str(exc) if isinstance(exc, ShimError) else f"unexpected shim failure: {exc}"
+                sys.stderr.write(f"stream error after headers: {detail[:500]}\n")
                 sys.stderr.flush()
-                if not retry:
-                    break
-
-            if offered and parsed.calls:
-                if parsed.text:
-                    sys.stderr.write(
-                        "text around a valid tool block discarded (%d chars)\n" % len(parsed.text)
-                    )
-                sys.stderr.write(
-                    "tool_calls returned: %s\n" % ", ".join(call["name"] for call in parsed.calls)
-                )
-                completion = tools_mod.completion_with_tool_calls(
-                    parsed.calls, model, _openai_usage(payloads)
-                )
+                stream.finish([_stream_error_chunk(model, detail)])
+                return
+            if completion["choices"][0].get("finish_reason") == "tool_calls":
+                stream.finish(tools_mod.stream_chunks_for_tool_calls(completion))
             else:
-                if parsed.had_block:
-                    content = parsed.text or tools_mod.TOOL_FAIL_TEXT
-                    sys.stderr.write("tool block removed from text answer (mode=%s)\n" % mode)
-                else:
-                    content = raw_text
-                    if offered and mode == "required":
-                        sys.stderr.write(
-                            "tool_choice=required (forced=%s) but reply was text; returning text\n"
-                            % (forced or "-")
-                        )
-                merged = dict(payloads[-1])
-                merged["result"] = content
-                merged["usage"] = _summed_usage(payloads)
-                completion = to_completion(merged, model)
+                stream.finish(self._text_stream_chunks(completion))
+            return
+
+        try:
+            completion = self._tool_rounds(
+                tools_mod, body, model, system_prompt, transcript, tools, mode, forced, offered
+            )
         except ShimError as exc:
             self._send_or_drop(lambda: self._send_error(502, str(exc)))
             return
         except Exception as exc:  # pragma: no cover - defensive
             self._send_or_drop(lambda: self._send_error(500, f"unexpected shim failure: {exc}"))
             return
-        sys.stderr.flush()
 
         if not body.get("stream"):
             self._send_or_drop(lambda: self._send_json(200, completion))
@@ -601,6 +635,132 @@ class Handler(BaseHTTPRequestHandler):
             self._send_or_drop(lambda: self._send_tool_stream(tools_mod, completion))
         else:
             self._send_or_drop(lambda: self._send_stream(completion))
+
+    def _tool_rounds(
+        self,
+        tools_mod: Any,
+        body: dict[str, Any],
+        model: str,
+        system_prompt: str,
+        transcript: str,
+        tools: list[dict[str, Any]],
+        mode: str,
+        forced: str | None,
+        offered: bool,
+    ) -> dict[str, Any]:
+        """Runde 1, hoechstens eine Korrekturrunde; liefert die fertige Completion.
+
+        Korrigiert wird ein ungueltiger Block und, bei ``tool_choice`` required
+        bzw. benanntem Werkzeug, eine reine Textantwort. Wirft ShimError, wenn
+        schon Runde 1 an der CLI scheitert.
+        """
+
+        call_required = offered and mode == "required"
+        budget = float(self.timeout_seconds)
+        started = time.monotonic()
+        payloads: list[dict[str, Any]] = []
+        parsed: Any = None
+        raw_text = ""
+        round_no = 0
+        while True:
+            round_no += 1
+            prompt = transcript
+            if round_no > 1:
+                parts = []
+                if parsed.errors:
+                    parts.append(tools_mod.correction_prompt(parsed.errors))
+                if call_required:
+                    parts.append(tools_mod.required_correction_prompt(forced))
+                prompt = transcript + "\n\n" + "\n\n".join(parts)
+            remaining = budget - (time.monotonic() - started)
+            round_started = time.monotonic()
+            try:
+                payload = run_claude(
+                    system_prompt=system_prompt,
+                    transcript=prompt,
+                    model=model,
+                    timeout=budget if round_no == 1 else remaining,
+                    response_format=body.get("response_format"),
+                    disable_builtin_tools=True,
+                )
+            except ShimError as exc:
+                if round_no == 1:
+                    raise
+                # Die Korrektur scheiterte an der CLI: es bleibt beim Ergebnis
+                # aus Runde 1 (Resttext bzw. feste Meldung), kein HTTP-Fehler.
+                sys.stderr.write(
+                    "round: n=%d wall_ms=%d api_ms=- cache_read=- outcome=fail\n"
+                    % (round_no, int((time.monotonic() - round_started) * 1000))
+                )
+                sys.stderr.write(f"round {round_no} cli error, keeping round 1 result: {str(exc)[:500]}\n")
+                break
+            text = payload.get("result")
+            if not isinstance(text, str):
+                raise ShimError("Claude Code result did not contain text")
+            payloads.append(payload)
+            raw_text = text
+            parsed = tools_mod.parse_reply(text, tools)
+
+            missing_call = call_required and not parsed.had_block
+            retry = (
+                offered
+                and (bool(parsed.errors) or missing_call)
+                and round_no == 1
+                and budget - (time.monotonic() - started) >= budget * 0.5
+            )
+            if offered and parsed.calls:
+                outcome = "tool_calls"
+            elif retry:
+                outcome = "retry"
+            elif offered and parsed.errors:
+                outcome = "fail"
+            else:
+                outcome = "text"
+            usage = payload.get("usage") or {}
+            sys.stderr.write(
+                "round: n=%d wall_ms=%d api_ms=%s cache_read=%s outcome=%s\n"
+                % (
+                    round_no,
+                    int((time.monotonic() - round_started) * 1000),
+                    payload.get("duration_api_ms", "?"),
+                    usage.get("cache_read_input_tokens", "?"),
+                    outcome,
+                )
+            )
+            if parsed.errors:
+                sys.stderr.write("tool block invalid: %s\n" % "; ".join(parsed.errors)[:1000])
+            elif missing_call:
+                sys.stderr.write("tool_choice=required but round %d answered with text\n" % round_no)
+            sys.stderr.flush()
+            if not retry:
+                break
+
+        if offered and parsed.calls:
+            if parsed.text:
+                sys.stderr.write(
+                    "text around a valid tool block discarded (%d chars)\n" % len(parsed.text)
+                )
+            sys.stderr.write(
+                "tool_calls returned: %s\n" % ", ".join(call["name"] for call in parsed.calls)
+            )
+            sys.stderr.flush()
+            return tools_mod.completion_with_tool_calls(parsed.calls, model, _openai_usage(payloads))
+
+        if parsed.had_block:
+            content = parsed.text or tools_mod.TOOL_FAIL_TEXT
+            sys.stderr.write("tool block removed from text answer (mode=%s)\n" % mode)
+        else:
+            content = raw_text
+            if call_required:
+                sys.stderr.write(
+                    "tool_choice=required (forced=%s) but reply was text; returning text\n"
+                    % (forced or "-")
+                )
+        sys.stderr.flush()
+        merged = dict(payloads[-1])
+        merged["result"] = content
+        merged["usage"] = _summed_usage(payloads)
+        return to_completion(merged, model)
 
     def _send_or_drop(self, send: Any) -> None:
         """Ein Client, der waehrend der Antwort auflegt, ist kein Shim-Fehler."""

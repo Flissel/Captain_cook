@@ -292,13 +292,138 @@ def test_tool_choice_none_strips_block(rig):
 
 
 def test_required_but_text_returns_text(rig, capsys):
-    rig.start(["Nur Text."], tool_calls=True)
+    rig.start(["Nur Text.", "Immer noch Text."], tool_calls=True)
     status, raw = rig.post(_request(tool_choice="required"))
     data = json.loads(raw)
     assert data["choices"][0]["finish_reason"] == "stop"
-    assert data["choices"][0]["message"]["content"] == "Nur Text."
-    assert "Pflicht: Antworte jetzt mit mindestens einem Werkzeugaufruf" in rig.calls()[0]["system_prompt"]
-    assert "tool_choice=required" in capsys.readouterr().err
+    assert data["choices"][0]["message"]["content"] == "Immer noch Text."
+    calls = rig.calls()
+    assert len(calls) == 2  # genau eine Korrekturrunde
+    assert "Pflicht: Antworte jetzt mit mindestens einem Werkzeugaufruf" in calls[0]["system_prompt"]
+    err = capsys.readouterr().err
+    assert "outcome=retry" in err
+    assert "tool_choice=required" in err
+
+
+def test_required_text_then_block_gives_calls(rig):
+    rig.start(["Nur Text.", VALID_BLOCK], tool_calls=True)
+    status, raw = rig.post(_request(tool_choice="required"))
+    data = json.loads(raw)
+    assert data["choices"][0]["finish_reason"] == "tool_calls"
+    calls = rig.calls()
+    assert len(calls) == 2
+    assert "Ein Werkzeugaufruf ist hier Pflicht" in calls[1]["stdin"]
+    assert "<tool_calls>-Block" in calls[1]["stdin"]
+    assert "Ein Werkzeugaufruf ist hier Pflicht" not in calls[0]["stdin"]
+
+
+def test_named_tool_text_gets_named_correction(rig):
+    rig.start(["Nur Text.", VALID_BLOCK], tool_calls=True)
+    choice = {"type": "function", "function": {"name": "file-list"}}
+    status, raw = rig.post(_request(tool_choice=choice))
+    assert json.loads(raw)["choices"][0]["finish_reason"] == "tool_calls"
+    calls = rig.calls()
+    assert len(calls) == 2
+    assert 'Ein Werkzeugaufruf an "file-list" ist hier Pflicht' in calls[1]["stdin"]
+
+
+def test_auto_text_gets_no_correction(rig):
+    rig.start(["Nur Text.", VALID_BLOCK], tool_calls=True)
+    status, raw = rig.post(_request())
+    assert json.loads(raw)["choices"][0]["message"]["content"] == "Nur Text."
+    assert len(rig.calls()) == 1
+
+
+def test_round2_cli_error_logs_round_line(rig, capsys):
+    rig.start([INVALID_BLOCK, {"is_error": True, "result": "kaputt"}], tool_calls=True)
+    status, raw = rig.post(_request())
+    data = json.loads(raw)
+    assert status == 200
+    assert data["choices"][0]["message"]["content"] == tools_mod.TOOL_FAIL_TEXT
+    err = capsys.readouterr().err
+    line = next(l for l in err.splitlines() if l.startswith("round: n=2"))
+    assert "wall_ms=" in line and "api_ms=" in line and "cache_read=" in line
+    assert line.endswith("outcome=fail")
+
+
+# ------------------------------------------------------- Keepalive (Stream)
+def _read_until_close(sock: socket.socket) -> bytes:
+    data = b""
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return data
+        data += chunk
+
+
+def test_stream_keepalive_before_final(rig, monkeypatch):
+    monkeypatch.setenv("SHIM_SSE_KEEPALIVE_S", "0.2")
+    monkeypatch.setenv("FAKE_CLAUDE_DELAY", "1.5")
+    rig.start([VALID_BLOCK], tool_calls=True)
+    started = time.monotonic()
+    sock = _raw_post(rig.port, _request(stream=True))
+    head = b""
+    while b"\r\n\r\n" not in head:
+        head += sock.recv(1)
+    assert time.monotonic() - started < 1.2  # Header vor dem Ende der CLI-Runde
+    assert head.startswith(b"HTTP/1.0 200") or head.startswith(b"HTTP/1.1 200")
+    assert b"text/event-stream" in head
+    body = _read_until_close(sock)
+    sock.close()
+    text = body.decode("utf-8")
+    assert text.startswith(": keepalive\n\n")
+    assert text.index(": keepalive") < text.index("data: ")
+    assert text.count("HTTP/1.") == 0  # keine zweite Statuszeile
+    events = _sse(body.replace(b": keepalive\n\n", b""))
+    assert events[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "file-list"
+    assert events[1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert events[-1] == "[DONE]"
+
+
+def test_stream_text_answer_in_tool_mode_keeps_shape(rig):
+    rig.start(["Nur Text."], tool_calls=True)
+    status, raw = rig.post(_request(stream=True))
+    events = _sse(raw)
+    assert events[0]["choices"][0]["delta"] == {"role": "assistant", "content": "Nur Text."}
+    assert events[1]["choices"][0]["finish_reason"] == "stop"
+    assert events[2] == "[DONE]"
+
+
+def test_stream_cli_error_midstream(rig):
+    rig.start([{"is_error": True, "result": "boom"}], tool_calls=True)
+    sock = _raw_post(rig.port, _request(stream=True))
+    raw = _read_until_close(sock)
+    sock.close()
+    assert raw.count(b"HTTP/1.") == 1
+    assert raw.startswith(b"HTTP/1.0 200") or raw.startswith(b"HTTP/1.1 200")
+    events = _sse(raw.split(b"\r\n\r\n", 1)[1])
+    assert len(events) == 2
+    choice = events[0]["choices"][0]
+    assert choice["delta"]["content"].startswith("Fehler im Claude-Shim: ")
+    assert "boom" in choice["delta"]["content"]
+    assert choice["finish_reason"] == "stop"
+    assert events[1] == "[DONE]"
+
+
+def test_stream_nonstream_error_still_502(rig):
+    rig.start([{"is_error": True, "result": "boom"}], tool_calls=True)
+    status, raw = rig.post(_request())
+    assert status == 502
+
+
+def test_disconnect_during_keepalive_is_quiet(rig, capsys, monkeypatch):
+    monkeypatch.setenv("SHIM_SSE_KEEPALIVE_S", "0.1")
+    monkeypatch.setenv("FAKE_CLAUDE_DELAY", "1.5")
+    rig.start([VALID_BLOCK], tool_calls=True)
+    sock = _raw_post(rig.port, _request(stream=True))
+    head = b""
+    while b"\r\n\r\n" not in head:
+        head += sock.recv(1)
+    _reset(sock)
+    err = _wait_for_handler(rig, capsys, "round: n=1")
+    assert "Traceback" not in err
+    assert err.count("client disconnected") == 1
+    assert not any(t.name == "sse-keepalive" and t.is_alive() for t in threading.enumerate())
 
 
 def test_plain_text_is_passed_through_unchanged(rig):
