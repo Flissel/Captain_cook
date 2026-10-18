@@ -330,3 +330,67 @@ def test_stream_chunks_shape():
     assert json.loads(delta["tool_calls"][1]["function"]["arguments"]) == {"dir": "x"}
     assert last["choices"][0]["delta"] == {}
     assert last["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def _clean(parsed):
+    assert "<tool_calls>" not in parsed.text and "</tool_calls>" not in parsed.text
+    assert "ping" not in parsed.text
+
+
+def test_error_paths_do_not_leak_payload_or_tags():
+    ping = _block([{"name": "ping", "arguments": {}}])
+    unclosed = tools_mod.parse_reply('<tool_calls>[{"name":"ping","arguments":{}}]', _tools())
+    assert unclosed.errors and unclosed.calls == []
+    _clean(unclosed)
+    two = tools_mod.parse_reply(ping + "\n" + ping, _tools())
+    assert two.errors
+    _clean(two)
+    mixed = tools_mod.parse_reply("Vorab.\n" + ping + "\n<tool_calls>[{\"name\":\"ping\"", _tools())
+    assert mixed.errors and mixed.text == "Vorab."
+    _clean(mixed)
+
+
+def test_prose_mentioning_tag_is_plain_text():
+    tools = _tools()
+    for reply in (
+        "Ich nutze das Tag <tool_calls> nur bei Bedarf.",
+        "Der Block endet mit </tool_calls> und beginnt mit <tool_calls> mitten im Satz.",
+        'Siehe <tool_calls>[{"name":"ping","arguments":{}}]</tool_calls> im Satz.',
+    ):
+        parsed = tools_mod.parse_reply(reply, tools)
+        assert parsed.had_block is False and parsed.calls == [] and parsed.errors == []
+        assert parsed.text == reply
+
+
+def test_fenced_example_inside_prose_is_plain_text():
+    reply = "So sieht ein Aufruf aus:\n```\n" + _block([{"name": "ping", "arguments": {}}]) + "\n```\nFertig."
+    parsed = tools_mod.parse_reply(reply, _tools())
+    assert parsed.had_block is False and parsed.calls == [] and parsed.errors == []
+    assert parsed.text == reply
+
+
+def test_prompt_forbids_tag_in_prose_and_history_copying():
+    section = tools_mod.tools_prompt_section(_tools(), "auto", None)
+    assert "Schreibe das Tag <tool_calls> niemals in Erklaerungen oder Beispielen." in section
+    assert "Kopiere nie die Verlaufszeilen" in section
+
+
+def test_nullable_type_accepts_none():
+    tools = tools_mod.normalize_tools(
+        [{"name": "n", "parameters": {"type": "object", "properties": {"v": {"type": ["string", "null"]}}}}]
+    )
+    ok = tools_mod.parse_reply(_block([{"name": "n", "arguments": {"v": None}}]), tools)
+    assert ok.errors == [] and len(ok.calls) == 1
+    bad = tools_mod.parse_reply(_block([{"name": "n", "arguments": {"v": 3}}]), tools)
+    assert bad.errors and bad.calls == []
+
+
+def test_missing_arguments_key_is_empty_dict():
+    ok = tools_mod.parse_reply(_block([{"name": "ping"}]), _tools())
+    assert ok.errors == [] and ok.calls[0]["arguments"] == {}
+    missing = tools_mod.parse_reply(_block([{"name": "file-write"}]), _tools())
+    assert missing.calls == [] and any("path" in e for e in missing.errors)
+
+
+def test_tool_choice_type_none():
+    assert tools_mod.tool_choice_mode({"type": "none"}) == ("none", None)

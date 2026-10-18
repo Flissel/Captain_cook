@@ -30,6 +30,7 @@ _BLOCK_RE = re.compile(r"<tool_calls>(.*?)</tool_calls>", re.DOTALL)
 _FENCED_BLOCK_RE = re.compile(
     r"```[A-Za-z0-9_-]*[ \t]*\r?\n?\s*(<tool_calls>.*?</tool_calls>)\s*```", re.DOTALL
 )
+_LINE_START_OPEN_RE = re.compile(r"(?m)^[ 	]*<tool_calls>")
 _INNER_FENCE_RE = re.compile(r"^```[A-Za-z0-9_-]*[ \t]*\r?\n?(.*?)\s*```$", re.DOTALL)
 _EMPTY_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
 
@@ -70,6 +71,8 @@ def tool_choice_mode(tool_choice: Any) -> tuple[str, str | None]:
             return "required", None
         return "auto", None
     if isinstance(tool_choice, dict):
+        if tool_choice.get("type") == "none":
+            return "none", None
         spec = tool_choice.get("function")
         name = spec.get("name") if isinstance(spec, dict) else tool_choice.get("name")
         if isinstance(name, str) and name:
@@ -90,7 +93,10 @@ _CONTRACT = (
     "Der Block enthaelt ein JSON-Array; jedes Element hat \"name\" (ein Name aus der "
     "Liste unten) und \"arguments\" (ein JSON-Objekt, das zum Schema passt, mit allen "
     "Pflichtfeldern). Mehrere unabhaengige Aufrufe gehoeren in dasselbe Array. "
-    "Verwende keinen Code-Zaun und nur einen einzigen Block."
+    "Verwende keinen Code-Zaun und nur einen einzigen Block. "
+    "Schreibe das Tag <tool_calls> niemals in Erklaerungen oder Beispielen. "
+    "Kopiere nie die Verlaufszeilen 'Assistant (Werkzeugaufruf): ...' - rufe "
+    "Werkzeuge nur ueber den Block auf."
 )
 
 
@@ -215,6 +221,7 @@ _TYPE_CHECKS = {
     "boolean": lambda v: isinstance(v, bool),
     "object": lambda v: isinstance(v, dict),
     "array": lambda v: isinstance(v, list),
+    "null": lambda v: v is None,
 }
 
 
@@ -228,7 +235,7 @@ def _validate_call(index: int, item: Any, by_name: dict[str, dict]) -> tuple[dic
     tool = by_name.get(name)
     if tool is None:
         return None, [f"{label}: Unbekanntes Werkzeug \"{name}\" (nicht angeboten)"]
-    arguments = item.get("arguments")
+    arguments = item.get("arguments", {}) if "arguments" not in item else item["arguments"]
     if not isinstance(arguments, dict):
         return None, [f"{label} ({name}): \"arguments\" fehlt oder ist kein JSON-Objekt"]
 
@@ -260,19 +267,26 @@ def parse_reply(text: str, tools: list[dict]) -> ParsedReply:
     """
 
     source = text if isinstance(text, str) else ""
-    source = _FENCED_BLOCK_RE.sub(lambda m: m.group(1), source)
-    matches = list(_BLOCK_RE.finditer(source))
-    opens = source.count(_OPEN_TAG)
+    # Ein Code-Zaun zaehlt nur, wenn er die Antwort eroeffnet (kein Text davor).
+    fenced = _FENCED_BLOCK_RE.search(source)
+    if fenced and not source[: fenced.start()].strip():
+        source = fenced.group(1) + source[fenced.end():]
 
-    if not matches and opens == 0 and _CLOSE_TAG not in source:
+    first = -1
+    for m in _LINE_START_OPEN_RE.finditer(source):
+        start = m.end() - len(_OPEN_TAG)
+        if source[:start].count("```") % 2 == 0:  # nicht in einem Zaun mitten im Text
+            first = start
+            break
+    if first < 0:
         return ParsedReply(text=source.strip())
 
-    outside = _BLOCK_RE.sub("", source)
+    head, rest = source[:first], source[first:]
+    matches = list(_BLOCK_RE.finditer(rest))
     errors: list[str] = []
-    if len(matches) > 1 or opens > 1:
+    if len(matches) > 1 or rest.count(_OPEN_TAG) > 1:
         errors.append("Mehr als ein <tool_calls>-Block; erlaubt ist genau einer")
     elif not matches:
-        outside = outside.replace(_OPEN_TAG, "").replace(_CLOSE_TAG, "")
         errors.append("Der <tool_calls>-Block ist nicht geschlossen oder unvollstaendig")
     else:
         body = matches[0].group(1).strip()
@@ -296,8 +310,12 @@ def parse_reply(text: str, tools: list[dict]) -> ParsedReply:
                     if call is not None:
                         calls.append(call)
                 if not errors:
+                    outside = head + _BLOCK_RE.sub("", rest)
                     return ParsedReply(calls=calls, text=outside.strip(), errors=[], had_block=True)
-    return ParsedReply(calls=[], text=outside.strip(), errors=errors, had_block=True)
+    # Fehlerpfad: nur der Text VOR dem ersten Tag, nie Nutzlast oder Tags.
+    return ParsedReply(
+        calls=[], text=head.replace(_CLOSE_TAG, "").strip(), errors=errors, had_block=True
+    )
 
 
 # -------------------------------------------------------------- OpenAI-Form
