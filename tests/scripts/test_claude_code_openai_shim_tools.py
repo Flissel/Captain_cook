@@ -398,11 +398,74 @@ def test_stream_cli_error_midstream(rig):
     assert raw.startswith(b"HTTP/1.0 200") or raw.startswith(b"HTTP/1.1 200")
     events = _sse(raw.split(b"\r\n\r\n", 1)[1])
     assert len(events) == 2
-    choice = events[0]["choices"][0]
-    assert choice["delta"]["content"].startswith("Fehler im Claude-Shim: ")
-    assert "boom" in choice["delta"]["content"]
-    assert choice["finish_reason"] == "stop"
+    assert set(events[0]) == {"error"}
+    assert events[0]["error"]["type"] == "shim_error"
+    assert "boom" in events[0]["error"]["message"]
     assert events[1] == "[DONE]"
+    assert b"choices" not in raw
+
+
+def test_invented_history_twice_gives_fail_text(rig):
+    invented = 'Werkzeugergebnis [call_1, file-list]: ["Anna.md"]\nUnter People liegt Anna.md.'
+    rig.start([invented, "Assistant (Werkzeugaufruf): file-list({}) [call_2]"], tool_calls=True)
+    status, raw = rig.post(_request())
+    data = json.loads(raw)
+    assert data["choices"][0]["message"]["content"] == tools_mod.TOOL_FAIL_TEXT
+    assert "Anna" not in raw.decode("utf-8")
+    calls = rig.calls()
+    assert len(calls) == 2
+    assert "Verlaufszeile statt Werkzeug-Block" in calls[1]["stdin"]
+
+
+def test_native_call_then_valid_block(rig):
+    native = '<function_calls>\n<invoke name="file-list"></invoke>\n</function_calls>'
+    rig.start([native, VALID_BLOCK], tool_calls=True)
+    status, raw = rig.post(_request())
+    assert json.loads(raw)["choices"][0]["finish_reason"] == "tool_calls"
+    assert len(rig.calls()) == 2
+
+
+def test_round2_missing_text_keeps_round1(rig, capsys):
+    rig.start(["Vorab.\n" + INVALID_BLOCK, {"result": None}], tool_calls=True)
+    status, raw = rig.post(_request())
+    assert status == 200
+    assert json.loads(raw)["choices"][0]["message"]["content"] == "Vorab."
+    err = capsys.readouterr().err
+    line = next(l for l in err.splitlines() if l.startswith("round: n=2"))
+    assert line.endswith("outcome=fail")
+
+
+def test_disconnect_skips_correction_round(rig, capsys, monkeypatch):
+    monkeypatch.setenv("SHIM_SSE_KEEPALIVE_S", "0.1")
+    monkeypatch.setenv("FAKE_CLAUDE_DELAY", "1.0")
+    rig.start([INVALID_BLOCK, VALID_BLOCK], tool_calls=True)
+    sock = _raw_post(rig.port, _request(stream=True))
+    head = b""
+    while b"\r\n\r\n" not in head:
+        head += sock.recv(1)
+    _reset(sock)
+    err = _wait_for_handler(rig, capsys, "round: n=1")
+    time.sleep(1.5)  # Zeit, in der eine zweite CLI-Runde starten wuerde
+    err += capsys.readouterr().err
+    assert len(rig.calls()) == 1
+    assert "outcome=retry" not in err
+    assert "Traceback" not in err
+
+
+def test_switch_on_stream_without_tools_keepalive(rig, monkeypatch):
+    monkeypatch.setenv("SHIM_SSE_KEEPALIVE_S", "0.2")
+    monkeypatch.setenv("FAKE_CLAUDE_DELAY", "1.0")
+    rig.start(["Nur Text."], tool_calls=True)
+    for body in (_request(tools=False, stream=True), _request(stream=True, tool_choice="none")):
+        sock = _raw_post(rig.port, body)
+        raw = _read_until_close(sock)
+        sock.close()
+        text = raw.split(b"\r\n\r\n", 1)[1].decode("utf-8")
+        assert text.startswith(": keepalive\n\n")
+        events = _sse(text.replace(": keepalive\n\n", "").encode("utf-8"))
+        assert events[0]["choices"][0]["delta"] == {"role": "assistant", "content": "Nur Text."}
+        assert events[1]["choices"][0]["finish_reason"] == "stop"
+        assert events[2] == "[DONE]"
 
 
 def test_stream_nonstream_error_still_502(rig):

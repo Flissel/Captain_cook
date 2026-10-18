@@ -257,7 +257,7 @@ def test_render_result_truncated():
     _, transcript = tools_mod.render_messages_with_tools(
         [{"role": "tool", "tool_call_id": "c", "content": big}]
     )
-    assert transcript.endswith("x" * 20000 + " (gekuerzt, 20001 Zeichen)")
+    assert transcript.endswith("x" * 20000 + " (gekuerzt, 20001 Zeichen – unvollstaendig, nicht als ganzen Inhalt zurueckschreiben)")
     exact = "y" * 20000
     _, transcript2 = tools_mod.render_messages_with_tools(
         [{"role": "tool", "tool_call_id": "c", "content": exact}]
@@ -422,3 +422,38 @@ def test_required_correction_prompt_names_tool():
     named = tools_mod.required_correction_prompt("file-list")
     assert generic.startswith("Ein Werkzeugaufruf ist hier Pflicht: antworte ausschliesslich mit dem <tool_calls>-Block")
     assert named.startswith('Ein Werkzeugaufruf an "file-list" ist hier Pflicht')
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        'Assistant (Werkzeugaufruf): file-list({"dir": "knowledge"}) [call_x]',
+        'Ich habe nachgesehen.\nWerkzeugergebnis [call_x, file-list]: ["Anna.md"]\nEs gibt Anna.',
+        '  Werkzeugergebnis [call_x, file-list]: []',
+        '<function_calls>\n<invoke name="file-list">\n<parameter name="dir">k</parameter>\n</invoke>\n</function_calls>',
+        'Moment.\n<invoke name="file-list"></invoke>',
+        'x <function_calls><invoke name="ping"></invoke></function_calls>',
+    ],
+)
+def test_history_line_or_native_call_is_error(reply):
+    parsed = tools_mod.parse_reply(reply, _tools())
+    assert parsed.calls == []
+    assert parsed.had_block is True
+    assert parsed.text == ""
+    assert any("Verlaufszeile statt Werkzeug-Block" in e for e in parsed.errors)
+
+
+def test_history_line_next_to_valid_block_is_error():
+    reply = _block([{"name": "ping", "arguments": {}}]) + "\nWerkzeugergebnis [c, ping]: pong"
+    parsed = tools_mod.parse_reply(reply, _tools())
+    assert parsed.calls == []
+    assert parsed.text == ""
+    assert parsed.errors
+
+
+def test_history_words_mid_line_are_not_an_error():
+    parsed = tools_mod.parse_reply("Das Werkzeugergebnis [oben] war leer.", _tools())
+    assert parsed.errors == [] and parsed.had_block is False

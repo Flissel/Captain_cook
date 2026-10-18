@@ -33,7 +33,9 @@ _FENCED_BLOCK_RE = re.compile(
 _LEADING_FENCE_RE = re.compile(r"\s*```[A-Za-z0-9_-]*[ \t]*\r?\n?")
 _LINE_START_OPEN_RE = re.compile(r"(?m)^[ \t]*<tool_calls>")
 _INNER_FENCE_RE = re.compile(r"^```[A-Za-z0-9_-]*[ \t]*\r?\n?(.*?)\s*```$", re.DOTALL)
-_EMPTY_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
+_HISTORY_LINE_RE = re.compile(r"(?m)^[ \t]*(?:Assistant \(Werkzeugaufruf\):|Werkzeugergebnis \[)")
+_NATIVE_CALL_RE = re.compile(r"<(?:[A-Za-z_][\w-]*:)?(?:function_calls\b|invoke\b)")
+_EMPTY_SCHEMA: dict[str, Any] ={"type": "object", "properties": {}}
 
 
 # ---------------------------------------------------------------- Werkzeuge
@@ -172,7 +174,10 @@ def _args_text(arguments: Any) -> str:
 def _limit(text: str) -> str:
     if len(text) <= RESULT_LIMIT:
         return text
-    return f"{text[:RESULT_LIMIT]} (gekuerzt, {len(text)} Zeichen)"
+    return (
+        f"{text[:RESULT_LIMIT]} (gekuerzt, {len(text)} Zeichen – unvollstaendig, "
+        "nicht als ganzen Inhalt zurueckschreiben)"
+    )
 
 
 def render_messages_with_tools(messages: list[dict]) -> tuple[str, str]:
@@ -284,6 +289,20 @@ def _cut_at_tag(text: str) -> str:
 def parse_reply(text: str, tools: list[dict]) -> ParsedReply:
     """Wie ``_parse_reply``, plus Endwache: kein Tag erreicht je den Text."""
 
+    # Anti-Ziel "erfundene Ergebnisse": Verlaufszeilen oder Claudes eigene
+    # Aufrufform in der Antwort heissen, dass Claude einen Aufruf bzw. dessen
+    # Ergebnis selbst geschrieben hat. Nichts davon geht weiter, auch kein Text.
+    if isinstance(text, str) and (_HISTORY_LINE_RE.search(text) or _NATIVE_CALL_RE.search(text)):
+        return ParsedReply(
+            calls=[],
+            text="",
+            errors=[
+                "Verlaufszeile statt Werkzeug-Block: Zeilen wie 'Assistant (Werkzeugaufruf): ...', "
+                "'Werkzeugergebnis [...]' oder <function_calls>/<invoke> sind verboten; "
+                "rufe Werkzeuge nur ueber den <tool_calls>-Block auf und erfinde keine Ergebnisse"
+            ],
+            had_block=True,
+        )
     parsed = _parse_reply(text, tools)
     if _OPEN_TAG in parsed.text or _CLOSE_TAG in parsed.text:
         errors = parsed.errors or ["Ein <tool_calls>-Tag stand ausserhalb eines gueltigen Blocks"]
