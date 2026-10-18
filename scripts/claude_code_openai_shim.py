@@ -26,6 +26,7 @@ Then point Hermes at it:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import pathlib
@@ -33,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,6 +53,47 @@ _MODEL_ALIASES = {
 
 class ShimError(RuntimeError):
     """Raised when the CLI could not produce a usable answer."""
+
+
+# Werkzeugaufrufe (env-gated, Vorgabe: aus). Mit SHIM_TOOL_CALLS=1 bekommt Claude
+# die `tools` des Aufrufers als Textvertrag im System-Prompt und der Shim gibt
+# echte OpenAI-`tool_calls` zurueck. Ohne Schalter bleibt jede Antwort byte-gleich
+# (Hermes, Captain, Marketing). Die Logik liegt im Nachbarmodul
+# claude_code_openai_tools.py; es wird erst bei eingeschaltetem Schalter geladen,
+# damit eine Kopie des Shims ohne Modul weiterlaeuft.
+_TOOLS_MODULE_NAME = "claude_code_openai_tools"
+_TOOLS_MODULE_LOCK = threading.Lock()
+_CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+
+def tool_calls_enabled() -> bool:
+    return os.environ.get("SHIM_TOOL_CALLS", "").strip() == "1"
+
+
+def load_tools_module() -> Any:
+    """Laedt das Werkzeugmodul aus dem Verzeichnis dieses Skripts.
+
+    Ueber den Dateipfad statt sys.path, damit ~/.local/bin nicht zum Suchpfad
+    fuer jeden spaeteren Import wird. Die Registrierung in sys.modules braucht
+    ``@dataclass`` im Modul.
+    """
+
+    with _TOOLS_MODULE_LOCK:
+        module = sys.modules.get(_TOOLS_MODULE_NAME)
+        if module is not None:
+            return module
+        path = pathlib.Path(__file__).resolve().parent / f"{_TOOLS_MODULE_NAME}.py"
+        spec = importlib.util.spec_from_file_location(_TOOLS_MODULE_NAME, path)
+        if spec is None or spec.loader is None:
+            raise ShimError(f"tool module not loadable: {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[_TOOLS_MODULE_NAME] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(_TOOLS_MODULE_NAME, None)
+            raise
+        return module
 
 
 def resolve_cli() -> str:
@@ -140,6 +183,7 @@ def run_claude(
     model: str | None,
     timeout: float,
     response_format: Any = None,
+    disable_builtin_tools: bool = False,
 ) -> dict[str, Any]:
     cli = resolve_cli()
     argv: list[str] = [cli, "-p", "--output-format", "json"]
@@ -207,6 +251,12 @@ def run_claude(
     argv += ["--setting-sources", ""]
     if allowed_tools:
         argv += ["--allowedTools", *allowed_tools]
+    # Werkzeugmodus (SHIM_TOOL_CALLS): Werkzeuge laufen beim Aufrufer. Die
+    # eingebauten CLI-Werkzeuge (Bash, Read, Write, ...) gehen aus, damit Claude
+    # nichts selbst ausfuehrt und kein Ergebnis vortaeuscht. Laut `claude --help`
+    # schaltet `--tools ""` alle eingebauten Werkzeuge ab; MCP-Werkzeuge bleiben.
+    if disable_builtin_tools:
+        argv += ["--tools", ""]
 
     # The caller's own prompt asks for opaque artifact references but cannot know
     # how this backend produces one, so the side that supplies the tool documents
@@ -343,6 +393,27 @@ def to_completion(payload: dict[str, Any], model: str) -> dict[str, Any]:
     }
 
 
+def _summed_usage(payloads: list[dict[str, Any]]) -> dict[str, int]:
+    """CLI-Usage ueber alle Runden eines Zugs (eine Runde: unveraendert)."""
+    total = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
+    for payload in payloads:
+        usage = payload.get("usage") or {}
+        for key in total:
+            total[key] += int(usage.get(key) or 0)
+    return total
+
+
+def _openai_usage(payloads: list[dict[str, Any]]) -> dict[str, int]:
+    usage = _summed_usage(payloads)
+    prompt_tokens = usage["input_tokens"] + usage["cache_read_input_tokens"]
+    completion_tokens = usage["output_tokens"]
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ClaudeCodeOpenAIShim/1.0"
     timeout_seconds = 600.0
@@ -389,6 +460,157 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
+    def _send_tool_stream(self, tools_mod: Any, completion: dict[str, Any]) -> None:
+        """Werkzeugaufrufe als SSE: Delta(s) mit ``index``, ``finish_reason: tool_calls``, [DONE]."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        for item in tools_mod.stream_chunks_for_tool_calls(completion):
+            self.wfile.write(f"data: {json.dumps(item)}\n\n".encode("utf-8"))
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    # -- Werkzeugmodus (SHIM_TOOL_CALLS=1) -------------------------------
+    def _complete_with_tools(
+        self,
+        tools_mod: Any,
+        body: dict[str, Any],
+        model: str,
+        system_prompt: str,
+        transcript: str,
+    ) -> None:
+        """Bis zu zwei CLI-Runden: Antwort, bei ungueltigem Block eine Korrektur.
+
+        Ein ungueltiger Aufruf geht nie weiter, auch kein Teil eines Plans. Der
+        rohe ``<tool_calls>``-Block erscheint nie im Inhalt.
+        """
+
+        tools = tools_mod.normalize_tools(body.get("tools"))
+        mode, forced = tools_mod.tool_choice_mode(body.get("tool_choice"))
+        offered = bool(tools) and mode != "none"
+        if offered:
+            section = tools_mod.tools_prompt_section(tools, mode, forced)
+            system_prompt = f"{system_prompt}\n\n{section}" if system_prompt else section
+
+        budget = float(self.timeout_seconds)
+        started = time.monotonic()
+        payloads: list[dict[str, Any]] = []
+        parsed: Any = None
+        raw_text = ""
+        round_no = 0
+        try:
+            while True:
+                round_no += 1
+                prompt = transcript
+                if round_no > 1:
+                    prompt = f"{transcript}\n\n{tools_mod.correction_prompt(parsed.errors)}"
+                remaining = budget - (time.monotonic() - started)
+                round_started = time.monotonic()
+                try:
+                    payload = run_claude(
+                        system_prompt=system_prompt,
+                        transcript=prompt,
+                        model=model,
+                        timeout=budget if round_no == 1 else remaining,
+                        response_format=body.get("response_format"),
+                        disable_builtin_tools=True,
+                    )
+                except ShimError as exc:
+                    if round_no == 1:
+                        raise
+                    # Die Korrektur scheiterte an der CLI: es bleibt beim Fehlerfall
+                    # aus Runde 1 (Resttext bzw. feste Meldung), kein HTTP-Fehler.
+                    sys.stderr.write(f"round: n={round_no} cli error, keeping round 1 result: {exc}\n")
+                    break
+                text = payload.get("result")
+                if not isinstance(text, str):
+                    raise ShimError("Claude Code result did not contain text")
+                payloads.append(payload)
+                raw_text = text
+                parsed = tools_mod.parse_reply(text, tools)
+
+                retry = (
+                    offered
+                    and bool(parsed.errors)
+                    and round_no == 1
+                    and budget - (time.monotonic() - started) >= budget * 0.5
+                )
+                if offered and parsed.calls:
+                    outcome = "tool_calls"
+                elif retry:
+                    outcome = "retry"
+                elif offered and parsed.errors:
+                    outcome = "fail"
+                else:
+                    outcome = "text"
+                usage = payload.get("usage") or {}
+                sys.stderr.write(
+                    "round: n=%d wall_ms=%d api_ms=%s cache_read=%s outcome=%s\n"
+                    % (
+                        round_no,
+                        int((time.monotonic() - round_started) * 1000),
+                        payload.get("duration_api_ms", "?"),
+                        usage.get("cache_read_input_tokens", "?"),
+                        outcome,
+                    )
+                )
+                if parsed.errors:
+                    sys.stderr.write("tool block invalid: %s\n" % "; ".join(parsed.errors)[:1000])
+                sys.stderr.flush()
+                if not retry:
+                    break
+
+            if offered and parsed.calls:
+                if parsed.text:
+                    sys.stderr.write(
+                        "text around a valid tool block discarded (%d chars)\n" % len(parsed.text)
+                    )
+                sys.stderr.write(
+                    "tool_calls returned: %s\n" % ", ".join(call["name"] for call in parsed.calls)
+                )
+                completion = tools_mod.completion_with_tool_calls(
+                    parsed.calls, model, _openai_usage(payloads)
+                )
+            else:
+                if parsed.had_block:
+                    content = parsed.text or tools_mod.TOOL_FAIL_TEXT
+                    sys.stderr.write("tool block removed from text answer (mode=%s)\n" % mode)
+                else:
+                    content = raw_text
+                    if offered and mode == "required":
+                        sys.stderr.write(
+                            "tool_choice=required (forced=%s) but reply was text; returning text\n"
+                            % (forced or "-")
+                        )
+                merged = dict(payloads[-1])
+                merged["result"] = content
+                merged["usage"] = _summed_usage(payloads)
+                completion = to_completion(merged, model)
+        except ShimError as exc:
+            self._send_or_drop(lambda: self._send_error(502, str(exc)))
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            self._send_or_drop(lambda: self._send_error(500, f"unexpected shim failure: {exc}"))
+            return
+        sys.stderr.flush()
+
+        if not body.get("stream"):
+            self._send_or_drop(lambda: self._send_json(200, completion))
+        elif completion["choices"][0].get("finish_reason") == "tool_calls":
+            self._send_or_drop(lambda: self._send_tool_stream(tools_mod, completion))
+        else:
+            self._send_or_drop(lambda: self._send_stream(completion))
+
+    def _send_or_drop(self, send: Any) -> None:
+        """Ein Client, der waehrend der Antwort auflegt, ist kein Shim-Fehler."""
+        try:
+            send()
+        except _CLIENT_GONE as exc:
+            sys.stderr.write(f"client disconnected before the answer was sent ({type(exc).__name__})\n")
+            sys.stderr.flush()
+            self.close_connection = True
+
     # -- routes --------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0].rstrip("/")
@@ -428,7 +650,18 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         model = str(body.get("model") or DEFAULT_MODEL_ID)
-        system_prompt, transcript = render_messages(body.get("messages") or [])
+        tools_mod: Any = None
+        if tool_calls_enabled():
+            try:
+                tools_mod = load_tools_module()
+            except Exception as exc:  # noqa: BLE001 -- fail-closed statt still ohne Werkzeuge
+                self._send_error(500, f"tool module unavailable: {exc}")
+                return
+        if tools_mod is not None:
+            # Mit Schalter: Werkzeugaufrufe und -ergebnisse erscheinen im Verlauf.
+            system_prompt, transcript = tools_mod.render_messages_with_tools(body.get("messages") or [])
+        else:
+            system_prompt, transcript = render_messages(body.get("messages") or [])
 
         roles = [str(m.get("role", "?")) for m in (body.get("messages") or [])]
         tool_names = [
@@ -467,6 +700,10 @@ class Handler(BaseHTTPRequestHandler):
                 sys.stderr.write("request dumped to %s\n" % dump_path)
             except Exception as exc:  # noqa: BLE001 -- Diagnose darf den Dienst nicht kippen
                 sys.stderr.write("request dump failed: %s\n" % exc)
+
+        if tools_mod is not None:
+            self._complete_with_tools(tools_mod, body, model, system_prompt, transcript)
+            return
 
         try:
             payload = run_claude(
