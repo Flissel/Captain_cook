@@ -1754,7 +1754,7 @@ def create_app(
             ) from None
 
     @app.post("/v1/factory-runtime/store")
-    def execute_factory_runtime_store(
+    async def execute_factory_runtime_store(
         command: FactoryGatewayRpcCommand,
         authorization: str | None = Header(default=None),
     ) -> object:
