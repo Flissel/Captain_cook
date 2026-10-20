@@ -375,7 +375,7 @@ def test_duplicate_batch_ids_are_rejected(client: TestClient) -> None:
 
     response = client.post(
         "/blocks",
-        json={"block_type": "work_batch", "data": batch_payload(title="Duplicate")},
+        json={"block_type": "work_batch", "status": "pending", "data": batch_payload(title="Duplicate")},
     )
 
     assert response.status_code == 409
@@ -387,7 +387,7 @@ def test_identical_canonical_work_batch_replay_returns_existing_block(
 ) -> None:
     first = client.post(
         "/blocks",
-        json={"block_type": "work_batch", "data": batch_payload()},
+        json={"block_type": "work_batch", "status": "pending", "data": batch_payload()},
     )
     assert first.status_code == 201
     existing = first.json()
@@ -421,7 +421,7 @@ def test_concurrent_duplicate_batch_creation_persists_exactly_one_root(
     def create(_: int) -> Any:
         return client.post(
             "/blocks",
-            json={"block_type": "work_batch", "data": batch_payload()},
+            json={"block_type": "work_batch", "status": "pending", "data": batch_payload()},
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -825,7 +825,7 @@ def test_identical_holdout_replay_with_different_parent_remains_conflict(
 def test_work_batch_must_satisfy_the_captain_contract(client: TestClient) -> None:
     response = client.post(
         "/blocks",
-        json={"block_type": "work_batch", "data": {"batch_id": "batch-1", "title": "Incomplete"}},
+        json={"block_type": "work_batch", "status": "pending", "data": {"batch_id": "batch-1", "title": "Incomplete"}},
     )
 
     assert response.status_code == 422
@@ -1186,7 +1186,7 @@ def test_mirror_failure_never_fails_a_ledger_write(storage: MariaDBStorage) -> N
 
     response = client.post(
         "/blocks",
-        json={"block_type": "work_batch", "data": batch_payload(title="T")},
+        json={"block_type": "work_batch", "status": "pending", "data": batch_payload(title="T")},
     )
 
     assert response.status_code == 201
@@ -1205,7 +1205,8 @@ def test_heartbeat_extends_a_live_claim(client: TestClient, storage: MariaDBStor
 
     assert response.status_code == 200
     expiry = datetime.fromisoformat(response.json()["claim_expires_at"])
-    assert timedelta(minutes=29) < expiry - datetime.now(timezone.utc) <= timedelta(minutes=30)
+    # A heartbeat renews the full claim TTL (default 90 minutes) and never shortens the lease.
+    assert timedelta(minutes=89) < expiry - datetime.now(timezone.utc) <= timedelta(minutes=90)
     blocks = storage.load()
     assert next(block for block in blocks if block["index"] == parent_index) == parent_before
     lifecycle = [block for block in blocks if block["parent_index"] == parent_index]
@@ -1243,6 +1244,33 @@ def test_expired_claim_requires_recovery_before_reclaim_and_lists_as_pending(
         new_token,
         data={"batch_id": "batch-1", "iteration": 2},
     ).status_code == 201
+
+
+def test_second_expired_claim_requires_its_own_recovery_and_is_not_stranded(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gateway import store as store_module
+
+    start = datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(store_module, "_utcnow", lambda: start)
+    create_batch(client)
+    claim(client)
+    monkeypatch.setattr(store_module, "_utcnow", lambda: start + timedelta(minutes=91))
+    requeue_expired_claim(client)
+    claim(client)
+    monkeypatch.setattr(store_module, "_utcnow", lambda: start + timedelta(minutes=183))
+
+    # The second claim expired: the batch must surface as recoverable, not stay "claimed".
+    assert client.get("/batches/batch-1").json()["status"] == "pending"
+    assert client.get("/batches", params={"status": "pending"}).json() == [
+        {"batch_id": "batch-1", "title": "Build the notification workflow"}
+    ]
+    # Iteration 2 still needs its own recovery decision before anyone may reclaim.
+    assert client.post("/batches/batch-1/claim").status_code == 409
+    requeue_expired_claim(client, iteration=2)
+    claim(client)
+    assert client.get("/batches/batch-1").json()["claim_iteration"] == 3
 
 
 def test_approve_is_flag_gated_and_transitions_pending_review(storage: MariaDBStorage) -> None:

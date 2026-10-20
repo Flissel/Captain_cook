@@ -291,6 +291,8 @@ class GatewayBenchmarkToolBrokerSession:
             authorization is None
             or authorization.call_id != call_id
             or authorization.lease_id != lease_id
+            # The lease authorizes one operation; never rely on the registry alone.
+            or authorization.operation != operation
             or tool_key in self._results
         ):
             raise CapabilityLiveAuthorityUnavailable(

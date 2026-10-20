@@ -59,6 +59,13 @@ class AutonomousCaptainPlanner:
         else:
             compiled = await self._pipeline.compile(planning_context)
         plan = self._compiler.compile(project_input, compiled.batches, compiled.holdouts)
+        # Publish the canonical plan before any batch reaches the Gateway: a released
+        # batch is claimable immediately unless the Gateway review gate holds it.
+        CanonicalPlanPublisher(self._output_dir).publish(
+            project_input,
+            plan,
+            compiled.holdouts,
+        )
         if release_compiled:
             if run_id is None:
                 await self._pipeline.release(compiled)
@@ -67,11 +74,6 @@ class AutonomousCaptainPlanner:
                     planning_context,
                     run_id=run_id,
                 )
-        CanonicalPlanPublisher(self._output_dir).publish(
-            project_input,
-            plan,
-            compiled.holdouts,
-        )
         return AutonomousPlanningResult(
             plan=plan,
             output_dir=str(self._output_dir.resolve()),
