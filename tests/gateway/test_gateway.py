@@ -594,12 +594,14 @@ def test_append_retries_only_documented_transaction_errors(
     retry_delays: list[float] = []
     monkeypatch.setattr("gateway.store.time.sleep", retry_delays.append)
 
-    def transient_then_success(request: BlockRequest, claim_token: str | None) -> dict[str, Any]:
+    def transient_then_success(
+        request: BlockRequest, claim_token: str | None, agent_id: str | None = None
+    ) -> dict[str, Any]:
         nonlocal attempts
         attempts += 1
         if attempts < 3:
             raise OperationalError(1213, "deadlock victim")
-        return original(request, claim_token)
+        return original(request, claim_token, agent_id)
 
     monkeypatch.setattr(store, "_append_once", transient_then_success)
     assert store.append(request, None)["block_type"] == "work_batch"
@@ -609,7 +611,9 @@ def test_append_retries_only_documented_transaction_errors(
     monkeypatch.setattr(
         store,
         "_append_once",
-        lambda request, claim_token: (_ for _ in ()).throw(OperationalError(9999, "other")),
+        lambda request, claim_token, agent_id=None: (_ for _ in ()).throw(
+            OperationalError(9999, "other")
+        ),
     )
     with pytest.raises(OperationalError) as error:
         store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-2")), None)
@@ -618,7 +622,9 @@ def test_append_retries_only_documented_transaction_errors(
 
     exhausted_attempts = 0
 
-    def always_transient(request: BlockRequest, claim_token: str | None) -> dict[str, Any]:
+    def always_transient(
+        request: BlockRequest, claim_token: str | None, agent_id: str | None = None
+    ) -> dict[str, Any]:
         nonlocal exhausted_attempts
         exhausted_attempts += 1
         raise OperationalError(1213, "persistent deadlock")
