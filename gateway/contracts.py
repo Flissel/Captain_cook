@@ -866,6 +866,8 @@ class BatchProjection(BaseModel):
     recovered_iteration: int | None = None
     passing_review_recorded: bool = False
     failed_review_count: int = 0
+    # Appended last to keep the established field order stable.
+    claim_agent_id: str | None = None
 
 
 class ActiveCodexSession(BaseModel):
@@ -892,6 +894,8 @@ class ClaimEvent(BaseModel):
     fencing_token: int = Field(ge=1, strict=True)
     claim_token_sha256: str
     claim_expires_at: datetime
+    # Registered agent that took the claim; None for legacy/shared-token claims.
+    agent_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 class HeartbeatEvent(BaseModel):
@@ -1120,6 +1124,7 @@ def project_batch(
     status: BatchStatus = parent["status"]
     claim_token_sha256: str | None = None
     claim_id: str | None = None
+    claim_agent_id: str | None = None
     fencing_token: int | None = None
     claim_expires_at: datetime | None = None
     claim_iteration = 0
@@ -1163,6 +1168,7 @@ def project_batch(
             claim_iteration += 1
             claim_token_sha256 = event.claim_token_sha256
             claim_id = event.claim_id
+            claim_agent_id = event.agent_id
             fencing_token = event.fencing_token
             claim_expires_at = _as_utc(event.claim_expires_at)
             codex_session_recorded = False
@@ -1229,6 +1235,7 @@ def project_batch(
             recovered_iteration = event.iteration
             claim_token_sha256 = None
             claim_id = None
+            claim_agent_id = None
             fencing_token = None
             claim_expires_at = None
             if event.decision == "aborted_infra":
@@ -1266,6 +1273,7 @@ def project_batch(
         status=status,
         claim_token_sha256=claim_token_sha256,
         claim_id=claim_id,
+        claim_agent_id=claim_agent_id,
         fencing_token=fencing_token,
         claim_expires_at=claim_expires_at,
         claim_iteration=claim_iteration,

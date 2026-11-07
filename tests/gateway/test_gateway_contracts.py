@@ -123,6 +123,7 @@ def test_existing_batch_projection_contract_remains_compatible() -> None:
         "recovered_iteration",
         "passing_review_recorded",
         "failed_review_count",
+        "claim_agent_id",
     )
 
 

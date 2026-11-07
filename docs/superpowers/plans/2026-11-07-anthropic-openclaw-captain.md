@@ -59,7 +59,11 @@ replay) but not yet a trust base for generated agents.
       derive the start status from hashed data; run `verify_chain` at gateway
       startup and periodically (today it has no production caller); give the
       gateway DB user INSERT/SELECT only on `blocks`.
-- [ ] Agent identity: claims carry no `worker_id` and all workers share one
+- [x] Agent identity (done: `WORKER_AGENT_TOKEN_SHA256_JSON` per-agent tokens,
+      claims bound via `ClaimEvent.agent_id`; heartbeat, evidence, holdout and
+      delivery events refused for other agents; `GATEWAY_REQUIRE_AGENT_IDENTITY`
+      refuses shared-token claims. Also closed: any worker could post delivery
+      events against another claim because `claim_id` is world-readable): claims carry no `worker_id` and all workers share one
       token (`gateway/auth.py:60-80`, claim route `gateway/app.py:1567`).
       Per-agent tokens, `agent_id` in `ClaimEvent`, checked against
       `trace.worker_id`.

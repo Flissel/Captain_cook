@@ -45,6 +45,7 @@ jobs:
           tests/blockchain/test_mariadb_storage.py
           tests/gateway/test_gateway.py
           tests/gateway/test_agent_runtime.py
+          tests/gateway/test_gateway_auth.py
       - name: Exercise architecture and CI contracts
         run: >-
           python -m pytest -q --no-cov -rs

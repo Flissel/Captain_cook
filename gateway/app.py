@@ -58,6 +58,7 @@ from agenten.agent_factory.skill_workflow_contracts import TeamEvaluationV1
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from gateway.auth import (
     GatewayRole,
+    current_agent_id,
     load_gateway_settings,
     require_actor,
     require_captain,
@@ -118,6 +119,7 @@ from gateway.store import (
     GatewayStore,
     PortalCredentialMetadataSource,
     PortalCredentialVerificationSource,
+    require_claim_identity,
     verify_ledger_chain,
 )
 from gateway.integration_setup_contracts import (
@@ -1539,6 +1541,7 @@ def create_app(
         event: DeliveryEventEnvelope,
         response: Response,
         actor: GatewayRole = Depends(require_actor),
+        agent_id: str | None = Depends(current_agent_id),
     ) -> AppendResult:
         require_skill_event_writer(event, actor)
         result = get_store().append_delivery_event(
@@ -1547,6 +1550,7 @@ def create_app(
                 actor is GatewayRole.WORKER
                 and event.event_type not in HERMES_SKILL_EVENT_TYPES
             ),
+            agent_id=agent_id,
         )
         response.status_code = status.HTTP_200_OK if result.replayed else status.HTTP_201_CREATED
         return result
@@ -1598,16 +1602,19 @@ def create_app(
     async def claim_batch(
         batch_id: str,
         _: GatewayRole = Depends(require_worker),
+        agent_id: str | None = Depends(current_agent_id),
     ) -> dict[str, str | int]:
-        return get_store().claim(batch_id)
+        require_claim_identity(agent_id, required_settings=load_gateway_settings(app))
+        return get_store().claim(batch_id, agent_id)
 
     @app.post("/batches/{batch_id}/claim/heartbeat")
     async def heartbeat(
         batch_id: str,
         x_claim_token: str | None = Header(default=None),
         _: GatewayRole = Depends(require_worker),
+        agent_id: str | None = Depends(current_agent_id),
     ) -> dict[str, str]:
-        return get_store().heartbeat(batch_id, x_claim_token)
+        return get_store().heartbeat(batch_id, x_claim_token, agent_id)
 
     @app.post("/batches/{batch_id}/approve")
     async def approve(
@@ -1666,12 +1673,13 @@ def create_app(
         request: BlockRequest,
         x_claim_token: str | None = Header(default=None),
         actor: GatewayRole = Depends(require_actor),
+        agent_id: str | None = Depends(current_agent_id),
     ) -> dict[str, Any]:
         require_block_writer(request.block_type, actor)
         request = apply_review_gate(
             request, approval_enabled=load_gateway_settings(app).approval_enabled
         )
-        block = get_store().append(request, x_claim_token)
+        block = get_store().append(request, x_claim_token, agent_id)
         try:
             mirror.enqueue_nowait(block)
         except Exception:

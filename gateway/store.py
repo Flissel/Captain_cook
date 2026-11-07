@@ -228,6 +228,23 @@ def require_generic_block_type(block_type: str) -> None:
         )
 
 
+class _IdentitySettings(Protocol):
+    @property
+    def require_agent_identity(self) -> bool: ...
+
+
+def require_claim_identity(agent_id: str | None, *, required_settings: _IdentitySettings) -> None:
+    """Refuse shared-token claims once per-agent identity is mandatory."""
+
+    if agent_id is None and required_settings.require_agent_identity:
+        raise HTTPException(status_code=403, detail="agent identity required to claim")
+
+
+def _require_claim_agent(projection: BatchProjection, agent_id: str | None) -> None:
+    if projection.claim_agent_id is not None and agent_id != projection.claim_agent_id:
+        raise HTTPException(status_code=403, detail="claim belongs to another agent")
+
+
 class _LoadableLedger(Protocol):
     def load(self) -> list[dict[str, Any]]: ...
 
@@ -2062,12 +2079,14 @@ class GatewayStore:
         event: DeliveryEventEnvelope,
         *,
         require_current_claim: bool = False,
+        agent_id: str | None = None,
     ) -> AppendResult:
         try:
             stored = self._retry_write(
                 lambda: self._append_delivery_event_once(
                     event,
                     require_current_claim=require_current_claim,
+                    agent_id=agent_id,
                 )
             )
             return AppendResult(event=stored, replayed=False)
@@ -2079,6 +2098,7 @@ class GatewayStore:
         event: DeliveryEventEnvelope,
         *,
         require_current_claim: bool,
+        agent_id: str | None = None,
     ) -> DeliveryEventEnvelope:
         canonical = event.model_dump(mode="json")
         trace = event.trace
@@ -2107,6 +2127,9 @@ class GatewayStore:
                             status_code=409,
                             detail="delivery event must match the current claim",
                         )
+                    # claim_id is readable by every worker; only the agent
+                    # that holds a bound claim may report against it.
+                    _require_claim_agent(projection, agent_id)
                 cursor.execute(
                     """
                     SELECT data FROM blocks
@@ -7765,6 +7788,7 @@ class GatewayStore:
         token: str | None,
         *,
         now: datetime,
+        agent_id: str | None = None,
     ) -> None:
         presented_hash = hashlib.sha256((token or "").encode("utf-8")).hexdigest()
         expires = projection.claim_expires_at
@@ -7777,6 +7801,7 @@ class GatewayStore:
             or expires <= now
         ):
             raise HTTPException(status_code=409, detail="invalid or expired claim token")
+        _require_claim_agent(projection, agent_id)
 
     @staticmethod
     def _validate_candidate(
@@ -7807,9 +7832,14 @@ class GatewayStore:
                 time.sleep(TRANSACTION_RETRY_DELAYS_SECONDS[attempt])
         raise RuntimeError("unreachable transaction retry state")
 
-    def append(self, request: BlockWrite, claim_token: str | None) -> dict[str, Any]:
+    def append(
+        self,
+        request: BlockWrite,
+        claim_token: str | None,
+        agent_id: str | None = None,
+    ) -> dict[str, Any]:
         try:
-            return self._retry_write(lambda: self._append_once(request, claim_token))
+            return self._retry_write(lambda: self._append_once(request, claim_token, agent_id))
         except _IdempotentReplay as replay:
             return replay.block
 
@@ -7820,7 +7850,12 @@ class GatewayStore:
     ) -> bool:
         return existing["data"] == data
 
-    def _append_once(self, request: BlockWrite, claim_token: str | None) -> dict[str, Any]:
+    def _append_once(
+        self,
+        request: BlockWrite,
+        claim_token: str | None,
+        agent_id: str | None = None,
+    ) -> dict[str, Any]:
         block_type = request.block_type
         require_generic_block_type(block_type)
         data = dict(request.data)
@@ -7855,7 +7890,7 @@ class GatewayStore:
                         for_update=True,
                         now=now,
                     )
-                    self._assert_live_claim(projection, claim_token, now=now)
+                    self._assert_live_claim(projection, claim_token, now=now, agent_id=agent_id)
                     if parent_index is None:
                         parent_index = parent["index"]
                     elif parent_index != parent["index"]:
@@ -8192,10 +8227,10 @@ class GatewayStore:
                     self._insert(cursor, terminal)
         return block
 
-    def claim(self, batch_id: str) -> dict[str, str | int]:
-        return self._retry_write(lambda: self._claim_once(batch_id))
+    def claim(self, batch_id: str, agent_id: str | None = None) -> dict[str, str | int]:
+        return self._retry_write(lambda: self._claim_once(batch_id, agent_id))
 
-    def _claim_once(self, batch_id: str) -> dict[str, str]:
+    def _claim_once(self, batch_id: str, agent_id: str | None = None) -> dict[str, str]:
         now = _utcnow()
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
@@ -8221,12 +8256,14 @@ class GatewayStore:
                     fencing_token=fencing_token,
                     claim_token_sha256=hashlib.sha256(token.encode("utf-8")).hexdigest(),
                     claim_expires_at=expiry,
+                    agent_id=agent_id,
                 )
                 block = self._new_block(
                     cursor,
                     index=index,
                     block_type="batch_claimed",
-                    data=event.model_dump(mode="json"),
+                    # Legacy shared-token claims keep their historic shape.
+                    data=event.model_dump(mode="json", exclude_none=True),
                     status="recorded",
                     parent_index=parent["index"],
                 )
@@ -8239,10 +8276,20 @@ class GatewayStore:
             "claim_expires_at": expiry.isoformat(),
         }
 
-    def heartbeat(self, batch_id: str, token: str | None) -> dict[str, str]:
-        return self._retry_write(lambda: self._heartbeat_once(batch_id, token))
+    def heartbeat(
+        self,
+        batch_id: str,
+        token: str | None,
+        agent_id: str | None = None,
+    ) -> dict[str, str]:
+        return self._retry_write(lambda: self._heartbeat_once(batch_id, token, agent_id))
 
-    def _heartbeat_once(self, batch_id: str, token: str | None) -> dict[str, str]:
+    def _heartbeat_once(
+        self,
+        batch_id: str,
+        token: str | None,
+        agent_id: str | None = None,
+    ) -> dict[str, str]:
         now = _utcnow()
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
@@ -8253,7 +8300,7 @@ class GatewayStore:
                     for_update=True,
                     now=now,
                 )
-                self._assert_live_claim(projection, token, now=now)
+                self._assert_live_claim(projection, token, now=now, agent_id=agent_id)
                 expiry = renewed_claim_expiry(
                     projection.claim_expires_at, now, self._claim_ttl
                 )
@@ -8354,7 +8401,12 @@ class GatewayStore:
             }
         return decoded if include_holdout else [row for row in decoded if row["block_type"] != "holdout"]
 
-    def holdout(self, batch_id: str, token: str | None) -> dict[str, Any]:
+    def holdout(
+        self,
+        batch_id: str,
+        token: str | None,
+        agent_id: str | None = None,
+    ) -> dict[str, Any]:
         now = _utcnow()
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
@@ -8364,7 +8416,7 @@ class GatewayStore:
                     for_update=True,
                     now=now,
                 )
-                self._assert_live_claim(projection, token, now=now)
+                self._assert_live_claim(projection, token, now=now, agent_id=agent_id)
                 if not projection.codex_session_recorded:
                     raise HTTPException(status_code=404, detail="holdout not released")
                 cursor.execute(
