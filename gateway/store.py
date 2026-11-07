@@ -101,7 +101,7 @@ from agenten.agent_factory.state_machine import (
     next_action,
 )
 from agenten.agent_factory.workflow_promotion import build_release_workflow_promotion
-from blockchain.Blockchain_modell import Block
+from blockchain.Blockchain_modell import Block, verify_chain
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
     REVIEW_MARKER_BLOCK_TYPE,
@@ -226,6 +226,22 @@ def require_generic_block_type(block_type: str) -> None:
             status_code=422,
             detail=f"{block_type} is not writable through /blocks",
         )
+
+
+class _LoadableLedger(Protocol):
+    def load(self) -> list[dict[str, Any]]: ...
+
+
+def verify_ledger_chain(storage: _LoadableLedger) -> int:
+    """Re-verify linkage and payload hashes of the whole ledger.
+
+    Raises `ChainVerificationError` on a broken link or edited payload and
+    returns the number of verified blocks.
+    """
+
+    rows = storage.load()
+    verify_chain([Block(**row) for row in rows])
+    return len(rows)
 
 
 class BlockWrite(Protocol):

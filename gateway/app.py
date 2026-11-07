@@ -118,6 +118,7 @@ from gateway.store import (
     GatewayStore,
     PortalCredentialMetadataSource,
     PortalCredentialVerificationSource,
+    verify_ledger_chain,
 )
 from gateway.integration_setup_contracts import (
     IntegrationSetupMutationV1,
@@ -327,6 +328,17 @@ HERMES_SKILL_EVENT_TYPES = frozenset(
 )
 
 
+def verify_ledger_before_serving(storage: object) -> None:
+    """Fail closed: never serve from a ledger whose hash chain is broken.
+
+    Storage doubles without a ledger (`load`) are composition-test stand-ins.
+    """
+
+    if callable(getattr(storage, "load", None)):
+        verified = verify_ledger_chain(storage)  # type: ignore[arg-type]
+        logger.info("Verified ledger hash chain (%d blocks)", verified)
+
+
 def require_block_writer(block_type: str, actor: GatewayRole) -> None:
     expected = (
         GatewayRole.CAPTAIN
@@ -478,6 +490,7 @@ def create_app(
             if configured is not None and configured.provider_proxy_url is not None
             else (),
         )
+        verify_ledger_before_serving(target_storage)
         if (
             configured is not None
             and configured.portal_n8n_adapters_configured
@@ -1913,8 +1926,10 @@ def create_production_app_from_environment(
     clock = lambda: datetime.now(timezone.utc)
     artifacts = ContentAddressedArtifactAdapter(bootstrap.artifact_root)
     source_artifacts = RepositoryFactoryInputArtifactStore(artifacts=artifacts)
+    ledger_storage = MariaDBStorage(configured.ledger_dsn.get_secret_value())
+    verify_ledger_before_serving(ledger_storage)
     gateway = GatewayStore(
-        MariaDBStorage(configured.ledger_dsn.get_secret_value()),
+        ledger_storage,
         claim_ttl=timedelta(seconds=configured.claim_ttl_seconds),
         runtime_usage_artifacts=artifacts,
         runtime_provider_proxy_bindings=((
