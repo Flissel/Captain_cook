@@ -51,7 +51,10 @@ replay) but not yet a trust base for generated agents.
       Workers may write only `codex_session`, `codex_process`,
       `reasoning_slice`, `validation_run`, `batch_done`; Captain only
       `problem`, `work_batch`, `holdout`; everything else via dedicated routes.
-- [ ] Tamper evidence: `project_batch` starts from unhashed `parent["status"]`
+- [x] Tamper evidence (done: hashed `batch_review_required` child instead of a
+      `WorkBatch` field, startup `verify_ledger_chain`, append-only DB triggers
+      instead of grants because MariaDB cannot partially revoke a database-wide
+      grant; batches created before the change keep the old status rule): `project_batch` starts from unhashed `parent["status"]`
       (`gateway/contracts.py:1090`). Hash `status` (and schema metadata) or
       derive the start status from hashed data; run `verify_chain` at gateway
       startup and periodically (today it has no production caller); give the

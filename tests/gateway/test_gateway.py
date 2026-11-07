@@ -1329,9 +1329,11 @@ def test_tampered_review_status_column_cannot_bypass_the_review_gate(
     )
     create_batch(client, status="pending_review")
 
-    # Simulate a direct database edit of the unhashed status column.
+    # Simulate an administrator who drops the append-only guard and edits the
+    # unhashed status column directly.
     with storage.transaction() as connection:
         with connection.cursor() as cursor:
+            cursor.execute("DROP TRIGGER IF EXISTS blocks_append_only_update")
             cursor.execute(
                 "UPDATE blocks SET status = 'pending' WHERE block_type = 'work_batch'"
             )
