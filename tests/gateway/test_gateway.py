@@ -855,6 +855,26 @@ def test_worker_blocks_require_the_current_fencing_token(client: TestClient) -> 
     assert worker_block(client, token).status_code == 201
 
 
+@pytest.mark.parametrize(
+    "block_type",
+    ["delivery_event", "agent_runtime_command", "agent_runtime_grant", "validated_capability"],
+)
+def test_claimed_worker_cannot_forge_dedicated_route_block_types(
+    client: TestClient,
+    storage: MariaDBStorage,
+    block_type: str,
+) -> None:
+    create_batch(client)
+    token = claim(client)
+    before = len(storage.load())
+
+    response = worker_block(client, token, block_type=block_type, status="recorded")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == f"{block_type} is not writable through /blocks"
+    assert len(storage.load()) == before
+
+
 def test_fenced_block_cannot_attach_to_another_batch(client: TestClient) -> None:
     create_batch(client, "batch-1")
     other_parent = create_batch(client, "batch-2")

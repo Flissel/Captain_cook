@@ -44,7 +44,7 @@ replay) but not yet a trust base for generated agents.
 
 ## Phase 1 - ledger must-fix (before any agent gets tools)
 
-- [ ] `POST /blocks` allow-list instead of deny-list. Today only
+- [x] `POST /blocks` allow-list instead of deny-list. Today only
       `GATEWAY_OWNED_EVENT_TYPES` (5 types, `gateway/store.py:191`, check at
       `:7778`) are rejected, so a worker with a live claim can write
       `delivery_event`, `agent_runtime_command`, `agent_runtime_grant`, ...

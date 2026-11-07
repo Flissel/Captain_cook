@@ -193,10 +193,31 @@ CAPTAIN_BLOCK_TYPES = frozenset({"problem", "work_batch", "holdout"})
 GATEWAY_OWNED_EVENT_TYPES = frozenset(
     {"batch_claimed", "batch_heartbeat", "batch_approved", "recovery_decision", "review_decision"}
 )
+WORKER_EVIDENCE_BLOCK_TYPES = frozenset(
+    {"codex_session", "codex_process", "reasoning_slice", "validation_run", "batch_done"}
+)
+# `POST /blocks` is an allow-list: every other block type has a dedicated route
+# with its own validation and authority, and must not be forgeable generically.
+GENERIC_BLOCK_TYPES = CAPTAIN_BLOCK_TYPES | WORKER_EVIDENCE_BLOCK_TYPES
 TRANSIENT_TRANSACTION_ERRORS = frozenset({1020, 1213})
 TRANSACTION_ATTEMPTS = 3
 TRANSACTION_RETRY_DELAYS_SECONDS = (0.05, 0.1)
 WriteResult = TypeVar("WriteResult")
+
+
+def require_generic_block_type(block_type: str) -> None:
+    """Reject block types that `POST /blocks` must not write."""
+
+    if block_type in GATEWAY_OWNED_EVENT_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{block_type} must use its dedicated gateway route",
+        )
+    if block_type not in GENERIC_BLOCK_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{block_type} is not writable through /blocks",
+        )
 
 
 class BlockWrite(Protocol):
@@ -7777,11 +7798,7 @@ class GatewayStore:
 
     def _append_once(self, request: BlockWrite, claim_token: str | None) -> dict[str, Any]:
         block_type = request.block_type
-        if block_type in GATEWAY_OWNED_EVENT_TYPES:
-            raise HTTPException(
-                status_code=422,
-                detail=f"{block_type} must use its dedicated gateway route",
-            )
+        require_generic_block_type(block_type)
         data = dict(request.data)
         try:
             if block_type == "work_batch":
