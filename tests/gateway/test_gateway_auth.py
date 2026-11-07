@@ -394,7 +394,7 @@ def test_review_route_is_captain_only_and_binds_current_validation(
     batch = client.post(
         "/blocks",
         headers=captain,
-        json={"block_type": "work_batch", "data": batch_payload()},
+        json={"block_type": "work_batch", "status": "pending", "data": batch_payload()},
     )
     assert batch.status_code == 201
     claimed = client.post("/batches/batch-1/claim", headers=worker)
@@ -487,7 +487,7 @@ def test_fifth_immutable_failed_review_appends_terminal_outcome(
     assert client.post(
         "/blocks",
         headers=captain,
-        json={"block_type": "work_batch", "data": batch_payload()},
+        json={"block_type": "work_batch", "status": "pending", "data": batch_payload()},
     ).status_code == 201
     claim = client.post("/batches/batch-1/claim", headers=worker).json()
     worker_claim = authorization(WORKER_TOKEN, claim_token=claim["claim_token"])
@@ -541,7 +541,7 @@ def test_recovery_route_is_captain_only_idempotent_and_cannot_be_bypassed(
     assert client.post(
         "/blocks",
         headers=captain,
-        json={"block_type": "work_batch", "data": batch_payload()},
+        json={"block_type": "work_batch", "status": "pending", "data": batch_payload()},
     ).status_code == 201
     claimed = client.post("/batches/batch-1/claim", headers=worker)
     assert claimed.status_code == 200
@@ -597,7 +597,7 @@ def test_expired_claim_requires_captain_requeue_before_worker_can_reclaim(
     assert client.post(
         "/blocks",
         headers=captain,
-        json={"block_type": "work_batch", "data": batch_payload()},
+        json={"block_type": "work_batch", "status": "pending", "data": batch_payload()},
     ).status_code == 201
     first = client.post("/batches/batch-1/claim", headers=worker)
     assert first.status_code == 200
@@ -630,7 +630,7 @@ def test_claim_id_remains_a_codex_request_identifier_for_all_random_bodies(
     assert client.post(
         "/blocks",
         headers=captain,
-        json={"block_type": "work_batch", "data": batch_payload()},
+        json={"block_type": "work_batch", "status": "pending", "data": batch_payload()},
     ).status_code == 201
 
     claim = client.post("/batches/batch-1/claim", headers=worker)

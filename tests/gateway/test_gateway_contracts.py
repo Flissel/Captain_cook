@@ -15,6 +15,8 @@ from gateway.contracts import (
     EvidenceEvent,
     HeartbeatEvent,
     ReviewDecisionEvent,
+    claim_requires_recovery,
+    renewed_claim_expiry,
     project_batch,
 )
 
@@ -339,6 +341,61 @@ def test_requeue_recovery_clears_the_expired_claim_and_projects_pending() -> Non
     assert projection.claim_iteration == 1
     assert projection.claim_token_sha256 is None
     assert projection.claim_expires_at is None
+
+
+def test_second_expired_claim_after_a_recovery_is_not_stranded_as_claimed() -> None:
+    first_recovery = child(
+        12,
+        "recovery_decision",
+        iteration=1,
+        reason="claim_expired",
+        decision="requeue",
+    )
+    blocks = [
+        work_batch(),
+        claim(11, expires_at=NOW - timedelta(hours=2)),
+        first_recovery,
+        claim(13, expires_at=NOW - timedelta(seconds=1)),
+    ]
+
+    projection = project_batch(blocks, BATCH_ID, now=NOW)
+
+    assert projection.status == "pending"
+    assert projection.claim_iteration == 2
+    assert projection.recovered_iteration == 1
+    # The expired second claim still needs its own recovery decision.
+    assert claim_requires_recovery(projection, NOW) is True
+
+    second_recovery = child(
+        14,
+        "recovery_decision",
+        iteration=2,
+        reason="claim_expired",
+        decision="requeue",
+    )
+    recovered = project_batch([*blocks, second_recovery], BATCH_ID, now=NOW)
+
+    assert recovered.status == "pending"
+    assert recovered.recovered_iteration == 2
+    assert claim_requires_recovery(recovered, NOW) is False
+
+
+def test_heartbeat_renews_the_full_lease_and_never_shortens_it() -> None:
+    ttl = timedelta(minutes=90)
+    fresh_claim_expiry = NOW + ttl
+
+    # Right after a 90-minute claim, a heartbeat must not cut the lease to 30 minutes.
+    assert renewed_claim_expiry(fresh_claim_expiry, NOW, ttl) == fresh_claim_expiry
+    # Later heartbeats renew the full configured lease from now.
+    later = NOW + timedelta(minutes=60)
+    assert renewed_claim_expiry(fresh_claim_expiry, later, ttl) == later + ttl
+    assert renewed_claim_expiry(None, NOW, ttl) == NOW + ttl
+
+
+def test_live_or_unclaimed_batches_never_require_recovery() -> None:
+    assert claim_requires_recovery(project_batch([work_batch()], BATCH_ID, now=NOW), NOW) is False
+    live = project_batch([work_batch(), claim(11)], BATCH_ID, now=NOW)
+    assert claim_requires_recovery(live, NOW) is False
 
 
 def test_aborted_infra_recovery_is_terminal() -> None:

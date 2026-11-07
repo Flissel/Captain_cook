@@ -259,6 +259,23 @@ class BlockRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+
+def apply_review_gate(request: BlockRequest, *, approval_enabled: bool) -> BlockRequest:
+    """Hold a released work batch for approval when the Gateway review gate is on.
+
+    Only the model default is replaced: an explicit status is a deliberate Captain
+    decision. With the gate off, batches stay immediately claimable as before.
+    """
+
+    if (
+        approval_enabled
+        and request.block_type == "work_batch"
+        and "status" not in request.model_fields_set
+    ):
+        return request.model_copy(update={"status": "pending_review"})
+    return request
+
+
 class SinkCall(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -1638,6 +1655,9 @@ def create_app(
         actor: GatewayRole = Depends(require_actor),
     ) -> dict[str, Any]:
         require_block_writer(request.block_type, actor)
+        request = apply_review_gate(
+            request, approval_enabled=load_gateway_settings(app).approval_enabled
+        )
         block = get_store().append(request, x_claim_token)
         try:
             mirror.enqueue_nowait(block)
@@ -1734,7 +1754,7 @@ def create_app(
             ) from None
 
     @app.post("/v1/factory-runtime/store")
-    def execute_factory_runtime_store(
+    async def execute_factory_runtime_store(
         command: FactoryGatewayRpcCommand,
         authorization: str | None = Header(default=None),
     ) -> object:

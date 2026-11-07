@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -50,7 +51,8 @@ def _create_committed_adapter_repository(tmp_path: Path) -> tuple[Path, bytes]:
 def _run_generator(repository: Path) -> subprocess.CompletedProcess[str]:
     return _run(
         [
-            str(ROOT / ".venv" / "Scripts" / "python.exe"),
+            # The interpreter running the suite: CI runners and worktrees have no repo .venv.
+            sys.executable,
             str(GENERATOR),
             "--repository-root",
             str(repository),

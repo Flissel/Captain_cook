@@ -160,3 +160,50 @@ async def test_resume_checkpoint_is_not_released_before_canonical_plan_validatio
         await planner.run(source, release_compiled=True, run_id="run-1")
 
     assert pipeline.release_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_plan_is_published_before_any_batch_is_released(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "input.md"
+    source.write_text("# Goal\n\nBuild safely.\n", encoding="utf-8")
+    batch = WorkBatch(
+        batch_id="safe",
+        title="Safe",
+        goal="Build safely",
+        subtask_ids=["sub-1"],
+        target="external",
+        acceptance_criteria=[
+            AcceptanceAssertion(
+                assertion_id="done",
+                kind=AssertionKind.STATUS_EQUALS,
+                expected="succeeded",
+            )
+        ],
+    )
+    holdout = HoldoutSuite(
+        batch_id="safe",
+        cases=[ExampleCase(case_id="hidden", input={"value": 2})],
+    )
+    output = tmp_path / "run"
+
+    class OrderRecordingPipeline:
+        plan_published_at_release: bool | None = None
+
+        async def compile(self, project_description: str):
+            del project_description
+            return CaptainCompiledPlan(batches=(batch,), holdouts=(holdout,))
+
+        async def release(self, compiled):
+            del compiled
+            # Workers can claim a released batch at once, so the reviewed plan must exist first.
+            self.plan_published_at_release = (output / "plans" / "index.md").exists()
+
+    pipeline = OrderRecordingPipeline()
+
+    await AutonomousCaptainPlanner(pipeline=pipeline, output_dir=output).run(
+        source, release_compiled=True
+    )
+
+    assert pipeline.plan_published_at_release is True

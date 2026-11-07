@@ -64,6 +64,7 @@ def publish_holdout(client: TestClient) -> None:
         headers=authorization(CAPTAIN_TOKEN),
         json={
             "block_type": "work_batch",
+            "status": "pending",
             "data": {
                 "batch_id": "batch-1",
                 "title": "Build workflow",
