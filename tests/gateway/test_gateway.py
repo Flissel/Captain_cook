@@ -1316,6 +1316,28 @@ def test_approve_is_flag_gated_and_transitions_pending_review(storage: MariaDBSt
     assert parent["children"] == []
     assert approval["parent_index"] == parent["index"]
     assert approval["data"] == {"batch_id": "batch-1"}
+    marker = next(block for block in blocks if block["block_type"] == "batch_review_required")
+    assert marker["parent_index"] == parent["index"]
+    assert parent["index"] < marker["index"] < approval["index"]
+
+
+def test_tampered_review_status_column_cannot_bypass_the_review_gate(
+    storage: MariaDBStorage,
+) -> None:
+    client = TestClient(
+        legacy_application(storage=storage, mirror=RecordingMirror(), approval_enabled=True)
+    )
+    create_batch(client, status="pending_review")
+
+    # Simulate a direct database edit of the unhashed status column.
+    with storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE blocks SET status = 'pending' WHERE block_type = 'work_batch'"
+            )
+
+    assert client.post("/batches/batch-1/claim").status_code == 409
+    assert client.get("/batches/batch-1").json()["status"] == "pending_review"
 
 
 def test_mock_crm_sink_round_trip(client: TestClient) -> None:

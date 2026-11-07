@@ -104,6 +104,7 @@ from agenten.agent_factory.workflow_promotion import build_release_workflow_prom
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
+    REVIEW_MARKER_BLOCK_TYPE,
     ActiveCodexSession,
     ArtifactBuiltPayload,
     BatchDoneEvent,
@@ -191,7 +192,14 @@ from gateway.portal_live_contracts import (
 
 CAPTAIN_BLOCK_TYPES = frozenset({"problem", "work_batch", "holdout"})
 GATEWAY_OWNED_EVENT_TYPES = frozenset(
-    {"batch_claimed", "batch_heartbeat", "batch_approved", "recovery_decision", "review_decision"}
+    {
+        "batch_claimed",
+        "batch_heartbeat",
+        "batch_approved",
+        "recovery_decision",
+        "review_decision",
+        REVIEW_MARKER_BLOCK_TYPE,
+    }
 )
 WORKER_EVIDENCE_BLOCK_TYPES = frozenset(
     {"codex_session", "codex_process", "reasoning_slice", "validation_run", "batch_done"}
@@ -7904,6 +7912,20 @@ class GatewayStore:
                 elif parent is not None:
                     self._validate_candidate(parent, children, block, batch_id, now=now)
                 self._insert(cursor, block)
+                if block_type == "work_batch" and request.status == "pending_review":
+                    # The status column is not hashed; pin the review gate in a
+                    # hashed child written in the same transaction.
+                    self._insert(
+                        cursor,
+                        self._new_block(
+                            cursor,
+                            index=self._next_index(cursor),
+                            block_type=REVIEW_MARKER_BLOCK_TYPE,
+                            data={"batch_id": batch_id},
+                            status="recorded",
+                            parent_index=block["index"],
+                        ),
+                    )
                 if block_type == "batch_done" and data["outcome"] == "succeeded":
                     self._upsert_capability(cursor, block)
         return block

@@ -971,8 +971,14 @@ class ReviewDecisionEvent(EvidenceEvent):
         return value
 
 
+# Gateway-written, hashed child that pins a batch to the review gate. The
+# parent `status` column is outside the block hash, so the review requirement
+# must not depend on it alone.
+REVIEW_MARKER_BLOCK_TYPE = "batch_review_required"
+
 _LIFECYCLE_BLOCK_TYPES = frozenset(
     {
+        REVIEW_MARKER_BLOCK_TYPE,
         "batch_approved",
         "batch_claimed",
         "batch_heartbeat",
@@ -1126,6 +1132,7 @@ def project_batch(
     passing_review_recorded = False
     failed_review_count = 0
     review_ids: set[str] = set()
+    lifecycle_seen = False
 
     for block in children:
         block_type = block.get("block_type")
@@ -1133,6 +1140,14 @@ def project_batch(
             continue
         if terminal:
             raise ValueError("lifecycle event cannot appear after terminal batch_done")
+
+        if block_type == REVIEW_MARKER_BLOCK_TYPE:
+            if lifecycle_seen:
+                raise ValueError("review marker must be the unique first lifecycle event")
+            lifecycle_seen = True
+            status = "pending_review"
+            continue
+        lifecycle_seen = True
 
         if block_type == "batch_approved":
             if status != "pending_review":
