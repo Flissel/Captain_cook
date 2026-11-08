@@ -1,0 +1,27 @@
+{
+  // Seed config, copied once into the home volume (JSON5).
+  // Secrets stay ${VAR} references resolved from the container environment.
+  "gateway": {
+    "mode": "local",
+    "bind": "lan",
+    "auth": { "token": "${OPENCLAW_GATEWAY_TOKEN}" },
+    "controlUi": {
+      "allowedOrigins": ["http://127.0.0.1:18889", "http://localhost:18889"]
+    }
+  },
+  "mcp": {
+    "servers": {
+      // Read-only Captain tools (agenten/captain_mcp/server.py on the host).
+      "captain": {
+        "url": "${CAPTAIN_MCP_URL}",
+        "transport": "streamable-http",
+        "headers": { "Authorization": "Bearer ${CAPTAIN_MCP_TOKEN}" },
+        "enabled": true
+      }
+    }
+  },
+  "tools": {
+    // Keep the few Captain tools visible upfront instead of deferred.
+    "toolSearch": false
+  }
+}

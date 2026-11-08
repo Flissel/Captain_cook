@@ -1,0 +1,89 @@
+# OpenClaw as Captain's planner (spike, plan 2026-11-07 Phase 5).
+#
+# Own Compose project and volume names so it never touches other stacks.
+# The whole container home is one named volume: Claude Code's binary, its
+# login (/home/node/.claude*, /home/node/.local) and OpenClaw state
+# (/home/node/.openclaw) must all survive image upgrades.
+#
+# Validate before starting:
+#   docker compose -f deploy/captain-openclaw/compose.captain-openclaw.yml config --quiet
+name: captain-openclaw
+
+x-openclaw-env: &openclaw-env
+  HOME: /home/node
+  TZ: ${TZ:-UTC}
+  OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:?OPENCLAW_GATEWAY_TOKEN is required}
+  # Read by openclaw.json via ${CAPTAIN_MCP_TOKEN}; never written into config.
+  CAPTAIN_MCP_TOKEN: ${CAPTAIN_MCP_TOKEN:?CAPTAIN_MCP_TOKEN is required}
+  CAPTAIN_MCP_URL: ${CAPTAIN_MCP_URL:-http://host.docker.internal:8121/mcp}
+
+services:
+  # One-shot: seed openclaw.json into the home volume if it is not there yet.
+  # Never overwrites an existing config (OpenClaw rewrites it on auth login).
+  captain-openclaw-seed:
+    image: ${CAPTAIN_OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:2026.10.4}
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        mkdir -p /home/node/.openclaw/workspace &&
+        if [ -f /home/node/.openclaw/openclaw.json ]; then
+        echo "openclaw.json exists, leaving it unchanged";
+        else cp /seed/openclaw.json /home/node/.openclaw/openclaw.json &&
+        echo "seeded openclaw.json"; fi
+    volumes:
+      - captain-openclaw-home:/home/node
+      - type: bind
+        source: ./openclaw.json
+        target: /seed/openclaw.json
+        read_only: true
+    restart: "no"
+
+  captain-openclaw-gateway:
+    image: ${CAPTAIN_OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:2026.10.4}
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
+    environment: *openclaw-env
+    volumes:
+      - captain-openclaw-home:/home/node
+    ports:
+      # Loopback only; 18889 avoids a default OpenClaw install on 18789.
+      - "127.0.0.1:${CAPTAIN_OPENCLAW_PORT:-18889}:18789"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      captain-openclaw-seed:
+        condition: service_completed_successfully
+    init: true
+    cap_drop:
+      - NET_RAW
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "dist/docker-healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    # Spike: started by hand, never on Docker Desktop boot.
+    restart: "no"
+
+  # CLI shares the gateway's network namespace (OpenClaw's documented shape).
+  captain-openclaw-cli:
+    image: ${CAPTAIN_OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:2026.10.4}
+    entrypoint: ["node", "dist/index.js"]
+    environment:
+      <<: *openclaw-env
+      BROWSER: echo
+    volumes:
+      - captain-openclaw-home:/home/node
+    network_mode: "service:captain-openclaw-gateway"
+    depends_on:
+      - captain-openclaw-gateway
+    stdin_open: true
+    tty: true
+    init: true
+    profiles: ["cli"]
+
+volumes:
+  captain-openclaw-home:
+    name: captain-openclaw-home
