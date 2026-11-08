@@ -15,7 +15,7 @@ x-openclaw-env: &openclaw-env
   OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:?OPENCLAW_GATEWAY_TOKEN is required}
   # Read by openclaw.json via ${CAPTAIN_MCP_TOKEN}; never written into config.
   CAPTAIN_MCP_TOKEN: ${CAPTAIN_MCP_TOKEN:?CAPTAIN_MCP_TOKEN is required}
-  CAPTAIN_MCP_URL: ${CAPTAIN_MCP_URL:-http://host.docker.internal:8121/mcp}
+  CAPTAIN_MCP_URL: ${CAPTAIN_MCP_URL:-http://host.docker.internal:18121/mcp}
 
 services:
   # One-shot: seed openclaw.json into the home volume if it is not there yet.

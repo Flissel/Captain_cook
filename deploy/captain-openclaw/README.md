@@ -7,7 +7,7 @@ over MCP. Scope is read-only: `list_batches` and `get_batch`.
 
 ```
 OpenClaw (container, :18889 loopback)
-  └─ MCP streamable-http ─> Captain MCP server (host, 127.0.0.1:8121, bearer)
+  └─ MCP streamable-http ─> Captain MCP server (host, 127.0.0.1:18121, bearer)
         └─ HTTP, agent token "openclaw" ─> Captain gateway (host, :8090)
               └─ throwaway MariaDB (Compose project captain-openclaw-ledger, :3307)
 ```

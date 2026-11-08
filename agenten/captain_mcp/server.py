@@ -159,7 +159,7 @@ class McpSettings:
     gateway_token: str
     inbound_token: str
     host: str = "127.0.0.1"
-    port: int = 8121
+    port: int = 18121
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str]) -> "McpSettings":
@@ -170,7 +170,7 @@ class McpSettings:
             raise CaptainMcpConfigurationError(
                 "CAPTAIN_MCP_TOKEN must differ from CAPTAIN_MCP_GATEWAY_TOKEN"
             )
-        port_raw = environment.get("CAPTAIN_MCP_PORT", "8121").strip()
+        port_raw = environment.get("CAPTAIN_MCP_PORT", "18121").strip()
         try:
             port = int(port_raw)
         except ValueError:

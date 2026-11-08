@@ -6,7 +6,7 @@ gitignored. Secret values are never printed.
 
     python scripts/openclaw_spike.py init-env
     python scripts/openclaw_spike.py gateway      # Captain gateway on :8090
-    python scripts/openclaw_spike.py mcp          # Captain MCP server on :8121
+    python scripts/openclaw_spike.py mcp          # Captain MCP server on :18121
     python scripts/openclaw_spike.py seed-batch   # one pending work_batch
 """
 
@@ -95,10 +95,28 @@ def _load_into_process(path: Path) -> None:
     os.environ.update(read_env(path))
 
 
-def _run_gateway() -> None:
-    from gateway.app import main
+class _NullMirror:
+    """The spike has no Minibook; drop projections instead of queueing them."""
 
-    main()
+    def enqueue_nowait(self, block: object) -> None:
+        del block
+
+
+def _run_gateway() -> None:
+    # Core gateway only (the routes the MCP server reads), the same app the
+    # gateway tests build. The production builder also wires provider,
+    # billing and capability-assembly services the spike does not need.
+    import uvicorn
+
+    from blockchain.mariadb_storage import MariaDBStorage
+    from gateway.app import create_app, verify_ledger_before_serving
+    from gateway.settings import GatewaySettings
+
+    settings = GatewaySettings.from_env()
+    storage = MariaDBStorage(settings.ledger_dsn.get_secret_value())
+    verify_ledger_before_serving(storage)
+    app = create_app(storage=storage, mirror=_NullMirror(), settings=settings)
+    uvicorn.run(app, host="127.0.0.1", port=settings.port, log_level="warning")
 
 
 def _run_mcp() -> None:

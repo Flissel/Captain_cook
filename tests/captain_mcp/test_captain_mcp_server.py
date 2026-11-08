@@ -107,7 +107,7 @@ def test_settings_load_with_loopback_defaults() -> None:
     settings = McpSettings.from_env(environment())
 
     assert settings.host == "127.0.0.1"
-    assert settings.port == 8121
+    assert settings.port == 18121
 
 
 @pytest.mark.parametrize("missing", ["CAPTAIN_GATEWAY_URL", "CAPTAIN_MCP_GATEWAY_TOKEN", "CAPTAIN_MCP_TOKEN"])
@@ -129,7 +129,7 @@ def test_inbound_and_gateway_tokens_must_differ() -> None:
 
 
 def mcp_client(seen: list[httpx.Request]) -> TestClient:
-    return TestClient(create_mcp_app(reader(seen), inbound_token=MCP_TOKEN), base_url="http://127.0.0.1:8121")
+    return TestClient(create_mcp_app(reader(seen), inbound_token=MCP_TOKEN), base_url="http://127.0.0.1:18121")
 
 
 def rpc(client: TestClient, method: str, params: dict[str, Any], *, token: str | None = MCP_TOKEN) -> httpx.Response:
@@ -183,5 +183,5 @@ def test_container_host_name_is_accepted() -> None:
     """OpenClaw in Docker reaches the host as host.docker.internal."""
 
     app = create_mcp_app(reader([]), inbound_token=MCP_TOKEN)
-    with TestClient(app, base_url="http://host.docker.internal:8121") as client:
+    with TestClient(app, base_url="http://host.docker.internal:18121") as client:
         assert rpc(client, "initialize", INIT).status_code == 200
