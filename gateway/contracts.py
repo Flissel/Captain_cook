@@ -841,6 +841,7 @@ BatchStatus: TypeAlias = Literal[
     "failed_after_max_iterations",
     "aborted_infra",
 ]
+CancelReason: TypeAlias = Literal["captain_cancelled", "operator_cancelled", "policy_violation"]
 TerminalOutcome: TypeAlias = Literal[
     "succeeded",
     "failed",
@@ -868,6 +869,9 @@ class BatchProjection(BaseModel):
     failed_review_count: int = 0
     # Appended last to keep the established field order stable.
     claim_agent_id: str | None = None
+    # Set only by a Captain `batch_cancelled`, never by a worker's own
+    # cancelled `batch_done`; it is what turns writes into 410.
+    cancel_reason: CancelReason | None = None
 
 
 class ActiveCodexSession(BaseModel):
@@ -951,9 +955,6 @@ class RecoveryDecisionEvent(BaseModel):
     iteration: int = Field(ge=1, strict=True)
     reason: Literal["claim_expired"]
     decision: Literal["requeue", "aborted_infra"]
-
-
-CancelReason: TypeAlias = Literal["captain_cancelled", "operator_cancelled", "policy_violation"]
 
 
 class BatchCancelRequest(BaseModel):
@@ -1149,6 +1150,7 @@ def project_batch(
     claim_token_sha256: str | None = None
     claim_id: str | None = None
     claim_agent_id: str | None = None
+    cancel_reason: CancelReason | None = None
     fencing_token: int | None = None
     claim_expires_at: datetime | None = None
     claim_iteration = 0
@@ -1188,6 +1190,7 @@ def project_batch(
             claim_agent_id = None
             fencing_token = None
             claim_expires_at = None
+            cancel_reason = event.reason
             status = "cancelled"
             terminal = True
             continue
@@ -1321,4 +1324,5 @@ def project_batch(
         recovered_iteration=recovered_iteration,
         passing_review_recorded=passing_review_recorded,
         failed_review_count=failed_review_count,
+        cancel_reason=cancel_reason,
     )

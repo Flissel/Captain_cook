@@ -69,6 +69,9 @@ class GatewayBatchProjection(BaseModel):
     passing_review_recorded: bool = False
     failed_review_count: int = Field(default=0, ge=0, strict=True)
     claim_agent_id: str | None = None
+    cancel_reason: (
+        Literal["captain_cancelled", "operator_cancelled", "policy_violation"] | None
+    ) = None
 
 
 class GatewayClaim(BaseModel):

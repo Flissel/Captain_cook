@@ -251,3 +251,29 @@ def test_only_captain_may_cancel_and_replays_answer_200() -> None:
     assert first.json() == {"batch_id": "batch-1", "reason": "captain_cancelled", "claim_iteration": 1}
     assert post("captain-cancel-token").status_code == 200
     assert calls == [("batch-1", "captain_cancelled")] * 2
+
+
+def test_worker_reported_cancel_keeps_the_generic_conflict() -> None:
+    """410 means Captain cancelled; a worker's own cancelled outcome stays 409."""
+
+    projection = project_batch(
+        [work_batch(), claimed(), child(12, "batch_done", outcome="cancelled")],
+        "batch-1",
+        now=NOW,
+    )
+
+    assert projection.status == "cancelled"
+    assert projection.cancel_reason is None
+    with pytest.raises(HTTPException) as excinfo:
+        GatewayStore._assert_live_claim(projection, CLAIM_TOKEN, now=NOW, agent_id="openclaw")
+    assert excinfo.value.status_code == 409
+
+
+def test_projection_exposes_the_cancel_reason() -> None:
+    projection = project_batch(
+        [work_batch(), claimed(), cancelled(12, claim_iteration=1, reason="policy_violation")],
+        "batch-1",
+        now=NOW,
+    )
+
+    assert projection.cancel_reason == "policy_violation"

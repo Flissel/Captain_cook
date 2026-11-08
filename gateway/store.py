@@ -253,7 +253,7 @@ def _require_claim_agent(projection: BatchProjection, agent_id: str | None) -> N
 def _require_not_cancelled(projection: BatchProjection) -> None:
     # 410 instead of the generic 409 tells a claim holder to stop for good
     # rather than retry or wait for recovery.
-    if projection.status == "cancelled":
+    if projection.cancel_reason is not None:
         raise HTTPException(status_code=410, detail="batch cancelled")
 
 
