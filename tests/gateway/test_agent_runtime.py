@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -169,6 +170,78 @@ def test_grant_and_result_require_the_exact_command(client: TestClient) -> None:
     assert operation.json()["command"] == canonical_runtime_command(command)
     assert operation.json()["grant"] == grant
     assert operation.json()["result"] == result
+
+
+def _sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def test_bound_grant_result_is_reported_only_by_its_holder(
+    storage: MariaDBStorage,
+    mirror: RecordingMirror,
+) -> None:
+    assert TEST_DSN is not None
+    settings = GatewaySettings(
+        ledger_dsn=SecretStr(TEST_DSN),
+        captain_gateway_token=SecretStr("captain-test-token"),
+        worker_gateway_token=SecretStr("worker-test-token"),
+        worker_agent_token_sha256={
+            "openclaw": _sha256("openclaw-test-token"),
+            "hermes-coder-1": _sha256("hermes-test-token"),
+        },
+    )
+    app = create_app(storage=storage, mirror=mirror, settings=settings)
+
+    def as_(token: str) -> TestClient:
+        return TestClient(app, headers={"Authorization": f"Bearer {token}"})
+
+    captain = as_("captain-test-token")
+    release_batch(captain)
+    command = load("agent_runtime_command.v1.json")
+    issued_at = datetime.now(timezone.utc)
+    grant = {
+        "schema": "captain.capability-grant.v1",
+        "grant_id": "grant-holder-1",
+        "command_id": command["event_id"],
+        "batch_id": "batch-1",
+        "batch_version": 3,
+        "subtask_id": "subtask-1",
+        "workspace_ref": "workspace://authorized/project-1/subtask-1",
+        "profile": "n8n-builder",
+        "capabilities": [
+            "codex.cancel",
+            "codex.heartbeat",
+            "codex.resume",
+            "codex.run",
+            "codex.status",
+            "mcp.n8n",
+            "tests.run",
+            "workspace.write",
+        ],
+        "mcp_servers": ["n8n-mcp"],
+        "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
+        "expires_at": (issued_at + timedelta(minutes=15)).isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "holder_agent_id": "openclaw",
+    }
+    result = load("agent_runtime_result.v1.json")
+    result["grant_id"] = grant["grant_id"]
+
+    assert captain.post("/v1/runtime/commands", json=command).status_code == 202
+    ghost = {**grant, "holder_agent_id": "ghost-agent"}
+    assert captain.post("/v1/runtime/grants", json=ghost).status_code == 422
+    assert captain.post("/v1/runtime/grants", json=grant).status_code == 201
+
+    for intruder in ("captain-test-token", "worker-test-token", "hermes-test-token"):
+        refused = as_(intruder).post("/v1/runtime/results", json=result)
+        assert refused.status_code == 403, intruder
+
+    holder = as_("openclaw-test-token")
+    assert holder.post("/v1/runtime/results", json=result).status_code == 201
+    assert holder.post("/v1/runtime/results", json=result).status_code == 200
+    operation = captain.get(f"/v1/runtime/operations/{command['event_id']}")
+    assert operation.json()["grant"] == grant
 
 
 def test_captain_can_revoke_an_active_grant_once_and_gateway_projects_it(

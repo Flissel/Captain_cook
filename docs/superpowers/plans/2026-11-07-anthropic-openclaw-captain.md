@@ -67,8 +67,15 @@ replay) but not yet a trust base for generated agents.
       token (`gateway/auth.py:60-80`, claim route `gateway/app.py:1567`).
       Per-agent tokens, `agent_id` in `ClaimEvent`, checked against
       `trace.worker_id`.
-- [ ] `POST /v1/runtime/results` (`gateway/app.py:1479`) accepts any role;
-      bind results to the agent that holds the grant.
+- [x] `POST /v1/runtime/results` (`gateway/app.py:1479`) accepts any role;
+      bind results to the agent that holds the grant. (done: optional
+      `CapabilityGrant.holder_agent_id`, must be a registered agent at grant
+      time; a bound grant's result is accepted only from that agent's token,
+      not Captain or the shared worker token; unbound grants keep role-only
+      checks, but anonymous worker results are refused once
+      `GATEWAY_REQUIRE_AGENT_IDENTITY` is on. Gateway-internal services
+      record results without the reporter check. Nothing sets the holder
+      yet; Phase 2 `agent_assigned` / grant issuance must fill it.)
 - [ ] Captain-initiated batch cancel/revoke block, signalled to the claim
       holder.
 - [ ] Unify the two `batch_done` schemas (`gateway/contracts.py:540` vs

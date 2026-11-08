@@ -15,12 +15,15 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
 
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
+AGENT_ID_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,63}$"
 IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 BLUEPRINT_NAME_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 _SECRET_KEY_PATTERN = re.compile(
@@ -263,6 +266,20 @@ class CapabilityGrant(_FrozenContract):
     mcp_servers: tuple[str, ...] = ()
     issued_at: datetime
     expires_at: datetime
+    # The registered agent that alone may report this grant's result.
+    # Grants issued before agent identity carry none and keep role checks.
+    holder_agent_id: str | None = Field(default=None, pattern=AGENT_ID_PATTERN)
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_holder(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        # Stored grants are compared byte-for-byte on replay, so an unbound
+        # grant must keep its historic canonical shape.
+        data: dict[str, Any] = handler(self)
+        if self.holder_agent_id is None:
+            data.pop("holder_agent_id", None)
+        return data
 
     @field_validator("workspace_ref")
     @classmethod

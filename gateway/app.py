@@ -119,7 +119,9 @@ from gateway.store import (
     GatewayStore,
     PortalCredentialMetadataSource,
     PortalCredentialVerificationSource,
+    RuntimeResultReporter,
     require_claim_identity,
+    require_registered_grant_holder,
     verify_ledger_chain,
 )
 from gateway.integration_setup_contracts import (
@@ -1462,6 +1464,7 @@ def create_app(
         response: Response,
         _: GatewayRole = Depends(require_captain),
     ) -> RuntimeWriteReceipt:
+        require_registered_grant_holder(grant, settings=load_gateway_settings(app))
         receipt = get_store().record_capability_grant(grant)
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
@@ -1508,9 +1511,14 @@ def create_app(
     async def record_runtime_result(
         result: AgentRuntimeResult,
         response: Response,
-        _: GatewayRole = Depends(require_actor),
+        actor: GatewayRole = Depends(require_actor),
+        agent_id: str | None = Depends(current_agent_id),
     ) -> RuntimeWriteReceipt:
-        receipt = get_store().record_runtime_result(result)
+        receipt = get_store().record_runtime_result(
+            result,
+            RuntimeResultReporter(actor=actor, agent_id=agent_id),
+            require_agent_identity=load_gateway_settings(app).require_agent_identity,
+        )
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
         else:

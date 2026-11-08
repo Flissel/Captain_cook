@@ -18,6 +18,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ValidationError
 from pymysql.err import IntegrityError, OperationalError
 
+from gateway.auth import GatewayRole
 from gateway.capability_identity import generic_capability_subject_id
 from agenten.validation.contracts import HoldoutSuite, WorkBatch
 from agenten.agent_runtime.capabilities import CapabilityDenied, validate_grant
@@ -243,6 +244,55 @@ def require_claim_identity(agent_id: str | None, *, required_settings: _Identity
 def _require_claim_agent(projection: BatchProjection, agent_id: str | None) -> None:
     if projection.claim_agent_id is not None and agent_id != projection.claim_agent_id:
         raise HTTPException(status_code=403, detail="claim belongs to another agent")
+
+
+class _AgentRegistry(Protocol):
+    @property
+    def worker_agent_token_sha256(self) -> Mapping[str, str]: ...
+
+
+def require_registered_grant_holder(grant: CapabilityGrant, *, settings: _AgentRegistry) -> None:
+    """A grant may name only an agent that can authenticate as itself."""
+
+    holder = grant.holder_agent_id
+    if holder is not None and holder not in settings.worker_agent_token_sha256:
+        raise HTTPException(status_code=422, detail="grant holder is not a registered agent")
+
+
+@dataclass(frozen=True)
+class RuntimeResultReporter:
+    """The authenticated caller submitting a runtime result over HTTP."""
+
+    actor: GatewayRole
+    agent_id: str | None
+
+
+def require_result_reporter(
+    grant: CapabilityGrant,
+    reporter: RuntimeResultReporter | None,
+    *,
+    require_agent_identity: bool,
+) -> None:
+    """Only the grant holder may report a bound grant's result.
+
+    `reporter` is None for gateway-internal services, which already run
+    inside the trust boundary. Unbound grants keep role-only checks, except
+    that anonymous worker reports stop once agent identity is mandatory.
+    """
+
+    if reporter is None:
+        return
+    holder = grant.holder_agent_id
+    if holder is not None:
+        if reporter.actor is not GatewayRole.WORKER or reporter.agent_id != holder:
+            raise HTTPException(status_code=403, detail="runtime grant belongs to another agent")
+        return
+    if (
+        require_agent_identity
+        and reporter.actor is GatewayRole.WORKER
+        and reporter.agent_id is None
+    ):
+        raise HTTPException(status_code=403, detail="agent identity required to report results")
 
 
 class _LoadableLedger(Protocol):
@@ -2343,9 +2393,18 @@ class GatewayStore:
     def record_runtime_result(
         self,
         result: AgentRuntimeResult,
+        reporter: RuntimeResultReporter | None = None,
+        *,
+        require_agent_identity: bool = False,
     ) -> RuntimeWriteReceipt:
         try:
-            self._retry_write(lambda: self._record_runtime_result_once(result))
+            self._retry_write(
+                lambda: self._record_runtime_result_once(
+                    result,
+                    reporter,
+                    require_agent_identity=require_agent_identity,
+                )
+            )
         except _RuntimeReplay as replay:
             return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
         return RuntimeWriteReceipt(operation_id=result.command_id, replayed=False)
@@ -2552,7 +2611,13 @@ class GatewayStore:
                 )
                 self._insert(cursor, block)
 
-    def _record_runtime_result_once(self, result: AgentRuntimeResult) -> None:
+    def _record_runtime_result_once(
+        self,
+        result: AgentRuntimeResult,
+        reporter: RuntimeResultReporter | None = None,
+        *,
+        require_agent_identity: bool = False,
+    ) -> None:
         canonical = result.model_dump(mode="json", by_alias=True)
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
@@ -2589,6 +2654,11 @@ class GatewayStore:
                         status_code=409,
                         detail="runtime grant belongs to a different command",
                     )
+                require_result_reporter(
+                    grant,
+                    reporter,
+                    require_agent_identity=require_agent_identity,
+                )
                 revocation_block = self._runtime_block_by_json_value(
                     cursor,
                     block_type="agent_runtime_grant_revocation",

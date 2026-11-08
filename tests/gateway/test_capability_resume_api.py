@@ -244,7 +244,7 @@ def test_only_provider_receipt_role_can_record_provider_settlement() -> None:
                 replayed=False,
             )
 
-        def record_runtime_result(self, _result):
+        def record_runtime_result(self, _result, _reporter=None, **_options):
             raise HTTPException(
                 status_code=409,
                 detail="runtime provider settlement is unavailable",
