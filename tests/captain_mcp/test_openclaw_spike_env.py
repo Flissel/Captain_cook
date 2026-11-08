@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -60,6 +62,15 @@ def test_init_env_never_overwrites(tmp_path: Path) -> None:
     with pytest.raises(SpikeEnvExistsError):
         init_env(path)
     assert path.read_text(encoding="utf-8") == "KEEP=1\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_init_env_is_owner_only(tmp_path: Path) -> None:
+    path = tmp_path / ".env"
+
+    init_env(path)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_read_env_ignores_comments_and_blank_lines(tmp_path: Path) -> None:
