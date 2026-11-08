@@ -1575,3 +1575,53 @@ def test_delivery_event_requires_current_gateway_claim_identity_atomically(
     with pytest.raises(HTTPException, match="current claim") as fence_error:
         store.append_delivery_event(stale_fence, require_current_claim=True)
     assert fence_error.value.status_code == 409
+
+
+def test_captain_cancel_revokes_the_claim_and_stops_the_holder(client: TestClient) -> None:
+    create_batch(client)
+    token = claim(client)
+
+    cancel = client.post("/batches/batch-1/cancel", json={"reason": "captain_cancelled"})
+    assert cancel.status_code == 201, cancel.text
+    assert cancel.json() == {
+        "batch_id": "batch-1",
+        "reason": "captain_cancelled",
+        "claim_iteration": 1,
+    }
+    replay = client.post("/batches/batch-1/cancel", json={"reason": "captain_cancelled"})
+    assert replay.status_code == 200
+    other = client.post("/batches/batch-1/cancel", json={"reason": "policy_violation"})
+    assert other.status_code == 409
+
+    heartbeat = client.post("/batches/batch-1/claim/heartbeat", headers={"X-Claim-Token": token})
+    assert heartbeat.status_code == 410
+    assert heartbeat.json()["detail"] == "batch cancelled"
+    assert worker_block(client, token).status_code == 410
+    assert client.post("/batches/batch-1/claim").status_code == 409
+
+    projection = client.get("/batches/batch-1").json()
+    assert projection["status"] == "cancelled"
+    assert projection["claim_token_sha256"] is None
+    cancel_blocks = [
+        block
+        for block in client.get("/batches/batch-1/blocks").json()
+        if block["block_type"] == "batch_cancelled"
+    ]
+    assert len(cancel_blocks) == 1
+
+
+def test_finished_batch_cannot_be_cancelled_over_http(client: TestClient) -> None:
+    create_batch(client)
+    token = claim(client)
+    assert worker_block(
+        client,
+        token,
+        block_type="batch_done",
+        status="failed",
+        data={"batch_id": "batch-1", "outcome": "failed"},
+    ).status_code == 201
+
+    response = client.post("/batches/batch-1/cancel", json={"reason": "operator_cancelled"})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "batch is already terminal"

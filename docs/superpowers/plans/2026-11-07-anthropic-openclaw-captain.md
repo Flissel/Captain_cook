@@ -76,8 +76,16 @@ replay) but not yet a trust base for generated agents.
       `GATEWAY_REQUIRE_AGENT_IDENTITY` is on. Gateway-internal services
       record results without the reporter check. Nothing sets the holder
       yet; Phase 2 `agent_assigned` / grant issuance must fill it.)
-- [ ] Captain-initiated batch cancel/revoke block, signalled to the claim
-      holder.
+- [x] Captain-initiated batch cancel/revoke block, signalled to the claim
+      holder. (done: gateway-owned `batch_cancelled` via Captain-only
+      `POST /batches/{id}/cancel` with a reason; terminal from
+      `pending_review`, `pending` (also an expired, unrecovered claim) and
+      `claimed`; revokes the claim; replay with the same reason is 200.
+      The holder gets 410 "batch cancelled" on heartbeat, evidence, holdout
+      and delivery events; the delivery client raises
+      `GatewayBatchCancelledError`, a subclass of the conflict error. Still
+      open: Captain must terminalize an active Codex session after a cancel,
+      as after recovery; no worker loop consumes heartbeat 410 yet.)
 - [ ] Unify the two `batch_done` schemas (`gateway/contracts.py:540` vs
       `:936`); scope release-policy checks to run + claim iteration
       (`gateway/release_policy.py:49-53`).

@@ -105,10 +105,13 @@ from agenten.agent_factory.workflow_promotion import build_release_workflow_prom
 from blockchain.Blockchain_modell import Block, verify_chain
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
+    BATCH_CANCELLED_BLOCK_TYPE,
     REVIEW_MARKER_BLOCK_TYPE,
     ActiveCodexSession,
     ArtifactBuiltPayload,
+    BatchCancelEvent,
     BatchDoneEvent,
+    CancelReason,
     BatchProjection,
     ClaimEvent,
     CodexSessionFinishedPayload,
@@ -200,6 +203,7 @@ GATEWAY_OWNED_EVENT_TYPES = frozenset(
         "recovery_decision",
         "review_decision",
         REVIEW_MARKER_BLOCK_TYPE,
+        BATCH_CANCELLED_BLOCK_TYPE,
     }
 )
 WORKER_EVIDENCE_BLOCK_TYPES = frozenset(
@@ -244,6 +248,13 @@ def require_claim_identity(agent_id: str | None, *, required_settings: _Identity
 def _require_claim_agent(projection: BatchProjection, agent_id: str | None) -> None:
     if projection.claim_agent_id is not None and agent_id != projection.claim_agent_id:
         raise HTTPException(status_code=403, detail="claim belongs to another agent")
+
+
+def _require_not_cancelled(projection: BatchProjection) -> None:
+    # 410 instead of the generic 409 tells a claim holder to stop for good
+    # rather than retry or wait for recovery.
+    if projection.status == "cancelled":
+        raise HTTPException(status_code=410, detail="batch cancelled")
 
 
 class _AgentRegistry(Protocol):
@@ -2168,6 +2179,7 @@ class GatewayStore:
                         for_update=True,
                         now=_utcnow(),
                     )
+                    _require_not_cancelled(projection)
                     if (
                         projection.status != "claimed"
                         or trace.claim_id != projection.claim_id
@@ -7860,6 +7872,7 @@ class GatewayStore:
         now: datetime,
         agent_id: str | None = None,
     ) -> None:
+        _require_not_cancelled(projection)
         presented_hash = hashlib.sha256((token or "").encode("utf-8")).hexdigest()
         expires = projection.claim_expires_at
         if (
@@ -8386,6 +8399,58 @@ class GatewayStore:
                 self._validate_candidate(parent, children, block, batch_id, now=now)
                 self._insert(cursor, block)
         return {"claim_expires_at": expiry.isoformat()}
+
+    def cancel(self, batch_id: str, reason: CancelReason) -> tuple[dict[str, Any], bool]:
+        """Terminally cancel a non-terminal batch; returns (block, replayed)."""
+
+        try:
+            return self._retry_write(lambda: self._cancel_once(batch_id, reason)), False
+        except _IdempotentReplay as replay:
+            return replay.block, True
+
+    def _cancel_once(self, batch_id: str, reason: CancelReason) -> dict[str, Any]:
+        now = _utcnow()
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                parent, children, projection = self._batch_context(
+                    cursor,
+                    batch_id,
+                    for_update=True,
+                    now=now,
+                )
+                existing = next(
+                    (
+                        child
+                        for child in children
+                        if child["block_type"] == BATCH_CANCELLED_BLOCK_TYPE
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if existing["data"].get("reason") == reason:
+                        raise _IdempotentReplay(existing)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="batch was already cancelled for another reason",
+                    )
+                if projection.status not in {"pending_review", "pending", "claimed"}:
+                    raise HTTPException(status_code=409, detail="batch is already terminal")
+                event = BatchCancelEvent(
+                    batch_id=batch_id,
+                    reason=reason,
+                    claim_iteration=projection.claim_iteration,
+                )
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type=BATCH_CANCELLED_BLOCK_TYPE,
+                    data=event.model_dump(mode="json"),
+                    status="cancelled",
+                    parent_index=parent["index"],
+                )
+                self._validate_candidate(parent, children, block, batch_id, now=now)
+                self._insert(cursor, block)
+        return block
 
     def approve(self, batch_id: str) -> None:
         self._retry_write(lambda: self._approve_once(batch_id))

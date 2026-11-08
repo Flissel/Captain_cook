@@ -68,6 +68,8 @@ from gateway.auth import (
 )
 from gateway.contracts import (
     ActiveCodexSession,
+    BatchCancelEvent,
+    BatchCancelRequest,
     BatchProjection,
     DeliveryEventEnvelope,
     ReleaseProjection,
@@ -1633,6 +1635,18 @@ def create_app(
             raise HTTPException(status_code=404, detail="approval endpoint disabled")
         get_store().approve(batch_id)
         return {"status": "pending"}
+
+    @app.post("/batches/{batch_id}/cancel", status_code=status.HTTP_201_CREATED)
+    async def cancel_batch(
+        batch_id: str,
+        request: BatchCancelRequest,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> BatchCancelEvent:
+        block, replayed = get_store().cancel(batch_id, request.reason)
+        if replayed:
+            response.status_code = status.HTTP_200_OK
+        return BatchCancelEvent.model_validate(block["data"])
 
     @app.get("/batches/{batch_id}")
     async def get_batch(

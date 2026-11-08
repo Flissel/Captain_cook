@@ -953,6 +953,28 @@ class RecoveryDecisionEvent(BaseModel):
     decision: Literal["requeue", "aborted_infra"]
 
 
+CancelReason: TypeAlias = Literal["captain_cancelled", "operator_cancelled", "policy_violation"]
+
+
+class BatchCancelRequest(BaseModel):
+    """Captain's request body for `POST /batches/{batch_id}/cancel`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: CancelReason
+
+
+class BatchCancelEvent(BaseModel):
+    """Gateway-written terminal cancellation of a non-terminal batch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1)
+    reason: CancelReason
+    # Pins the claim that was revoked (0: the batch was never claimed).
+    claim_iteration: int = Field(ge=0, strict=True)
+
+
 class ReviewDecisionEvent(EvidenceEvent):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -979,10 +1001,12 @@ class ReviewDecisionEvent(EvidenceEvent):
 # parent `status` column is outside the block hash, so the review requirement
 # must not depend on it alone.
 REVIEW_MARKER_BLOCK_TYPE = "batch_review_required"
+BATCH_CANCELLED_BLOCK_TYPE = "batch_cancelled"
 
 _LIFECYCLE_BLOCK_TYPES = frozenset(
     {
         REVIEW_MARKER_BLOCK_TYPE,
+        BATCH_CANCELLED_BLOCK_TYPE,
         "batch_approved",
         "batch_claimed",
         "batch_heartbeat",
@@ -1144,7 +1168,7 @@ def project_batch(
         if block_type not in _LIFECYCLE_BLOCK_TYPES:
             continue
         if terminal:
-            raise ValueError("lifecycle event cannot appear after terminal batch_done")
+            raise ValueError("lifecycle event cannot appear after terminal batch_done or batch_cancelled")
 
         if block_type == REVIEW_MARKER_BLOCK_TYPE:
             if lifecycle_seen:
@@ -1153,6 +1177,20 @@ def project_batch(
             status = "pending_review"
             continue
         lifecycle_seen = True
+
+        if block_type == BATCH_CANCELLED_BLOCK_TYPE:
+            event = _event_data(block, BatchCancelEvent)
+            assert isinstance(event, BatchCancelEvent)
+            if event.claim_iteration != claim_iteration:
+                raise ValueError("batch cancel must name the current claim iteration")
+            claim_token_sha256 = None
+            claim_id = None
+            claim_agent_id = None
+            fencing_token = None
+            claim_expires_at = None
+            status = "cancelled"
+            terminal = True
+            continue
 
         if block_type == "batch_approved":
             if status != "pending_review":
