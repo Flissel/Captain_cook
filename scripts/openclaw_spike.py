@@ -95,27 +95,14 @@ def _load_into_process(path: Path) -> None:
     os.environ.update(read_env(path))
 
 
-class _NullMirror:
-    """The spike has no Minibook; drop projections instead of queueing them."""
-
-    def enqueue_nowait(self, block: object) -> None:
-        del block
-
-
 def _run_gateway() -> None:
-    # Core gateway only (the routes the MCP server reads), the same app the
-    # gateway tests build. The production builder also wires provider,
-    # billing and capability-assembly services the spike does not need.
+    # Core gateway only (the routes the MCP server reads); only gateway/
+    # may construct ledger storage, so the app comes from there.
     import uvicorn
 
-    from blockchain.mariadb_storage import MariaDBStorage
-    from gateway.app import create_app, verify_ledger_before_serving
-    from gateway.settings import GatewaySettings
+    from gateway.core_app import create_core_app_from_environment
 
-    settings = GatewaySettings.from_env()
-    storage = MariaDBStorage(settings.ledger_dsn.get_secret_value())
-    verify_ledger_before_serving(storage)
-    app = create_app(storage=storage, mirror=_NullMirror(), settings=settings)
+    app, settings = create_core_app_from_environment()
     uvicorn.run(app, host="127.0.0.1", port=settings.port, log_level="warning")
 
 
