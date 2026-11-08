@@ -86,11 +86,15 @@ replay) but not yet a trust base for generated agents.
       `GatewayBatchCancelledError`, a subclass of the conflict error. Still
       open: Captain must terminalize an active Codex session after a cancel,
       as after recovery; no worker loop consumes heartbeat 410 yet.)
-- [ ] Unify the two `batch_done` schemas (`gateway/contracts.py:540` vs
-      `:936`); scope release-policy checks to run + claim iteration
-      (`gateway/release_policy.py:49-53`).
-- [ ] `JSONFileStorage.load` returns `[]` on corrupt JSON
-      (`blockchain/storage.py:41`) - fail closed instead.
+- [x] `JSONFileStorage.load` returns `[]` on corrupt JSON
+      (`blockchain/storage.py:41`) - fail closed instead. (done: raises
+      `LedgerStorageCorruptError` for invalid JSON, a non-list root or
+      non-object entries, and leaves the file untouched; before, `Blockchain`
+      wrote a fresh genesis block over the damaged file. `reset=True` still
+      replaces it on purpose. Reads and writes are UTF-8.)
+- Moved to Phase 2: unify the two `batch_done` schemas. Phase 2's
+  `agent_outcome_recorded` reshapes the same outcome and release-policy code,
+  so doing it now would touch that code twice.
 
 ## Phase 2 - agent lifecycle contracts
 
@@ -99,6 +103,10 @@ replay) but not yet a trust base for generated agents.
       `CapabilityGrant` is profile-fixed)
 - [ ] `agent_assigned` (batch, agent, fencing token)
 - [ ] `agent_outcome_recorded`, `agent_retired`
+- [ ] Unify the two `batch_done` schemas (`gateway/contracts.py:540` vs
+      `:936`) together with `agent_outcome_recorded`; scope release-policy
+      checks to run + claim iteration (`gateway/release_policy.py:49-53`).
+      (moved from Phase 1)
 - [ ] gateway `dead_letter` block for permanently unroutable work
 - [ ] agent liveness record independent of a batch claim
 
