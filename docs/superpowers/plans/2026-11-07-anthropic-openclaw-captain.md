@@ -336,6 +336,12 @@ through the subscription-backed `claude-cli` runtime
       `~/.claude.json`, `~/.openclaw/openclaw.json`, a `/tmp/openclaw-cli-mcp-*`
       dummy, `/etc/hostname` and Grep in `~/.openclaw` denied by rule;
       `skills list` shows `captain-plan` ready from the new workspace.
+      Follow-up review: `/tmp/openclaw/` (OpenClaw log, per-turn skills
+      plugin dir) was still readable; now all of `Read(//tmp/**)` is denied.
+      A catch-all `Read(//**)` is not usable because deny beats allow and
+      would seal the workspace too. Re-probed: the `/tmp/openclaw` log and
+      Grep there denied, workspace readable, and an `openclaw agent` turn
+      still loads `captain-plan` through the Skill tool.
 - [ ] Recursive Grep/Glob from a parent such as `/home/node` is blocked in
       headless Claude only by the outside-cwd permission prompt, not by a
       rule (hidden subtrees are denied, `/home/node` itself is not). In

@@ -24,7 +24,7 @@
       "DesignSync",
       "Read(~/.*)",
       "Read(~/.*/**)",
-      "Read(//tmp/openclaw-cli-mcp-*/**)",
+      "Read(//tmp/**)",
       "Read(//app/**)",
       "Read(//bin/**)",
       "Read(//boot/**)",

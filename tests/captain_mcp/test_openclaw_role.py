@@ -154,19 +154,23 @@ def test_seed_installs_the_claude_code_settings_read_only() -> None:
 
 def test_native_reads_are_denied_by_default_outside_the_workspace() -> None:
     """Read/Glob/Grep stay for the workspace and skills; every hidden home path,
-    every system directory and OpenClaw's per-turn MCP config are denied."""
+    every system directory and all of /tmp are denied."""
 
     denied = set(json.loads((DEPLOY / "claude-settings.json").read_text(encoding="utf-8"))["permissions"]["deny"])
 
     # Default deny for the home directory: all hidden files and directories
     # (~/.claude, ~/.claude.json, ~/.openclaw, ~/.local, future ones).
     assert {"Read(~/.*)", "Read(~/.*/**)"} <= denied
-    # The bearer header OpenClaw hands to Claude Code lives in /tmp.
-    assert "Read(//tmp/openclaw-cli-mcp-*/**)" in denied
+    # /tmp holds the per-turn MCP config with the bearer header, OpenClaw's
+    # logs and the per-turn skills plugin dir; the planner needs none of it.
+    assert "Read(//tmp/**)" in denied
     image_root = {"app", "bin", "boot", "dev", "etc", "lib", "lib64", "media", "mnt",
                   "opt", "proc", "root", "run", "sbin", "srv", "sys", "usr", "var"}
     assert {f"Read(//{name}/**)" for name in image_root} <= denied
     # The workspace must not be hidden, or the home rule would seal it too.
     env = compose()["x-openclaw-env"]
     assert env["OPENCLAW_WORKSPACE_DIR"] == "/home/node/workspace"
-    assert not any(rule.startswith("Read(~/workspace") or rule == "Read(//tmp/**)" for rule in denied)
+    # Deny beats allow in Claude Code, so a catch-all Read(//**) would seal the
+    # workspace as well; the denials must leave it and /home itself open.
+    assert not any(rule.startswith(("Read(~/workspace", "Read(//home")) for rule in denied)
+    assert "Read(//**)" not in denied
