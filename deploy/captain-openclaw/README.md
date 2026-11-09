@@ -80,6 +80,19 @@ to run without a TTY, so do not pass `-T`. The CLI service shares the
 gateway's PID namespace on purpose; without it OpenClaw refuses state
 access (`GatewayLockNamespaceError`).
 
+## Captain write tools (opt-in)
+
+The MCP server is read-only unless it gets `CAPTAIN_MCP_CAPTAIN_TOKEN`
+(the gateway's Captain token). Then it also offers a fixed set of Captain
+tools: `register_agent`, `retire_agent`, `grant_agent_capability`,
+`revoke_agent_capability`, `assign_batch`, `cancel_batch`, `approve_batch`.
+There is no generic block write. Reads keep using the agent token. Every
+tool carries MCP safety annotations (read-only, destructive, idempotent),
+so OpenClaw can require approval for destructive calls.
+
+Giving the planner this token makes it Captain. Enable it only for a run
+that is meant to orchestrate, never for the read-only spike.
+
 ## Stop and clean up
 
 ```powershell

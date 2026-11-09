@@ -184,12 +184,19 @@ Phase 1). No generic `/blocks` write tool.
 - [ ] Read tools: `GET /batches`, `/batches/{id}`, `/batches/{id}/blocks`,
       `/batches/{id}/bundle`, `/capabilities?need=`,
       `/v1/runtime/operations/{id}`, run events, release status,
-      `/v1/factory/jobs/{id}`.
+      `/v1/factory/jobs/{id}`. Done (2026-11-09): `list_batches`,
+      `get_batch`, `get_agent`, `get_agent_outcomes`
+      (`agenten/captain_mcp/server.py`, agent token).
 - [ ] Planning tool: `compile_plan` wrapping
       `CaptainPipeline.compile_from_plan()` (validation + canonical compile
       + publish stay deterministic).
 - [ ] Write tools: approve, recovery, review, runtime commands/grants/
       revocations, factory jobs, release decision, cancel (Phase 1).
+      Done (2026-11-09), opt-in via `CAPTAIN_MCP_CAPTAIN_TOKEN`, all
+      annotated: `register_agent`, `retire_agent`, `grant_agent_capability`,
+      `revoke_agent_capability`, `assign_batch`, `cancel_batch`,
+      `approve_batch`. Open: recovery, review, runtime commands/grants,
+      factory jobs, release decision.
 - [ ] Constitution check tool: HTTP/MCP wrapper around the rule layer of
       `ConstitutionGatekeeper` (today event-bus internal only).
 

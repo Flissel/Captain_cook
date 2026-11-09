@@ -1,8 +1,11 @@
-"""Read-only Captain MCP server over the sole-writer gateway.
+"""Captain MCP server over the sole-writer gateway.
 
-Spike scope (plan 2026-11-07, Phase 4/5): prove that OpenClaw in a container
-can call Captain tools. It exposes reads only and holds a registered *agent*
-token, never the Captain token, so a compromised planner cannot write.
+Reads use a registered *agent* token. Captain write tools exist only when
+the server is given its own Captain token (`CAPTAIN_MCP_CAPTAIN_TOKEN`);
+without it the server stays read-only, as in the OpenClaw spike. The write
+surface is a fixed list of dedicated gateway routes, never generic
+`/blocks`, and every tool carries MCP safety annotations so the client can
+apply its approval policy.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import httpx
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
@@ -34,24 +38,91 @@ BatchStatusFilter = Literal[
     "failed_after_max_iterations",
     "aborted_infra",
 ]
+# Mirrors of the gateway vocabularies (kept in sync by tests; this package
+# talks to the gateway over HTTP only and does not import it).
+BatchCancelReason = Literal["captain_cancelled", "operator_cancelled", "policy_violation", "unroutable"]
+RetireReason = Literal["captain_retired", "operator_retired", "policy_violation"]
+GrantRevokeReason = Literal["captain_revoked", "operator_revoked", "policy_violation"]
+
 _STATUSES = frozenset(get_args(BatchStatusFilter))
 # Hosts the server answers for: local callers and OpenClaw inside Docker.
 _ALLOWED_HOSTS = ["127.0.0.1:*", "localhost:*", "host.docker.internal:*"]
+# Gateway error reasons are short fixed strings; anything longer or
+# structured (validation echoes) may carry ledger content and is dropped.
+_MAX_REASON_LENGTH = 200
+
+_READ = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+_WRITE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_DESTRUCTIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+)
 
 
 class CaptainMcpConfigurationError(RuntimeError):
     """The MCP server cannot start safely with the given environment."""
 
 
-class CaptainGatewayReader:
-    """Minimal authenticated reads against the Captain gateway."""
-
+class _GatewayHttp:
     def __init__(self, base_url: str, token: str, client: httpx.AsyncClient) -> None:
         if not base_url.strip() or not token:
             raise ValueError("gateway base_url and token are required")
         self._base_url = base_url.rstrip("/")
         self._token = token
         self._client = client
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        operation: str,
+        ok: frozenset[int],
+        params: Mapping[str, str] | None = None,
+        json_body: Any = None,
+    ) -> httpx.Response:
+        try:
+            response = await self._client.request(
+                method,
+                f"{self._base_url}{path}",
+                params=params,
+                json=json_body,
+                headers={"Authorization": f"Bearer {self._token}"},
+            )
+        except httpx.HTTPError:
+            raise RuntimeError(f"{operation} could not reach the gateway") from None
+        if response.status_code not in ok:
+            raise RuntimeError(_failure(operation, response))
+        return response
+
+
+def _failure(operation: str, response: httpx.Response) -> str:
+    message = f"{operation} failed with gateway status {response.status_code}"
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        return message
+    if isinstance(detail, str) and 0 < len(detail) <= _MAX_REASON_LENGTH:
+        return f"{message}: {detail}"
+    return message
+
+
+def _json(response: httpx.Response, operation: str) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        raise RuntimeError(f"{operation} returned an invalid response") from None
+
+
+def _segment(value: str, name: str) -> str:
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    return quote(value, safe="")
+
+
+class CaptainGatewayReader(_GatewayHttp):
+    """Minimal authenticated reads against the Captain gateway."""
 
     async def list_batches(self, status: str) -> list[dict[str, Any]]:
         if status not in _STATUSES:
@@ -62,33 +133,101 @@ class CaptainGatewayReader:
         return payload
 
     async def get_batch(self, batch_id: str) -> dict[str, Any]:
-        if not batch_id:
-            raise ValueError("batch_id must not be empty")
-        payload = await self._get(
-            f"/batches/{quote(batch_id, safe='')}", operation="read batch"
-        )
+        payload = await self._get(f"/batches/{_segment(batch_id, 'batch_id')}", operation="read batch")
         if not isinstance(payload, dict):
             raise RuntimeError("read batch returned an invalid response")
         # A digest is not a secret, but the planner has no use for it.
         payload.pop("claim_token_sha256", None)
         return payload
 
+    async def get_agent(self, agent_id: str) -> dict[str, Any]:
+        payload = await self._get(f"/agents/{_segment(agent_id, 'agent_id')}", operation="read agent")
+        if not isinstance(payload, dict):
+            raise RuntimeError("read agent returned an invalid response")
+        return payload
+
+    async def get_agent_outcomes(self, agent_id: str) -> list[dict[str, Any]]:
+        payload = await self._get(
+            f"/agents/{_segment(agent_id, 'agent_id')}/outcomes", operation="read agent outcomes"
+        )
+        if not isinstance(payload, list):
+            raise RuntimeError("read agent outcomes returned an invalid response")
+        return payload
+
     async def _get(self, path: str, *, operation: str, params: Mapping[str, str] | None = None) -> Any:
-        try:
-            response = await self._client.get(
-                f"{self._base_url}{path}",
-                params=params,
-                headers={"Authorization": f"Bearer {self._token}"},
-            )
-        except httpx.HTTPError:
-            raise RuntimeError(f"{operation} could not reach the gateway") from None
-        if response.status_code != 200:
-            # Bodies are not echoed: they may carry ledger content.
-            raise RuntimeError(f"{operation} failed with gateway status {response.status_code}")
-        try:
-            return response.json()
-        except ValueError:
-            raise RuntimeError(f"{operation} returned an invalid response") from None
+        response = await self._request(
+            "GET", path, operation=operation, ok=frozenset({200}), params=params
+        )
+        return _json(response, operation)
+
+
+class CaptainGatewayWriter(_GatewayHttp):
+    """Captain-authority writes, one dedicated gateway route per method.
+
+    Every write is replay-safe at the gateway: 201 records a new block, 200
+    returns the identical existing one (`replayed`).
+    """
+
+    async def register_agent(
+        self, agent_id: str, version: str, owner: str, spec_sha256: str
+    ) -> dict[str, Any]:
+        return await self._post(
+            "/agents",
+            operation="register agent",
+            body={"agent_id": agent_id, "version": version, "owner": owner, "spec_sha256": spec_sha256},
+        )
+
+    async def retire_agent(self, agent_id: str, reason: str) -> dict[str, Any]:
+        return await self._post(
+            f"/agents/{_segment(agent_id, 'agent_id')}/retire",
+            operation="retire agent",
+            body={"reason": reason},
+        )
+
+    async def grant_agent_capability(
+        self, agent_id: str, grant_id: str, capability_tags: list[str], expires_at: str
+    ) -> dict[str, Any]:
+        return await self._post(
+            f"/agents/{_segment(agent_id, 'agent_id')}/grants",
+            operation="grant agent capability",
+            body={"grant_id": grant_id, "capability_tags": capability_tags, "expires_at": expires_at},
+        )
+
+    async def revoke_agent_capability(
+        self, agent_id: str, grant_id: str, reason: str
+    ) -> dict[str, Any]:
+        return await self._post(
+            f"/agents/{_segment(agent_id, 'agent_id')}/grants/{_segment(grant_id, 'grant_id')}/revoke",
+            operation="revoke agent capability",
+            body={"reason": reason},
+        )
+
+    async def assign_batch(self, batch_id: str, agent_id: str) -> dict[str, Any]:
+        return await self._post(
+            f"/batches/{_segment(batch_id, 'batch_id')}/assign",
+            operation="assign batch",
+            body={"agent_id": agent_id},
+        )
+
+    async def cancel_batch(self, batch_id: str, reason: str) -> dict[str, Any]:
+        return await self._post(
+            f"/batches/{_segment(batch_id, 'batch_id')}/cancel",
+            operation="cancel batch",
+            body={"reason": reason},
+        )
+
+    async def approve_batch(self, batch_id: str) -> dict[str, Any]:
+        return await self._post(
+            f"/batches/{_segment(batch_id, 'batch_id')}/approve",
+            operation="approve batch",
+            body=None,
+        )
+
+    async def _post(self, path: str, *, operation: str, body: Any) -> dict[str, Any]:
+        response = await self._request(
+            "POST", path, operation=operation, ok=frozenset({200, 201}), json_body=body
+        )
+        return {"replayed": response.status_code == 200, "record": _json(response, operation)}
 
 
 class _BearerGuard:
@@ -118,7 +257,12 @@ async def _unauthorized(send: Callable[[dict[str, Any]], Awaitable[None]]) -> No
     await send({"type": "http.response.body", "body": b'{"detail":"unauthorized"}'})
 
 
-def create_mcp_app(reader: CaptainGatewayReader, *, inbound_token: str) -> ASGIApp:
+def create_mcp_app(
+    reader: CaptainGatewayReader,
+    *,
+    inbound_token: str,
+    writer: CaptainGatewayWriter | None = None,
+) -> ASGIApp:
     """Build the Streamable HTTP MCP app (served at `/mcp`)."""
 
     if not inbound_token:
@@ -126,8 +270,12 @@ def create_mcp_app(reader: CaptainGatewayReader, *, inbound_token: str) -> ASGIA
     server = FastMCP(
         "captain",
         instructions=(
-            "Read-only view of Captain's ledger-backed work batches. "
-            "Writes are not available on this server."
+            "Captain's ledger-backed work batches and agents. "
+            + (
+                "Writes go through fixed Captain tools; there is no generic block write."
+                if writer is not None
+                else "Writes are not available on this server."
+            )
         ),
         stateless_http=True,
         json_response=True,
@@ -137,20 +285,93 @@ def create_mcp_app(reader: CaptainGatewayReader, *, inbound_token: str) -> ASGIA
             allowed_origins=[],
         ),
     )
+    _register_read_tools(server, reader)
+    if writer is not None:
+        _register_write_tools(server, writer)
+    return _BearerGuard(server.streamable_http_app(), inbound_token)
 
-    @server.tool()
+
+def _register_read_tools(server: FastMCP, reader: CaptainGatewayReader) -> None:
+    @server.tool(annotations=_READ)
     async def list_batches(status: BatchStatusFilter) -> list[dict[str, Any]]:
         """List work batches (batch_id, title) whose derived status matches."""
 
         return await reader.list_batches(status)
 
-    @server.tool()
+    @server.tool(annotations=_READ)
     async def get_batch(batch_id: str) -> dict[str, Any]:
         """Read one batch's derived lifecycle projection from the ledger."""
 
         return await reader.get_batch(batch_id)
 
-    return _BearerGuard(server.streamable_http_app(), inbound_token)
+    @server.tool(annotations=_READ)
+    async def get_agent(agent_id: str) -> dict[str, Any]:
+        """Read an agent's ledger lifecycle: version, status and capability grants."""
+
+        return await reader.get_agent(agent_id)
+
+    @server.tool(annotations=_READ)
+    async def get_agent_outcomes(agent_id: str) -> list[dict[str, Any]]:
+        """List every claim the agent held and how its batch ended under it."""
+
+        return await reader.get_agent_outcomes(agent_id)
+
+
+def _register_write_tools(server: FastMCP, writer: CaptainGatewayWriter) -> None:
+    @server.tool(annotations=_WRITE)
+    async def register_agent(
+        agent_id: str, version: str, owner: str, spec_sha256: str
+    ) -> dict[str, Any]:
+        """Register a token-holding agent version (spec_sha256: 64 hex chars)."""
+
+        return await writer.register_agent(agent_id, version, owner, spec_sha256)
+
+    @server.tool(annotations=_DESTRUCTIVE)
+    async def retire_agent(agent_id: str, reason: RetireReason) -> dict[str, Any]:
+        """Retire an agent for good: its token loses every write route."""
+
+        return await writer.retire_agent(agent_id, reason)
+
+    @server.tool(annotations=_WRITE)
+    async def grant_agent_capability(
+        agent_id: str, grant_id: str, capability_tags: list[str], expires_at: str
+    ) -> dict[str, Any]:
+        """Grant capability tags until expires_at (ISO 8601 with timezone).
+
+        A registered agent may claim a batch only while one active grant holds
+        every capability tag of that batch.
+        """
+
+        return await writer.grant_agent_capability(agent_id, grant_id, capability_tags, expires_at)
+
+    @server.tool(annotations=_DESTRUCTIVE)
+    async def revoke_agent_capability(
+        agent_id: str, grant_id: str, reason: GrantRevokeReason
+    ) -> dict[str, Any]:
+        """Revoke one capability grant of an agent."""
+
+        return await writer.revoke_agent_capability(agent_id, grant_id, reason)
+
+    @server.tool(annotations=_WRITE)
+    async def assign_batch(batch_id: str, agent_id: str) -> dict[str, Any]:
+        """Pin an unclaimed batch to one agent; only it may claim the batch."""
+
+        return await writer.assign_batch(batch_id, agent_id)
+
+    @server.tool(annotations=_DESTRUCTIVE)
+    async def cancel_batch(batch_id: str, reason: BatchCancelReason) -> dict[str, Any]:
+        """Terminally cancel a batch and revoke its claim.
+
+        Use reason "unroutable" for work no registered agent can serve.
+        """
+
+        return await writer.cancel_batch(batch_id, reason)
+
+    @server.tool(annotations=_WRITE)
+    async def approve_batch(batch_id: str) -> dict[str, Any]:
+        """Release a batch that waits for review approval to the claim queue."""
+
+        return await writer.approve_batch(batch_id)
 
 
 @dataclass(frozen=True)
@@ -158,6 +379,7 @@ class McpSettings:
     gateway_url: str
     gateway_token: str
     inbound_token: str
+    captain_token: str | None = None
     host: str = "127.0.0.1"
     port: int = 18121
 
@@ -170,6 +392,14 @@ class McpSettings:
             raise CaptainMcpConfigurationError(
                 "CAPTAIN_MCP_TOKEN must differ from CAPTAIN_MCP_GATEWAY_TOKEN"
             )
+        captain_token = environment.get("CAPTAIN_MCP_CAPTAIN_TOKEN", "").strip() or None
+        if captain_token is not None and (
+            secrets.compare_digest(captain_token, gateway_token)
+            or secrets.compare_digest(captain_token, inbound_token)
+        ):
+            raise CaptainMcpConfigurationError(
+                "CAPTAIN_MCP_CAPTAIN_TOKEN must differ from the agent and inbound tokens"
+            )
         port_raw = environment.get("CAPTAIN_MCP_PORT", "18121").strip()
         try:
             port = int(port_raw)
@@ -179,6 +409,7 @@ class McpSettings:
             gateway_url=gateway_url,
             gateway_token=gateway_token,
             inbound_token=inbound_token,
+            captain_token=captain_token,
             host=environment.get("CAPTAIN_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1",
             port=port,
         )
@@ -195,8 +426,18 @@ def main() -> None:
     settings = McpSettings.from_env(os.environ)
     client = httpx.AsyncClient(timeout=30)
     reader = CaptainGatewayReader(settings.gateway_url, settings.gateway_token, client)
-    app = create_mcp_app(reader, inbound_token=settings.inbound_token)
-    logger.info("Captain MCP server listening on %s:%s/mcp", settings.host, settings.port)
+    writer = (
+        CaptainGatewayWriter(settings.gateway_url, settings.captain_token, client)
+        if settings.captain_token is not None
+        else None
+    )
+    app = create_mcp_app(reader, inbound_token=settings.inbound_token, writer=writer)
+    logger.info(
+        "Captain MCP server listening on %s:%s/mcp (%s)",
+        settings.host,
+        settings.port,
+        "captain writes enabled" if writer is not None else "read-only",
+    )
     uvicorn.run(app, host=settings.host, port=settings.port, log_level="warning")
 
 

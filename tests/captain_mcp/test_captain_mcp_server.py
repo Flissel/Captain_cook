@@ -73,12 +73,13 @@ async def test_get_batch_drops_the_claim_token_digest() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gateway_errors_surface_without_response_bodies() -> None:
+async def test_gateway_errors_surface_only_the_short_reason() -> None:
+    """The planner needs the gateway's fixed reason; full bodies stay out."""
+
     with pytest.raises(RuntimeError) as excinfo:
         await reader([]).get_batch("missing")
 
-    assert "404" in str(excinfo.value)
-    assert "batch not found" not in str(excinfo.value)
+    assert str(excinfo.value) == "read batch failed with gateway status 404: batch not found"
 
 
 @pytest.mark.asyncio
@@ -158,13 +159,13 @@ def test_mcp_endpoint_requires_the_inbound_token(token: str | None) -> None:
     assert response.status_code == 401
 
 
-def test_mcp_lists_only_read_tools() -> None:
+def test_mcp_lists_only_read_tools_by_default() -> None:
     with mcp_client([]) as client:
         assert rpc(client, "initialize", INIT).status_code == 200
         listed = rpc(client, "tools/list", {})
 
     names = {tool["name"] for tool in listed.json()["result"]["tools"]}
-    assert names == {"list_batches", "get_batch"}
+    assert names == {"list_batches", "get_batch", "get_agent", "get_agent_outcomes"}
 
 
 def test_mcp_tool_call_reaches_the_gateway() -> None:
