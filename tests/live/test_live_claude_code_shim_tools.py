@@ -142,3 +142,39 @@ async def test_claude_code_provider_returns_validated_structured_output(shim_url
 
     assert isinstance(result.content, str)
     HouseholderReportModel.model_validate_json(result.content)
+
+
+@pytest.mark.asyncio
+async def test_claude_code_structured_output_resolves_defs_and_refs(shim_url: str) -> None:
+    """Nested Pydantic models produce $defs/$ref schemas; the CLI must take them."""
+
+    from pydantic import BaseModel
+
+    class Step(BaseModel):
+        title: str
+        minutes: int
+
+    class Plan(BaseModel):
+        goal: str
+        steps: list[Step]
+
+    assert "$defs" in Plan.model_json_schema()
+    client = build_model_client(
+        profile=resolve_provider(
+            {
+                "CAPTAIN_LLM_PROVIDER": "claude-code",
+                "CAPTAIN_LLM_BASE_URL": shim_url,
+                "CAPTAIN_MODEL": "claude-code-haiku",
+            }
+        )
+    )
+    try:
+        result = await client.create(
+            [UserMessage(content="Plan making tea in two or three steps.", source="user")],
+            json_output=Plan,
+        )
+    finally:
+        await client.close()
+
+    plan = Plan.model_validate_json(str(result.content))
+    assert plan.steps and all(step.minutes >= 0 for step in plan.steps)
