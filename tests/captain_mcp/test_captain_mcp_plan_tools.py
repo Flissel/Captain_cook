@@ -237,3 +237,29 @@ def test_publish_checks_the_released_batch_goal_not_only_the_subtasks() -> None:
     assert result["isError"] is True
     assert "batch:mail: malformed" in json.dumps(result["content"])
     assert release.batch_ids == []
+
+
+def test_a_partial_publish_names_the_batches_already_released() -> None:
+    posts: list[str] = []
+
+    def gateway(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        posts.append(body["block_type"])
+        if body["block_type"] == "work_batch" and body["data"]["batch_id"] == "mail":
+            return httpx.Response(409, json={"detail": "exists"}, request=request)
+        return httpx.Response(201, json={"index": len(posts)}, request=request)
+
+    release = GatewayPlanningClient(
+        "https://gateway.test",
+        CAPTAIN_TOKEN,
+        httpx.AsyncClient(transport=httpx.MockTransport(gateway)),
+        hold_for_review=True,
+    )
+    app = create_mcp_app(
+        reader([]), inbound_token=MCP_TOKEN, planner=CaptainPlanner(SETTINGS, release_client=release)
+    )
+
+    result = _call(app, "publish_plan", {"plan": _plan_json()})
+
+    assert result["isError"] is True
+    assert "batches released before the failure: ['collect']" in json.dumps(result["content"])

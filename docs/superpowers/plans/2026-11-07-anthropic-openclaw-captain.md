@@ -181,12 +181,16 @@ lifecycle (authorization). Order is by risk and independence:
 Thin MCP server over the gateway (bearer token per agent identity from
 Phase 1). No generic `/blocks` write tool.
 
-- [ ] Read tools: `GET /batches`, `/batches/{id}`, `/batches/{id}/blocks`,
+- [x] Read tools: `GET /batches`, `/batches/{id}`, `/batches/{id}/blocks`,
       `/batches/{id}/bundle`, `/capabilities?need=`,
       `/v1/runtime/operations/{id}`, run events, release status,
       `/v1/factory/jobs/{id}`. Done (2026-11-09): `list_batches`,
-      `get_batch`, `get_agent`, `get_agent_outcomes`
-      (`agenten/captain_mcp/server.py`, agent token).
+      `get_batch`, `get_batch_blocks` (holdout blocks never included,
+      claim digests stripped), `get_agent`, `get_agent_outcomes`,
+      `get_release_status`, `get_runtime_operation`, `get_factory_job`
+      (UUID-validated ids), all with the agent token. Not offered: the
+      bundle (duplicates blocks), run events (bulk evidence; add when a
+      planner flow needs them), capabilities (used inside `compile_plan`).
 - [x] Planning tool: `compile_plan` (+ `publish_plan`). Done
       (2026-11-09): the planner supplies decompose/align/enrich results
       (`SuppliedPlan`, `agenten/planning/supplied_plan.py`); they run as
@@ -201,12 +205,14 @@ Phase 1). No generic `/blocks` write tool.
       `CAPTAIN_PLAN_ALLOWED_TARGETS`).
 - [ ] `publish_plan` is not resumable: after a partial release a retry
       fails with 409 on the first published batch. Route it through the
-      `CaptainRunStore` checkpoint (`compile_and_release`) or skip batches
-      whose published content is identical.
+      `CaptainRunStore` checkpoint (`compile_and_release`); skipping
+      "identical" batches is not safe because holdouts are not readable
+      for comparison. Mitigated (2026-11-09): the error names the batches
+      released before the failure.
 - [ ] Planner-published batches need `GATEWAY_APPROVAL_ENABLED=true`;
       otherwise `/approve` is disabled and they stay held. Surface that as
       a startup check or a gateway capability flag.
-- [ ] Write tools: approve, recovery, review, runtime commands/grants/
+- [x] Write tools: approve, recovery, review, runtime commands/grants/
       revocations, factory jobs, release decision, cancel (Phase 1).
       Done (2026-11-09), opt-in via `CAPTAIN_MCP_CAPTAIN_TOKEN`, all
       annotated: `register_agent`, `retire_agent`, `grant_agent_capability`,
@@ -214,8 +220,15 @@ Phase 1). No generic `/blocks` write tool.
       `grant_agent_capability` is annotated destructive (it widens
       permissions). Approval is deliberately not a tool: it is the human
       review gate and stays with the operator (security review
-      2026-11-09). Open: recovery, review, runtime commands/grants,
-      factory jobs, release decision.
+      2026-11-09). Added: `recover_expired_claim` (destructive; the
+      gateway accepts it only for a really expired claim) and
+      `record_release_decision` (destructive; registered only with
+      `CAPTAIN_RELEASE_POLICY_VERSION`, which pins the policy version; the
+      gateway computes accepted/rejected fail-closed). Deliberately not
+      offered: review decisions (release evidence; the planner would
+      certify its own work), runtime commands/grants/revocations and
+      Factory job creation (execution and budget authority stays with
+      Captain's deterministic runtime).
 - [x] Constitution check tool: HTTP/MCP wrapper around the rule layer of
       `ConstitutionGatekeeper` (today event-bus internal only). Done
       (2026-11-09): `check_constitution` (read-only) runs the deterministic

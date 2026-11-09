@@ -36,6 +36,7 @@ from agenten.planning.captain_pipeline import (
     CapabilityResolver,
     CaptainCompiledPlan,
 )
+from agenten.validation.contracts import HoldoutSuite, WorkBatch
 from agenten.planning.supplied_plan import (
     PlanCompilerSettings,
     SuppliedPlan,
@@ -122,13 +123,37 @@ class CaptainPlanner:
             raise PlanRejectedError(
                 "constitution check failed: " + "; ".join(report.rejections())
             )
-        compiled = await publish_supplied_plan(
-            plan,
-            self.settings,
-            release_client=self.release_client,
-            capability_resolver=self.capability_resolver,
-        )
+        tracking = _TrackingRelease(self.release_client)
+        try:
+            compiled = await publish_supplied_plan(
+                plan,
+                self.settings,
+                release_client=tracking,
+                capability_resolver=self.capability_resolver,
+            )
+        except Exception as exc:
+            raise PartialPublishError(str(exc), tracking.released) from None
         return {"published": True, **_summary(compiled)}
+
+
+class PartialPublishError(RuntimeError):
+    """Publishing stopped; `released` names the batches already in the ledger."""
+
+    def __init__(self, cause: str, released: list[str]) -> None:
+        self.released = list(released)
+        super().__init__(
+            f"publish stopped: {cause}; batches released before the failure: {self.released or 'none'}"
+        )
+
+
+class _TrackingRelease:
+    def __init__(self, inner: BatchReleaseClient) -> None:
+        self._inner = inner
+        self.released: list[str] = []
+
+    async def release(self, batch: WorkBatch, holdouts: HoldoutSuite) -> None:
+        await self._inner.release(batch, holdouts)
+        self.released.append(batch.batch_id)
 
 
 def _summary(compiled: CaptainCompiledPlan) -> dict[str, Any]:
@@ -170,7 +195,8 @@ def register_plan_tools(server: FastMCP, planner: CaptainPlanner) -> None:
 
         The plan must pass check_constitution. Batches wait for operator
         review approval before workers can claim them. Publishing the same
-        batch ids again is refused.
+        batch ids again is refused. If publishing stops part-way, the error
+        names the batches that were already released.
         """
 
         return await planner.publish(plan)

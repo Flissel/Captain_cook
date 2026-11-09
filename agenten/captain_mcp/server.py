@@ -11,6 +11,16 @@ Batch approval is deliberately absent: it is the human review gate, and a
 planner that could approve its own batches would make the gate void.
 Widening an agent's permissions (`grant_agent_capability`) is marked
 destructive so the client asks before it runs.
+
+Also deliberately absent (decided 2026-11-09):
+- review decisions: they are release evidence; a planner recording them
+  would certify its own plan's work;
+- runtime commands, runtime grants/revocations and Factory job creation:
+  execution and budget authority stays with Captain's deterministic
+  runtime and capability-resolution code.
+The two decision tools offered here are gateway-validated: recovery is
+accepted only for a claim that has really expired, and the release decision
+is computed by the gateway's fail-closed release policy, never chosen.
 """
 
 from __future__ import annotations
@@ -22,6 +32,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
 from urllib.parse import quote
+from uuid import UUID
 
 import httpx
 import uvicorn
@@ -56,6 +67,7 @@ BatchStatusFilter = Literal[
 BatchCancelReason = Literal["captain_cancelled", "operator_cancelled", "policy_violation", "unroutable"]
 RetireReason = Literal["captain_retired", "operator_retired", "policy_violation"]
 GrantRevokeReason = Literal["captain_revoked", "operator_revoked", "policy_violation"]
+RecoveryDecision = Literal["requeue", "aborted_infra"]
 
 _STATUSES = frozenset(get_args(BatchStatusFilter))
 # Hosts the server answers for: local callers and OpenClaw inside Docker.
@@ -134,6 +146,13 @@ def _segment(value: str, name: str) -> str:
     return quote(value, safe="")
 
 
+def _uuid(value: str, name: str) -> str:
+    try:
+        return str(UUID(value))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError(f"{name} must be a UUID") from None
+
+
 class CaptainGatewayReader(_GatewayHttp):
     """Minimal authenticated reads against the Captain gateway."""
 
@@ -167,6 +186,41 @@ class CaptainGatewayReader(_GatewayHttp):
             raise RuntimeError("read agent outcomes returned an invalid response")
         return payload
 
+    async def get_batch_blocks(self, batch_id: str) -> list[dict[str, Any]]:
+        # The gateway omits holdout blocks on this route.
+        payload = await self._get(
+            f"/batches/{_segment(batch_id, 'batch_id')}/blocks", operation="read batch blocks"
+        )
+        if not isinstance(payload, list):
+            raise RuntimeError("read batch blocks returned an invalid response")
+        for block in payload:
+            if isinstance(block, dict) and isinstance(block.get("data"), dict):
+                block["data"].pop("claim_token_sha256", None)
+        return payload
+
+    async def get_release_status(self, project_id: str, run_id: str) -> dict[str, Any]:
+        return await self._get_object(
+            f"/v1/projects/{_segment(project_id, 'project_id')}/runs/{_segment(run_id, 'run_id')}/release",
+            operation="read release status",
+        )
+
+    async def get_runtime_operation(self, operation_id: str) -> dict[str, Any]:
+        return await self._get_object(
+            f"/v1/runtime/operations/{_uuid(operation_id, 'operation_id')}",
+            operation="read runtime operation",
+        )
+
+    async def get_factory_job(self, job_id: str) -> dict[str, Any]:
+        return await self._get_object(
+            f"/v1/factory/jobs/{_uuid(job_id, 'job_id')}", operation="read factory job"
+        )
+
+    async def _get_object(self, path: str, *, operation: str) -> dict[str, Any]:
+        payload = await self._get(path, operation=operation)
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{operation} returned an invalid response")
+        return payload
+
     async def _get(self, path: str, *, operation: str, params: Mapping[str, str] | None = None) -> Any:
         response = await self._request(
             "GET", path, operation=operation, ok=frozenset({200}), params=params
@@ -178,8 +232,21 @@ class CaptainGatewayWriter(_GatewayHttp):
     """Captain-authority writes, one dedicated gateway route per method.
 
     Every write is replay-safe at the gateway: 201 records a new block, 200
-    returns the identical existing one (`replayed`).
+    returns the identical existing one (`replayed`). The two decision routes
+    answer one fixed status for new and replayed records alike, so their
+    results carry no `replayed` flag.
     """
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        client: httpx.AsyncClient,
+        *,
+        release_policy_version: str | None = None,
+    ) -> None:
+        super().__init__(base_url, token, client)
+        self.release_policy_version = release_policy_version
 
     async def register_agent(
         self, agent_id: str, version: str, owner: str, spec_sha256: str
@@ -228,6 +295,36 @@ class CaptainGatewayWriter(_GatewayHttp):
             operation="cancel batch",
             body={"reason": reason},
         )
+
+    async def recover_expired_claim(
+        self, batch_id: str, iteration: int, decision: str
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/batches/{_segment(batch_id, 'batch_id')}/recovery",
+            operation="recover expired claim",
+            ok=frozenset({201}),
+            json_body={
+                "batch_id": batch_id,
+                "iteration": iteration,
+                "reason": "claim_expired",
+                "decision": decision,
+            },
+        )
+        return {"record": _json(response, "recover expired claim")}
+
+    async def record_release_decision(self, project_id: str, run_id: str) -> dict[str, Any]:
+        if self.release_policy_version is None:
+            raise RuntimeError("no release policy version is configured")
+        response = await self._request(
+            "POST",
+            f"/v1/projects/{_segment(project_id, 'project_id')}/runs/{_segment(run_id, 'run_id')}"
+            "/release/decision",
+            operation="record release decision",
+            ok=frozenset({200}),
+            json_body={"policy_version": self.release_policy_version},
+        )
+        return {"record": _json(response, "record release decision")}
 
     async def _post(self, path: str, *, operation: str, body: Any) -> dict[str, Any]:
         response = await self._request(
@@ -293,6 +390,7 @@ def create_mcp_app(
         ),
     )
     _register_read_tools(server, reader)
+    _register_more_read_tools(server, reader)
     if writer is not None:
         _register_write_tools(server, writer)
     if planner is not None:
@@ -324,6 +422,32 @@ def _register_read_tools(server: FastMCP, reader: CaptainGatewayReader) -> None:
         """List every claim the agent held and how its batch ended under it."""
 
         return await reader.get_agent_outcomes(agent_id)
+
+
+def _register_more_read_tools(server: FastMCP, reader: CaptainGatewayReader) -> None:
+    @server.tool(annotations=_READ)
+    async def get_batch_blocks(batch_id: str) -> list[dict[str, Any]]:
+        """List a batch's ledger blocks in order (holdout blocks are never included)."""
+
+        return await reader.get_batch_blocks(batch_id)
+
+    @server.tool(annotations=_READ)
+    async def get_release_status(project_id: str, run_id: str) -> dict[str, Any]:
+        """Read a run's release gate: status and the clean end-to-end runs counted so far."""
+
+        return await reader.get_release_status(project_id, run_id)
+
+    @server.tool(annotations=_READ)
+    async def get_runtime_operation(operation_id: str) -> dict[str, Any]:
+        """Read the projected state of one runtime operation (UUID)."""
+
+        return await reader.get_runtime_operation(operation_id)
+
+    @server.tool(annotations=_READ)
+    async def get_factory_job(job_id: str) -> dict[str, Any]:
+        """Read the projected state of one Agent Factory job (UUID)."""
+
+        return await reader.get_factory_job(job_id)
 
 
 def _register_write_tools(server: FastMCP, writer: CaptainGatewayWriter) -> None:
@@ -376,6 +500,32 @@ def _register_write_tools(server: FastMCP, writer: CaptainGatewayWriter) -> None
 
         return await writer.cancel_batch(batch_id, reason)
 
+    @server.tool(annotations=_DESTRUCTIVE)
+    async def recover_expired_claim(
+        batch_id: str, iteration: int, decision: RecoveryDecision
+    ) -> dict[str, Any]:
+        """Resolve an expired claim: `requeue` it, or end the batch as `aborted_infra`.
+
+        The gateway accepts this only when the claim of that iteration has
+        really expired and no session still runs; `aborted_infra` is final.
+        """
+
+        return await writer.recover_expired_claim(batch_id, iteration, decision)
+
+    if writer.release_policy_version is None:
+        return
+
+    @server.tool(annotations=_DESTRUCTIVE)
+    async def record_release_decision(project_id: str, run_id: str) -> dict[str, Any]:
+        """Record the release decision for a run under the configured policy.
+
+        The gateway computes accepted/rejected from the recorded evidence
+        (fail closed); the caller cannot choose the outcome. Check
+        get_release_status first. The decision is permanent.
+        """
+
+        return await writer.record_release_decision(project_id, run_id)
+
 
 @dataclass(frozen=True)
 class McpSettings:
@@ -384,6 +534,7 @@ class McpSettings:
     inbound_token: str
     captain_token: str | None = None
     plan: PlanCompilerSettings | None = None
+    release_policy_version: str | None = None
     host: str = "127.0.0.1"
     port: int = 18121
 
@@ -415,6 +566,9 @@ class McpSettings:
             inbound_token=inbound_token,
             captain_token=captain_token,
             plan=plan_compiler_settings_from_env(environment),
+            release_policy_version=(
+                environment.get("CAPTAIN_RELEASE_POLICY_VERSION", "").strip() or None
+            ),
             host=environment.get("CAPTAIN_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1",
             port=port,
         )
@@ -432,7 +586,12 @@ def main() -> None:
     client = httpx.AsyncClient(timeout=30)
     reader = CaptainGatewayReader(settings.gateway_url, settings.gateway_token, client)
     writer = (
-        CaptainGatewayWriter(settings.gateway_url, settings.captain_token, client)
+        CaptainGatewayWriter(
+            settings.gateway_url,
+            settings.captain_token,
+            client,
+            release_policy_version=settings.release_policy_version,
+        )
         if settings.captain_token is not None
         else None
     )

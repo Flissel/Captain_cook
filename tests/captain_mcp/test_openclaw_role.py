@@ -7,12 +7,13 @@ import re
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import yaml
 from starlette.testclient import TestClient
 
 from agenten.captain_mcp.plan_tools import CaptainPlanner
-from agenten.captain_mcp.server import create_mcp_app
+from agenten.captain_mcp.server import CaptainGatewayWriter, create_mcp_app
 from agenten.constitution.ruleset import load_constitution
 from agenten.constitution.validators import (
     MAX_CAPABILITY_TAGS,
@@ -26,7 +27,6 @@ from agenten.planning.supplied_plan import (
 )
 from agenten.validation.contracts import AssertionKind
 from tests.captain_mcp.test_captain_mcp_server import INIT, MCP_TOKEN, reader, rpc
-from tests.captain_mcp.test_captain_mcp_writes import writer
 from tests.captain_mcp.test_openclaw_deploy import DEPLOY, compose, seed_config
 
 WORKSPACE = DEPLOY / "workspace"
@@ -44,7 +44,10 @@ def _full_surface() -> dict[str, dict[str, Any]]:
         PlanCompilerSettings("python", frozenset({"python"}), frozenset({"python"})),
         release_client=_NoRelease(),
     )
-    app = create_mcp_app(reader([]), inbound_token=MCP_TOKEN, writer=writer([]), planner=planner)
+    release_writer = CaptainGatewayWriter(
+        "https://gateway.test", "captain-token", httpx.AsyncClient(), release_policy_version="v1"
+    )
+    app = create_mcp_app(reader([]), inbound_token=MCP_TOKEN, writer=release_writer, planner=planner)
     with TestClient(app, base_url="http://127.0.0.1:18121") as client:
         rpc(client, "initialize", INIT)
         listed = rpc(client, "tools/list", {})

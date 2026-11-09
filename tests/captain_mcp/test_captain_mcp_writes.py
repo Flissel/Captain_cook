@@ -36,8 +36,18 @@ WRITE_TOOLS = {
     "revoke_agent_capability",
     "assign_batch",
     "cancel_batch",
+    "recover_expired_claim",
 }
-READ_TOOLS = {"list_batches", "get_batch", "get_agent", "get_agent_outcomes"}
+READ_TOOLS = {
+    "list_batches",
+    "get_batch",
+    "get_agent",
+    "get_agent_outcomes",
+    "get_batch_blocks",
+    "get_release_status",
+    "get_runtime_operation",
+    "get_factory_job",
+}
 
 
 def captain_gateway(seen: list[httpx.Request], *, status: int = 201, body: Any = None) -> httpx.MockTransport:
@@ -173,6 +183,8 @@ def test_writer_adds_exactly_the_fixed_write_tools_with_annotations() -> None:
         assert tools[name]["annotations"]["readOnlyHint"] is False
     assert tools["retire_agent"]["annotations"]["destructiveHint"] is True
     assert tools["cancel_batch"]["annotations"]["destructiveHint"] is True
+    assert tools["recover_expired_claim"]["annotations"]["destructiveHint"] is True
+    assert "record_release_decision" not in tools  # no policy version configured
     assert tools["grant_agent_capability"]["annotations"]["destructiveHint"] is True
     assert tools["assign_batch"]["annotations"]["destructiveHint"] is False
     reasons = tools["cancel_batch"]["inputSchema"]["properties"]["reason"]
@@ -222,3 +234,95 @@ def test_planner_cannot_approve_its_own_batches() -> None:
 
     assert not any("approve" in name for name in tools)
     assert not hasattr(CaptainGatewayWriter, "approve_batch")
+
+
+# --- recovery, release, further reads -------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_recovery_posts_a_claim_expired_decision() -> None:
+    seen: list[httpx.Request] = []
+
+    result = await writer(seen).recover_expired_claim("batch-1", 2, "requeue")
+
+    assert seen[0].url.path == "/batches/batch-1/recovery"
+    assert json.loads(seen[0].content) == {
+        "batch_id": "batch-1",
+        "iteration": 2,
+        "reason": "claim_expired",
+        "decision": "requeue",
+    }
+    assert set(result) == {"record"}
+
+
+@pytest.mark.asyncio
+async def test_release_decision_uses_the_configured_policy_version_only() -> None:
+    seen: list[httpx.Request] = []
+    client = httpx.AsyncClient(transport=captain_gateway(seen, status=200))
+    pinned = CaptainGatewayWriter(
+        "https://gateway.test", CAPTAIN_TOKEN, client, release_policy_version="gate-e-v1"
+    )
+
+    await pinned.record_release_decision("proj/1", "run-1")
+
+    assert seen[0].url.raw_path == b"/v1/projects/proj%2F1/runs/run-1/release/decision"
+    assert json.loads(seen[0].content) == {"policy_version": "gate-e-v1"}
+    with pytest.raises(RuntimeError, match="no release policy version"):
+        await writer([]).record_release_decision("proj", "run")
+
+
+def test_release_tool_exists_only_with_a_policy_version() -> None:
+    pinned = CaptainGatewayWriter(
+        "https://gateway.test", CAPTAIN_TOKEN, httpx.AsyncClient(), release_policy_version="v1"
+    )
+    tools = _tools(create_mcp_app(reader([]), inbound_token=MCP_TOKEN, writer=pinned))
+
+    annotations = tools["record_release_decision"]["annotations"]
+    assert annotations["destructiveHint"] is True
+    assert set(tools["record_release_decision"]["inputSchema"]["properties"]) == {"project_id", "run_id"}
+    assert McpSettings.from_env(
+        environment(CAPTAIN_RELEASE_POLICY_VERSION=" gate-e-v1 ")
+    ).release_policy_version == "gate-e-v1"
+
+
+def test_no_review_runtime_or_factory_write_tools_exist() -> None:
+    pinned = CaptainGatewayWriter(
+        "https://gateway.test", CAPTAIN_TOKEN, httpx.AsyncClient(), release_policy_version="v1"
+    )
+    names = set(_tools(create_mcp_app(reader([]), inbound_token=MCP_TOKEN, writer=pinned)))
+
+    assert not any(word in name for name in names for word in ("review", "approve", "command", "holdout"))
+    assert not {"create_factory_job", "grant_runtime_capability"} & names
+
+
+@pytest.mark.asyncio
+async def test_further_reads_hit_their_routes_and_strip_claim_digests() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path.endswith("/blocks"):
+            body: Any = [{"block_type": "batch_claimed", "data": {"claim_token_sha256": "a" * 64, "agent_id": "x"}}]
+        else:
+            body = {"status": "ok"}
+        return httpx.Response(200, json=body, request=request)
+
+    agent_reader = CaptainGatewayReader(
+        "https://gateway.test", GATEWAY_TOKEN, httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    operation = "6f1c2c1e-6a43-4a5d-9a9e-1b2c3d4e5f60"
+
+    blocks = await agent_reader.get_batch_blocks("batch-1")
+    await agent_reader.get_release_status("proj", "run-1")
+    await agent_reader.get_runtime_operation(operation)
+    await agent_reader.get_factory_job(operation.upper())
+
+    assert blocks == [{"block_type": "batch_claimed", "data": {"agent_id": "x"}}]
+    assert [request.url.path for request in seen] == [
+        "/batches/batch-1/blocks",
+        "/v1/projects/proj/runs/run-1/release",
+        f"/v1/runtime/operations/{operation}",
+        f"/v1/factory/jobs/{operation}",
+    ]
+    with pytest.raises(ValueError, match="UUID"):
+        await agent_reader.get_runtime_operation("../agents")

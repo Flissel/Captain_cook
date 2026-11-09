@@ -165,7 +165,16 @@ def test_mcp_lists_only_read_tools_by_default() -> None:
         listed = rpc(client, "tools/list", {})
 
     names = {tool["name"] for tool in listed.json()["result"]["tools"]}
-    assert names == {"list_batches", "get_batch", "get_agent", "get_agent_outcomes"}
+    assert names == {
+        "list_batches",
+        "get_batch",
+        "get_agent",
+        "get_agent_outcomes",
+        "get_batch_blocks",
+        "get_release_status",
+        "get_runtime_operation",
+        "get_factory_job",
+    }
 
 
 def test_mcp_tool_call_reaches_the_gateway() -> None:
