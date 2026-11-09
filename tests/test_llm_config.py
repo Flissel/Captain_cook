@@ -4,7 +4,7 @@ import os
 import pytest
 
 import config.llm_config as llm_config
-from config.llm_provider import NEMOTRON_DEFAULT_MODEL, ProviderConfigurationError
+from config.llm_provider import CLAUDE_CODE_DEFAULT_MODEL, ProviderConfigurationError
 
 _PROVIDER_VARS = (
     "CAPTAIN_LLM_PROVIDER",
@@ -12,6 +12,7 @@ _PROVIDER_VARS = (
     "CAPTAIN_MODEL",
     "NEBIUS_API_KEY",
     "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
 )
 
 
@@ -30,12 +31,13 @@ def _clean(monkeypatch, tmp_path):
         monkeypatch.delenv(name, raising=False)
 
 
-def test_default_model_is_nemotron_on_nebius(monkeypatch, tmp_path):
+def test_default_is_the_claude_code_shim(monkeypatch, tmp_path):
     _clean(monkeypatch, tmp_path)
 
-    assert llm_config.get_profile().name == "nebius"
-    assert llm_config.PROFILE.name == "nebius"
-    assert llm_config.MODEL == NEMOTRON_DEFAULT_MODEL
+    assert llm_config.get_profile().name == "claude-code"
+    assert llm_config.PROFILE.name == "claude-code"
+    assert llm_config.MODEL == CLAUDE_CODE_DEFAULT_MODEL
+    assert llm_config.API_KEY is None
 
 
 def test_local_env_file_supplies_openai_opt_in(monkeypatch, tmp_path):
@@ -53,7 +55,9 @@ def test_local_env_file_supplies_openai_opt_in(monkeypatch, tmp_path):
 
 def test_local_env_file_supplies_nebius_key(monkeypatch, tmp_path):
     _clean(monkeypatch, tmp_path)
-    (tmp_path / ".env").write_text("NEBIUS_API_KEY=nb-test\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "CAPTAIN_LLM_PROVIDER=nebius\nNEBIUS_API_KEY=nb-test\n", encoding="utf-8"
+    )
 
     assert llm_config.API_KEY == "nb-test"
     assert "NEBIUS_API_KEY" not in os.environ
@@ -61,7 +65,9 @@ def test_local_env_file_supplies_nebius_key(monkeypatch, tmp_path):
 
 def test_process_environment_overrides_the_env_file(monkeypatch, tmp_path):
     _clean(monkeypatch, tmp_path)
-    (tmp_path / ".env").write_text("CAPTAIN_MODEL=nvidia/from-file\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "CAPTAIN_LLM_PROVIDER=nebius\nCAPTAIN_MODEL=nvidia/from-file\n", encoding="utf-8"
+    )
     monkeypatch.setenv("CAPTAIN_MODEL", "nvidia/from-process")
 
     assert llm_config.get_profile().model == "nvidia/from-process"
@@ -70,11 +76,11 @@ def test_process_environment_overrides_the_env_file(monkeypatch, tmp_path):
 def test_profile_is_cached_until_reset(monkeypatch, tmp_path):
     _clean(monkeypatch, tmp_path)
     first = llm_config.get_profile()
-    monkeypatch.setenv("CAPTAIN_MODEL", "nvidia/changed")
+    monkeypatch.setenv("CAPTAIN_MODEL", "claude-code-sonnet")
 
     assert llm_config.get_profile() is first
     llm_config.reset_profile_cache()
-    assert llm_config.get_profile().model == "nvidia/changed"
+    assert llm_config.get_profile().model == "claude-code-sonnet"
 
 
 def test_unknown_module_attribute_still_raises():
