@@ -85,10 +85,15 @@ access (`GatewayLockNamespaceError`).
 The MCP server is read-only unless it gets `CAPTAIN_MCP_CAPTAIN_TOKEN`
 (the gateway's Captain token). Then it also offers a fixed set of Captain
 tools: `register_agent`, `retire_agent`, `grant_agent_capability`,
-`revoke_agent_capability`, `assign_batch`, `cancel_batch`, `approve_batch`.
+`revoke_agent_capability`, `assign_batch`, `cancel_batch`.
 There is no generic block write. Reads keep using the agent token. Every
 tool carries MCP safety annotations (read-only, destructive, idempotent),
-so OpenClaw can require approval for destructive calls.
+so OpenClaw can require approval for destructive calls. Granting a
+capability counts as destructive because it widens what an agent may do.
+
+Batch approval is not an MCP tool. It is the human review gate; a planner
+that could approve its own batches would make the gate meaningless, so
+approval stays with the operator (`POST /batches/{id}/approve`).
 
 Giving the planner this token makes it Captain. Enable it only for a run
 that is meant to orchestrate, never for the read-only spike.

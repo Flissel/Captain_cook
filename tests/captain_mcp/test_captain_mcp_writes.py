@@ -36,7 +36,6 @@ WRITE_TOOLS = {
     "revoke_agent_capability",
     "assign_batch",
     "cancel_batch",
-    "approve_batch",
 }
 READ_TOOLS = {"list_batches", "get_batch", "get_agent", "get_agent_outcomes"}
 
@@ -80,7 +79,6 @@ async def test_every_write_hits_its_dedicated_route() -> None:
     await w.revoke_agent_capability("openclaw", "grant-1", "captain_revoked")
     await w.assign_batch("batch-1", "openclaw")
     await w.cancel_batch("batch-1", "unroutable")
-    await w.approve_batch("batch-1")
 
     assert [(request.method, request.url.path) for request in seen] == [
         ("POST", "/agents"),
@@ -89,7 +87,6 @@ async def test_every_write_hits_its_dedicated_route() -> None:
         ("POST", "/agents/openclaw/grants/grant-1/revoke"),
         ("POST", "/batches/batch-1/assign"),
         ("POST", "/batches/batch-1/cancel"),
-        ("POST", "/batches/batch-1/approve"),
     ]
     assert json.loads(seen[2].content) == {
         "grant_id": "grant-1",
@@ -103,7 +100,9 @@ async def test_short_gateway_reasons_surface_but_bodies_do_not() -> None:
     with pytest.raises(RuntimeError, match=r"status 409: agent is retired$"):
         await writer([], status=409, body={"detail": "agent is retired"}).assign_batch("b", "openclaw")
     with pytest.raises(RuntimeError) as structured:
-        await writer([], status=422, body={"detail": [{"input": "secret-ledger-content"}]}).approve_batch("b")
+        await writer([], status=422, body={"detail": [{"input": "secret-ledger-content"}]}).cancel_batch(
+            "b", "unroutable"
+        )
 
     assert "secret-ledger-content" not in str(structured.value)
     assert str(structured.value).endswith("status 422")
@@ -116,7 +115,9 @@ async def test_unreachable_gateway_is_reported_without_details() -> None:
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(broken))
     with pytest.raises(RuntimeError, match="could not reach the gateway") as excinfo:
-        await CaptainGatewayWriter("https://gateway.test", CAPTAIN_TOKEN, client).approve_batch("b")
+        await CaptainGatewayWriter("https://gateway.test", CAPTAIN_TOKEN, client).cancel_batch(
+            "b", "unroutable"
+        )
     assert "internals" not in str(excinfo.value)
 
 
@@ -172,6 +173,7 @@ def test_writer_adds_exactly_the_fixed_write_tools_with_annotations() -> None:
         assert tools[name]["annotations"]["readOnlyHint"] is False
     assert tools["retire_agent"]["annotations"]["destructiveHint"] is True
     assert tools["cancel_batch"]["annotations"]["destructiveHint"] is True
+    assert tools["grant_agent_capability"]["annotations"]["destructiveHint"] is True
     assert tools["assign_batch"]["annotations"]["destructiveHint"] is False
     reasons = tools["cancel_batch"]["inputSchema"]["properties"]["reason"]
     assert "unroutable" in json.dumps(reasons)
@@ -211,3 +213,12 @@ def test_agent_reads_use_the_agent_token() -> None:
 
     assert [request.url.path for request in seen] == ["/agents/openclaw", "/agents/openclaw/outcomes"]
     assert all(request.headers["authorization"] == f"Bearer {GATEWAY_TOKEN}" for request in seen)
+
+
+def test_planner_cannot_approve_its_own_batches() -> None:
+    """Approval is the human review gate; it never becomes an MCP tool."""
+
+    tools = _tools(create_mcp_app(reader([]), inbound_token=MCP_TOKEN, writer=writer([])))
+
+    assert not any("approve" in name for name in tools)
+    assert not hasattr(CaptainGatewayWriter, "approve_batch")

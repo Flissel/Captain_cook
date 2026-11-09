@@ -6,6 +6,11 @@ without it the server stays read-only, as in the OpenClaw spike. The write
 surface is a fixed list of dedicated gateway routes, never generic
 `/blocks`, and every tool carries MCP safety annotations so the client can
 apply its approval policy.
+
+Batch approval is deliberately absent: it is the human review gate, and a
+planner that could approve its own batches would make the gate void.
+Widening an agent's permissions (`grant_agent_capability`) is marked
+destructive so the client asks before it runs.
 """
 
 from __future__ import annotations
@@ -216,13 +221,6 @@ class CaptainGatewayWriter(_GatewayHttp):
             body={"reason": reason},
         )
 
-    async def approve_batch(self, batch_id: str) -> dict[str, Any]:
-        return await self._post(
-            f"/batches/{_segment(batch_id, 'batch_id')}/approve",
-            operation="approve batch",
-            body=None,
-        )
-
     async def _post(self, path: str, *, operation: str, body: Any) -> dict[str, Any]:
         response = await self._request(
             "POST", path, operation=operation, ok=frozenset({200, 201}), json_body=body
@@ -332,7 +330,7 @@ def _register_write_tools(server: FastMCP, writer: CaptainGatewayWriter) -> None
 
         return await writer.retire_agent(agent_id, reason)
 
-    @server.tool(annotations=_WRITE)
+    @server.tool(annotations=_DESTRUCTIVE)
     async def grant_agent_capability(
         agent_id: str, grant_id: str, capability_tags: list[str], expires_at: str
     ) -> dict[str, Any]:
@@ -366,12 +364,6 @@ def _register_write_tools(server: FastMCP, writer: CaptainGatewayWriter) -> None
         """
 
         return await writer.cancel_batch(batch_id, reason)
-
-    @server.tool(annotations=_WRITE)
-    async def approve_batch(batch_id: str) -> dict[str, Any]:
-        """Release a batch that waits for review approval to the claim queue."""
-
-        return await writer.approve_batch(batch_id)
 
 
 @dataclass(frozen=True)

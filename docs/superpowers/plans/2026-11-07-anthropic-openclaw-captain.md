@@ -194,8 +194,11 @@ Phase 1). No generic `/blocks` write tool.
       revocations, factory jobs, release decision, cancel (Phase 1).
       Done (2026-11-09), opt-in via `CAPTAIN_MCP_CAPTAIN_TOKEN`, all
       annotated: `register_agent`, `retire_agent`, `grant_agent_capability`,
-      `revoke_agent_capability`, `assign_batch`, `cancel_batch`,
-      `approve_batch`. Open: recovery, review, runtime commands/grants,
+      `revoke_agent_capability`, `assign_batch`, `cancel_batch`.
+      `grant_agent_capability` is annotated destructive (it widens
+      permissions). Approval is deliberately not a tool: it is the human
+      review gate and stays with the operator (security review
+      2026-11-09). Open: recovery, review, runtime commands/grants,
       factory jobs, release decision.
 - [ ] Constitution check tool: HTTP/MCP wrapper around the rule layer of
       `ConstitutionGatekeeper` (today event-bus internal only).
