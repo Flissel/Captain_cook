@@ -148,14 +148,20 @@ from gateway.contracts import (
 )
 from gateway.release_policy import ReleaseReadiness, evaluate_release_readiness
 from gateway.agent_lifecycle import (
+    AGENT_CAPABILITY_GRANTED_BLOCK_TYPE,
+    AGENT_CAPABILITY_REVOKED_BLOCK_TYPE,
     AGENT_LIFECYCLE_BLOCK_TYPES,
     AGENT_REGISTERED_BLOCK_TYPE,
     AGENT_RETIRED_BLOCK_TYPE,
+    AgentCapabilityGrantedEvent,
+    AgentCapabilityGrantRequest,
+    AgentCapabilityRevokedEvent,
     AgentLedgerError,
     AgentProjection,
     AgentRegisteredEvent,
     AgentRetiredEvent,
     RetireReason,
+    RevokeReason,
     project_agent,
 )
 from gateway.registry_feed import (
@@ -217,6 +223,8 @@ GATEWAY_OWNED_EVENT_TYPES = frozenset(
         BATCH_CANCELLED_BLOCK_TYPE,
         AGENT_REGISTERED_BLOCK_TYPE,
         AGENT_RETIRED_BLOCK_TYPE,
+        AGENT_CAPABILITY_GRANTED_BLOCK_TYPE,
+        AGENT_CAPABILITY_REVOKED_BLOCK_TYPE,
     }
 )
 WORKER_EVIDENCE_BLOCK_TYPES = frozenset(
@@ -8357,6 +8365,7 @@ class GatewayStore:
                 )
                 if projection.status != "pending" or claim_expired_without_recovery:
                     raise HTTPException(status_code=409, detail="batch is not claimable")
+                self._require_claim_capability(cursor, agent_id, parent, now=now)
                 token = secrets.token_urlsafe(32)
                 claim_id = f"claim-{secrets.token_urlsafe(18)}"
                 fencing_token = projection.claim_iteration + 1
@@ -8520,6 +8529,134 @@ class GatewayStore:
                 )
                 self._insert(cursor, block)
         return block
+
+    def grant_agent_capability(
+        self, agent_id: str, request: AgentCapabilityGrantRequest
+    ) -> tuple[dict[str, Any], bool]:
+        """Grant a registered agent capability tags; returns (block, replayed)."""
+
+        try:
+            return self._retry_write(lambda: self._grant_once(agent_id, request)), False
+        except _IdempotentReplay as replay:
+            return replay.block, True
+
+    def _grant_once(self, agent_id: str, request: AgentCapabilityGrantRequest) -> dict[str, Any]:
+        event = AgentCapabilityGrantedEvent(agent_id=agent_id, **request.model_dump())
+        data = event.model_dump(mode="json")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                blocks = self._agent_blocks(cursor, agent_id, for_update=True)
+                current = self._project_agent_blocks(blocks, agent_id)
+                if current is None:
+                    raise HTTPException(status_code=404, detail="agent not registered")
+                existing = next(
+                    (
+                        block
+                        for block in blocks
+                        if block["block_type"] == AGENT_CAPABILITY_GRANTED_BLOCK_TYPE
+                        and block["data"].get("grant_id") == request.grant_id
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if existing["data"] == data:
+                        raise _IdempotentReplay(existing)
+                    raise HTTPException(
+                        status_code=409, detail="grant_id already holds a different grant"
+                    )
+                if current.status == "retired":
+                    raise HTTPException(status_code=409, detail="agent is retired")
+                if event.expires_at <= _utcnow():
+                    raise HTTPException(status_code=422, detail="grant is already expired")
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type=AGENT_CAPABILITY_GRANTED_BLOCK_TYPE,
+                    data=data,
+                    status="granted",
+                    parent_index=None,
+                )
+                self._project_agent_blocks([*blocks, block], agent_id)
+                self._insert(cursor, block)
+        return block
+
+    def revoke_agent_capability(
+        self, agent_id: str, grant_id: str, reason: RevokeReason
+    ) -> tuple[dict[str, Any], bool]:
+        """Revoke one capability grant; returns (block, replayed)."""
+
+        try:
+            return (
+                self._retry_write(lambda: self._revoke_once(agent_id, grant_id, reason)),
+                False,
+            )
+        except _IdempotentReplay as replay:
+            return replay.block, True
+
+    def _revoke_once(self, agent_id: str, grant_id: str, reason: RevokeReason) -> dict[str, Any]:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                blocks = self._agent_blocks(cursor, agent_id, for_update=True)
+                current = self._project_agent_blocks(blocks, agent_id)
+                if current is None or not any(
+                    grant.grant_id == grant_id for grant in current.grants
+                ):
+                    raise HTTPException(status_code=404, detail="grant not found")
+                existing = next(
+                    (
+                        block
+                        for block in blocks
+                        if block["block_type"] == AGENT_CAPABILITY_REVOKED_BLOCK_TYPE
+                        and block["data"].get("grant_id") == grant_id
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if existing["data"].get("reason") == reason:
+                        raise _IdempotentReplay(existing)
+                    raise HTTPException(
+                        status_code=409, detail="grant was already revoked for another reason"
+                    )
+                if current.status == "retired":
+                    raise HTTPException(status_code=409, detail="agent is retired")
+                event = AgentCapabilityRevokedEvent(
+                    agent_id=agent_id, grant_id=grant_id, reason=reason
+                )
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type=AGENT_CAPABILITY_REVOKED_BLOCK_TYPE,
+                    data=event.model_dump(mode="json"),
+                    status="revoked",
+                    parent_index=None,
+                )
+                self._insert(cursor, block)
+        return block
+
+    def _require_claim_capability(
+        self, cursor: Any, agent_id: str | None, parent: dict[str, Any], *, now: datetime
+    ) -> None:
+        """A ledger-registered agent claims only batches a grant covers.
+
+        Agents with a token but no ledger registration keep the pre-Phase-2
+        behavior; Captain opts an agent into grant scoping by registering it.
+        """
+
+        if agent_id is None:
+            return
+        projection = self._project_agent_blocks(
+            self._agent_blocks(cursor, agent_id, for_update=False), agent_id
+        )
+        if projection is None:
+            return
+        if projection.status == "retired":
+            raise HTTPException(status_code=403, detail="agent is retired")
+        tags = parent.get("data", {}).get("capability_tags") or []
+        if not projection.covers(tags, now=now):
+            raise HTTPException(
+                status_code=403,
+                detail="agent has no active grant covering the batch capabilities",
+            )
 
     @staticmethod
     def _project_agent_blocks(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -11,8 +12,11 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from gateway.agent_lifecycle import (
+    AGENT_CAPABILITY_GRANTED_BLOCK_TYPE,
+    AGENT_CAPABILITY_REVOKED_BLOCK_TYPE,
     AGENT_REGISTERED_BLOCK_TYPE,
     AGENT_RETIRED_BLOCK_TYPE,
+    AgentCapabilityGrantRequest,
     AgentLedgerError,
     AgentProjection,
     AgentRegisteredEvent,
@@ -128,6 +132,7 @@ class FakeAgentStore:
         self.projection = projection
         self.registered: list[AgentRegisteredEvent] = []
         self.claims: list[str | None] = []
+        self.granted: list[tuple[str, AgentCapabilityGrantRequest]] = []
 
     def agent(self, agent_id: str) -> AgentProjection | None:
         return self.projection
@@ -140,6 +145,13 @@ class FakeAgentStore:
     def claim(self, batch_id: str, agent_id: str | None) -> dict[str, str | int]:
         self.claims.append(agent_id)
         return {"claim_token": "t", "claim_id": "c", "fencing_token": 1}
+
+    def grant_agent_capability(
+        self, agent_id: str, request: AgentCapabilityGrantRequest
+    ) -> tuple[dict[str, Any], bool]:
+        self.granted.append((agent_id, request))
+        data = {"agent_id": agent_id, **request.model_dump(mode="json")}
+        return {"data": data}, len(self.granted) > 1
 
 
 def _client(store: FakeAgentStore) -> TestClient:
@@ -218,3 +230,112 @@ def test_unknown_agent_reads_404() -> None:
     )
 
     assert response.status_code == 404
+
+
+# --- capability grants ------------------------------------------------------
+
+NOW = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
+
+
+def granted(
+    index: int,
+    grant_id: str = "grant-1",
+    tags: tuple[str, ...] = ("python", "n8n-builder"),
+    expires: datetime | None = None,
+) -> dict[str, Any]:
+    return {
+        "index": index,
+        "parent_index": None,
+        "block_type": AGENT_CAPABILITY_GRANTED_BLOCK_TYPE,
+        "data": {
+            "agent_id": "openclaw",
+            "grant_id": grant_id,
+            "capability_tags": list(tags),
+            "expires_at": (expires or NOW + timedelta(hours=1)).isoformat(),
+        },
+        "status": "granted",
+    }
+
+
+def revoked(index: int, grant_id: str = "grant-1") -> dict[str, Any]:
+    return {
+        "index": index,
+        "parent_index": None,
+        "block_type": AGENT_CAPABILITY_REVOKED_BLOCK_TYPE,
+        "data": {"agent_id": "openclaw", "grant_id": grant_id, "reason": "captain_revoked"},
+        "status": "revoked",
+    }
+
+
+def test_grant_request_needs_tags_and_an_aware_expiry() -> None:
+    with pytest.raises(ValidationError):
+        AgentCapabilityGrantRequest(grant_id="grant-1", capability_tags=(), expires_at=NOW)
+    with pytest.raises(ValidationError):
+        AgentCapabilityGrantRequest.model_validate(
+            {"grant_id": "grant-1", "capability_tags": ["python"], "expires_at": "2026-11-09T12:00:00"}
+        )
+
+
+def test_active_grant_must_cover_every_batch_tag() -> None:
+    projection = project_agent([registered(1), granted(2)], "openclaw")
+    assert projection is not None
+
+    assert projection.covers(("python",), now=NOW)
+    assert projection.covers(("n8n-builder", "python"), now=NOW)
+    assert projection.covers((), now=NOW)
+    assert not projection.covers(("python", "deploy"), now=NOW)
+
+
+def test_one_grant_must_cover_all_tags_not_the_union() -> None:
+    projection = project_agent(
+        [registered(1), granted(2, tags=("python",)), granted(3, "grant-2", tags=("deploy",))],
+        "openclaw",
+    )
+    assert projection is not None
+
+    assert not projection.covers(("python", "deploy"), now=NOW)
+
+
+def test_expired_or_revoked_grants_cover_nothing() -> None:
+    expired = project_agent([registered(1), granted(2, expires=NOW)], "openclaw")
+    withdrawn = project_agent([registered(1), granted(2), revoked(3)], "openclaw")
+
+    assert expired is not None and not expired.covers(("python",), now=NOW)
+    assert withdrawn is not None and not withdrawn.covers(("python",), now=NOW)
+    assert withdrawn.grants[0].revoked is True
+
+
+def test_grant_rules_reject_inconsistent_ledgers() -> None:
+    with pytest.raises(AgentLedgerError, match="before agent_registered"):
+        project_agent([granted(1)], "openclaw")
+    with pytest.raises(AgentLedgerError, match="granted twice"):
+        project_agent([registered(1), granted(2), granted(3)], "openclaw")
+    with pytest.raises(AgentLedgerError, match="unknown grant"):
+        project_agent([registered(1), revoked(2)], "openclaw")
+    with pytest.raises(AgentLedgerError, match="revoked twice"):
+        project_agent([registered(1), granted(2), revoked(3), revoked(4)], "openclaw")
+
+
+def test_only_captain_grants_capabilities_and_replay_answers_200() -> None:
+    store = FakeAgentStore(_projection("registered"))
+    client = _client(store)
+    body = {
+        "grant_id": "grant-1",
+        "capability_tags": ["python", "deploy"],
+        "expires_at": "2026-11-10T12:00:00+00:00",
+    }
+
+    worker = client.post(
+        "/agents/openclaw/grants", json=body, headers={"Authorization": f"Bearer {AGENT_TOKEN}"}
+    )
+    created = client.post(
+        "/agents/openclaw/grants", json=body, headers={"Authorization": f"Bearer {CAPTAIN_TOKEN}"}
+    )
+    replayed = client.post(
+        "/agents/openclaw/grants", json=body, headers={"Authorization": f"Bearer {CAPTAIN_TOKEN}"}
+    )
+
+    assert worker.status_code == 403
+    assert (created.status_code, replayed.status_code) == (201, 200)
+    assert created.json()["capability_tags"] == ["deploy", "python"]
+    assert [agent for agent, _ in store.granted] == ["openclaw", "openclaw"]

@@ -19,7 +19,7 @@ from pymysql.err import OperationalError
 
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
-from gateway.agent_lifecycle import AgentRegisteredEvent
+from gateway.agent_lifecycle import AgentCapabilityGrantRequest, AgentRegisteredEvent
 from gateway.app import CAPTAIN_WRITE_BLOCK_TYPES, BlockRequest, create_app
 from gateway.auth import GatewayRole, require_actor
 from gateway.contracts import DeliveryEventEnvelope, ReleaseProjection
@@ -1680,3 +1680,66 @@ def test_retired_agent_is_terminal_and_loses_write_authority(storage: MariaDBSto
     assert (refused.value.status_code, refused.value.detail) == (403, "agent is retired")
     projection = store.agent("openclaw")
     assert projection is not None and projection.retire_reason == "captain_retired"
+
+
+def _grant(
+    grant_id: str = "grant-1",
+    tags: tuple[str, ...] = ("email", "notifications"),
+    hours: int = 1,
+) -> AgentCapabilityGrantRequest:
+    return AgentCapabilityGrantRequest(
+        grant_id=grant_id,
+        capability_tags=tags,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=hours),
+    )
+
+
+def test_capability_grant_is_replayable_and_validated(storage: MariaDBStorage) -> None:
+    store = GatewayStore(storage)
+    with pytest.raises(HTTPException) as unregistered:
+        store.grant_agent_capability("openclaw", _grant())
+    assert unregistered.value.status_code == 404
+
+    store.register_agent(_agent_registration())
+    request = _grant()
+    _, first_replayed = store.grant_agent_capability("openclaw", request)
+    _, replayed = store.grant_agent_capability("openclaw", request)
+    with pytest.raises(HTTPException) as conflicting:
+        store.grant_agent_capability("openclaw", _grant(tags=("email",)))
+    with pytest.raises(HTTPException) as expired:
+        store.grant_agent_capability("openclaw", _grant("grant-2", hours=-1))
+
+    assert (first_replayed, replayed) == (False, True)
+    assert conflicting.value.status_code == 409
+    assert expired.value.status_code == 422
+    projection = store.agent("openclaw")
+    assert projection is not None and [grant.grant_id for grant in projection.grants] == ["grant-1"]
+
+
+def test_registered_agent_claims_only_batches_an_active_grant_covers(
+    storage: MariaDBStorage,
+) -> None:
+    store = GatewayStore(storage)
+    store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-1")), None)
+    store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-2")), None)
+    store.register_agent(_agent_registration())
+
+    with pytest.raises(HTTPException) as ungranted:
+        store.claim("batch-1", "openclaw")
+    store.grant_agent_capability("openclaw", _grant(tags=("email",)))
+    with pytest.raises(HTTPException) as partial:
+        store.claim("batch-1", "openclaw")
+    store.grant_agent_capability("openclaw", _grant("grant-2"))
+    claimed = store.claim("batch-1", "openclaw")
+    _, revoke_replayed = store.revoke_agent_capability("openclaw", "grant-2", "captain_revoked")
+    with pytest.raises(HTTPException) as revoked:
+        store.claim("batch-2", "openclaw")
+
+    assert ungranted.value.status_code == 403
+    assert partial.value.status_code == 403
+    assert "claim_token" in claimed
+    assert revoke_replayed is False
+    assert revoked.value.status_code == 403
+    assert store.batch_projection("batch-1").claim_agent_id == "openclaw"
+    # An agent with a token but no ledger registration keeps legacy behavior.
+    assert "claim_token" in store.claim("batch-2", "other-agent")

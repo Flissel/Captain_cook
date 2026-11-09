@@ -117,6 +117,10 @@ from gateway.registry_feed import (
 )
 from gateway.settings import GatewaySettings
 from gateway.agent_lifecycle import (
+    AgentCapabilityGrantedEvent,
+    AgentCapabilityGrantRequest,
+    AgentCapabilityRevokedEvent,
+    AgentCapabilityRevokeRequest,
     AgentProjection,
     AgentRegisteredEvent,
     AgentRetiredEvent,
@@ -1685,6 +1689,33 @@ def create_app(
         if replayed:
             response.status_code = status.HTTP_200_OK
         return AgentRetiredEvent.model_validate(block["data"])
+
+    @app.post("/agents/{agent_id}/grants", status_code=status.HTTP_201_CREATED)
+    async def grant_agent_capability(
+        agent_id: str,
+        request: AgentCapabilityGrantRequest,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> AgentCapabilityGrantedEvent:
+        block, replayed = get_store().grant_agent_capability(agent_id, request)
+        if replayed:
+            response.status_code = status.HTTP_200_OK
+        return AgentCapabilityGrantedEvent.model_validate(block["data"])
+
+    @app.post(
+        "/agents/{agent_id}/grants/{grant_id}/revoke", status_code=status.HTTP_201_CREATED
+    )
+    async def revoke_agent_capability(
+        agent_id: str,
+        grant_id: str,
+        request: AgentCapabilityRevokeRequest,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> AgentCapabilityRevokedEvent:
+        block, replayed = get_store().revoke_agent_capability(agent_id, grant_id, request.reason)
+        if replayed:
+            response.status_code = status.HTTP_200_OK
+        return AgentCapabilityRevokedEvent.model_validate(block["data"])
 
     @app.get("/agents/{agent_id}")
     async def get_agent(

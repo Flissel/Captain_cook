@@ -122,10 +122,15 @@ lifecycle (authorization). Order is by risk and independence:
       `agent_retired`; `project_agent` (`gateway/agent_lifecycle.py`). A
       retired agent's token loses all write routes (403); reads stay open.
       Routes: `POST /agents`, `POST /agents/{id}/retire`, `GET /agents/{id}`.
-- [ ] `agent_capability_granted` / `agent_capability_revoked` (grant_id,
+- [x] `agent_capability_granted` / `agent_capability_revoked` (grant_id,
       capability tags, expiry). A ledger-registered agent may claim only a
-      batch whose `capability_tags` an active grant covers. The runtime
-      `CapabilityGrant` (per command, profile-fixed) stays separate.
+      batch whose `capability_tags` one active grant covers (grants are not
+      unioned). The runtime `CapabilityGrant` (per command, profile-fixed)
+      stays separate. Routes: `POST /agents/{id}/grants`,
+      `POST /agents/{id}/grants/{grant_id}/revoke`.
+- [ ] Agents with a token but no ledger registration still claim anything
+      (compatibility). Add a setting that requires ledger registration for
+      every claiming agent once Captain registers all of them.
 - [ ] `agent_assigned` (batch, agent): Captain pins the next claim of a
       batch to one agent; other agents get 403.
 - [ ] Agent outcomes: derived read model over batch projections
