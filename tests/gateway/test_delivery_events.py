@@ -800,3 +800,30 @@ def test_codex_warning_requires_sequence_and_forbids_lifecycle_metadata() -> Non
                 },
             }
         )
+
+
+def test_new_delivery_batch_done_is_refused_in_favor_of_the_lifecycle_block() -> None:
+    """Batch terminal state has one record: the lifecycle `batch_done` block."""
+
+    from fastapi import HTTPException
+
+    from gateway.store import GatewayStore
+
+    event = DeliveryEventEnvelope.model_validate(
+        {
+            "event_id": uuid4(),
+            "event_type": "batch_done",
+            "occurred_at": NOW,
+            "actor": "captain",
+            "trace": {**TRACE, "batch_id": "batch-1"},
+            "payload": {"event_type": "batch_done", "outcome": "succeeded"},
+        }
+    )
+    # No storage at all: the refusal must happen before the ledger is touched.
+    store = object.__new__(GatewayStore)
+
+    with pytest.raises(HTTPException) as refused:
+        store.append_delivery_event(event)
+
+    assert refused.value.status_code == 422
+    assert "lifecycle batch_done" in str(refused.value.detail)

@@ -215,8 +215,9 @@ Contradictions between specs and code:
    envelope use `succeeded|failed|blocked|escalated`. The batch lifecycle
    (`BatchStatus`, `TerminalOutcome`) uses
    `succeeded|failed|rejected|cancelled|failed_after_max_iterations|aborted_infra`.
-   No `blocked` or `escalated` batch state exists. This leaves two `batch_done`
-   schemas under one name.
+   No `blocked` or `escalated` batch state exists. Since 2026-11-09 the Gateway
+   refuses new delivery-event `batch_done` appends (422); the lifecycle block is
+   the only terminal record. Stored envelopes stay readable.
 4. **`passed` requires real evidence (07-15, invariant 10).** The Gateway
    enforces this (`validation_run` plus a passing review). The legacy SQLite
    ledger does not check evidence on `reviewing → passed`.

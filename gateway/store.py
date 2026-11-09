@@ -18,6 +18,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ValidationError
 from pymysql.err import IntegrityError, OperationalError
 
+from gateway.auth import GatewayRole
 from gateway.capability_identity import generic_capability_subject_id
 from agenten.validation.contracts import HoldoutSuite, WorkBatch
 from agenten.agent_runtime.capabilities import CapabilityDenied, validate_grant
@@ -101,12 +102,18 @@ from agenten.agent_factory.state_machine import (
     next_action,
 )
 from agenten.agent_factory.workflow_promotion import build_release_workflow_promotion
-from blockchain.Blockchain_modell import Block
+from blockchain.Blockchain_modell import Block, verify_chain
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
+    BATCH_ASSIGNED_BLOCK_TYPE,
+    BATCH_CANCELLED_BLOCK_TYPE,
+    BatchAssignEvent,
+    REVIEW_MARKER_BLOCK_TYPE,
     ActiveCodexSession,
     ArtifactBuiltPayload,
+    BatchCancelEvent,
     BatchDoneEvent,
+    CancelReason,
     BatchProjection,
     ClaimEvent,
     CodexSessionFinishedPayload,
@@ -142,6 +149,25 @@ from gateway.contracts import (
     project_release,
 )
 from gateway.release_policy import ReleaseReadiness, evaluate_release_readiness
+from gateway.agent_lifecycle import (
+    AGENT_CAPABILITY_GRANTED_BLOCK_TYPE,
+    AGENT_CAPABILITY_REVOKED_BLOCK_TYPE,
+    AGENT_LIFECYCLE_BLOCK_TYPES,
+    AGENT_REGISTERED_BLOCK_TYPE,
+    AGENT_RETIRED_BLOCK_TYPE,
+    AgentCapabilityGrantedEvent,
+    AgentCapabilityGrantRequest,
+    AgentCapabilityRevokedEvent,
+    AgentClaimOutcome,
+    AgentLedgerError,
+    AgentProjection,
+    AgentRegisteredEvent,
+    AgentRetiredEvent,
+    RetireReason,
+    RevokeReason,
+    claim_outcome,
+    project_agent,
+)
 from gateway.registry_feed import (
     factory_registry_mirror_event,
     integration_setup_registry_mirror_event,
@@ -191,12 +217,142 @@ from gateway.portal_live_contracts import (
 
 CAPTAIN_BLOCK_TYPES = frozenset({"problem", "work_batch", "holdout"})
 GATEWAY_OWNED_EVENT_TYPES = frozenset(
-    {"batch_claimed", "batch_heartbeat", "batch_approved", "recovery_decision", "review_decision"}
+    {
+        "batch_claimed",
+        "batch_heartbeat",
+        "batch_approved",
+        "recovery_decision",
+        "review_decision",
+        REVIEW_MARKER_BLOCK_TYPE,
+        BATCH_CANCELLED_BLOCK_TYPE,
+        BATCH_ASSIGNED_BLOCK_TYPE,
+        AGENT_REGISTERED_BLOCK_TYPE,
+        AGENT_RETIRED_BLOCK_TYPE,
+        AGENT_CAPABILITY_GRANTED_BLOCK_TYPE,
+        AGENT_CAPABILITY_REVOKED_BLOCK_TYPE,
+    }
 )
+WORKER_EVIDENCE_BLOCK_TYPES = frozenset(
+    {"codex_session", "codex_process", "reasoning_slice", "validation_run", "batch_done"}
+)
+# `POST /blocks` is an allow-list: every other block type has a dedicated route
+# with its own validation and authority, and must not be forgeable generically.
+GENERIC_BLOCK_TYPES = CAPTAIN_BLOCK_TYPES | WORKER_EVIDENCE_BLOCK_TYPES
 TRANSIENT_TRANSACTION_ERRORS = frozenset({1020, 1213})
 TRANSACTION_ATTEMPTS = 3
 TRANSACTION_RETRY_DELAYS_SECONDS = (0.05, 0.1)
 WriteResult = TypeVar("WriteResult")
+
+
+def require_generic_block_type(block_type: str) -> None:
+    """Reject block types that `POST /blocks` must not write."""
+
+    if block_type in GATEWAY_OWNED_EVENT_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{block_type} must use its dedicated gateway route",
+        )
+    if block_type not in GENERIC_BLOCK_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{block_type} is not writable through /blocks",
+        )
+
+
+class _IdentitySettings(Protocol):
+    @property
+    def require_agent_identity(self) -> bool: ...
+
+
+def require_claim_identity(agent_id: str | None, *, required_settings: _IdentitySettings) -> None:
+    """Refuse shared-token claims once per-agent identity is mandatory."""
+
+    if agent_id is None and required_settings.require_agent_identity:
+        raise HTTPException(status_code=403, detail="agent identity required to claim")
+
+
+def _require_claim_agent(projection: BatchProjection, agent_id: str | None) -> None:
+    if projection.claim_agent_id is not None and agent_id != projection.claim_agent_id:
+        raise HTTPException(status_code=403, detail="claim belongs to another agent")
+
+
+def _require_not_cancelled(projection: BatchProjection) -> None:
+    # 410 instead of the generic 409 tells a claim holder to stop for good
+    # rather than retry or wait for recovery.
+    if projection.cancel_reason is not None:
+        raise HTTPException(status_code=410, detail="batch cancelled")
+
+
+class _AgentRegistry(Protocol):
+    @property
+    def worker_agent_token_sha256(self) -> Mapping[str, str]: ...
+
+
+def require_token_holding_agent(agent_id: str, *, settings: _AgentRegistry) -> None:
+    """Only an agent that can authenticate as itself may be registered."""
+
+    if agent_id not in settings.worker_agent_token_sha256:
+        raise HTTPException(status_code=422, detail="agent has no registered token")
+
+
+def require_registered_grant_holder(grant: CapabilityGrant, *, settings: _AgentRegistry) -> None:
+    """A grant may name only an agent that can authenticate as itself."""
+
+    holder = grant.holder_agent_id
+    if holder is not None and holder not in settings.worker_agent_token_sha256:
+        raise HTTPException(status_code=422, detail="grant holder is not a registered agent")
+
+
+@dataclass(frozen=True)
+class RuntimeResultReporter:
+    """The authenticated caller submitting a runtime result over HTTP."""
+
+    actor: GatewayRole
+    agent_id: str | None
+
+
+def require_result_reporter(
+    grant: CapabilityGrant,
+    reporter: RuntimeResultReporter | None,
+    *,
+    require_agent_identity: bool,
+) -> None:
+    """Only the grant holder may report a bound grant's result.
+
+    `reporter` is None for gateway-internal services, which already run
+    inside the trust boundary. Unbound grants keep role-only checks, except
+    that anonymous worker reports stop once agent identity is mandatory.
+    """
+
+    if reporter is None:
+        return
+    holder = grant.holder_agent_id
+    if holder is not None:
+        if reporter.actor is not GatewayRole.WORKER or reporter.agent_id != holder:
+            raise HTTPException(status_code=403, detail="runtime grant belongs to another agent")
+        return
+    if (
+        require_agent_identity
+        and reporter.actor is GatewayRole.WORKER
+        and reporter.agent_id is None
+    ):
+        raise HTTPException(status_code=403, detail="agent identity required to report results")
+
+
+class _LoadableLedger(Protocol):
+    def load(self) -> list[dict[str, Any]]: ...
+
+
+def verify_ledger_chain(storage: _LoadableLedger) -> int:
+    """Re-verify linkage and payload hashes of the whole ledger.
+
+    Raises `ChainVerificationError` on a broken link or edited payload and
+    returns the number of verified blocks.
+    """
+
+    rows = storage.load()
+    verify_chain([Block(**row) for row in rows])
+    return len(rows)
 
 
 class BlockWrite(Protocol):
@@ -2017,12 +2173,22 @@ class GatewayStore:
         event: DeliveryEventEnvelope,
         *,
         require_current_claim: bool = False,
+        agent_id: str | None = None,
     ) -> AppendResult:
+        if event.event_type == "batch_done":
+            # One terminal record per batch: the lifecycle `batch_done` block
+            # (POST /blocks), which project_batch validates. Stored delivery
+            # events of this type stay readable.
+            raise HTTPException(
+                status_code=422,
+                detail="batch terminal state is recorded as a lifecycle batch_done block",
+            )
         try:
             stored = self._retry_write(
                 lambda: self._append_delivery_event_once(
                     event,
                     require_current_claim=require_current_claim,
+                    agent_id=agent_id,
                 )
             )
             return AppendResult(event=stored, replayed=False)
@@ -2034,6 +2200,7 @@ class GatewayStore:
         event: DeliveryEventEnvelope,
         *,
         require_current_claim: bool,
+        agent_id: str | None = None,
     ) -> DeliveryEventEnvelope:
         canonical = event.model_dump(mode="json")
         trace = event.trace
@@ -2053,6 +2220,7 @@ class GatewayStore:
                         for_update=True,
                         now=_utcnow(),
                     )
+                    _require_not_cancelled(projection)
                     if (
                         projection.status != "claimed"
                         or trace.claim_id != projection.claim_id
@@ -2062,6 +2230,9 @@ class GatewayStore:
                             status_code=409,
                             detail="delivery event must match the current claim",
                         )
+                    # claim_id is readable by every worker; only the agent
+                    # that holds a bound claim may report against it.
+                    _require_claim_agent(projection, agent_id)
                 cursor.execute(
                     """
                     SELECT data FROM blocks
@@ -2275,9 +2446,18 @@ class GatewayStore:
     def record_runtime_result(
         self,
         result: AgentRuntimeResult,
+        reporter: RuntimeResultReporter | None = None,
+        *,
+        require_agent_identity: bool = False,
     ) -> RuntimeWriteReceipt:
         try:
-            self._retry_write(lambda: self._record_runtime_result_once(result))
+            self._retry_write(
+                lambda: self._record_runtime_result_once(
+                    result,
+                    reporter,
+                    require_agent_identity=require_agent_identity,
+                )
+            )
         except _RuntimeReplay as replay:
             return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
         return RuntimeWriteReceipt(operation_id=result.command_id, replayed=False)
@@ -2484,7 +2664,13 @@ class GatewayStore:
                 )
                 self._insert(cursor, block)
 
-    def _record_runtime_result_once(self, result: AgentRuntimeResult) -> None:
+    def _record_runtime_result_once(
+        self,
+        result: AgentRuntimeResult,
+        reporter: RuntimeResultReporter | None = None,
+        *,
+        require_agent_identity: bool = False,
+    ) -> None:
         canonical = result.model_dump(mode="json", by_alias=True)
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
@@ -2521,6 +2707,11 @@ class GatewayStore:
                         status_code=409,
                         detail="runtime grant belongs to a different command",
                     )
+                require_result_reporter(
+                    grant,
+                    reporter,
+                    require_agent_identity=require_agent_identity,
+                )
                 revocation_block = self._runtime_block_by_json_value(
                     cursor,
                     block_type="agent_runtime_grant_revocation",
@@ -7720,7 +7911,9 @@ class GatewayStore:
         token: str | None,
         *,
         now: datetime,
+        agent_id: str | None = None,
     ) -> None:
+        _require_not_cancelled(projection)
         presented_hash = hashlib.sha256((token or "").encode("utf-8")).hexdigest()
         expires = projection.claim_expires_at
         if (
@@ -7732,6 +7925,7 @@ class GatewayStore:
             or expires <= now
         ):
             raise HTTPException(status_code=409, detail="invalid or expired claim token")
+        _require_claim_agent(projection, agent_id)
 
     @staticmethod
     def _validate_candidate(
@@ -7762,9 +7956,14 @@ class GatewayStore:
                 time.sleep(TRANSACTION_RETRY_DELAYS_SECONDS[attempt])
         raise RuntimeError("unreachable transaction retry state")
 
-    def append(self, request: BlockWrite, claim_token: str | None) -> dict[str, Any]:
+    def append(
+        self,
+        request: BlockWrite,
+        claim_token: str | None,
+        agent_id: str | None = None,
+    ) -> dict[str, Any]:
         try:
-            return self._retry_write(lambda: self._append_once(request, claim_token))
+            return self._retry_write(lambda: self._append_once(request, claim_token, agent_id))
         except _IdempotentReplay as replay:
             return replay.block
 
@@ -7775,13 +7974,14 @@ class GatewayStore:
     ) -> bool:
         return existing["data"] == data
 
-    def _append_once(self, request: BlockWrite, claim_token: str | None) -> dict[str, Any]:
+    def _append_once(
+        self,
+        request: BlockWrite,
+        claim_token: str | None,
+        agent_id: str | None = None,
+    ) -> dict[str, Any]:
         block_type = request.block_type
-        if block_type in GATEWAY_OWNED_EVENT_TYPES:
-            raise HTTPException(
-                status_code=422,
-                detail=f"{block_type} must use its dedicated gateway route",
-            )
+        require_generic_block_type(block_type)
         data = dict(request.data)
         try:
             if block_type == "work_batch":
@@ -7814,7 +8014,7 @@ class GatewayStore:
                         for_update=True,
                         now=now,
                     )
-                    self._assert_live_claim(projection, claim_token, now=now)
+                    self._assert_live_claim(projection, claim_token, now=now, agent_id=agent_id)
                     if parent_index is None:
                         parent_index = parent["index"]
                     elif parent_index != parent["index"]:
@@ -7887,6 +8087,20 @@ class GatewayStore:
                 elif parent is not None:
                     self._validate_candidate(parent, children, block, batch_id, now=now)
                 self._insert(cursor, block)
+                if block_type == "work_batch" and request.status == "pending_review":
+                    # The status column is not hashed; pin the review gate in a
+                    # hashed child written in the same transaction.
+                    self._insert(
+                        cursor,
+                        self._new_block(
+                            cursor,
+                            index=self._next_index(cursor),
+                            block_type=REVIEW_MARKER_BLOCK_TYPE,
+                            data={"batch_id": batch_id},
+                            status="recorded",
+                            parent_index=block["index"],
+                        ),
+                    )
                 if block_type == "batch_done" and data["outcome"] == "succeeded":
                     self._upsert_capability(cursor, block)
         return block
@@ -8137,10 +8351,10 @@ class GatewayStore:
                     self._insert(cursor, terminal)
         return block
 
-    def claim(self, batch_id: str) -> dict[str, str | int]:
-        return self._retry_write(lambda: self._claim_once(batch_id))
+    def claim(self, batch_id: str, agent_id: str | None = None) -> dict[str, str | int]:
+        return self._retry_write(lambda: self._claim_once(batch_id, agent_id))
 
-    def _claim_once(self, batch_id: str) -> dict[str, str]:
+    def _claim_once(self, batch_id: str, agent_id: str | None = None) -> dict[str, str]:
         now = _utcnow()
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
@@ -8156,6 +8370,14 @@ class GatewayStore:
                 )
                 if projection.status != "pending" or claim_expired_without_recovery:
                     raise HTTPException(status_code=409, detail="batch is not claimable")
+                if (
+                    projection.assigned_agent_id is not None
+                    and agent_id != projection.assigned_agent_id
+                ):
+                    raise HTTPException(
+                        status_code=403, detail="batch is assigned to another agent"
+                    )
+                self._require_claim_capability(cursor, agent_id, parent, now=now)
                 token = secrets.token_urlsafe(32)
                 claim_id = f"claim-{secrets.token_urlsafe(18)}"
                 fencing_token = projection.claim_iteration + 1
@@ -8166,12 +8388,14 @@ class GatewayStore:
                     fencing_token=fencing_token,
                     claim_token_sha256=hashlib.sha256(token.encode("utf-8")).hexdigest(),
                     claim_expires_at=expiry,
+                    agent_id=agent_id,
                 )
                 block = self._new_block(
                     cursor,
                     index=index,
                     block_type="batch_claimed",
-                    data=event.model_dump(mode="json"),
+                    # Legacy shared-token claims keep their historic shape.
+                    data=event.model_dump(mode="json", exclude_none=True),
                     status="recorded",
                     parent_index=parent["index"],
                 )
@@ -8184,10 +8408,20 @@ class GatewayStore:
             "claim_expires_at": expiry.isoformat(),
         }
 
-    def heartbeat(self, batch_id: str, token: str | None) -> dict[str, str]:
-        return self._retry_write(lambda: self._heartbeat_once(batch_id, token))
+    def heartbeat(
+        self,
+        batch_id: str,
+        token: str | None,
+        agent_id: str | None = None,
+    ) -> dict[str, str]:
+        return self._retry_write(lambda: self._heartbeat_once(batch_id, token, agent_id))
 
-    def _heartbeat_once(self, batch_id: str, token: str | None) -> dict[str, str]:
+    def _heartbeat_once(
+        self,
+        batch_id: str,
+        token: str | None,
+        agent_id: str | None = None,
+    ) -> dict[str, str]:
         now = _utcnow()
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
@@ -8198,7 +8432,7 @@ class GatewayStore:
                     for_update=True,
                     now=now,
                 )
-                self._assert_live_claim(projection, token, now=now)
+                self._assert_live_claim(projection, token, now=now, agent_id=agent_id)
                 expiry = renewed_claim_expiry(
                     projection.claim_expires_at, now, self._claim_ttl
                 )
@@ -8214,6 +8448,386 @@ class GatewayStore:
                 self._validate_candidate(parent, children, block, batch_id, now=now)
                 self._insert(cursor, block)
         return {"claim_expires_at": expiry.isoformat()}
+
+    # --- agent lifecycle -------------------------------------------------
+
+    def agent(self, agent_id: str) -> AgentProjection | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                return self._project_agent_blocks(
+                    self._agent_blocks(cursor, agent_id, for_update=False), agent_id
+                )
+
+    def agent_outcomes(self, agent_id: str) -> list[AgentClaimOutcome]:
+        """Every claim the agent held, with how its batch ended under it."""
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT data FROM blocks
+                    WHERE block_type = 'batch_claimed'
+                      AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.agent_id')) = %s
+                    ORDER BY `index`
+                    """,
+                    (agent_id,),
+                )
+                claims = []
+                for row in cursor.fetchall():
+                    data = row["data"]
+                    if isinstance(data, str):
+                        data = json.loads(data)
+                    claims.append((str(data["batch_id"]), int(data["fencing_token"])))
+        projections: dict[str, BatchProjection] = {}
+        outcomes: list[AgentClaimOutcome] = []
+        for batch_id, fencing_token in claims:
+            if batch_id not in projections:
+                projections[batch_id] = self.batch_projection(batch_id)
+            outcomes.append(
+                AgentClaimOutcome(
+                    batch_id=batch_id,
+                    fencing_token=fencing_token,
+                    outcome=claim_outcome(projections[batch_id], fencing_token),
+                )
+            )
+        return outcomes
+
+    def require_active_agent(self, agent_id: str | None) -> None:
+        """A retired agent's token no longer authorizes writes (reads stay open).
+
+        Checked per request before the write transaction: a retirement that
+        commits concurrently can still let one in-flight request through.
+        """
+
+        if agent_id is None:
+            return
+        projection = self.agent(agent_id)
+        if projection is not None and projection.status == "retired":
+            raise HTTPException(status_code=403, detail="agent is retired")
+
+    def register_agent(self, event: AgentRegisteredEvent) -> tuple[dict[str, Any], bool]:
+        """Append a registration; returns (block, replayed)."""
+
+        try:
+            return self._retry_write(lambda: self._register_agent_once(event)), False
+        except _IdempotentReplay as replay:
+            return replay.block, True
+
+    def _register_agent_once(self, event: AgentRegisteredEvent) -> dict[str, Any]:
+        data = event.model_dump(mode="json")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                blocks = self._agent_blocks(cursor, event.agent_id, for_update=True)
+                current = self._project_agent_blocks(blocks, event.agent_id)
+                if current is not None and current.status == "retired":
+                    raise HTTPException(status_code=409, detail="agent is retired")
+                registrations = [
+                    block for block in blocks if block["block_type"] == AGENT_REGISTERED_BLOCK_TYPE
+                ]
+                if registrations and registrations[-1]["data"] == data:
+                    raise _IdempotentReplay(registrations[-1])
+                if any(block["data"].get("version") == event.version for block in registrations):
+                    raise HTTPException(
+                        status_code=409, detail="agent version is already registered"
+                    )
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type=AGENT_REGISTERED_BLOCK_TYPE,
+                    data=data,
+                    status="registered",
+                    parent_index=None,
+                )
+                self._project_agent_blocks([*blocks, block], event.agent_id)
+                self._insert(cursor, block)
+        return block
+
+    def retire_agent(self, agent_id: str, reason: RetireReason) -> tuple[dict[str, Any], bool]:
+        """Terminally retire a registered agent; returns (block, replayed)."""
+
+        try:
+            return self._retry_write(lambda: self._retire_agent_once(agent_id, reason)), False
+        except _IdempotentReplay as replay:
+            return replay.block, True
+
+    def _retire_agent_once(self, agent_id: str, reason: RetireReason) -> dict[str, Any]:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                blocks = self._agent_blocks(cursor, agent_id, for_update=True)
+                current = self._project_agent_blocks(blocks, agent_id)
+                if current is None:
+                    raise HTTPException(status_code=404, detail="agent not registered")
+                if current.status == "retired":
+                    existing = blocks[-1]
+                    if existing["data"].get("reason") == reason:
+                        raise _IdempotentReplay(existing)
+                    raise HTTPException(
+                        status_code=409, detail="agent was already retired for another reason"
+                    )
+                event = AgentRetiredEvent(agent_id=agent_id, reason=reason)
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type=AGENT_RETIRED_BLOCK_TYPE,
+                    data=event.model_dump(mode="json"),
+                    status="retired",
+                    parent_index=None,
+                )
+                self._insert(cursor, block)
+        return block
+
+    def grant_agent_capability(
+        self, agent_id: str, request: AgentCapabilityGrantRequest
+    ) -> tuple[dict[str, Any], bool]:
+        """Grant a registered agent capability tags; returns (block, replayed)."""
+
+        try:
+            return self._retry_write(lambda: self._grant_once(agent_id, request)), False
+        except _IdempotentReplay as replay:
+            return replay.block, True
+
+    def _grant_once(self, agent_id: str, request: AgentCapabilityGrantRequest) -> dict[str, Any]:
+        event = AgentCapabilityGrantedEvent(agent_id=agent_id, **request.model_dump())
+        data = event.model_dump(mode="json")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                blocks = self._agent_blocks(cursor, agent_id, for_update=True)
+                current = self._project_agent_blocks(blocks, agent_id)
+                if current is None:
+                    raise HTTPException(status_code=404, detail="agent not registered")
+                existing = next(
+                    (
+                        block
+                        for block in blocks
+                        if block["block_type"] == AGENT_CAPABILITY_GRANTED_BLOCK_TYPE
+                        and block["data"].get("grant_id") == request.grant_id
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if existing["data"] == data:
+                        raise _IdempotentReplay(existing)
+                    raise HTTPException(
+                        status_code=409, detail="grant_id already holds a different grant"
+                    )
+                if current.status == "retired":
+                    raise HTTPException(status_code=409, detail="agent is retired")
+                if event.expires_at <= _utcnow():
+                    raise HTTPException(status_code=422, detail="grant is already expired")
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type=AGENT_CAPABILITY_GRANTED_BLOCK_TYPE,
+                    data=data,
+                    status="granted",
+                    parent_index=None,
+                )
+                self._project_agent_blocks([*blocks, block], agent_id)
+                self._insert(cursor, block)
+        return block
+
+    def revoke_agent_capability(
+        self, agent_id: str, grant_id: str, reason: RevokeReason
+    ) -> tuple[dict[str, Any], bool]:
+        """Revoke one capability grant; returns (block, replayed)."""
+
+        try:
+            return (
+                self._retry_write(lambda: self._revoke_once(agent_id, grant_id, reason)),
+                False,
+            )
+        except _IdempotentReplay as replay:
+            return replay.block, True
+
+    def _revoke_once(self, agent_id: str, grant_id: str, reason: RevokeReason) -> dict[str, Any]:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                blocks = self._agent_blocks(cursor, agent_id, for_update=True)
+                current = self._project_agent_blocks(blocks, agent_id)
+                if current is None or not any(
+                    grant.grant_id == grant_id for grant in current.grants
+                ):
+                    raise HTTPException(status_code=404, detail="grant not found")
+                existing = next(
+                    (
+                        block
+                        for block in blocks
+                        if block["block_type"] == AGENT_CAPABILITY_REVOKED_BLOCK_TYPE
+                        and block["data"].get("grant_id") == grant_id
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if existing["data"].get("reason") == reason:
+                        raise _IdempotentReplay(existing)
+                    raise HTTPException(
+                        status_code=409, detail="grant was already revoked for another reason"
+                    )
+                if current.status == "retired":
+                    raise HTTPException(status_code=409, detail="agent is retired")
+                event = AgentCapabilityRevokedEvent(
+                    agent_id=agent_id, grant_id=grant_id, reason=reason
+                )
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type=AGENT_CAPABILITY_REVOKED_BLOCK_TYPE,
+                    data=event.model_dump(mode="json"),
+                    status="revoked",
+                    parent_index=None,
+                )
+                self._insert(cursor, block)
+        return block
+
+    def _require_claim_capability(
+        self, cursor: Any, agent_id: str | None, parent: dict[str, Any], *, now: datetime
+    ) -> None:
+        """A ledger-registered agent claims only batches a grant covers.
+
+        Agents with a token but no ledger registration keep the pre-Phase-2
+        behavior; Captain opts an agent into grant scoping by registering it.
+        """
+
+        if agent_id is None:
+            return
+        projection = self._project_agent_blocks(
+            self._agent_blocks(cursor, agent_id, for_update=False), agent_id
+        )
+        if projection is None:
+            return
+        if projection.status == "retired":
+            raise HTTPException(status_code=403, detail="agent is retired")
+        tags = parent.get("data", {}).get("capability_tags") or []
+        if not projection.covers(tags, now=now):
+            raise HTTPException(
+                status_code=403,
+                detail="agent has no active grant covering the batch capabilities",
+            )
+
+    @staticmethod
+    def _project_agent_blocks(
+        blocks: list[dict[str, Any]], agent_id: str
+    ) -> AgentProjection | None:
+        try:
+            return project_agent(blocks, agent_id)
+        except AgentLedgerError as exc:
+            # Fail closed: a contradictory agent history authorizes nothing.
+            raise HTTPException(status_code=409, detail=f"agent ledger invalid: {exc}") from None
+
+    def _agent_blocks(
+        self, cursor: Any, agent_id: str, *, for_update: bool
+    ) -> list[dict[str, Any]]:
+        block_types = sorted(AGENT_LIFECYCLE_BLOCK_TYPES)
+        placeholders = ", ".join(["%s"] * len(block_types))
+        sql = f"""
+            SELECT `index`, parent_index, block_type, data, status, children,
+                   metadata, hash, previous_hash
+            FROM blocks
+            WHERE block_type IN ({placeholders})
+              AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.agent_id')) = %s
+            ORDER BY `index`
+        """
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (*block_types, agent_id))
+        return [self.storage._decode_row(row) for row in cursor.fetchall()]
+
+    def assign(self, batch_id: str, agent_id: str) -> tuple[dict[str, Any], bool]:
+        """Pin an unclaimed batch's claims to one agent; returns (block, replayed)."""
+
+        try:
+            return self._retry_write(lambda: self._assign_once(batch_id, agent_id)), False
+        except _IdempotentReplay as replay:
+            return replay.block, True
+
+    def _assign_once(self, batch_id: str, agent_id: str) -> dict[str, Any]:
+        now = _utcnow()
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                parent, children, projection = self._batch_context(
+                    cursor,
+                    batch_id,
+                    for_update=True,
+                    now=now,
+                )
+                if projection.assigned_agent_id == agent_id:
+                    latest = [
+                        child for child in children if child["block_type"] == BATCH_ASSIGNED_BLOCK_TYPE
+                    ][-1]
+                    raise _IdempotentReplay(latest)
+                if projection.status not in {"pending_review", "pending"} or claim_requires_recovery(
+                    projection, now
+                ):
+                    raise HTTPException(status_code=409, detail="batch is not assignable")
+                agent = self._project_agent_blocks(
+                    self._agent_blocks(cursor, agent_id, for_update=False), agent_id
+                )
+                if agent is not None and agent.status == "retired":
+                    raise HTTPException(status_code=409, detail="agent is retired")
+                event = BatchAssignEvent(batch_id=batch_id, agent_id=agent_id)
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type=BATCH_ASSIGNED_BLOCK_TYPE,
+                    data=event.model_dump(mode="json"),
+                    status="recorded",
+                    parent_index=parent["index"],
+                )
+                self._validate_candidate(parent, children, block, batch_id, now=now)
+                self._insert(cursor, block)
+        return block
+
+    def cancel(self, batch_id: str, reason: CancelReason) -> tuple[dict[str, Any], bool]:
+        """Terminally cancel a non-terminal batch; returns (block, replayed)."""
+
+        try:
+            return self._retry_write(lambda: self._cancel_once(batch_id, reason)), False
+        except _IdempotentReplay as replay:
+            return replay.block, True
+
+    def _cancel_once(self, batch_id: str, reason: CancelReason) -> dict[str, Any]:
+        now = _utcnow()
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                parent, children, projection = self._batch_context(
+                    cursor,
+                    batch_id,
+                    for_update=True,
+                    now=now,
+                )
+                existing = next(
+                    (
+                        child
+                        for child in children
+                        if child["block_type"] == BATCH_CANCELLED_BLOCK_TYPE
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if existing["data"].get("reason") == reason:
+                        raise _IdempotentReplay(existing)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="batch was already cancelled for another reason",
+                    )
+                if projection.status not in {"pending_review", "pending", "claimed"}:
+                    raise HTTPException(status_code=409, detail="batch is already terminal")
+                event = BatchCancelEvent(
+                    batch_id=batch_id,
+                    reason=reason,
+                    claim_iteration=projection.claim_iteration,
+                )
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type=BATCH_CANCELLED_BLOCK_TYPE,
+                    data=event.model_dump(mode="json"),
+                    status="cancelled",
+                    parent_index=parent["index"],
+                )
+                self._validate_candidate(parent, children, block, batch_id, now=now)
+                self._insert(cursor, block)
+        return block
 
     def approve(self, batch_id: str) -> None:
         self._retry_write(lambda: self._approve_once(batch_id))
@@ -8299,7 +8913,12 @@ class GatewayStore:
             }
         return decoded if include_holdout else [row for row in decoded if row["block_type"] != "holdout"]
 
-    def holdout(self, batch_id: str, token: str | None) -> dict[str, Any]:
+    def holdout(
+        self,
+        batch_id: str,
+        token: str | None,
+        agent_id: str | None = None,
+    ) -> dict[str, Any]:
         now = _utcnow()
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
@@ -8309,7 +8928,7 @@ class GatewayStore:
                     for_update=True,
                     now=now,
                 )
-                self._assert_live_claim(projection, token, now=now)
+                self._assert_live_claim(projection, token, now=now, agent_id=agent_id)
                 if not projection.codex_session_recorded:
                     raise HTTPException(status_code=404, detail="holdout not released")
                 cursor.execute(

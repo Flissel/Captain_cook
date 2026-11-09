@@ -78,7 +78,18 @@ class MariaDBStorage(LedgerStorage):
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(statement)
+                self._ensure_append_only_triggers(cursor)
             connection.commit()
+
+    @staticmethod
+    def _ensure_append_only_triggers(cursor: Any) -> None:
+        """Reject every UPDATE and DELETE on ledger rows inside the database."""
+        for event in ("UPDATE", "DELETE"):
+            cursor.execute(
+                f"CREATE TRIGGER IF NOT EXISTS blocks_append_only_{event.lower()} "
+                f"BEFORE {event} ON blocks FOR EACH ROW "
+                "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'blocks is append-only'"
+            )
 
     @staticmethod
     def _values(block: Dict[str, Any]) -> tuple[Any, ...]:
@@ -158,16 +169,32 @@ class MariaDBStorage(LedgerStorage):
         }
 
     def save(self, blocks: List[Dict[str, Any]]) -> None:
-        """Replace the chain atomically for compatibility with LedgerStorage."""
+        """Replace the chain for compatibility with LedgerStorage.
+
+        Administrative only: the table is append-only, so the old chain is
+        cleared (see `clear`) before the replacement is inserted atomically.
+        """
+        self.clear()
+        if not blocks:
+            return
         with self._connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute("DELETE FROM blocks")
-                if blocks:
-                    cursor.executemany(self._insert_sql(), [self._values(block) for block in blocks])
+                cursor.executemany(self._insert_sql(), [self._values(block) for block in blocks])
             connection.commit()
 
     def clear(self) -> None:
+        """Administrative reset that lifts the delete guard only for itself.
+
+        Cascades to Gateway side tables through their foreign keys. The guard
+        is restored even if the delete fails.
+        """
         with self._connect() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute("DELETE FROM blocks")
-            connection.commit()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("DROP TRIGGER IF EXISTS blocks_append_only_delete")
+                    cursor.execute("DELETE FROM blocks")
+                connection.commit()
+            finally:
+                with connection.cursor() as cursor:
+                    self._ensure_append_only_triggers(cursor)
+                connection.commit()

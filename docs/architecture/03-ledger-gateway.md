@@ -216,8 +216,9 @@ The pipeline ledger has no HTTP path. Events reach `LedgerRecorderAgent` over
    The code uses `batch_claimed` / `batch_heartbeat` ([store.py:184](../../gateway/store.py)).
 2. **`batch_done` outcomes.** Spec 07-17 §6 lists `succeeded|failed|blocked|escalated`.
    Code `TerminalOutcome` is `succeeded|failed|rejected|cancelled|failed_after_max_iterations|aborted_infra` ([contracts.py:844](../../gateway/contracts.py)).
-   The delivery-event payload `DeliveryBatchDonePayload` still uses the spec vocabulary, so two
-   `batch_done` schemas share one name (see [04 §5](04-delivery-minibook.md#5-implemented-vs-planned-code-wins)).
+   The delivery-event payload `DeliveryBatchDonePayload` still uses the spec vocabulary, but
+   the Gateway refuses new delivery `batch_done` appends; the lifecycle block is the only
+   terminal record (see [04 §5](04-delivery-minibook.md#5-implemented-vs-planned-code-wins)).
 3. **Repair budget.** Spec 07-17 §2.7 allows ≤3 repair resumes. Spec 07-16 and the code
    require 5 failed reviews for `failed_after_max_iterations` ([contracts.py:1214](../../gateway/contracts.py)).
 4. **Idempotency key.** Spec 07-17 §6 names a `command_id`. The code keys replay on

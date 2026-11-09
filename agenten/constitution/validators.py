@@ -30,6 +30,11 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
+def normalize_description(text: str) -> str:
+    """Public form of the duplicate-comparison key (lowercase, collapsed whitespace)."""
+    return _normalize(text)
+
+
 def check_required_fields(description: str, capability_tags: List[str]) -> Optional[ValidationFailure]:
     """description must be a non-empty, reasonably-sized string; capability_tags
     must be a non-empty list of strings.

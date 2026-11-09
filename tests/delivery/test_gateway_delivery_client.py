@@ -344,3 +344,27 @@ async def test_delivery_event_routes_append_and_read_typed_envelopes() -> None:
         "/v1/delivery/events",
         "/v1/projects/project-1/runs/run-1/events",
     ]
+
+
+def test_client_projection_accepts_every_field_the_gateway_serves() -> None:
+    """The client model is extra=forbid, so it must track BatchProjection."""
+
+    from agenten.delivery.gateway_client import GatewayBatchProjection
+    from gateway.contracts import BatchProjection
+
+    served = BatchProjection(
+        batch_id="batch-1",
+        parent_index=41,
+        status="claimed",
+        claim_token_sha256="a" * 64,
+        claim_id="claim-current",
+        fencing_token=1,
+        claim_expires_at=datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc),
+        claim_iteration=1,
+        claim_agent_id="openclaw",
+    ).model_dump(mode="json")
+
+    parsed = GatewayBatchProjection.model_validate(served)
+
+    assert parsed.model_dump(mode="json").keys() == served.keys()
+    assert parsed.claim_agent_id == "openclaw"

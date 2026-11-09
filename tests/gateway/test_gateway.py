@@ -19,11 +19,12 @@ from pymysql.err import OperationalError
 
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
+from gateway.agent_lifecycle import AgentCapabilityGrantRequest, AgentRegisteredEvent
 from gateway.app import CAPTAIN_WRITE_BLOCK_TYPES, BlockRequest, create_app
 from gateway.auth import GatewayRole, require_actor
 from gateway.contracts import DeliveryEventEnvelope, ReleaseProjection
 from gateway.settings import GatewaySettings
-from gateway.store import GatewayStore
+from gateway.store import GatewayStore, verify_ledger_chain
 from tests.support.mariadb import assert_isolated_test_database
 
 
@@ -594,12 +595,14 @@ def test_append_retries_only_documented_transaction_errors(
     retry_delays: list[float] = []
     monkeypatch.setattr("gateway.store.time.sleep", retry_delays.append)
 
-    def transient_then_success(request: BlockRequest, claim_token: str | None) -> dict[str, Any]:
+    def transient_then_success(
+        request: BlockRequest, claim_token: str | None, agent_id: str | None = None
+    ) -> dict[str, Any]:
         nonlocal attempts
         attempts += 1
         if attempts < 3:
             raise OperationalError(1213, "deadlock victim")
-        return original(request, claim_token)
+        return original(request, claim_token, agent_id)
 
     monkeypatch.setattr(store, "_append_once", transient_then_success)
     assert store.append(request, None)["block_type"] == "work_batch"
@@ -609,7 +612,9 @@ def test_append_retries_only_documented_transaction_errors(
     monkeypatch.setattr(
         store,
         "_append_once",
-        lambda request, claim_token: (_ for _ in ()).throw(OperationalError(9999, "other")),
+        lambda request, claim_token, agent_id=None: (_ for _ in ()).throw(
+            OperationalError(9999, "other")
+        ),
     )
     with pytest.raises(OperationalError) as error:
         store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-2")), None)
@@ -618,7 +623,9 @@ def test_append_retries_only_documented_transaction_errors(
 
     exhausted_attempts = 0
 
-    def always_transient(request: BlockRequest, claim_token: str | None) -> dict[str, Any]:
+    def always_transient(
+        request: BlockRequest, claim_token: str | None, agent_id: str | None = None
+    ) -> dict[str, Any]:
         nonlocal exhausted_attempts
         exhausted_attempts += 1
         raise OperationalError(1213, "persistent deadlock")
@@ -853,6 +860,26 @@ def test_worker_blocks_require_the_current_fencing_token(client: TestClient) -> 
     assert worker_block(client, None).status_code == 409
     assert worker_block(client, "stale-token").status_code == 409
     assert worker_block(client, token).status_code == 201
+
+
+@pytest.mark.parametrize(
+    "block_type",
+    ["delivery_event", "agent_runtime_command", "agent_runtime_grant", "validated_capability"],
+)
+def test_claimed_worker_cannot_forge_dedicated_route_block_types(
+    client: TestClient,
+    storage: MariaDBStorage,
+    block_type: str,
+) -> None:
+    create_batch(client)
+    token = claim(client)
+    before = len(storage.load())
+
+    response = worker_block(client, token, block_type=block_type, status="recorded")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == f"{block_type} is not writable through /blocks"
+    assert len(storage.load()) == before
 
 
 def test_fenced_block_cannot_attach_to_another_batch(client: TestClient) -> None:
@@ -1296,6 +1323,30 @@ def test_approve_is_flag_gated_and_transitions_pending_review(storage: MariaDBSt
     assert parent["children"] == []
     assert approval["parent_index"] == parent["index"]
     assert approval["data"] == {"batch_id": "batch-1"}
+    marker = next(block for block in blocks if block["block_type"] == "batch_review_required")
+    assert marker["parent_index"] == parent["index"]
+    assert parent["index"] < marker["index"] < approval["index"]
+
+
+def test_tampered_review_status_column_cannot_bypass_the_review_gate(
+    storage: MariaDBStorage,
+) -> None:
+    client = TestClient(
+        legacy_application(storage=storage, mirror=RecordingMirror(), approval_enabled=True)
+    )
+    create_batch(client, status="pending_review")
+
+    # Simulate an administrator who drops the append-only guard and edits the
+    # unhashed status column directly.
+    with storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TRIGGER IF EXISTS blocks_append_only_update")
+            cursor.execute(
+                "UPDATE blocks SET status = 'pending' WHERE block_type = 'work_batch'"
+            )
+
+    assert client.post("/batches/batch-1/claim").status_code == 409
+    assert client.get("/batches/batch-1").json()["status"] == "pending_review"
 
 
 def test_mock_crm_sink_round_trip(client: TestClient) -> None:
@@ -1525,3 +1576,223 @@ def test_delivery_event_requires_current_gateway_claim_identity_atomically(
     with pytest.raises(HTTPException, match="current claim") as fence_error:
         store.append_delivery_event(stale_fence, require_current_claim=True)
     assert fence_error.value.status_code == 409
+
+
+def test_captain_cancel_revokes_the_claim_and_stops_the_holder(client: TestClient) -> None:
+    create_batch(client)
+    token = claim(client)
+
+    cancel = client.post("/batches/batch-1/cancel", json={"reason": "captain_cancelled"})
+    assert cancel.status_code == 201, cancel.text
+    assert cancel.json() == {
+        "batch_id": "batch-1",
+        "reason": "captain_cancelled",
+        "claim_iteration": 1,
+    }
+    replay = client.post("/batches/batch-1/cancel", json={"reason": "captain_cancelled"})
+    assert replay.status_code == 200
+    other = client.post("/batches/batch-1/cancel", json={"reason": "policy_violation"})
+    assert other.status_code == 409
+
+    heartbeat = client.post("/batches/batch-1/claim/heartbeat", headers={"X-Claim-Token": token})
+    assert heartbeat.status_code == 410
+    assert heartbeat.json()["detail"] == "batch cancelled"
+    assert worker_block(client, token).status_code == 410
+    assert client.post("/batches/batch-1/claim").status_code == 409
+
+    projection = client.get("/batches/batch-1").json()
+    assert projection["status"] == "cancelled"
+    assert projection["claim_token_sha256"] is None
+    cancel_blocks = [
+        block
+        for block in client.get("/batches/batch-1/blocks").json()
+        if block["block_type"] == "batch_cancelled"
+    ]
+    assert len(cancel_blocks) == 1
+
+
+def test_finished_batch_cannot_be_cancelled_over_http(client: TestClient) -> None:
+    create_batch(client)
+    token = claim(client)
+    assert worker_block(
+        client,
+        token,
+        block_type="batch_done",
+        status="failed",
+        data={"batch_id": "batch-1", "outcome": "failed"},
+    ).status_code == 201
+
+    response = client.post("/batches/batch-1/cancel", json={"reason": "operator_cancelled"})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "batch is already terminal"
+
+
+def _agent_registration(version: str = "1") -> AgentRegisteredEvent:
+    return AgentRegisteredEvent(
+        agent_id="openclaw", version=version, owner="captain", spec_sha256="b" * 64
+    )
+
+
+def test_agent_registration_is_replayable_and_versioned(storage: MariaDBStorage) -> None:
+    store = GatewayStore(storage)
+
+    first, first_replayed = store.register_agent(_agent_registration())
+    again, again_replayed = store.register_agent(_agent_registration())
+    store.register_agent(_agent_registration("2"))
+    with pytest.raises(HTTPException) as reused:
+        store.register_agent(_agent_registration("1"))
+
+    assert (first_replayed, again_replayed) == (False, True)
+    assert again["index"] == first["index"]
+    assert reused.value.status_code == 409
+    projection = store.agent("openclaw")
+    assert projection is not None
+    assert (projection.status, projection.version, projection.registration_count) == (
+        "registered",
+        "2",
+        2,
+    )
+    assert store.agent("unknown") is None
+    assert verify_ledger_chain(storage) >= 2
+
+
+def test_retired_agent_is_terminal_and_loses_write_authority(storage: MariaDBStorage) -> None:
+    store = GatewayStore(storage)
+    with pytest.raises(HTTPException) as unknown:
+        store.retire_agent("openclaw", "captain_retired")
+    assert unknown.value.status_code == 404
+
+    store.register_agent(_agent_registration())
+    store.require_active_agent("openclaw")
+    _, replayed = store.retire_agent("openclaw", "captain_retired")
+    _, replayed_again = store.retire_agent("openclaw", "captain_retired")
+    with pytest.raises(HTTPException) as other_reason:
+        store.retire_agent("openclaw", "policy_violation")
+    with pytest.raises(HTTPException) as reregister:
+        store.register_agent(_agent_registration("2"))
+    with pytest.raises(HTTPException) as refused:
+        store.require_active_agent("openclaw")
+
+    assert (replayed, replayed_again) == (False, True)
+    assert other_reason.value.status_code == 409
+    assert reregister.value.status_code == 409
+    assert (refused.value.status_code, refused.value.detail) == (403, "agent is retired")
+    projection = store.agent("openclaw")
+    assert projection is not None and projection.retire_reason == "captain_retired"
+
+
+def _grant(
+    grant_id: str = "grant-1",
+    tags: tuple[str, ...] = ("email", "notifications"),
+    hours: int = 1,
+) -> AgentCapabilityGrantRequest:
+    return AgentCapabilityGrantRequest(
+        grant_id=grant_id,
+        capability_tags=tags,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=hours),
+    )
+
+
+def test_capability_grant_is_replayable_and_validated(storage: MariaDBStorage) -> None:
+    store = GatewayStore(storage)
+    with pytest.raises(HTTPException) as unregistered:
+        store.grant_agent_capability("openclaw", _grant())
+    assert unregistered.value.status_code == 404
+
+    store.register_agent(_agent_registration())
+    request = _grant()
+    _, first_replayed = store.grant_agent_capability("openclaw", request)
+    _, replayed = store.grant_agent_capability("openclaw", request)
+    with pytest.raises(HTTPException) as conflicting:
+        store.grant_agent_capability("openclaw", _grant(tags=("email",)))
+    with pytest.raises(HTTPException) as expired:
+        store.grant_agent_capability("openclaw", _grant("grant-2", hours=-1))
+
+    assert (first_replayed, replayed) == (False, True)
+    assert conflicting.value.status_code == 409
+    assert expired.value.status_code == 422
+    projection = store.agent("openclaw")
+    assert projection is not None and [grant.grant_id for grant in projection.grants] == ["grant-1"]
+
+
+def test_registered_agent_claims_only_batches_an_active_grant_covers(
+    storage: MariaDBStorage,
+) -> None:
+    store = GatewayStore(storage)
+    store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-1")), None)
+    store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-2")), None)
+    store.register_agent(_agent_registration())
+
+    with pytest.raises(HTTPException) as ungranted:
+        store.claim("batch-1", "openclaw")
+    store.grant_agent_capability("openclaw", _grant(tags=("email",)))
+    with pytest.raises(HTTPException) as partial:
+        store.claim("batch-1", "openclaw")
+    store.grant_agent_capability("openclaw", _grant("grant-2"))
+    claimed = store.claim("batch-1", "openclaw")
+    _, revoke_replayed = store.revoke_agent_capability("openclaw", "grant-2", "captain_revoked")
+    with pytest.raises(HTTPException) as revoked:
+        store.claim("batch-2", "openclaw")
+
+    assert ungranted.value.status_code == 403
+    assert partial.value.status_code == 403
+    assert "claim_token" in claimed
+    assert revoke_replayed is False
+    assert revoked.value.status_code == 403
+    assert store.batch_projection("batch-1").claim_agent_id == "openclaw"
+    # An agent with a token but no ledger registration keeps legacy behavior.
+    assert "claim_token" in store.claim("batch-2", "other-agent")
+
+
+def test_assigned_batch_is_claimable_only_by_its_agent(storage: MariaDBStorage) -> None:
+    store = GatewayStore(storage)
+    store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-1")), None)
+
+    _, first_replayed = store.assign("batch-1", "openclaw")
+    _, replayed = store.assign("batch-1", "openclaw")
+    with pytest.raises(HTTPException) as other_agent:
+        store.claim("batch-1", "other-agent")
+    with pytest.raises(HTTPException) as shared_token:
+        store.claim("batch-1")
+    claimed = store.claim("batch-1", "openclaw")
+    with pytest.raises(HTTPException) as reassign:
+        store.assign("batch-1", "other-agent")
+
+    assert (first_replayed, replayed) == (False, True)
+    assert other_agent.value.status_code == 403
+    assert shared_token.value.status_code == 403
+    assert "claim_token" in claimed
+    assert reassign.value.status_code == 409
+    projection = store.batch_projection("batch-1")
+    assert (projection.assigned_agent_id, projection.claim_agent_id) == ("openclaw", "openclaw")
+
+
+def test_batch_cannot_be_assigned_to_a_retired_agent(storage: MariaDBStorage) -> None:
+    store = GatewayStore(storage)
+    store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-1")), None)
+    store.register_agent(_agent_registration())
+    store.retire_agent("openclaw", "captain_retired")
+
+    with pytest.raises(HTTPException) as refused:
+        store.assign("batch-1", "openclaw")
+
+    assert refused.value.status_code == 409
+    assert store.batch_projection("batch-1").assigned_agent_id is None
+
+
+def test_agent_outcomes_are_derived_from_its_claims(storage: MariaDBStorage) -> None:
+    store = GatewayStore(storage)
+    store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-1")), None)
+    store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-2")), None)
+    store.claim("batch-1", "openclaw")
+    store.cancel("batch-1", "unroutable")
+    store.claim("batch-2", "openclaw")
+
+    outcomes = store.agent_outcomes("openclaw")
+
+    assert [(item.batch_id, item.fencing_token, item.outcome) for item in outcomes] == [
+        ("batch-1", 1, "cancelled"),
+        ("batch-2", 1, "active"),
+    ]
+    assert store.agent_outcomes("other-agent") == []

@@ -15,12 +15,18 @@ def _event(
     *,
     batch_id: str,
     payload: dict[str, object],
+    claim_id: str = "claim-1",
+    fencing_token: int = 1,
 ) -> DeliveryEventEnvelope:
+    # The gateway refuses unfenced or lower-fenced events for a batch once a
+    # fenced one exists, so every event of one claim carries its fence.
     trace: dict[str, object] = {
         "project_id": "project-1",
         "run_id": "candidate-1",
         "trace_id": f"trace-{batch_id}",
         "batch_id": batch_id,
+        "claim_id": claim_id,
+        "fencing_token": fencing_token,
     }
     if event_type == "artifact_built":
         trace["artifact_id"] = str(payload["artifact_id"])
@@ -29,14 +35,7 @@ def _event(
     if event_type == "validation_run":
         trace.update({"artifact_id": "artifact-1", "case_id": "case-1"})
     if event_type == "codex_session_finished":
-        trace.update(
-            {
-                "worker_id": "worker-1",
-                "claim_id": "claim-1",
-                "fencing_token": 1,
-                "session_id": "session-1",
-            }
-        )
+        trace.update({"worker_id": "worker-1", "session_id": "session-1"})
     return DeliveryEventEnvelope.model_validate(
         {
             "event_id": uuid4(),
@@ -49,11 +48,15 @@ def _event(
     )
 
 
-def _complete_run(*, batch_id: str, index: int) -> list[DeliveryEventEnvelope]:
+def _complete_run(
+    *, batch_id: str, index: int, claim_id: str = "claim-1", fencing_token: int = 1
+) -> list[DeliveryEventEnvelope]:
+    fence = {"claim_id": claim_id, "fencing_token": fencing_token}
     return [
         _event(
             "codex_session_finished",
             batch_id=batch_id,
+            **fence,
             payload={
                 "session_id": "session-1",
                 "process_ref": "artifact://processes/session-1",
@@ -67,6 +70,7 @@ def _complete_run(*, batch_id: str, index: int) -> list[DeliveryEventEnvelope]:
         _event(
             "artifact_built",
             batch_id=batch_id,
+            **fence,
             payload={
                 "artifact_id": "artifact-1",
                 "artifact_version": "1",
@@ -78,6 +82,7 @@ def _complete_run(*, batch_id: str, index: int) -> list[DeliveryEventEnvelope]:
         _event(
             "deploy",
             batch_id=batch_id,
+            **fence,
             payload={
                 "deployment_id": f"deployment-{index}",
                 "target": "n8n",
@@ -89,6 +94,7 @@ def _complete_run(*, batch_id: str, index: int) -> list[DeliveryEventEnvelope]:
         _event(
             "validation_run",
             batch_id=batch_id,
+            **fence,
             payload={
                 "validation_id": f"validation-{index}",
                 "layer": "live",
@@ -102,6 +108,7 @@ def _complete_run(*, batch_id: str, index: int) -> list[DeliveryEventEnvelope]:
         _event(
             "e2e_run",
             batch_id=batch_id,
+            **fence,
             payload={
                 "e2e_run_id": f"e2e-{index}",
                 "run_index": index,
@@ -143,3 +150,52 @@ def test_release_rejects_clean_e2e_without_provider_completion() -> None:
         "e2e:e2e-2:validation_missing_or_failed",
         "e2e:e2e-3:validation_missing_or_failed",
     }
+
+
+def _without(events: list[DeliveryEventEnvelope], event_type: str) -> list[DeliveryEventEnvelope]:
+    return [event for event in events if event.event_type != event_type]
+
+
+def test_release_ignores_evidence_from_an_earlier_claim_of_the_same_batch() -> None:
+    """A deploy that succeeded under claim 1 must not vouch for claim 2's e2e run."""
+
+    earlier = _without(_complete_run(batch_id="batch-1", index=1), "e2e_run")
+    retried = _without(
+        _complete_run(batch_id="batch-1", index=1, claim_id="claim-2", fencing_token=2),
+        "deploy",
+    )
+    events = [
+        *earlier,
+        *retried,
+        *_complete_run(batch_id="batch-2", index=2),
+        *_complete_run(batch_id="batch-3", index=3),
+    ]
+
+    readiness = evaluate_release_readiness(events)
+
+    assert readiness.ready is False
+    assert readiness.reasons == ("e2e:e2e-1:deployment_missing_or_failed",)
+
+
+def test_release_ignores_evidence_from_a_later_claim_of_the_same_batch() -> None:
+    """Evidence recorded under a newer claim cannot complete an older e2e run."""
+
+    first = _without(_complete_run(batch_id="batch-1", index=1), "validation_run")
+    later_validation = [
+        event
+        for event in _complete_run(
+            batch_id="batch-1", index=1, claim_id="claim-2", fencing_token=2
+        )
+        if event.event_type == "validation_run"
+    ]
+    events = [
+        *first,
+        *later_validation,
+        *_complete_run(batch_id="batch-2", index=2),
+        *_complete_run(batch_id="batch-3", index=3),
+    ]
+
+    readiness = evaluate_release_readiness(events)
+
+    assert readiness.ready is False
+    assert readiness.reasons == ("e2e:e2e-1:validation_missing_or_failed",)

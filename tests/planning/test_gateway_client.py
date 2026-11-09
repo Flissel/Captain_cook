@@ -66,6 +66,23 @@ async def test_release_posts_authenticated_batch_then_hidden_holdout() -> None:
     assert first["block_type"] == "work_batch"
     assert second["block_type"] == "holdout"
     assert second["parent_index"] == 41
+    assert "status" not in first
+
+
+@pytest.mark.asyncio
+async def test_hold_for_review_releases_work_batches_as_pending_review() -> None:
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(__import__("json").loads(request.content))
+        return httpx.Response(201, json={"index": len(bodies)}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = GatewayPlanningClient("http://gateway", "captain-secret", http, hold_for_review=True)
+        await client.release(batch_fixture(), holdout_fixture())
+
+    assert bodies[0]["status"] == "pending_review"
+    assert "status" not in bodies[1]
 
 
 @pytest.mark.asyncio

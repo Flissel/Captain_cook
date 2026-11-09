@@ -88,7 +88,25 @@ def test_malformed_row_does_not_wipe_valid_chain(storage: MariaDBStorage) -> Non
     with pytest.raises(ValueError, match="Malformed ledger row"):
         storage.load()
 
-    execute_sql("DELETE FROM blocks WHERE `index` = 1")
+    with storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT `index` FROM blocks ORDER BY `index`")
+            assert [row["index"] for row in cursor.fetchall()] == [0, 1]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "UPDATE blocks SET status = 'succeeded' WHERE `index` = 0",
+        "DELETE FROM blocks WHERE `index` = 0",
+    ],
+)
+def test_blocks_table_is_append_only(storage: MariaDBStorage, statement: str) -> None:
+    storage.append_block(make_block(0, "0"))
+
+    with pytest.raises(pymysql.err.OperationalError, match="append-only"):
+        execute_sql(statement)
+
     assert storage.load() == [make_block(0, "0")]
 
 

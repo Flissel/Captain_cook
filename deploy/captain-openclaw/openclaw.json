@@ -1,0 +1,46 @@
+{
+  // Seed config, copied once into the home volume (JSON5).
+  // Secrets stay ${VAR} references resolved from the container environment.
+  "gateway": {
+    "mode": "local",
+    "bind": "lan",
+    "auth": { "token": "${OPENCLAW_GATEWAY_TOKEN}" },
+    "controlUi": {
+      "allowedOrigins": ["http://127.0.0.1:18889", "http://localhost:18889"]
+    }
+  },
+  "mcp": {
+    "servers": {
+      // Read-only Captain tools (agenten/captain_mcp/server.py on the host).
+      "captain": {
+        "url": "${CAPTAIN_MCP_URL}",
+        "transport": "streamable-http",
+        "headers": { "Authorization": "Bearer ${CAPTAIN_MCP_TOKEN}" },
+        "enabled": true
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      // The seed service manages AGENTS.md and the captain-plan skill.
+      "skipBootstrap": true
+    }
+  },
+  "plugins": {
+    "entries": {
+      // No unplanned LLM turns: the memory "dreaming" job is off.
+      "memory-core": { "config": { "dreaming": { "enabled": false } } }
+    }
+  },
+  "tools": {
+    // Keep the few Captain tools visible upfront instead of deferred.
+    "toolSearch": false,
+    // The planner plans through the captain MCP tools only. An allow-list,
+    // because a deny-list left 44 OpenClaw tools (terminal, computer,
+    // file_write, sessions_spawn, message, ...) visible in the live check.
+    // `read` stays for skill files. Claude Code's native tools are denied
+    // separately in claude-settings.json (~/.claude/settings.json).
+    "allow": ["*captain*", "read"],
+    "deny": ["group:runtime", "group:automation"]
+  }
+}

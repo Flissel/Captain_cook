@@ -650,3 +650,80 @@ def test_runtime_lifespan_fails_closed_without_complete_settings(
     with pytest.raises(GatewayConfigurationError):
         with TestClient(application):
             pass
+
+
+AGENT_A_TOKEN = "agent-a-test-token"
+AGENT_B_TOKEN = "agent-b-test-token"
+
+
+def _identity_client(storage: MariaDBStorage, *, required: bool) -> TestClient:
+    import hashlib
+
+    assert TEST_DSN is not None
+    configured = GatewaySettings(
+        ledger_dsn=SecretStr(TEST_DSN),
+        captain_gateway_token=SecretStr(CAPTAIN_TOKEN),
+        worker_gateway_token=SecretStr(WORKER_TOKEN),
+        worker_agent_token_sha256={
+            "agent-a": hashlib.sha256(AGENT_A_TOKEN.encode()).hexdigest(),
+            "agent-b": hashlib.sha256(AGENT_B_TOKEN.encode()).hexdigest(),
+        },
+        require_agent_identity=required,
+    )
+    return TestClient(create_app(storage=storage, mirror=RecordingMirror(), settings=configured))
+
+
+def test_bound_claim_rejects_other_agents_even_with_the_claim_token(
+    storage: MariaDBStorage,
+) -> None:
+    client = _identity_client(storage, required=False)
+    created = client.post(
+        "/blocks",
+        headers=authorization(CAPTAIN_TOKEN),
+        json={"block_type": "work_batch", "status": "pending", "data": batch_payload()},
+    )
+    assert created.status_code == 201
+    claimed = client.post("/batches/batch-1/claim", headers=authorization(AGENT_A_TOKEN))
+    assert claimed.status_code == 200
+    claim_token = claimed.json()["claim_token"]
+    assert client.get(
+        "/batches/batch-1", headers=authorization(CAPTAIN_TOKEN)
+    ).json()["claim_agent_id"] == "agent-a"
+
+    evidence = {
+        "block_type": "codex_session",
+        "status": "in_progress",
+        "data": {"batch_id": "batch-1", "iteration": 1},
+    }
+    for intruder in (AGENT_B_TOKEN, WORKER_TOKEN):
+        denied_block = client.post(
+            "/blocks", headers=authorization(intruder, claim_token=claim_token), json=evidence
+        )
+        denied_heartbeat = client.post(
+            "/batches/batch-1/claim/heartbeat",
+            headers=authorization(intruder, claim_token=claim_token),
+        )
+        assert denied_block.status_code == 403
+        assert denied_block.json()["detail"] == "claim belongs to another agent"
+        assert denied_heartbeat.status_code == 403
+
+    accepted = client.post(
+        "/blocks", headers=authorization(AGENT_A_TOKEN, claim_token=claim_token), json=evidence
+    )
+    assert accepted.status_code == 201
+
+
+def test_required_identity_refuses_shared_token_claims(storage: MariaDBStorage) -> None:
+    client = _identity_client(storage, required=True)
+    assert client.post(
+        "/blocks",
+        headers=authorization(CAPTAIN_TOKEN),
+        json={"block_type": "work_batch", "status": "pending", "data": batch_payload()},
+    ).status_code == 201
+
+    shared = client.post("/batches/batch-1/claim", headers=authorization(WORKER_TOKEN))
+    assert shared.status_code == 403
+    assert shared.json()["detail"] == "agent identity required to claim"
+    assert client.post(
+        "/batches/batch-1/claim", headers=authorization(AGENT_A_TOKEN)
+    ).status_code == 200

@@ -10,6 +10,14 @@ import os
 from typing import Any, Dict, List
 
 
+class LedgerStorageCorruptError(RuntimeError):
+    """Persisted ledger exists but cannot be read as a list of blocks.
+
+    Raised instead of returning an empty chain: an empty result makes
+    Blockchain write a fresh genesis block over the damaged file.
+    """
+
+
 class LedgerStorage(ABC):
     """Storage backend contract for a Blockchain's blocks."""
 
@@ -36,14 +44,24 @@ class JSONFileStorage(LedgerStorage):
         if not os.path.exists(self.file_path):
             return []
         try:
-            with open(self.file_path, "r") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            return []
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # Content is deliberately not echoed: ledger data may be sensitive.
+            raise LedgerStorageCorruptError(
+                f"ledger file {self.file_path} is not valid JSON; refusing to replace it"
+            ) from None
+        if not isinstance(records, list) or not all(
+            isinstance(record, dict) for record in records
+        ):
+            raise LedgerStorageCorruptError(
+                f"ledger file {self.file_path} is not a list of blocks; refusing to replace it"
+            )
+        return records
 
     def save(self, blocks: List[Dict[str, Any]]) -> None:
         temp_file_path = f"{self.file_path}.tmp"
-        with open(temp_file_path, "w") as f:
+        with open(temp_file_path, "w", encoding="utf-8") as f:
             json.dump(blocks, f, indent=4)
         os.replace(temp_file_path, self.file_path)
 

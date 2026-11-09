@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import json
 import re
@@ -27,6 +28,10 @@ from agenten.agent_factory.gitea_template_contracts import (
 )
 
 
+_AGENT_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
 class GatewayConfigurationError(ValueError):
     """Raised when production gateway configuration is absent or ambiguous."""
 
@@ -49,6 +54,10 @@ class GatewaySettings(BaseModel):
     provider_paid_command_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     provider_hard_ceiling_enforced: bool | None = Field(default=None, strict=True)
     approval_enabled: bool = False
+    # agent_id -> sha256 of that agent's own worker bearer token. The plaintext
+    # tokens live only with the agents.
+    worker_agent_token_sha256: dict[str, str] = Field(default_factory=dict)
+    require_agent_identity: bool = False
     host: Literal["127.0.0.1"] = "127.0.0.1"
     port: int = Field(default=8090, ge=1, le=65535)
     claim_ttl_seconds: int = Field(default=5_400, ge=1, le=86_400)
@@ -184,6 +193,28 @@ class GatewaySettings(BaseModel):
         ):
             raise ValueError("TLS CA bundle must be an existing absolute file")
         return str(candidate)
+
+    @field_validator("worker_agent_token_sha256")
+    @classmethod
+    def _validate_agent_token_digests(cls, value: dict[str, str]) -> dict[str, str]:
+        for agent_id, digest in value.items():
+            if not _AGENT_ID.fullmatch(agent_id) or not _SHA256_HEX.fullmatch(digest):
+                raise ValueError("invalid worker agent token digest")
+        if len(set(value.values())) != len(value):
+            raise ValueError("worker agent tokens must be distinct")
+        return value
+
+    @model_validator(mode="after")
+    def _agent_identity_is_isolated(self) -> "GatewaySettings":
+        if self.require_agent_identity and not self.worker_agent_token_sha256:
+            raise ValueError("agent identity requires registered agent tokens")
+        role_digests = {
+            hashlib.sha256(token.get_secret_value().encode("utf-8")).hexdigest()
+            for token in (self.captain_gateway_token, self.worker_gateway_token)
+        }
+        if role_digests & set(self.worker_agent_token_sha256.values()):
+            raise ValueError("worker agent tokens must differ from role tokens")
+        return self
 
     @model_validator(mode="after")
     def _role_tokens_must_be_distinct(self) -> "GatewaySettings":
@@ -366,6 +397,23 @@ class GatewaySettings(BaseModel):
             raise GatewayConfigurationError("invalid gateway configuration")
         approval_enabled = approval_raw.lower() == "true"
 
+        require_identity_raw = source.get("GATEWAY_REQUIRE_AGENT_IDENTITY", "false")
+        if require_identity_raw.lower() not in {"true", "false"}:
+            raise GatewayConfigurationError("invalid gateway configuration")
+        agent_digests_raw = source.get("WORKER_AGENT_TOKEN_SHA256_JSON", "")
+        agent_digests: dict[str, str] = {}
+        if agent_digests_raw.strip():
+            try:
+                decoded_digests = json.loads(agent_digests_raw)
+            except json.JSONDecodeError:
+                raise GatewayConfigurationError("invalid gateway configuration") from None
+            if not isinstance(decoded_digests, dict) or not all(
+                isinstance(key, str) and isinstance(item, str)
+                for key, item in decoded_digests.items()
+            ):
+                raise GatewayConfigurationError("invalid gateway configuration")
+            agent_digests = decoded_digests
+
         portal_n8n_raw = source.get(
             "CAPTAIN_PORTAL_N8N_ADAPTERS_ENABLED",
             "false",
@@ -432,6 +480,8 @@ class GatewaySettings(BaseModel):
                     else None
                 ),
                 approval_enabled=approval_enabled,
+                worker_agent_token_sha256=agent_digests,
+                require_agent_identity=require_identity_raw.lower() == "true",
                 port=port,
                 claim_ttl_seconds=claim_ttl_seconds,
                 captain_n8n_ui_url=source.get(

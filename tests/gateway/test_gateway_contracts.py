@@ -123,6 +123,9 @@ def test_existing_batch_projection_contract_remains_compatible() -> None:
         "recovered_iteration",
         "passing_review_recorded",
         "failed_review_count",
+        "claim_agent_id",
+        "cancel_reason",
+        "assigned_agent_id",
     )
 
 
@@ -276,6 +279,62 @@ def test_pending_review_requires_one_ordered_approval() -> None:
 )
 def test_projection_rejects_invalid_or_duplicate_approval_ordering(blocks: list[dict[str, Any]]) -> None:
     with pytest.raises(ValueError, match="approval"):
+        project_batch(blocks, BATCH_ID, now=NOW)
+
+
+def test_hashed_review_marker_overrides_a_tampered_parent_status() -> None:
+    # `status` is outside the block hash; the gateway therefore records the
+    # review requirement as a hashed child. Flipping the parent status column
+    # from pending_review to pending must not bypass the review gate.
+    tampered = project_batch(
+        [work_batch(status="pending"), child(11, "batch_review_required")],
+        BATCH_ID,
+        now=NOW,
+    )
+
+    assert tampered.status == "pending_review"
+
+
+def test_hashed_review_marker_is_cleared_by_one_approval() -> None:
+    approved = project_batch(
+        [
+            work_batch(status="pending_review"),
+            child(11, "batch_review_required"),
+            child(12, "batch_approved"),
+        ],
+        BATCH_ID,
+        now=NOW,
+    )
+
+    assert approved.status == "pending"
+
+
+def test_review_marker_blocks_claims_on_a_tampered_parent() -> None:
+    with pytest.raises(ValueError, match="approval"):
+        project_batch(
+            [work_batch(status="pending"), child(11, "batch_review_required"), claim(12)],
+            BATCH_ID,
+            now=NOW,
+        )
+
+
+@pytest.mark.parametrize(
+    "blocks",
+    [
+        [
+            work_batch(status="pending_review"),
+            child(11, "batch_review_required"),
+            child(12, "batch_review_required"),
+        ],
+        [
+            work_batch(status="pending_review"),
+            child(11, "batch_approved"),
+            child(12, "batch_review_required"),
+        ],
+    ],
+)
+def test_review_marker_must_be_unique_and_first(blocks: list[dict[str, Any]]) -> None:
+    with pytest.raises(ValueError, match="review marker"):
         project_batch(blocks, BATCH_ID, now=NOW)
 
 

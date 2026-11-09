@@ -841,6 +841,11 @@ BatchStatus: TypeAlias = Literal[
     "failed_after_max_iterations",
     "aborted_infra",
 ]
+# `unroutable` is the dead letter: no registered agent can serve the batch
+# and Captain gives up on it permanently.
+CancelReason: TypeAlias = Literal[
+    "captain_cancelled", "operator_cancelled", "policy_violation", "unroutable"
+]
 TerminalOutcome: TypeAlias = Literal[
     "succeeded",
     "failed",
@@ -866,6 +871,13 @@ class BatchProjection(BaseModel):
     recovered_iteration: int | None = None
     passing_review_recorded: bool = False
     failed_review_count: int = 0
+    # Appended last to keep the established field order stable.
+    claim_agent_id: str | None = None
+    # Set only by a Captain `batch_cancelled`, never by a worker's own
+    # cancelled `batch_done`; it is what turns writes into 410.
+    cancel_reason: CancelReason | None = None
+    # Captain's pin (`batch_assigned`): only this agent may take the claim.
+    assigned_agent_id: str | None = None
 
 
 class ActiveCodexSession(BaseModel):
@@ -892,6 +904,8 @@ class ClaimEvent(BaseModel):
     fencing_token: int = Field(ge=1, strict=True)
     claim_token_sha256: str
     claim_expires_at: datetime
+    # Registered agent that took the claim; None for legacy/shared-token claims.
+    agent_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 class HeartbeatEvent(BaseModel):
@@ -949,6 +963,42 @@ class RecoveryDecisionEvent(BaseModel):
     decision: Literal["requeue", "aborted_infra"]
 
 
+class BatchAssignRequest(BaseModel):
+    """Captain's request body for `POST /batches/{batch_id}/assign`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+class BatchAssignEvent(BaseModel):
+    """Gateway-written pin of a batch's claims to one registered agent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1)
+    agent_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+class BatchCancelRequest(BaseModel):
+    """Captain's request body for `POST /batches/{batch_id}/cancel`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: CancelReason
+
+
+class BatchCancelEvent(BaseModel):
+    """Gateway-written terminal cancellation of a non-terminal batch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1)
+    reason: CancelReason
+    # Pins the claim that was revoked (0: the batch was never claimed).
+    claim_iteration: int = Field(ge=0, strict=True)
+
+
 class ReviewDecisionEvent(EvidenceEvent):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -971,8 +1021,18 @@ class ReviewDecisionEvent(EvidenceEvent):
         return value
 
 
+# Gateway-written, hashed child that pins a batch to the review gate. The
+# parent `status` column is outside the block hash, so the review requirement
+# must not depend on it alone.
+REVIEW_MARKER_BLOCK_TYPE = "batch_review_required"
+BATCH_CANCELLED_BLOCK_TYPE = "batch_cancelled"
+BATCH_ASSIGNED_BLOCK_TYPE = "batch_assigned"
+
 _LIFECYCLE_BLOCK_TYPES = frozenset(
     {
+        REVIEW_MARKER_BLOCK_TYPE,
+        BATCH_CANCELLED_BLOCK_TYPE,
+        BATCH_ASSIGNED_BLOCK_TYPE,
         "batch_approved",
         "batch_claimed",
         "batch_heartbeat",
@@ -1114,6 +1174,9 @@ def project_batch(
     status: BatchStatus = parent["status"]
     claim_token_sha256: str | None = None
     claim_id: str | None = None
+    claim_agent_id: str | None = None
+    cancel_reason: CancelReason | None = None
+    assigned_agent_id: str | None = None
     fencing_token: int | None = None
     claim_expires_at: datetime | None = None
     claim_iteration = 0
@@ -1126,13 +1189,45 @@ def project_batch(
     passing_review_recorded = False
     failed_review_count = 0
     review_ids: set[str] = set()
+    lifecycle_seen = False
 
     for block in children:
         block_type = block.get("block_type")
         if block_type not in _LIFECYCLE_BLOCK_TYPES:
             continue
         if terminal:
-            raise ValueError("lifecycle event cannot appear after terminal batch_done")
+            raise ValueError("lifecycle event cannot appear after terminal batch_done or batch_cancelled")
+
+        if block_type == REVIEW_MARKER_BLOCK_TYPE:
+            if lifecycle_seen:
+                raise ValueError("review marker must be the unique first lifecycle event")
+            lifecycle_seen = True
+            status = "pending_review"
+            continue
+        lifecycle_seen = True
+
+        if block_type == BATCH_ASSIGNED_BLOCK_TYPE:
+            if status == "claimed":
+                raise ValueError("batch cannot be reassigned while claimed")
+            event = _event_data(block, BatchAssignEvent)
+            assert isinstance(event, BatchAssignEvent)
+            assigned_agent_id = event.agent_id
+            continue
+
+        if block_type == BATCH_CANCELLED_BLOCK_TYPE:
+            event = _event_data(block, BatchCancelEvent)
+            assert isinstance(event, BatchCancelEvent)
+            if event.claim_iteration != claim_iteration:
+                raise ValueError("batch cancel must name the current claim iteration")
+            claim_token_sha256 = None
+            claim_id = None
+            claim_agent_id = None
+            fencing_token = None
+            claim_expires_at = None
+            cancel_reason = event.reason
+            status = "cancelled"
+            terminal = True
+            continue
 
         if block_type == "batch_approved":
             if status != "pending_review":
@@ -1145,9 +1240,12 @@ def project_batch(
                 raise ValueError("batch approval is required before a claim")
             event = _event_data(block, ClaimEvent)
             assert isinstance(event, ClaimEvent)
+            if assigned_agent_id is not None and event.agent_id != assigned_agent_id:
+                raise ValueError("claim must come from the assigned agent")
             claim_iteration += 1
             claim_token_sha256 = event.claim_token_sha256
             claim_id = event.claim_id
+            claim_agent_id = event.agent_id
             fencing_token = event.fencing_token
             claim_expires_at = _as_utc(event.claim_expires_at)
             codex_session_recorded = False
@@ -1214,6 +1312,7 @@ def project_batch(
             recovered_iteration = event.iteration
             claim_token_sha256 = None
             claim_id = None
+            claim_agent_id = None
             fencing_token = None
             claim_expires_at = None
             if event.decision == "aborted_infra":
@@ -1251,6 +1350,8 @@ def project_batch(
         status=status,
         claim_token_sha256=claim_token_sha256,
         claim_id=claim_id,
+        claim_agent_id=claim_agent_id,
+        assigned_agent_id=assigned_agent_id,
         fencing_token=fencing_token,
         claim_expires_at=claim_expires_at,
         claim_iteration=claim_iteration,
@@ -1260,4 +1361,5 @@ def project_batch(
         recovered_iteration=recovered_iteration,
         passing_review_recorded=passing_review_recorded,
         failed_review_count=failed_review_count,
+        cancel_reason=cancel_reason,
     )

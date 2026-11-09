@@ -58,6 +58,7 @@ from agenten.agent_factory.skill_workflow_contracts import TeamEvaluationV1
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from gateway.auth import (
     GatewayRole,
+    current_agent_id,
     load_gateway_settings,
     require_actor,
     require_captain,
@@ -67,6 +68,10 @@ from gateway.auth import (
 )
 from gateway.contracts import (
     ActiveCodexSession,
+    BatchAssignEvent,
+    BatchAssignRequest,
+    BatchCancelEvent,
+    BatchCancelRequest,
     BatchProjection,
     DeliveryEventEnvelope,
     ReleaseProjection,
@@ -113,11 +118,27 @@ from gateway.registry_feed import (
     runtime_result_projection,
 )
 from gateway.settings import GatewaySettings
+from gateway.agent_lifecycle import (
+    AgentCapabilityGrantedEvent,
+    AgentCapabilityGrantRequest,
+    AgentCapabilityRevokedEvent,
+    AgentCapabilityRevokeRequest,
+    AgentClaimOutcome,
+    AgentProjection,
+    AgentRegisteredEvent,
+    AgentRetiredEvent,
+    AgentRetireRequest,
+)
 from gateway.store import (
     AppendResult,
     GatewayStore,
     PortalCredentialMetadataSource,
     PortalCredentialVerificationSource,
+    RuntimeResultReporter,
+    require_claim_identity,
+    require_registered_grant_holder,
+    require_token_holding_agent,
+    verify_ledger_chain,
 )
 from gateway.integration_setup_contracts import (
     IntegrationSetupMutationV1,
@@ -327,6 +348,17 @@ HERMES_SKILL_EVENT_TYPES = frozenset(
 )
 
 
+def verify_ledger_before_serving(storage: object) -> None:
+    """Fail closed: never serve from a ledger whose hash chain is broken.
+
+    Storage doubles without a ledger (`load`) are composition-test stand-ins.
+    """
+
+    if callable(getattr(storage, "load", None)):
+        verified = verify_ledger_chain(storage)  # type: ignore[arg-type]
+        logger.info("Verified ledger hash chain (%d blocks)", verified)
+
+
 def require_block_writer(block_type: str, actor: GatewayRole) -> None:
     expected = (
         GatewayRole.CAPTAIN
@@ -478,6 +510,7 @@ def create_app(
             if configured is not None and configured.provider_proxy_url is not None
             else (),
         )
+        verify_ledger_before_serving(target_storage)
         if (
             configured is not None
             and configured.portal_n8n_adapters_configured
@@ -653,6 +686,13 @@ def create_app(
                     dsn = configured.ledger_dsn.get_secret_value()
                     store = configured_store(MariaDBStorage(dsn), configured)
         return store
+
+    def active_agent_id(agent_id: str | None = Depends(current_agent_id)) -> str | None:
+        """Writes need a token whose agent Captain has not retired."""
+
+        if agent_id is not None:
+            get_store().require_active_agent(agent_id)
+        return agent_id
 
     def get_capability_resume_service() -> CapabilityResumeService:
         nonlocal resume_service, runtime_http_client
@@ -1447,6 +1487,7 @@ def create_app(
         response: Response,
         _: GatewayRole = Depends(require_captain),
     ) -> RuntimeWriteReceipt:
+        require_registered_grant_holder(grant, settings=load_gateway_settings(app))
         receipt = get_store().record_capability_grant(grant)
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
@@ -1493,9 +1534,14 @@ def create_app(
     async def record_runtime_result(
         result: AgentRuntimeResult,
         response: Response,
-        _: GatewayRole = Depends(require_actor),
+        actor: GatewayRole = Depends(require_actor),
+        agent_id: str | None = Depends(active_agent_id),
     ) -> RuntimeWriteReceipt:
-        receipt = get_store().record_runtime_result(result)
+        receipt = get_store().record_runtime_result(
+            result,
+            RuntimeResultReporter(actor=actor, agent_id=agent_id),
+            require_agent_identity=load_gateway_settings(app).require_agent_identity,
+        )
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
         else:
@@ -1526,6 +1572,7 @@ def create_app(
         event: DeliveryEventEnvelope,
         response: Response,
         actor: GatewayRole = Depends(require_actor),
+        agent_id: str | None = Depends(active_agent_id),
     ) -> AppendResult:
         require_skill_event_writer(event, actor)
         result = get_store().append_delivery_event(
@@ -1534,6 +1581,7 @@ def create_app(
                 actor is GatewayRole.WORKER
                 and event.event_type not in HERMES_SKILL_EVENT_TYPES
             ),
+            agent_id=agent_id,
         )
         response.status_code = status.HTTP_200_OK if result.replayed else status.HTTP_201_CREATED
         return result
@@ -1585,16 +1633,19 @@ def create_app(
     async def claim_batch(
         batch_id: str,
         _: GatewayRole = Depends(require_worker),
+        agent_id: str | None = Depends(active_agent_id),
     ) -> dict[str, str | int]:
-        return get_store().claim(batch_id)
+        require_claim_identity(agent_id, required_settings=load_gateway_settings(app))
+        return get_store().claim(batch_id, agent_id)
 
     @app.post("/batches/{batch_id}/claim/heartbeat")
     async def heartbeat(
         batch_id: str,
         x_claim_token: str | None = Header(default=None),
         _: GatewayRole = Depends(require_worker),
+        agent_id: str | None = Depends(active_agent_id),
     ) -> dict[str, str]:
-        return get_store().heartbeat(batch_id, x_claim_token)
+        return get_store().heartbeat(batch_id, x_claim_token, agent_id)
 
     @app.post("/batches/{batch_id}/approve")
     async def approve(
@@ -1605,6 +1656,99 @@ def create_app(
             raise HTTPException(status_code=404, detail="approval endpoint disabled")
         get_store().approve(batch_id)
         return {"status": "pending"}
+
+    @app.post("/batches/{batch_id}/assign", status_code=status.HTTP_201_CREATED)
+    async def assign_batch(
+        batch_id: str,
+        request: BatchAssignRequest,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> BatchAssignEvent:
+        require_token_holding_agent(request.agent_id, settings=load_gateway_settings(app))
+        block, replayed = get_store().assign(batch_id, request.agent_id)
+        if replayed:
+            response.status_code = status.HTTP_200_OK
+        return BatchAssignEvent.model_validate(block["data"])
+
+    @app.post("/batches/{batch_id}/cancel", status_code=status.HTTP_201_CREATED)
+    async def cancel_batch(
+        batch_id: str,
+        request: BatchCancelRequest,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> BatchCancelEvent:
+        block, replayed = get_store().cancel(batch_id, request.reason)
+        if replayed:
+            response.status_code = status.HTTP_200_OK
+        return BatchCancelEvent.model_validate(block["data"])
+
+    @app.post("/agents", status_code=status.HTTP_201_CREATED)
+    async def register_agent(
+        event: AgentRegisteredEvent,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> AgentRegisteredEvent:
+        require_token_holding_agent(event.agent_id, settings=load_gateway_settings(app))
+        block, replayed = get_store().register_agent(event)
+        if replayed:
+            response.status_code = status.HTTP_200_OK
+        return AgentRegisteredEvent.model_validate(block["data"])
+
+    @app.post("/agents/{agent_id}/retire", status_code=status.HTTP_201_CREATED)
+    async def retire_agent(
+        agent_id: str,
+        request: AgentRetireRequest,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> AgentRetiredEvent:
+        block, replayed = get_store().retire_agent(agent_id, request.reason)
+        if replayed:
+            response.status_code = status.HTTP_200_OK
+        return AgentRetiredEvent.model_validate(block["data"])
+
+    @app.post("/agents/{agent_id}/grants", status_code=status.HTTP_201_CREATED)
+    async def grant_agent_capability(
+        agent_id: str,
+        request: AgentCapabilityGrantRequest,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> AgentCapabilityGrantedEvent:
+        block, replayed = get_store().grant_agent_capability(agent_id, request)
+        if replayed:
+            response.status_code = status.HTTP_200_OK
+        return AgentCapabilityGrantedEvent.model_validate(block["data"])
+
+    @app.post(
+        "/agents/{agent_id}/grants/{grant_id}/revoke", status_code=status.HTTP_201_CREATED
+    )
+    async def revoke_agent_capability(
+        agent_id: str,
+        grant_id: str,
+        request: AgentCapabilityRevokeRequest,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> AgentCapabilityRevokedEvent:
+        block, replayed = get_store().revoke_agent_capability(agent_id, grant_id, request.reason)
+        if replayed:
+            response.status_code = status.HTTP_200_OK
+        return AgentCapabilityRevokedEvent.model_validate(block["data"])
+
+    @app.get("/agents/{agent_id}/outcomes")
+    async def get_agent_outcomes(
+        agent_id: str,
+        _: GatewayRole = Depends(require_reader),
+    ) -> list[AgentClaimOutcome]:
+        return get_store().agent_outcomes(agent_id)
+
+    @app.get("/agents/{agent_id}")
+    async def get_agent(
+        agent_id: str,
+        _: GatewayRole = Depends(require_reader),
+    ) -> AgentProjection:
+        projection = get_store().agent(agent_id)
+        if projection is None:
+            raise HTTPException(status_code=404, detail="agent not registered")
+        return projection
 
     @app.get("/batches/{batch_id}")
     async def get_batch(
@@ -1653,12 +1797,13 @@ def create_app(
         request: BlockRequest,
         x_claim_token: str | None = Header(default=None),
         actor: GatewayRole = Depends(require_actor),
+        agent_id: str | None = Depends(active_agent_id),
     ) -> dict[str, Any]:
         require_block_writer(request.block_type, actor)
         request = apply_review_gate(
             request, approval_enabled=load_gateway_settings(app).approval_enabled
         )
-        block = get_store().append(request, x_claim_token)
+        block = get_store().append(request, x_claim_token, agent_id)
         try:
             mirror.enqueue_nowait(block)
         except Exception:
@@ -1913,8 +2058,10 @@ def create_production_app_from_environment(
     clock = lambda: datetime.now(timezone.utc)
     artifacts = ContentAddressedArtifactAdapter(bootstrap.artifact_root)
     source_artifacts = RepositoryFactoryInputArtifactStore(artifacts=artifacts)
+    ledger_storage = MariaDBStorage(configured.ledger_dsn.get_secret_value())
+    verify_ledger_before_serving(ledger_storage)
     gateway = GatewayStore(
-        MariaDBStorage(configured.ledger_dsn.get_secret_value()),
+        ledger_storage,
         claim_ttl=timedelta(seconds=configured.claim_ttl_seconds),
         runtime_usage_artifacts=artifacts,
         runtime_provider_proxy_bindings=((

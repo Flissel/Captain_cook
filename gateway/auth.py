@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 from enum import Enum
 
@@ -57,14 +58,31 @@ def _unauthorized() -> HTTPException:
     )
 
 
+def _registered_agent(presented: str, settings: GatewaySettings) -> str | None:
+    """Return the agent whose own worker token was presented, if any."""
+
+    digest = hashlib.sha256(presented.encode("utf-8")).hexdigest()
+    matched: str | None = None
+    for agent_id, expected in settings.worker_agent_token_sha256.items():
+        if secrets.compare_digest(digest, expected):
+            matched = agent_id
+    return matched
+
+
 def require_actor(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
     settings: GatewaySettings = Depends(get_gateway_settings),
 ) -> GatewayRole:
+    request.state.gateway_agent_id = None
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise _unauthorized()
 
     presented = credentials.credentials
+    agent_id = _registered_agent(presented, settings)
+    if agent_id is not None:
+        request.state.gateway_agent_id = agent_id
+        return GatewayRole.WORKER
     captain_match = secrets.compare_digest(
         presented,
         settings.captain_gateway_token.get_secret_value(),
@@ -78,6 +96,15 @@ def require_actor(
     if worker_match:
         return GatewayRole.WORKER
     raise _unauthorized()
+
+
+def current_agent_id(
+    request: Request,
+    _: GatewayRole = Depends(require_actor),
+) -> str | None:
+    """The registered agent behind the request; None for shared role tokens."""
+
+    return getattr(request.state, "gateway_agent_id", None)
 
 
 def _require_role(actor: GatewayRole, expected: GatewayRole) -> GatewayRole:
@@ -109,7 +136,7 @@ def require_provider_receipt_authority(
         presented, provider.get_secret_value()
     ):
         return GatewayRole.PROVIDER_RECEIPT
-    if any(
+    if _registered_agent(presented, settings) is not None or any(
         secrets.compare_digest(presented, token.get_secret_value())
         for token in (
             settings.captain_gateway_token,

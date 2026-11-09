@@ -28,6 +28,10 @@ BatchStatus: TypeAlias = Literal[
     "failed_after_max_iterations",
     "aborted_infra",
 ]
+# Mirrors gateway.contracts.CancelReason; `unroutable` is the dead letter.
+BatchCancelReason: TypeAlias = Literal[
+    "captain_cancelled", "operator_cancelled", "policy_violation", "unroutable"
+]
 TerminalOutcome: TypeAlias = Literal[
     "succeeded",
     "failed",
@@ -47,6 +51,10 @@ class GatewayDeliveryConflictError(GatewayDeliveryError):
     """The gateway rejected a stale, invalid, or conflicting lifecycle write."""
 
 
+class GatewayBatchCancelledError(GatewayDeliveryConflictError):
+    """Captain cancelled the batch; the claim holder must stop for good."""
+
+
 class GatewayBatchProjection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -64,6 +72,9 @@ class GatewayBatchProjection(BaseModel):
     recovered_iteration: int | None = Field(default=None, ge=1, strict=True)
     passing_review_recorded: bool = False
     failed_review_count: int = Field(default=0, ge=0, strict=True)
+    claim_agent_id: str | None = None
+    cancel_reason: BatchCancelReason | None = None
+    assigned_agent_id: str | None = None
 
 
 class GatewayClaim(BaseModel):
@@ -179,6 +190,14 @@ class _RecoveryResponse(BaseModel):
     iteration: int = Field(ge=1, strict=True)
     reason: Literal["claim_expired"]
     decision: Literal["requeue", "aborted_infra"]
+
+
+class _CancelResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1)
+    reason: BatchCancelReason
+    claim_iteration: int = Field(ge=0, strict=True)
 
 
 class _ReviewResponse(BaseModel):
@@ -418,6 +437,23 @@ class GatewayDeliveryClient:
             event.model_dump(mode="json"),
         )
 
+    async def cancel_batch(
+        self,
+        batch_id: str,
+        *,
+        reason: BatchCancelReason,
+    ) -> None:
+        """Captain-only: terminally cancel a batch and revoke its claim."""
+
+        response = await self._request(
+            "POST",
+            f"/batches/{self._batch_path(batch_id)}/cancel",
+            operation="cancel batch",
+            json={"reason": reason},
+        )
+        self._require_status(response, {200, 201}, operation="cancel batch")
+        self._validate(_CancelResponse, response, operation="cancel batch")
+
     async def record_recovery(self, decision: "RecoveryDecision") -> "RecoveryDecision":
         from agenten.delivery.recovery import RecoveryDecision
 
@@ -606,7 +642,9 @@ class GatewayDeliveryClient:
         if response.status_code in expected:
             return
         error_type = (
-            GatewayDeliveryConflictError
+            GatewayBatchCancelledError
+            if response.status_code == 410
+            else GatewayDeliveryConflictError
             if response.status_code == 409
             else GatewayDeliveryError
         )
