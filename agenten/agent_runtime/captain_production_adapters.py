@@ -19,7 +19,7 @@ from agenten.agent_runtime.runtime_codex import (
 )
 from agenten.agent_factory.codex_build_recovery import canonical_factory_codex_model
 from agenten.agent_factory.hermes_cli import HermesCliFactory, HermesCliSettings
-from agenten.agent_factory.hermes_endpoint import hermes_endpoint_overrides
+from agenten.agent_factory.hermes_endpoint import hermes_provider_settings
 from agenten.agent_factory.orchestration import FactoryDispatchError
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
@@ -139,21 +139,21 @@ class CaptainHermesPlannerAdapter:
             / "workspaces"
             / "hermes-runtime"
         ).root
-        # Without an explicit provider/model the Hermes CLI falls back to its
-        # own default endpoint, which in this deployment is an OpenRouter route
-        # that has neither a key nor a model name -- the CLI then reports
-        # "API call failed" on stdout and exits 0, so the wrapper sees only
-        # unparseable output. Both are configured together or not at all;
-        # HermesCliSettings rejects a half-configured pair.
-        provider = context.environ.get("CAPTAIN_HERMES_PROVIDER", "").strip() or None
-        model = context.environ.get("CAPTAIN_HERMES_MODEL", "").strip() or None
-
+        # Without an explicit provider/model the Hermes CLI would fall back to
+        # its own default endpoint (an OpenRouter route without key or model:
+        # "API call failed" on stdout, exit 0). The shared helper therefore
+        # defaults to the Claude Code subscription shim; an explicit pair is
+        # kept and HermesCliSettings rejects a half-configured one.
+        #
         # Hermes resolves a custom provider endpoint from OPENAI_BASE_URL and
         # OPENAI_API_KEY in its own process environment. Captain carries the
-        # endpoint as CAPTAIN_HERMES_BASE_URL; the shared helper translates it
-        # into overrides for the Hermes child only, so os.environ (and every
-        # later OpenAI client or child process) never sees the Nebius key.
-        environment_overrides = hermes_endpoint_overrides(context.environ)
+        # endpoint as CAPTAIN_HERMES_BASE_URL; the helper translates it into
+        # overrides for the Hermes child only, so os.environ (and every later
+        # client or child process) never sees a provider key.
+        hermes = hermes_provider_settings(context.environ)
+        provider = hermes.provider
+        model = hermes.model
+        environment_overrides = hermes.environment_overrides
         factory = HermesCliFactory(
             settings=HermesCliSettings(
                 executable=(

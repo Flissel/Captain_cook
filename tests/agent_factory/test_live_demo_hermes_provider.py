@@ -46,11 +46,12 @@ def test_live_demo_hermes_settings_read_provider_and_model(monkeypatch, tmp_path
     assert settings.model == "nvidia/x"
 
 
-def test_live_demo_hermes_without_provider_keeps_defaults(monkeypatch, tmp_path):
+def test_live_demo_hermes_without_provider_uses_the_claude_code_shim(monkeypatch, tmp_path):
     settings = _build(monkeypatch, tmp_path, {})
 
-    assert settings.provider is None
-    assert settings.model is None
+    assert settings.provider == "custom"
+    assert settings.model == "claude-code"
+    assert settings.environment_overrides["OPENAI_BASE_URL"] == "http://127.0.0.1:8114/v1"
 
 
 def test_live_demo_hermes_on_token_factory_carries_the_nebius_endpoint(monkeypatch, tmp_path):
@@ -88,6 +89,33 @@ def test_live_demo_hermes_on_token_factory_without_key_fails_closed(monkeypatch,
 
 
 def test_live_demo_hermes_without_base_url_has_no_overrides(monkeypatch, tmp_path):
-    settings = _build(monkeypatch, tmp_path, {})
+    settings = _build(
+        monkeypatch,
+        tmp_path,
+        {"CAPTAIN_HERMES_PROVIDER": "custom", "CAPTAIN_HERMES_MODEL": "nvidia/x"},
+    )
 
     assert dict(settings.environment_overrides) == {}
+
+
+def test_live_demo_hermes_on_anthropic_forwards_only_that_key(monkeypatch, tmp_path):
+    settings = _build(
+        monkeypatch,
+        tmp_path,
+        {
+            "CAPTAIN_HERMES_PROVIDER": "anthropic",
+            "CAPTAIN_HERMES_MODEL": "claude-sonnet-5-5",
+            "ANTHROPIC_API_KEY": "sk-ant-test",
+        },
+    )
+
+    assert dict(settings.environment_overrides) == {"ANTHROPIC_API_KEY": "sk-ant-test"}
+
+
+def test_live_demo_hermes_on_anthropic_without_key_fails_closed(monkeypatch, tmp_path):
+    with pytest.raises(live_demo_entrypoint.LiveDemoConfigurationError, match="ANTHROPIC_API_KEY"):
+        _build(
+            monkeypatch,
+            tmp_path,
+            {"CAPTAIN_HERMES_PROVIDER": "anthropic", "CAPTAIN_HERMES_MODEL": "claude-sonnet-5-5"},
+        )

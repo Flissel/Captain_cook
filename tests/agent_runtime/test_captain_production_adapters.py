@@ -1824,7 +1824,7 @@ def test_hermes_local_shim_keeps_the_placeholder_key(
     assert "OPENAI_BASE_URL" not in os.environ
 
 
-def test_hermes_without_base_url_has_no_endpoint_overrides(
+def test_unconfigured_hermes_targets_the_claude_code_shim_without_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _clear_ambient_openai(monkeypatch)
@@ -1833,5 +1833,10 @@ def test_hermes_without_base_url_has_no_endpoint_overrides(
 
     create_runtime_adapters(context)
 
-    assert dict(captured["settings"].environment_overrides) == {}
+    settings = captured["settings"]
+    assert (settings.provider, settings.model) == ("custom", "claude-code")
+    assert dict(settings.environment_overrides) == {
+        "OPENAI_BASE_URL": "http://127.0.0.1:8114/v1",
+        "OPENAI_API_KEY": "captain-hermes-local-endpoint",
+    }
     assert "OPENAI_API_KEY" not in os.environ
