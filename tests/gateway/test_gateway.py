@@ -19,11 +19,12 @@ from pymysql.err import OperationalError
 
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
+from gateway.agent_lifecycle import AgentRegisteredEvent
 from gateway.app import CAPTAIN_WRITE_BLOCK_TYPES, BlockRequest, create_app
 from gateway.auth import GatewayRole, require_actor
 from gateway.contracts import DeliveryEventEnvelope, ReleaseProjection
 from gateway.settings import GatewaySettings
-from gateway.store import GatewayStore
+from gateway.store import GatewayStore, verify_ledger_chain
 from tests.support.mariadb import assert_isolated_test_database
 
 
@@ -1625,3 +1626,57 @@ def test_finished_batch_cannot_be_cancelled_over_http(client: TestClient) -> Non
 
     assert response.status_code == 409
     assert response.json()["detail"] == "batch is already terminal"
+
+
+def _agent_registration(version: str = "1") -> AgentRegisteredEvent:
+    return AgentRegisteredEvent(
+        agent_id="openclaw", version=version, owner="captain", spec_sha256="b" * 64
+    )
+
+
+def test_agent_registration_is_replayable_and_versioned(storage: MariaDBStorage) -> None:
+    store = GatewayStore(storage)
+
+    first, first_replayed = store.register_agent(_agent_registration())
+    again, again_replayed = store.register_agent(_agent_registration())
+    store.register_agent(_agent_registration("2"))
+    with pytest.raises(HTTPException) as reused:
+        store.register_agent(_agent_registration("1"))
+
+    assert (first_replayed, again_replayed) == (False, True)
+    assert again["index"] == first["index"]
+    assert reused.value.status_code == 409
+    projection = store.agent("openclaw")
+    assert projection is not None
+    assert (projection.status, projection.version, projection.registration_count) == (
+        "registered",
+        "2",
+        2,
+    )
+    assert store.agent("unknown") is None
+    assert verify_ledger_chain(storage) >= 2
+
+
+def test_retired_agent_is_terminal_and_loses_write_authority(storage: MariaDBStorage) -> None:
+    store = GatewayStore(storage)
+    with pytest.raises(HTTPException) as unknown:
+        store.retire_agent("openclaw", "captain_retired")
+    assert unknown.value.status_code == 404
+
+    store.register_agent(_agent_registration())
+    store.require_active_agent("openclaw")
+    _, replayed = store.retire_agent("openclaw", "captain_retired")
+    _, replayed_again = store.retire_agent("openclaw", "captain_retired")
+    with pytest.raises(HTTPException) as other_reason:
+        store.retire_agent("openclaw", "policy_violation")
+    with pytest.raises(HTTPException) as reregister:
+        store.register_agent(_agent_registration("2"))
+    with pytest.raises(HTTPException) as refused:
+        store.require_active_agent("openclaw")
+
+    assert (replayed, replayed_again) == (False, True)
+    assert other_reason.value.status_code == 409
+    assert reregister.value.status_code == 409
+    assert (refused.value.status_code, refused.value.detail) == (403, "agent is retired")
+    projection = store.agent("openclaw")
+    assert projection is not None and projection.retire_reason == "captain_retired"

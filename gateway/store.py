@@ -147,6 +147,17 @@ from gateway.contracts import (
     project_release,
 )
 from gateway.release_policy import ReleaseReadiness, evaluate_release_readiness
+from gateway.agent_lifecycle import (
+    AGENT_LIFECYCLE_BLOCK_TYPES,
+    AGENT_REGISTERED_BLOCK_TYPE,
+    AGENT_RETIRED_BLOCK_TYPE,
+    AgentLedgerError,
+    AgentProjection,
+    AgentRegisteredEvent,
+    AgentRetiredEvent,
+    RetireReason,
+    project_agent,
+)
 from gateway.registry_feed import (
     factory_registry_mirror_event,
     integration_setup_registry_mirror_event,
@@ -204,6 +215,8 @@ GATEWAY_OWNED_EVENT_TYPES = frozenset(
         "review_decision",
         REVIEW_MARKER_BLOCK_TYPE,
         BATCH_CANCELLED_BLOCK_TYPE,
+        AGENT_REGISTERED_BLOCK_TYPE,
+        AGENT_RETIRED_BLOCK_TYPE,
     }
 )
 WORKER_EVIDENCE_BLOCK_TYPES = frozenset(
@@ -260,6 +273,13 @@ def _require_not_cancelled(projection: BatchProjection) -> None:
 class _AgentRegistry(Protocol):
     @property
     def worker_agent_token_sha256(self) -> Mapping[str, str]: ...
+
+
+def require_token_holding_agent(agent_id: str, *, settings: _AgentRegistry) -> None:
+    """Only an agent that can authenticate as itself may be registered."""
+
+    if agent_id not in settings.worker_agent_token_sha256:
+        raise HTTPException(status_code=422, detail="agent has no registered token")
 
 
 def require_registered_grant_holder(grant: CapabilityGrant, *, settings: _AgentRegistry) -> None:
@@ -8407,6 +8427,127 @@ class GatewayStore:
                 self._validate_candidate(parent, children, block, batch_id, now=now)
                 self._insert(cursor, block)
         return {"claim_expires_at": expiry.isoformat()}
+
+    # --- agent lifecycle -------------------------------------------------
+
+    def agent(self, agent_id: str) -> AgentProjection | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                return self._project_agent_blocks(
+                    self._agent_blocks(cursor, agent_id, for_update=False), agent_id
+                )
+
+    def require_active_agent(self, agent_id: str | None) -> None:
+        """A retired agent's token no longer authorizes writes (reads stay open).
+
+        Checked per request before the write transaction: a retirement that
+        commits concurrently can still let one in-flight request through.
+        """
+
+        if agent_id is None:
+            return
+        projection = self.agent(agent_id)
+        if projection is not None and projection.status == "retired":
+            raise HTTPException(status_code=403, detail="agent is retired")
+
+    def register_agent(self, event: AgentRegisteredEvent) -> tuple[dict[str, Any], bool]:
+        """Append a registration; returns (block, replayed)."""
+
+        try:
+            return self._retry_write(lambda: self._register_agent_once(event)), False
+        except _IdempotentReplay as replay:
+            return replay.block, True
+
+    def _register_agent_once(self, event: AgentRegisteredEvent) -> dict[str, Any]:
+        data = event.model_dump(mode="json")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                blocks = self._agent_blocks(cursor, event.agent_id, for_update=True)
+                current = self._project_agent_blocks(blocks, event.agent_id)
+                if current is not None and current.status == "retired":
+                    raise HTTPException(status_code=409, detail="agent is retired")
+                registrations = [
+                    block for block in blocks if block["block_type"] == AGENT_REGISTERED_BLOCK_TYPE
+                ]
+                if registrations and registrations[-1]["data"] == data:
+                    raise _IdempotentReplay(registrations[-1])
+                if any(block["data"].get("version") == event.version for block in registrations):
+                    raise HTTPException(
+                        status_code=409, detail="agent version is already registered"
+                    )
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type=AGENT_REGISTERED_BLOCK_TYPE,
+                    data=data,
+                    status="registered",
+                    parent_index=None,
+                )
+                self._project_agent_blocks([*blocks, block], event.agent_id)
+                self._insert(cursor, block)
+        return block
+
+    def retire_agent(self, agent_id: str, reason: RetireReason) -> tuple[dict[str, Any], bool]:
+        """Terminally retire a registered agent; returns (block, replayed)."""
+
+        try:
+            return self._retry_write(lambda: self._retire_agent_once(agent_id, reason)), False
+        except _IdempotentReplay as replay:
+            return replay.block, True
+
+    def _retire_agent_once(self, agent_id: str, reason: RetireReason) -> dict[str, Any]:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                blocks = self._agent_blocks(cursor, agent_id, for_update=True)
+                current = self._project_agent_blocks(blocks, agent_id)
+                if current is None:
+                    raise HTTPException(status_code=404, detail="agent not registered")
+                if current.status == "retired":
+                    existing = blocks[-1]
+                    if existing["data"].get("reason") == reason:
+                        raise _IdempotentReplay(existing)
+                    raise HTTPException(
+                        status_code=409, detail="agent was already retired for another reason"
+                    )
+                event = AgentRetiredEvent(agent_id=agent_id, reason=reason)
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type=AGENT_RETIRED_BLOCK_TYPE,
+                    data=event.model_dump(mode="json"),
+                    status="retired",
+                    parent_index=None,
+                )
+                self._insert(cursor, block)
+        return block
+
+    @staticmethod
+    def _project_agent_blocks(
+        blocks: list[dict[str, Any]], agent_id: str
+    ) -> AgentProjection | None:
+        try:
+            return project_agent(blocks, agent_id)
+        except AgentLedgerError as exc:
+            # Fail closed: a contradictory agent history authorizes nothing.
+            raise HTTPException(status_code=409, detail=f"agent ledger invalid: {exc}") from None
+
+    def _agent_blocks(
+        self, cursor: Any, agent_id: str, *, for_update: bool
+    ) -> list[dict[str, Any]]:
+        block_types = sorted(AGENT_LIFECYCLE_BLOCK_TYPES)
+        placeholders = ", ".join(["%s"] * len(block_types))
+        sql = f"""
+            SELECT `index`, parent_index, block_type, data, status, children,
+                   metadata, hash, previous_hash
+            FROM blocks
+            WHERE block_type IN ({placeholders})
+              AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.agent_id')) = %s
+            ORDER BY `index`
+        """
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (*block_types, agent_id))
+        return [self.storage._decode_row(row) for row in cursor.fetchall()]
 
     def cancel(self, batch_id: str, reason: CancelReason) -> tuple[dict[str, Any], bool]:
         """Terminally cancel a non-terminal batch; returns (block, replayed)."""

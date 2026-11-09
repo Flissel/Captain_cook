@@ -116,6 +116,12 @@ from gateway.registry_feed import (
     runtime_result_projection,
 )
 from gateway.settings import GatewaySettings
+from gateway.agent_lifecycle import (
+    AgentProjection,
+    AgentRegisteredEvent,
+    AgentRetiredEvent,
+    AgentRetireRequest,
+)
 from gateway.store import (
     AppendResult,
     GatewayStore,
@@ -124,6 +130,7 @@ from gateway.store import (
     RuntimeResultReporter,
     require_claim_identity,
     require_registered_grant_holder,
+    require_token_holding_agent,
     verify_ledger_chain,
 )
 from gateway.integration_setup_contracts import (
@@ -672,6 +679,13 @@ def create_app(
                     dsn = configured.ledger_dsn.get_secret_value()
                     store = configured_store(MariaDBStorage(dsn), configured)
         return store
+
+    def active_agent_id(agent_id: str | None = Depends(current_agent_id)) -> str | None:
+        """Writes need a token whose agent Captain has not retired."""
+
+        if agent_id is not None:
+            get_store().require_active_agent(agent_id)
+        return agent_id
 
     def get_capability_resume_service() -> CapabilityResumeService:
         nonlocal resume_service, runtime_http_client
@@ -1514,7 +1528,7 @@ def create_app(
         result: AgentRuntimeResult,
         response: Response,
         actor: GatewayRole = Depends(require_actor),
-        agent_id: str | None = Depends(current_agent_id),
+        agent_id: str | None = Depends(active_agent_id),
     ) -> RuntimeWriteReceipt:
         receipt = get_store().record_runtime_result(
             result,
@@ -1551,7 +1565,7 @@ def create_app(
         event: DeliveryEventEnvelope,
         response: Response,
         actor: GatewayRole = Depends(require_actor),
-        agent_id: str | None = Depends(current_agent_id),
+        agent_id: str | None = Depends(active_agent_id),
     ) -> AppendResult:
         require_skill_event_writer(event, actor)
         result = get_store().append_delivery_event(
@@ -1612,7 +1626,7 @@ def create_app(
     async def claim_batch(
         batch_id: str,
         _: GatewayRole = Depends(require_worker),
-        agent_id: str | None = Depends(current_agent_id),
+        agent_id: str | None = Depends(active_agent_id),
     ) -> dict[str, str | int]:
         require_claim_identity(agent_id, required_settings=load_gateway_settings(app))
         return get_store().claim(batch_id, agent_id)
@@ -1622,7 +1636,7 @@ def create_app(
         batch_id: str,
         x_claim_token: str | None = Header(default=None),
         _: GatewayRole = Depends(require_worker),
-        agent_id: str | None = Depends(current_agent_id),
+        agent_id: str | None = Depends(active_agent_id),
     ) -> dict[str, str]:
         return get_store().heartbeat(batch_id, x_claim_token, agent_id)
 
@@ -1647,6 +1661,40 @@ def create_app(
         if replayed:
             response.status_code = status.HTTP_200_OK
         return BatchCancelEvent.model_validate(block["data"])
+
+    @app.post("/agents", status_code=status.HTTP_201_CREATED)
+    async def register_agent(
+        event: AgentRegisteredEvent,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> AgentRegisteredEvent:
+        require_token_holding_agent(event.agent_id, settings=load_gateway_settings(app))
+        block, replayed = get_store().register_agent(event)
+        if replayed:
+            response.status_code = status.HTTP_200_OK
+        return AgentRegisteredEvent.model_validate(block["data"])
+
+    @app.post("/agents/{agent_id}/retire", status_code=status.HTTP_201_CREATED)
+    async def retire_agent(
+        agent_id: str,
+        request: AgentRetireRequest,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> AgentRetiredEvent:
+        block, replayed = get_store().retire_agent(agent_id, request.reason)
+        if replayed:
+            response.status_code = status.HTTP_200_OK
+        return AgentRetiredEvent.model_validate(block["data"])
+
+    @app.get("/agents/{agent_id}")
+    async def get_agent(
+        agent_id: str,
+        _: GatewayRole = Depends(require_reader),
+    ) -> AgentProjection:
+        projection = get_store().agent(agent_id)
+        if projection is None:
+            raise HTTPException(status_code=404, detail="agent not registered")
+        return projection
 
     @app.get("/batches/{batch_id}")
     async def get_batch(
@@ -1695,7 +1743,7 @@ def create_app(
         request: BlockRequest,
         x_claim_token: str | None = Header(default=None),
         actor: GatewayRole = Depends(require_actor),
-        agent_id: str | None = Depends(current_agent_id),
+        agent_id: str | None = Depends(active_agent_id),
     ) -> dict[str, Any]:
         require_block_writer(request.block_type, actor)
         request = apply_review_gate(

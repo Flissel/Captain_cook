@@ -118,8 +118,10 @@ lifecycle (authorization). Order is by risk and independence:
       `batch_dead_lettered`: Captain route marks a non-terminal batch as
       permanently unroutable (reason, detail), terminal status
       `dead_lettered`, replay-idempotent like `batch_cancelled`.
-- [ ] `agent_registered` (agent_id, version, owner, spec_sha256) and
-      `agent_retired`; `project_agent`; a retired agent cannot claim.
+- [x] `agent_registered` (agent_id, version, owner, spec_sha256) and
+      `agent_retired`; `project_agent` (`gateway/agent_lifecycle.py`). A
+      retired agent's token loses all write routes (403); reads stay open.
+      Routes: `POST /agents`, `POST /agents/{id}/retire`, `GET /agents/{id}`.
 - [ ] `agent_capability_granted` / `agent_capability_revoked` (grant_id,
       capability tags, expiry). A ledger-registered agent may claim only a
       batch whose `capability_tags` an active grant covers. The runtime
