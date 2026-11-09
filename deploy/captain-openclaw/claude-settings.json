@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash",
+      "Write",
+      "Edit",
+      "NotebookEdit",
+      "Agent",
+      "Workflow",
+      "WebFetch",
+      "WebSearch",
+      "RemoteTrigger",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "ScheduleWakeup",
+      "Monitor",
+      "EnterWorktree",
+      "ExitWorktree",
+      "SendMessage",
+      "SendToProject",
+      "SendToProjectContext",
+      "PushNotification",
+      "DesignSync"
+    ]
+  }
+}

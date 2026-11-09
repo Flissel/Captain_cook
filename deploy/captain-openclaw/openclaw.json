@@ -35,8 +35,12 @@
   "tools": {
     // Keep the few Captain tools visible upfront instead of deferred.
     "toolSearch": false,
-    // The planner plans through MCP only: no shell/process execution and
-    // no scheduler, gateway or plugin administration.
+    // The planner plans through the captain MCP tools only. An allow-list,
+    // because a deny-list left 44 OpenClaw tools (terminal, computer,
+    // file_write, sessions_spawn, message, ...) visible in the live check.
+    // `read` stays for skill files. Claude Code's native tools are denied
+    // separately in claude-settings.json (~/.claude/settings.json).
+    "allow": ["*captain*", "read"],
     "deny": ["group:runtime", "group:automation"]
   }
 }

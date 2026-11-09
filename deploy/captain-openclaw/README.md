@@ -128,14 +128,18 @@ carries the plan format and procedure: draft -> `check_constitution` ->
 so edit them here, not in the container. Tests keep the role's tool lists
 in step with the real MCP surface.
 
-The seed config also denies shell/process execution and scheduler/gateway
-administration (`tools.deny`), turns off the memory "dreaming" job and
-skips OpenClaw's own bootstrap files. `openclaw.json` is copied only once:
+The seed config allows only the Captain MCP tools plus `read`
+(`tools.allow`; a deny-list left terminal, computer and file tools visible),
+still denies shell/process execution and scheduler/gateway administration,
+turns off the memory "dreaming" job and skips OpenClaw's own bootstrap
+files. Claude Code's native tools (Write, Edit, Agent, schedulers, ...) are
+denied in `claude-settings.json`, which the seed installs as
+`~/.claude/settings.json`. Check tool exposure in the Claude transcript,
+not by asking the model. `openclaw.json` is copied only once:
 an existing volume from the spike keeps its old config, so apply those keys
 there by hand (`openclaw config set ...` in the CLI container) or start
 with a fresh `captain-openclaw-home` volume after asking the operator.
-Whether these keys take effect on OpenClaw 2026.10.4 still needs one live
-check (`openclaw doctor`, then a planner turn).
+Verified live on OpenClaw 2026.10.4 on 2026-11-09 (see the plan, Phase 5).
 
 ## Stop and clean up
 

@@ -281,9 +281,44 @@ through the subscription-backed `claude-cli` runtime
       on every start; drift tests in `tests/captain_mcp/test_openclaw_role.py`
       (confirmation list == write tools, skill example compiles). Seed
       config denies `group:runtime` and `group:automation`.
-- [ ] Live check of the role on OpenClaw 2026.10.4: `openclaw doctor`
+- [x] Live check of the role on OpenClaw 2026.10.4: `openclaw doctor`
       accepts the new config keys, the skill is listed, `exec` is denied,
       and one planner turn runs check -> compile without publishing.
+      Done (2026-11-09, throwaway ledger, MCP without Captain token):
+      `config validate` accepts `skipBootstrap`, dreaming off, `tools.allow`
+      and `tools.deny`; `skills list` shows `captain-plan` ready
+      (`openclaw-workspace`); two planner turns drafted 3-batch plans,
+      passed `check_constitution` first time, compiled, showed holdouts as
+      counts only and did not publish. Findings, all fixed:
+  - [x] `tools.deny` alone left 44 OpenClaw tools in the API request
+        (`terminal`, `computer`, `browser`, `file_write`,
+        `sessions_spawn`, `message`, ...). Now an allow-list:
+        `tools.allow: ["*captain*", "read"]`; the next request carried 0
+        OpenClaw tools.
+  - [x] Claude Code's native tools are not governed by `openclaw.json`:
+        a probe created a file with native `Write`, and `Agent` started
+        a subagent (it had no `Bash`). Fixed with Captain-owned
+        `~/.claude/settings.json` `permissions.deny` (OpenClaw launches
+        Claude with `--setting-sources user`); re-probe: `Write`, `Edit`,
+        `Agent`, `Workflow`, `RemoteTrigger`, `Cron*`, `SendMessage`,
+        `NotebookEdit`, `WebSearch` gone from the request, no file written,
+        Captain tools still work.
+  - [x] The spike volume kept OpenClaw's default `BOOTSTRAP.md`,
+        `SOUL.md`, `IDENTITY.md` persona templates in the prompt. The seed
+        now writes Captain `SOUL.md`/`IDENTITY.md` and removes
+        `BOOTSTRAP.md`.
+  - [x] Model self-reports about its tools are unreliable (it first
+        over-, then under-reported). Verify tool exposure from the Claude
+        transcript (`api-request-shape`, `deferred_tools_delta` records),
+        never from the answer.
+- [ ] `openclaw.json` is copied once; an existing volume needs the planner
+      keys applied by hand (`openclaw config set ...`, done for the spike
+      volume). Consider a seed step that merges Captain-owned keys.
+- [ ] Remaining native tools: `Read`/`Glob`/`Grep` (needed for skills) can
+      read the whole container home, including `~/.claude/.credentials.json`
+      and `openclaw.json`. Scope reads to the workspace (Claude permission
+      rules such as `Read(~/.claude/**)` deny, or `tools.fs.workspaceOnly`)
+      and verify with a probe.
 - [ ] Offline deterministic path stays (replay clients) so the test gate
       needs no subscription.
 

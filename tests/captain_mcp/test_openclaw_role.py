@@ -109,7 +109,11 @@ def test_seed_service_installs_the_role_files_read_only() -> None:
 
     assert mounts["/seed/workspace"]["source"] == "./workspace"
     assert mounts["/seed/workspace"]["read_only"] is True
-    assert "/home/node/.openclaw/workspace/AGENTS.md" in script
+    assert (
+        "cp /seed/workspace/AGENTS.md /seed/workspace/SOUL.md /seed/workspace/IDENTITY.md "
+        "/home/node/.openclaw/workspace/"
+    ) in script
+    assert "rm -f /home/node/.openclaw/workspace/BOOTSTRAP.md" in script
     assert "/home/node/.openclaw/workspace/skills/captain-plan/SKILL.md" in script
 
 
@@ -125,3 +129,24 @@ def test_role_files_are_plain_text_without_secrets() -> None:
     for text in (ROLE, SKILL):
         assert not re.search(r"(sk-ant|Bearer [A-Za-z0-9_-]{16,}|CAPTAIN_MCP_CAPTAIN_TOKEN=)", text)
     assert Path(WORKSPACE / "AGENTS.md").stat().st_size < 20_000  # bootstrapMaxChars
+
+
+def test_planner_tools_are_an_allow_list_of_captain_tools() -> None:
+    assert seed_config()["tools"]["allow"] == ["*captain*", "read"]
+
+
+def test_claude_code_native_write_spawn_and_schedule_tools_are_denied() -> None:
+    settings = json.loads((DEPLOY / "claude-settings.json").read_text(encoding="utf-8"))
+    denied = set(settings["permissions"]["deny"])
+
+    assert {"Bash", "Write", "Edit", "NotebookEdit", "Agent", "Workflow", "RemoteTrigger"} <= denied
+    assert {"CronCreate", "CronDelete", "ScheduleWakeup", "SendMessage", "WebFetch"} <= denied
+    assert not {"Read", "Glob", "Grep", "Skill"} & denied  # skills must stay readable
+
+
+def test_seed_installs_the_claude_code_settings_read_only() -> None:
+    seed = compose()["services"]["captain-openclaw-seed"]
+    mounts = {volume["target"]: volume for volume in seed["volumes"] if isinstance(volume, dict)}
+
+    assert mounts["/seed/claude-settings.json"]["read_only"] is True
+    assert "/home/node/.claude/settings.json" in seed["command"][0]
