@@ -216,8 +216,17 @@ Phase 1). No generic `/blocks` write tool.
       review gate and stays with the operator (security review
       2026-11-09). Open: recovery, review, runtime commands/grants,
       factory jobs, release decision.
-- [ ] Constitution check tool: HTTP/MCP wrapper around the rule layer of
-      `ConstitutionGatekeeper` (today event-bus internal only).
+- [x] Constitution check tool: HTTP/MCP wrapper around the rule layer of
+      `ConstitutionGatekeeper` (today event-bus internal only). Done
+      (2026-11-09): `check_constitution` (read-only) runs the deterministic
+      validators over every subtask of a supplied plan
+      (`agenten/constitution/plan_check.py`: required fields, minimality
+      against the project description, in-plan duplicates, total
+      budget); `publish_plan` refuses plans it rejects.
+- [ ] Semantic constitution layer (LLM judge) for supplied plans. Not run
+      by the planner on its own plan; needs an independent judge (a
+      separate Claude call or the operator). Reports say
+      `semantic_review: not_performed` until then.
 
 ## Phase 5 - OpenClaw container
 

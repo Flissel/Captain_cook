@@ -5,9 +5,13 @@ validates and compiles them deterministically (`agenten.planning.supplied_plan`)
 
 - `compile_plan` is read-only: it may query the gateway's capability
   projection, but it never writes.
+- `check_constitution` is read-only: the deterministic constitution layer
+  over every subtask (`agenten.constitution.plan_check`). The semantic
+  layer is not run; the planner must not judge its own plan.
 - `publish_plan` exists only with the Captain token. It recompiles from
   the same inputs and releases what Captain produced, never a compiled
-  plan handed in by the planner. Every batch is released explicitly as
+  plan handed in by the planner. It refuses a plan that fails the
+  constitution check. Every batch is released explicitly as
   `pending_review`, whatever the gateway's default, so the operator
   approves before any worker can claim it. Approval needs
   `GATEWAY_APPROVAL_ENABLED=true`; without it the batches stay held.
@@ -19,12 +23,14 @@ holdout expectations are evaluation secrets and stay out of transcripts.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from agenten.constitution.plan_check import PlanConstitutionReport, check_supplied_plan
+from agenten.constitution.ruleset import ConstitutionRuleset, load_constitution
 from agenten.planning.captain_pipeline import (
     BatchReleaseClient,
     CapabilityResolver,
@@ -47,6 +53,10 @@ _PUBLISH = ToolAnnotations(
 
 class PlanToolsConfigurationError(RuntimeError):
     """Planning tool settings are incomplete or inconsistent."""
+
+
+class PlanRejectedError(RuntimeError):
+    """The plan failed the constitution check and was not published."""
 
 
 def plan_compiler_settings_from_env(environment: Mapping[str, str]) -> PlanCompilerSettings | None:
@@ -83,6 +93,14 @@ class CaptainPlanner:
     settings: PlanCompilerSettings
     capability_resolver: CapabilityResolver | None = None
     release_client: BatchReleaseClient | None = None
+    ruleset: ConstitutionRuleset = field(default_factory=load_constitution)
+
+    def check(self, plan: SuppliedPlan) -> PlanConstitutionReport:
+        return check_supplied_plan(
+            plan.project_description,
+            [(item.subtask_id, item.description, item.capability_tags) for item in plan.subtasks],
+            self.ruleset,
+        )
 
     async def compile(self, plan: SuppliedPlan) -> dict[str, Any]:
         compiled = await compile_supplied_plan(
@@ -93,6 +111,11 @@ class CaptainPlanner:
     async def publish(self, plan: SuppliedPlan) -> dict[str, Any]:
         if self.release_client is None:
             raise RuntimeError("publishing requires the Captain token")
+        report = self.check(plan)
+        if not report.accepted:
+            raise PlanRejectedError(
+                "constitution check failed: " + "; ".join(report.rejections())
+            )
         compiled = await publish_supplied_plan(
             plan,
             self.settings,
@@ -121,6 +144,17 @@ def register_plan_tools(server: FastMCP, planner: CaptainPlanner) -> None:
 
         return await planner.compile(plan)
 
+    @server.tool(annotations=_COMPILE)
+    async def check_constitution(plan: SuppliedPlan) -> dict[str, Any]:
+        """Check every subtask against Captain's constitution (deterministic layer).
+
+        Reports the constitution version and each rejection with its reason.
+        The semantic scope/quality review is not performed by this tool.
+        publish_plan refuses plans that this check rejects.
+        """
+
+        return planner.check(plan).to_json()
+
     if planner.release_client is None:
         return
 
@@ -128,8 +162,9 @@ def register_plan_tools(server: FastMCP, planner: CaptainPlanner) -> None:
     async def publish_plan(plan: SuppliedPlan) -> dict[str, Any]:
         """Recompile the plan and release every batch to the gateway.
 
-        Batches wait for operator review approval before workers can claim
-        them. Publishing the same batch ids again is refused.
+        The plan must pass check_constitution. Batches wait for operator
+        review approval before workers can claim them. Publishing the same
+        batch ids again is refused.
         """
 
         return await planner.publish(plan)

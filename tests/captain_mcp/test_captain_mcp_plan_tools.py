@@ -182,3 +182,43 @@ def test_publish_conflicts_surface_without_partial_success_claims() -> None:
     assert result["isError"] is True
     assert "409" in json.dumps(result["content"])
     assert CAPTAIN_TOKEN not in json.dumps(result)
+
+
+# --- constitution ---------------------------------------------------------
+
+
+def _bad_plan_json() -> dict[str, Any]:
+    bad = _plan_json()
+    bad["subtasks"][1]["description"] = "tiny"
+    return bad
+
+
+def test_check_constitution_reports_the_deterministic_verdict() -> None:
+    def app() -> Any:
+        return create_mcp_app(reader([]), inbound_token=MCP_TOKEN, planner=CaptainPlanner(SETTINGS))
+
+    passed = _call(app(), "check_constitution", {"plan": _plan_json()})["structuredContent"]
+    failed = _call(app(), "check_constitution", {"plan": _bad_plan_json()})["structuredContent"]
+
+    assert passed["accepted"] is True and passed["semantic_review"] == "not_performed"
+    assert failed["accepted"] is False
+    assert failed["rejections"][0].startswith("s2: malformed")
+
+
+def test_check_constitution_is_read_only() -> None:
+    tools = _tools(create_mcp_app(reader([]), inbound_token=MCP_TOKEN, planner=CaptainPlanner(SETTINGS)))
+
+    assert tools["check_constitution"]["annotations"]["readOnlyHint"] is True
+
+
+def test_publish_refuses_a_plan_the_constitution_rejects() -> None:
+    release = _RecordingRelease()
+    app = create_mcp_app(
+        reader([]), inbound_token=MCP_TOKEN, planner=CaptainPlanner(SETTINGS, release_client=release)
+    )
+
+    result = _call(app, "publish_plan", {"plan": _bad_plan_json()})
+
+    assert result["isError"] is True
+    assert "constitution check failed" in json.dumps(result["content"])
+    assert release.batch_ids == []

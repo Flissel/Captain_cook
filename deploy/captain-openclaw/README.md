@@ -105,9 +105,11 @@ separated; optionally `CAPTAIN_PLAN_ALLOWED_TARGETS`) the server offers
 `compile_plan`. OpenClaw supplies the subtasks, their alignment into
 batches and one enrichment per batch; Captain validates and compiles them
 deterministically and returns the batches plus holdout case counts.
+`check_constitution` runs the deterministic constitution rules over every
+subtask; the semantic review is not performed by the planner itself.
 
-With the Captain token it also offers `publish_plan`. It recompiles and
-releases every batch as `pending_review`, so nothing is claimable until the
+With the Captain token it also offers `publish_plan`. It refuses plans
+the constitution check rejects, then recompiles and releases every batch as `pending_review`, so nothing is claimable until the
 operator approves it. That needs `GATEWAY_APPROVAL_ENABLED=true` on the
 gateway; without it the batches stay held.
 
