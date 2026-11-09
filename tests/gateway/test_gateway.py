@@ -1743,3 +1743,39 @@ def test_registered_agent_claims_only_batches_an_active_grant_covers(
     assert store.batch_projection("batch-1").claim_agent_id == "openclaw"
     # An agent with a token but no ledger registration keeps legacy behavior.
     assert "claim_token" in store.claim("batch-2", "other-agent")
+
+
+def test_assigned_batch_is_claimable_only_by_its_agent(storage: MariaDBStorage) -> None:
+    store = GatewayStore(storage)
+    store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-1")), None)
+
+    _, first_replayed = store.assign("batch-1", "openclaw")
+    _, replayed = store.assign("batch-1", "openclaw")
+    with pytest.raises(HTTPException) as other_agent:
+        store.claim("batch-1", "other-agent")
+    with pytest.raises(HTTPException) as shared_token:
+        store.claim("batch-1")
+    claimed = store.claim("batch-1", "openclaw")
+    with pytest.raises(HTTPException) as reassign:
+        store.assign("batch-1", "other-agent")
+
+    assert (first_replayed, replayed) == (False, True)
+    assert other_agent.value.status_code == 403
+    assert shared_token.value.status_code == 403
+    assert "claim_token" in claimed
+    assert reassign.value.status_code == 409
+    projection = store.batch_projection("batch-1")
+    assert (projection.assigned_agent_id, projection.claim_agent_id) == ("openclaw", "openclaw")
+
+
+def test_batch_cannot_be_assigned_to_a_retired_agent(storage: MariaDBStorage) -> None:
+    store = GatewayStore(storage)
+    store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-1")), None)
+    store.register_agent(_agent_registration())
+    store.retire_agent("openclaw", "captain_retired")
+
+    with pytest.raises(HTTPException) as refused:
+        store.assign("batch-1", "openclaw")
+
+    assert refused.value.status_code == 409
+    assert store.batch_projection("batch-1").assigned_agent_id is None

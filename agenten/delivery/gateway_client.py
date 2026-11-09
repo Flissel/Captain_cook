@@ -74,6 +74,7 @@ class GatewayBatchProjection(BaseModel):
     failed_review_count: int = Field(default=0, ge=0, strict=True)
     claim_agent_id: str | None = None
     cancel_reason: BatchCancelReason | None = None
+    assigned_agent_id: str | None = None
 
 
 class GatewayClaim(BaseModel):

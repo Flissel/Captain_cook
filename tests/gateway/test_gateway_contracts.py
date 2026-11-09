@@ -125,6 +125,7 @@ def test_existing_batch_projection_contract_remains_compatible() -> None:
         "failed_review_count",
         "claim_agent_id",
         "cancel_reason",
+        "assigned_agent_id",
     )
 
 

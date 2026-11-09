@@ -876,6 +876,8 @@ class BatchProjection(BaseModel):
     # Set only by a Captain `batch_cancelled`, never by a worker's own
     # cancelled `batch_done`; it is what turns writes into 410.
     cancel_reason: CancelReason | None = None
+    # Captain's pin (`batch_assigned`): only this agent may take the claim.
+    assigned_agent_id: str | None = None
 
 
 class ActiveCodexSession(BaseModel):
@@ -961,6 +963,23 @@ class RecoveryDecisionEvent(BaseModel):
     decision: Literal["requeue", "aborted_infra"]
 
 
+class BatchAssignRequest(BaseModel):
+    """Captain's request body for `POST /batches/{batch_id}/assign`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+class BatchAssignEvent(BaseModel):
+    """Gateway-written pin of a batch's claims to one registered agent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1)
+    agent_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
 class BatchCancelRequest(BaseModel):
     """Captain's request body for `POST /batches/{batch_id}/cancel`."""
 
@@ -1007,11 +1026,13 @@ class ReviewDecisionEvent(EvidenceEvent):
 # must not depend on it alone.
 REVIEW_MARKER_BLOCK_TYPE = "batch_review_required"
 BATCH_CANCELLED_BLOCK_TYPE = "batch_cancelled"
+BATCH_ASSIGNED_BLOCK_TYPE = "batch_assigned"
 
 _LIFECYCLE_BLOCK_TYPES = frozenset(
     {
         REVIEW_MARKER_BLOCK_TYPE,
         BATCH_CANCELLED_BLOCK_TYPE,
+        BATCH_ASSIGNED_BLOCK_TYPE,
         "batch_approved",
         "batch_claimed",
         "batch_heartbeat",
@@ -1155,6 +1176,7 @@ def project_batch(
     claim_id: str | None = None
     claim_agent_id: str | None = None
     cancel_reason: CancelReason | None = None
+    assigned_agent_id: str | None = None
     fencing_token: int | None = None
     claim_expires_at: datetime | None = None
     claim_iteration = 0
@@ -1184,6 +1206,14 @@ def project_batch(
             continue
         lifecycle_seen = True
 
+        if block_type == BATCH_ASSIGNED_BLOCK_TYPE:
+            if status == "claimed":
+                raise ValueError("batch cannot be reassigned while claimed")
+            event = _event_data(block, BatchAssignEvent)
+            assert isinstance(event, BatchAssignEvent)
+            assigned_agent_id = event.agent_id
+            continue
+
         if block_type == BATCH_CANCELLED_BLOCK_TYPE:
             event = _event_data(block, BatchCancelEvent)
             assert isinstance(event, BatchCancelEvent)
@@ -1210,6 +1240,8 @@ def project_batch(
                 raise ValueError("batch approval is required before a claim")
             event = _event_data(block, ClaimEvent)
             assert isinstance(event, ClaimEvent)
+            if assigned_agent_id is not None and event.agent_id != assigned_agent_id:
+                raise ValueError("claim must come from the assigned agent")
             claim_iteration += 1
             claim_token_sha256 = event.claim_token_sha256
             claim_id = event.claim_id
@@ -1319,6 +1351,7 @@ def project_batch(
         claim_token_sha256=claim_token_sha256,
         claim_id=claim_id,
         claim_agent_id=claim_agent_id,
+        assigned_agent_id=assigned_agent_id,
         fencing_token=fencing_token,
         claim_expires_at=claim_expires_at,
         claim_iteration=claim_iteration,

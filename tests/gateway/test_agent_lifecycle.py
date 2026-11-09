@@ -339,3 +339,36 @@ def test_only_captain_grants_capabilities_and_replay_answers_200() -> None:
     assert (created.status_code, replayed.status_code) == (201, 200)
     assert created.json()["capability_tags"] == ["deploy", "python"]
     assert [agent for agent, _ in store.granted] == ["openclaw", "openclaw"]
+
+
+def test_assignment_route_is_captain_only_and_needs_a_token_holding_agent() -> None:
+    class AssigningStore(FakeAgentStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.assigned: list[tuple[str, str]] = []
+
+        def assign(self, batch_id: str, agent_id: str) -> tuple[dict[str, Any], bool]:
+            self.assigned.append((batch_id, agent_id))
+            return {"data": {"batch_id": batch_id, "agent_id": agent_id}}, False
+
+    store = AssigningStore()
+    client = _client(store)
+
+    worker = client.post(
+        "/batches/batch-1/assign",
+        json={"agent_id": "openclaw"},
+        headers={"Authorization": f"Bearer {AGENT_TOKEN}"},
+    )
+    ghost = client.post(
+        "/batches/batch-1/assign",
+        json={"agent_id": "ghost"},
+        headers={"Authorization": f"Bearer {CAPTAIN_TOKEN}"},
+    )
+    created = client.post(
+        "/batches/batch-1/assign",
+        json={"agent_id": "openclaw"},
+        headers={"Authorization": f"Bearer {CAPTAIN_TOKEN}"},
+    )
+
+    assert (worker.status_code, ghost.status_code, created.status_code) == (403, 422, 201)
+    assert store.assigned == [("batch-1", "openclaw")]

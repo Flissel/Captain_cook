@@ -105,7 +105,9 @@ from agenten.agent_factory.workflow_promotion import build_release_workflow_prom
 from blockchain.Blockchain_modell import Block, verify_chain
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
+    BATCH_ASSIGNED_BLOCK_TYPE,
     BATCH_CANCELLED_BLOCK_TYPE,
+    BatchAssignEvent,
     REVIEW_MARKER_BLOCK_TYPE,
     ActiveCodexSession,
     ArtifactBuiltPayload,
@@ -221,6 +223,7 @@ GATEWAY_OWNED_EVENT_TYPES = frozenset(
         "review_decision",
         REVIEW_MARKER_BLOCK_TYPE,
         BATCH_CANCELLED_BLOCK_TYPE,
+        BATCH_ASSIGNED_BLOCK_TYPE,
         AGENT_REGISTERED_BLOCK_TYPE,
         AGENT_RETIRED_BLOCK_TYPE,
         AGENT_CAPABILITY_GRANTED_BLOCK_TYPE,
@@ -8365,6 +8368,13 @@ class GatewayStore:
                 )
                 if projection.status != "pending" or claim_expired_without_recovery:
                     raise HTTPException(status_code=409, detail="batch is not claimable")
+                if (
+                    projection.assigned_agent_id is not None
+                    and agent_id != projection.assigned_agent_id
+                ):
+                    raise HTTPException(
+                        status_code=403, detail="batch is assigned to another agent"
+                    )
                 self._require_claim_capability(cursor, agent_id, parent, now=now)
                 token = secrets.token_urlsafe(32)
                 claim_id = f"claim-{secrets.token_urlsafe(18)}"
@@ -8685,6 +8695,51 @@ class GatewayStore:
             sql += " FOR UPDATE"
         cursor.execute(sql, (*block_types, agent_id))
         return [self.storage._decode_row(row) for row in cursor.fetchall()]
+
+    def assign(self, batch_id: str, agent_id: str) -> tuple[dict[str, Any], bool]:
+        """Pin an unclaimed batch's claims to one agent; returns (block, replayed)."""
+
+        try:
+            return self._retry_write(lambda: self._assign_once(batch_id, agent_id)), False
+        except _IdempotentReplay as replay:
+            return replay.block, True
+
+    def _assign_once(self, batch_id: str, agent_id: str) -> dict[str, Any]:
+        now = _utcnow()
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                parent, children, projection = self._batch_context(
+                    cursor,
+                    batch_id,
+                    for_update=True,
+                    now=now,
+                )
+                if projection.assigned_agent_id == agent_id:
+                    latest = [
+                        child for child in children if child["block_type"] == BATCH_ASSIGNED_BLOCK_TYPE
+                    ][-1]
+                    raise _IdempotentReplay(latest)
+                if projection.status not in {"pending_review", "pending"} or claim_requires_recovery(
+                    projection, now
+                ):
+                    raise HTTPException(status_code=409, detail="batch is not assignable")
+                agent = self._project_agent_blocks(
+                    self._agent_blocks(cursor, agent_id, for_update=False), agent_id
+                )
+                if agent is not None and agent.status == "retired":
+                    raise HTTPException(status_code=409, detail="agent is retired")
+                event = BatchAssignEvent(batch_id=batch_id, agent_id=agent_id)
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type=BATCH_ASSIGNED_BLOCK_TYPE,
+                    data=event.model_dump(mode="json"),
+                    status="recorded",
+                    parent_index=parent["index"],
+                )
+                self._validate_candidate(parent, children, block, batch_id, now=now)
+                self._insert(cursor, block)
+        return block
 
     def cancel(self, batch_id: str, reason: CancelReason) -> tuple[dict[str, Any], bool]:
         """Terminally cancel a non-terminal batch; returns (block, replayed)."""

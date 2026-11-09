@@ -131,8 +131,11 @@ lifecycle (authorization). Order is by risk and independence:
 - [ ] Agents with a token but no ledger registration still claim anything
       (compatibility). Add a setting that requires ledger registration for
       every claiming agent once Captain registers all of them.
-- [ ] `agent_assigned` (batch, agent): Captain pins the next claim of a
-      batch to one agent; other agents get 403.
+- [x] `agent_assigned` (batch, agent), stored as the batch lifecycle child
+      `batch_assigned`: Captain pins a batch's claims to one agent
+      (`POST /batches/{id}/assign`); other agents and shared-token workers
+      get 403. Latest assignment wins; reassigning needs an unclaimed batch,
+      never a retired agent. Projection field `assigned_agent_id`.
 - [ ] Agent outcomes: derived read model over batch projections
       (`claim_agent_id` + terminal status), not a second written record, so
       there is no dual write to keep consistent.
