@@ -6,7 +6,7 @@ validates and compiles them deterministically (`agenten.planning.supplied_plan`)
 - `compile_plan` is read-only: it may query the gateway's capability
   projection, but it never writes.
 - `check_constitution` is read-only: the deterministic constitution layer
-  over every subtask (`agenten.constitution.plan_check`). The semantic
+  over every subtask and every batch goal as released (`agenten.constitution.plan_check`). The semantic
   layer is not run; the planner must not judge its own plan.
 - `publish_plan` exists only with the Captain token. It recompiles from
   the same inputs and releases what Captain produced, never a compiled
@@ -100,6 +100,12 @@ class CaptainPlanner:
             plan.project_description,
             [(item.subtask_id, item.description, item.capability_tags) for item in plan.subtasks],
             self.ruleset,
+            # The released WorkBatch takes goal and tags from the enrichment,
+            # so the gate checks exactly that content too.
+            batches=[
+                (batch_id, enrichment.goal, enrichment.capability_tags)
+                for batch_id, enrichment in plan.enrichments.items()
+            ],
         )
 
     async def compile(self, plan: SuppliedPlan) -> dict[str, Any]:

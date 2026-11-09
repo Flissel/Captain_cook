@@ -222,3 +222,18 @@ def test_publish_refuses_a_plan_the_constitution_rejects() -> None:
     assert result["isError"] is True
     assert "constitution check failed" in json.dumps(result["content"])
     assert release.batch_ids == []
+
+
+def test_publish_checks_the_released_batch_goal_not_only_the_subtasks() -> None:
+    release = _RecordingRelease()
+    app = create_mcp_app(
+        reader([]), inbound_token=MCP_TOKEN, planner=CaptainPlanner(SETTINGS, release_client=release)
+    )
+    smuggled = _plan_json()
+    smuggled["enrichments"]["mail"]["goal"] = "x" * 4001
+
+    result = _call(app, "publish_plan", {"plan": smuggled})
+
+    assert result["isError"] is True
+    assert "batch:mail: malformed" in json.dumps(result["content"])
+    assert release.batch_ids == []

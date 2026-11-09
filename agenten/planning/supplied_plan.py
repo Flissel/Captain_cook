@@ -31,18 +31,29 @@ from agenten.planning.policy import PlanningPolicy
 from agenten.validation.contracts import HoldoutSuite, WorkBatch
 
 
+# Hard input bounds, independent of the constitution budget: they cap the
+# work any single tool call can make Captain do.
+MAX_PLAN_ITEMS = 500
+MAX_PROJECT_DESCRIPTION_LENGTH = 20_000
+MAX_ID_LENGTH = 128
+
+
 class SuppliedPlan(BaseModel):
     """The three planning stage results, as the planner produced them."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    project_description: str = Field(min_length=1)
-    subtasks: List[PlannedSubtask] = Field(min_length=1)
+    project_description: str = Field(min_length=1, max_length=MAX_PROJECT_DESCRIPTION_LENGTH)
+    subtasks: List[PlannedSubtask] = Field(min_length=1, max_length=MAX_PLAN_ITEMS)
     alignment: AlignmentPlan
-    enrichments: dict[str, BatchEnrichment]
+    enrichments: dict[str, BatchEnrichment] = Field(max_length=MAX_PLAN_ITEMS)
 
     @model_validator(mode="after")
     def _one_enrichment_per_aligned_batch(self) -> "SuppliedPlan":
+        if len(self.alignment.batches) > MAX_PLAN_ITEMS:
+            raise ValueError(f"a plan may hold at most {MAX_PLAN_ITEMS} batches")
+        if any(len(item.subtask_id) > MAX_ID_LENGTH for item in self.subtasks):
+            raise ValueError(f"subtask ids may be at most {MAX_ID_LENGTH} characters")
         aligned = {draft.batch_id for draft in self.alignment.batches}
         supplied = set(self.enrichments)
         if aligned != supplied:

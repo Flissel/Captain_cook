@@ -38,7 +38,7 @@ def enrichment(**overrides: Any) -> dict[str, Any]:
 
 def plan(**overrides: Any) -> SuppliedPlan:
     values: dict[str, Any] = {
-        "project_description": "Weekly report mailer",
+        "project_description": "Weekly report mailer for the sales team",
         "subtasks": [
             {"subtask_id": "s1", "description": "Collect data", "capability_tags": ["python"]},
             {"subtask_id": "s2", "description": "Send mail", "capability_tags": ["email"]},
@@ -56,7 +56,7 @@ def plan(**overrides: Any) -> SuppliedPlan:
             ]
         },
         "enrichments": {
-            "collect": enrichment(capability_tags=["python"]),
+            "collect": enrichment(goal="Collect the weekly sales data", capability_tags=["python"]),
             "mail": enrichment(holdout_cases=[{"case_id": "holdout-2", "input": {"week": 2}, "expected_observations": {"sent": True}}]),
         },
     }
@@ -127,3 +127,14 @@ async def test_publish_recompiles_and_releases_every_batch() -> None:
 
     assert [batch.batch_id for batch, _ in release.released] == ["collect", "mail"]
     assert [batch for batch, _ in release.released] == list(compiled.batches)
+
+
+def test_plan_size_is_bounded_before_any_work() -> None:
+    too_many = [
+        {"subtask_id": f"s{index}", "description": "Collect data", "capability_tags": ["python"]}
+        for index in range(501)
+    ]
+    with pytest.raises(ValueError):
+        plan(subtasks=too_many)
+    with pytest.raises(ValueError):
+        plan(project_description="x" * 20_001)

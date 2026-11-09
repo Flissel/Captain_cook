@@ -2,12 +2,16 @@
 
 The event-driven gatekeeper judges one `SubproblemProposed` at a time. A
 planner such as OpenClaw hands Captain a complete, flat plan instead, so
-this applies the same deterministic validators to every subtask in it:
+this applies the same deterministic validators to everything the plan
+would release:
 
-- required fields (description and capability tags),
-- minimality against the project description (the subtasks' parent),
-- duplicates within the plan (the plan is one root problem),
-- the ruleset's total-subproblem budget.
+- every subtask (description + capability tags),
+- every batch as it is released (enrichment goal + capability tags), so
+  the gate reads the same content the release writes,
+
+each with required fields, minimality against the project description
+(their parent) and duplicates within its own group, plus the ruleset's
+total-subproblem budget, which is checked first and stops the check.
 
 Layer 2, the semantic scope/quality judge, is deliberately *not* run here:
 the planner must not judge its own plan, and a report that silently skipped
@@ -22,17 +26,20 @@ from dataclasses import dataclass
 from typing import Any, Literal, Optional, Tuple
 
 from agenten.constitution.ruleset import ConstitutionRuleset
-from agenten.constitution.validators import ValidationFailure, run_deterministic_checks
+from agenten.constitution.validators import (
+    ValidationFailure,
+    check_minimality,
+    check_required_fields,
+    normalize_description,
+)
 
-_PLAN_ROOT = "supplied-plan"
-
-PlanSubtask = Tuple[str, str, Sequence[str]]
-"""(subtask_id, description, capability_tags)"""
+PlanItem = Tuple[str, str, Sequence[str]]
+"""(item_id, description, capability_tags)"""
 
 
 @dataclass(frozen=True)
-class SubtaskVerdict:
-    subtask_id: str
+class ItemVerdict:
+    item_id: str
     failure: Optional[ValidationFailure]
 
     @property
@@ -43,7 +50,7 @@ class SubtaskVerdict:
 @dataclass(frozen=True)
 class PlanConstitutionReport:
     constitution_version: str
-    verdicts: tuple[SubtaskVerdict, ...]
+    verdicts: tuple[ItemVerdict, ...]
     plan_failure: Optional[ValidationFailure]
     semantic_review: Literal["not_performed"] = "not_performed"
 
@@ -56,7 +63,7 @@ class PlanConstitutionReport:
         if self.plan_failure is not None:
             found.append(f"plan: {self.plan_failure[0]}: {self.plan_failure[1]}")
         found += [
-            f"{verdict.subtask_id}: {verdict.failure[0]}: {verdict.failure[1]}"
+            f"{verdict.item_id}: {verdict.failure[0]}: {verdict.failure[1]}"
             for verdict in self.verdicts
             if verdict.failure is not None
         ]
@@ -74,31 +81,44 @@ class PlanConstitutionReport:
 
 def check_supplied_plan(
     project_description: str,
-    subtasks: Sequence[PlanSubtask],
+    subtasks: Sequence[PlanItem],
     ruleset: ConstitutionRuleset,
+    *,
+    batches: Sequence[PlanItem] = (),
 ) -> PlanConstitutionReport:
-    """Run the deterministic constitution layer over every subtask."""
+    """Run the deterministic constitution layer over subtasks and released batches."""
 
     budget = ruleset.default_budget.max_total_subproblems
-    plan_failure: Optional[ValidationFailure] = None
-    if len(subtasks) > budget:
-        plan_failure = ("budget_exceeded", f"plan has {len(subtasks)} subtasks; the budget is {budget}")
-
-    seen: list[Tuple[str, str]] = []
-    verdicts: list[SubtaskVerdict] = []
-    for subtask_id, description, capability_tags in subtasks:
-        failure = run_deterministic_checks(
-            description=description,
-            capability_tags=list(capability_tags),
-            root_problem_id=_PLAN_ROOT,
-            parent_description=project_description,
-            pending_descriptions=seen,
+    if len(subtasks) > budget or len(batches) > budget:
+        return PlanConstitutionReport(
+            constitution_version=ruleset.version,
+            verdicts=(),
+            plan_failure=(
+                "budget_exceeded",
+                f"plan has {len(subtasks)} subtasks and {len(batches)} batches; the budget is {budget}",
+            ),
         )
-        verdicts.append(SubtaskVerdict(subtask_id=subtask_id, failure=failure))
-        if failure is None:
-            seen.append((_PLAN_ROOT, description))
+    verdicts = _check_group(project_description, subtasks, prefix="")
+    verdicts += _check_group(project_description, batches, prefix="batch:")
     return PlanConstitutionReport(
         constitution_version=ruleset.version,
         verdicts=tuple(verdicts),
-        plan_failure=plan_failure,
+        plan_failure=None,
     )
+
+
+def _check_group(parent: str, items: Sequence[PlanItem], *, prefix: str) -> list[ItemVerdict]:
+    seen: set[str] = set()
+    verdicts: list[ItemVerdict] = []
+    for item_id, description, capability_tags in items:
+        failure = check_required_fields(description, list(capability_tags)) or check_minimality(
+            description, parent
+        )
+        if failure is None:
+            normalized = normalize_description(description)
+            if normalized in seen:
+                failure = ("duplicate", "an identical item already appears in this plan")
+            else:
+                seen.add(normalized)
+        verdicts.append(ItemVerdict(item_id=f"{prefix}{item_id}", failure=failure))
+    return verdicts
