@@ -314,11 +314,22 @@ through the subscription-backed `claude-cli` runtime
 - [ ] `openclaw.json` is copied once; an existing volume needs the planner
       keys applied by hand (`openclaw config set ...`, done for the spike
       volume). Consider a seed step that merges Captain-owned keys.
-- [ ] Remaining native tools: `Read`/`Glob`/`Grep` (needed for skills) can
+- [x] Remaining native tools: `Read`/`Glob`/`Grep` (needed for skills) can
       read the whole container home, including `~/.claude/.credentials.json`
       and `openclaw.json`. Scope reads to the workspace (Claude permission
       rules such as `Read(~/.claude/**)` deny, or `tools.fs.workspaceOnly`)
-      and verify with a probe.
+      and verify with a probe. Done (2026-11-09, security review): `Read(...)`
+      denials for `~/.claude`, `~/.local`, OpenClaw config/keys/state/agents/
+      cache/media, `/proc`, `/etc`, `/app`. Probed with the container's
+      `claude --setting-sources user` on harmless files (the planner itself
+      refused the probe as a rules-suspension attempt, which is the intended
+      role behaviour): workspace Read/Grep allowed; Read, Grep and Glob on
+      `~/.claude`, `/proc/self/status`, `openclaw.json` denied by rule.
+- [ ] Recursive Grep/Glob from a parent such as `/home/node` is blocked in
+      headless Claude only by the outside-cwd permission prompt, not by a
+      rule. In OpenClaw turns that prompt goes to OpenClaw's permission
+      tool; verify it refuses (or add a rule-level guard) before the planner
+      runs unattended.
 - [ ] Offline deterministic path stays (replay clients) so the test gate
       needs no subscription.
 

@@ -150,3 +150,18 @@ def test_seed_installs_the_claude_code_settings_read_only() -> None:
 
     assert mounts["/seed/claude-settings.json"]["read_only"] is True
     assert "/home/node/.claude/settings.json" in seed["command"][0]
+
+
+def test_native_reads_of_secret_paths_are_denied() -> None:
+    """Read/Glob/Grep stay for skills, but not for credentials, process env or config."""
+
+    denied = set(json.loads((DEPLOY / "claude-settings.json").read_text(encoding="utf-8"))["permissions"]["deny"])
+
+    assert {
+        "Read(~/.claude/**)",
+        "Read(//proc/**)",
+        "Read(~/.openclaw/openclaw.json*)",
+        "Read(~/.openclaw/state/**)",
+        "Read(~/.openclaw/agents/**)",
+    } <= denied
+    assert not any(rule.startswith("Read(~/.openclaw/workspace") or "/tmp" in rule for rule in denied)

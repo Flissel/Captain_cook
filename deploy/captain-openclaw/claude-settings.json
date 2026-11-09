@@ -21,7 +21,18 @@
       "SendToProject",
       "SendToProjectContext",
       "PushNotification",
-      "DesignSync"
+      "DesignSync",
+      "Read(~/.claude/**)",
+      "Read(~/.local/**)",
+      "Read(~/.openclaw/openclaw.json*)",
+      "Read(~/.openclaw/*.key)",
+      "Read(~/.openclaw/state/**)",
+      "Read(~/.openclaw/agents/**)",
+      "Read(~/.openclaw/cache/**)",
+      "Read(~/.openclaw/media/**)",
+      "Read(//proc/**)",
+      "Read(//etc/**)",
+      "Read(//app/**)"
     ]
   }
 }
