@@ -2142,6 +2142,14 @@ class GatewayStore:
         require_current_claim: bool = False,
         agent_id: str | None = None,
     ) -> AppendResult:
+        if event.event_type == "batch_done":
+            # One terminal record per batch: the lifecycle `batch_done` block
+            # (POST /blocks), which project_batch validates. Stored delivery
+            # events of this type stay readable.
+            raise HTTPException(
+                status_code=422,
+                detail="batch terminal state is recorded as a lifecycle batch_done block",
+            )
         try:
             stored = self._retry_write(
                 lambda: self._append_delivery_event_once(

@@ -108,7 +108,7 @@ lifecycle (authorization). Order is by risk and independence:
       (`batch_id`, `claim_id`, `fencing_token`); a retried batch can no
       longer borrow a deploy or validation from another claim iteration
       (`gateway/release_policy.py`).
-- [ ] Delivery-event `batch_done` (`gateway/contracts.py:540`) has no
+- [x] Delivery-event `batch_done` (`gateway/contracts.py:540`) has no
       producer or consumer and a different outcome vocabulary than the
       lifecycle `batch_done` (`:944`). Refuse new delivery `batch_done`
       appends; keep stored ones readable. The lifecycle block is the only
