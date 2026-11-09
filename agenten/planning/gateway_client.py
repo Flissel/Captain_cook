@@ -43,9 +43,21 @@ _CAPABILITIES = TypeAdapter(list[_CapabilityResponse])
 
 
 class GatewayPlanningClient:
-    """Publish immutable batches and query validated capability projections."""
+    """Publish immutable batches and query validated capability projections.
 
-    def __init__(self, base_url: str, token: str, client: httpx.AsyncClient) -> None:
+    `hold_for_review` releases every work batch explicitly as
+    `pending_review`, independent of the gateway's review-gate setting, so
+    a human approves it before any worker can claim it.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        client: httpx.AsyncClient,
+        *,
+        hold_for_review: bool = False,
+    ) -> None:
         if not base_url.strip():
             raise ValueError("gateway base_url must not be empty")
         if not token:
@@ -53,6 +65,7 @@ class GatewayPlanningClient:
         self._base_url = base_url.rstrip("/")
         self._token = token
         self._client = client
+        self._hold_for_review = hold_for_review
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -62,13 +75,13 @@ class GatewayPlanningClient:
         if batch.batch_id != holdouts.batch_id:
             raise ValueError("batch and holdout suite must have the same batch_id")
 
-        parent = await self._post_block(
-            {
-                "block_type": "work_batch",
-                "data": batch.model_dump(mode="json"),
-            },
-            operation="release work batch",
-        )
+        work_batch: dict[str, Any] = {
+            "block_type": "work_batch",
+            "data": batch.model_dump(mode="json"),
+        }
+        if self._hold_for_review:
+            work_batch["status"] = "pending_review"
+        parent = await self._post_block(work_batch, operation="release work batch")
         await self._post_block(
             {
                 "block_type": "holdout",

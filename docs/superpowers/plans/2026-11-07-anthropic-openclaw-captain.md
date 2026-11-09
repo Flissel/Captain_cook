@@ -187,9 +187,25 @@ Phase 1). No generic `/blocks` write tool.
       `/v1/factory/jobs/{id}`. Done (2026-11-09): `list_batches`,
       `get_batch`, `get_agent`, `get_agent_outcomes`
       (`agenten/captain_mcp/server.py`, agent token).
-- [ ] Planning tool: `compile_plan` wrapping
-      `CaptainPipeline.compile_from_plan()` (validation + canonical compile
-      + publish stay deterministic).
+- [x] Planning tool: `compile_plan` (+ `publish_plan`). Done
+      (2026-11-09): the planner supplies decompose/align/enrich results
+      (`SuppliedPlan`, `agenten/planning/supplied_plan.py`); they run as
+      fixed stages through the unchanged `CaptainPipeline` with one
+      alignment attempt. `compile_plan` is read-only; `publish_plan` needs
+      the Captain token, recompiles instead of trusting a compiled plan,
+      and releases every batch explicitly as `pending_review`
+      (`GatewayPlanningClient(hold_for_review=True)`), so the operator
+      approves even when the gateway's default gate is off. Results show
+      holdout case counts only. Enabled by `CAPTAIN_PLAN_TARGET` and
+      `CAPTAIN_PLAN_CAPABILITY_TAGS` (optional
+      `CAPTAIN_PLAN_ALLOWED_TARGETS`).
+- [ ] `publish_plan` is not resumable: after a partial release a retry
+      fails with 409 on the first published batch. Route it through the
+      `CaptainRunStore` checkpoint (`compile_and_release`) or skip batches
+      whose published content is identical.
+- [ ] Planner-published batches need `GATEWAY_APPROVAL_ENABLED=true`;
+      otherwise `/approve` is disabled and they stay held. Surface that as
+      a startup check or a gateway capability flag.
 - [ ] Write tools: approve, recovery, review, runtime commands/grants/
       revocations, factory jobs, release decision, cancel (Phase 1).
       Done (2026-11-09), opt-in via `CAPTAIN_MCP_CAPTAIN_TOKEN`, all
@@ -233,7 +249,8 @@ through the subscription-backed `claude-cli` runtime
       isolate the planner to the MCP server only.
 - [ ] Gateway container uses about 1.3 GiB RAM idle.
 - [ ] Captain role prompt/skill: plan -> constitution check -> `compile_plan`
-      -> approve -> monitor -> release decision; never writes raw blocks.
+      -> `publish_plan` -> (operator approves) -> monitor -> release
+      decision; never writes raw blocks.
 - [ ] Offline deterministic path stays (replay clients) so the test gate
       needs no subscription.
 

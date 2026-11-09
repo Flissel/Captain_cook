@@ -98,6 +98,19 @@ approval stays with the operator (`POST /batches/{id}/approve`).
 Giving the planner this token makes it Captain. Enable it only for a run
 that is meant to orchestrate, never for the read-only spike.
 
+## Planning tools (opt-in)
+
+With `CAPTAIN_PLAN_TARGET` and `CAPTAIN_PLAN_CAPABILITY_TAGS` (comma
+separated; optionally `CAPTAIN_PLAN_ALLOWED_TARGETS`) the server offers
+`compile_plan`. OpenClaw supplies the subtasks, their alignment into
+batches and one enrichment per batch; Captain validates and compiles them
+deterministically and returns the batches plus holdout case counts.
+
+With the Captain token it also offers `publish_plan`. It recompiles and
+releases every batch as `pending_review`, so nothing is claimable until the
+operator approves it. That needs `GATEWAY_APPROVAL_ENABLED=true` on the
+gateway; without it the batches stay held.
+
 ## Stop and clean up
 
 ```powershell

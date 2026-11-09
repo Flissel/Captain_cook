@@ -30,6 +30,14 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from agenten.captain_mcp.plan_tools import (
+    CaptainPlanner,
+    plan_compiler_settings_from_env,
+    register_plan_tools,
+)
+from agenten.planning.gateway_client import GatewayPlanningClient
+from agenten.planning.supplied_plan import PlanCompilerSettings
+
 logger = logging.getLogger(__name__)
 
 BatchStatusFilter = Literal[
@@ -260,6 +268,7 @@ def create_mcp_app(
     *,
     inbound_token: str,
     writer: CaptainGatewayWriter | None = None,
+    planner: CaptainPlanner | None = None,
 ) -> ASGIApp:
     """Build the Streamable HTTP MCP app (served at `/mcp`)."""
 
@@ -286,6 +295,8 @@ def create_mcp_app(
     _register_read_tools(server, reader)
     if writer is not None:
         _register_write_tools(server, writer)
+    if planner is not None:
+        register_plan_tools(server, planner)
     return _BearerGuard(server.streamable_http_app(), inbound_token)
 
 
@@ -372,6 +383,7 @@ class McpSettings:
     gateway_token: str
     inbound_token: str
     captain_token: str | None = None
+    plan: PlanCompilerSettings | None = None
     host: str = "127.0.0.1"
     port: int = 18121
 
@@ -402,6 +414,7 @@ class McpSettings:
             gateway_token=gateway_token,
             inbound_token=inbound_token,
             captain_token=captain_token,
+            plan=plan_compiler_settings_from_env(environment),
             host=environment.get("CAPTAIN_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1",
             port=port,
         )
@@ -423,7 +436,26 @@ def main() -> None:
         if settings.captain_token is not None
         else None
     )
-    app = create_mcp_app(reader, inbound_token=settings.inbound_token, writer=writer)
+    planner = (
+        CaptainPlanner(
+            settings.plan,
+            capability_resolver=GatewayPlanningClient(
+                settings.gateway_url, settings.gateway_token, client
+            ),
+            release_client=(
+                GatewayPlanningClient(
+                    settings.gateway_url, settings.captain_token, client, hold_for_review=True
+                )
+                if settings.captain_token is not None
+                else None
+            ),
+        )
+        if settings.plan is not None
+        else None
+    )
+    app = create_mcp_app(
+        reader, inbound_token=settings.inbound_token, writer=writer, planner=planner
+    )
     logger.info(
         "Captain MCP server listening on %s:%s/mcp (%s)",
         settings.host,
