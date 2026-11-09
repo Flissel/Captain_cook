@@ -46,9 +46,13 @@ def evaluate_release_readiness(
             counted.setdefault(event.payload.e2e_run_id, event)
     for e2e_id in clean_ids:
         event = counted[e2e_id]
-        batch_id = event.trace.batch_id
+        # Evidence counts only from the claim the e2e run was recorded under:
+        # a retried batch must not borrow a deploy or validation from an
+        # earlier (or later) claim iteration. The query already scopes the
+        # history to one project and run.
+        claim_scope = _claim_scope(event)
         batch_events = tuple(
-            candidate for candidate in history if candidate.trace.batch_id == batch_id
+            candidate for candidate in history if _claim_scope(candidate) == claim_scope
         )
         event_types = {candidate.event_type for candidate in batch_events}
         if not any(
@@ -78,3 +82,8 @@ def evaluate_release_readiness(
         clean_e2e_run_ids=clean_ids,
         reasons=tuple(reasons),
     )
+
+
+def _claim_scope(event: DeliveryEventEnvelope) -> tuple[str | None, str | None, int | None]:
+    trace = event.trace
+    return (trace.batch_id, trace.claim_id, trace.fencing_token)

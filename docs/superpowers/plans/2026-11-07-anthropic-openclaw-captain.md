@@ -98,17 +98,37 @@ replay) but not yet a trust base for generated agents.
 
 ## Phase 2 - agent lifecycle contracts
 
-- [ ] `agent_registered` (agent_id, version, owner, spec hash)
-- [ ] `agent_capability_granted` (explicit tool list, scope, expiry; current
-      `CapabilityGrant` is profile-fixed)
-- [ ] `agent_assigned` (batch, agent, fencing token)
-- [ ] `agent_outcome_recorded`, `agent_retired`
-- [ ] Unify the two `batch_done` schemas (`gateway/contracts.py:540` vs
-      `:936`) together with `agent_outcome_recorded`; scope release-policy
-      checks to run + claim iteration (`gateway/release_policy.py:49-53`).
-      (moved from Phase 1)
-- [ ] gateway `dead_letter` block for permanently unroutable work
-- [ ] agent liveness record independent of a batch claim
+Design calls (2026-11-09, made without a design round at the user's
+request): agent records live in the gateway ledger as Captain-only,
+gateway-owned block types with dedicated routes; bearer tokens stay in
+`WORKER_AGENT_TOKEN_SHA256_JSON` (authentication), the ledger adds the
+lifecycle (authorization). Order is by risk and independence:
+
+- [x] Scope release-policy evidence to the e2e run's claim
+      (`batch_id`, `claim_id`, `fencing_token`); a retried batch can no
+      longer borrow a deploy or validation from another claim iteration
+      (`gateway/release_policy.py`).
+- [ ] Delivery-event `batch_done` (`gateway/contracts.py:540`) has no
+      producer or consumer and a different outcome vocabulary than the
+      lifecycle `batch_done` (`:944`). Refuse new delivery `batch_done`
+      appends; keep stored ones readable. The lifecycle block is the only
+      terminal record.
+- [ ] `batch_dead_lettered`: Captain route marks a non-terminal batch as
+      permanently unroutable (reason, detail), terminal status
+      `dead_lettered`, replay-idempotent like `batch_cancelled`.
+- [ ] `agent_registered` (agent_id, version, owner, spec_sha256) and
+      `agent_retired`; `project_agent`; a retired agent cannot claim.
+- [ ] `agent_capability_granted` / `agent_capability_revoked` (grant_id,
+      capability tags, expiry). A ledger-registered agent may claim only a
+      batch whose `capability_tags` an active grant covers. The runtime
+      `CapabilityGrant` (per command, profile-fixed) stays separate.
+- [ ] `agent_assigned` (batch, agent): Captain pins the next claim of a
+      batch to one agent; other agents get 403.
+- [ ] Agent outcomes: derived read model over batch projections
+      (`claim_agent_id` + terminal status), not a second written record, so
+      there is no dual write to keep consistent.
+- [ ] Agent liveness independent of a batch claim: deferred. A 20 s
+      heartbeat does not belong in the hash chain; needs a non-ledger store.
 
 ## Phase 3 - Anthropic as default provider
 
