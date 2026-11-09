@@ -134,7 +134,11 @@ still denies shell/process execution and scheduler/gateway administration,
 turns off the memory "dreaming" job and skips OpenClaw's own bootstrap
 files. Claude Code's native tools (Write, Edit, Agent, schedulers, ...) are
 denied in `claude-settings.json`, which the seed installs as
-`~/.claude/settings.json`. Check tool exposure in the Claude transcript,
+`~/.claude/settings.json`. Native reads are default-deny outside the
+workspace: the workspace lives at `/home/node/workspace`
+(`OPENCLAW_WORKSPACE_DIR`), every hidden home path (`~/.*`), every
+system root directory and OpenClaw's per-turn MCP config in `/tmp` are
+denied. Check tool exposure in the Claude transcript,
 not by asking the model. `openclaw.json` is copied only once:
 an existing volume from the spike keeps its old config, so apply those keys
 there by hand (`openclaw config set ...` in the CLI container) or start

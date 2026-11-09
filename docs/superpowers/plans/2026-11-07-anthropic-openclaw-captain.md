@@ -325,10 +325,22 @@ through the subscription-backed `claude-cli` runtime
       refused the probe as a rules-suspension attempt, which is the intended
       role behaviour): workspace Read/Grep allowed; Read, Grep and Glob on
       `~/.claude`, `/proc/self/status`, `openclaw.json` denied by rule.
+- [x] Name-based read denials miss new paths (security review). Replaced
+      with structural default-deny: workspace moved to the non-hidden
+      `/home/node/workspace` (`OPENCLAW_WORKSPACE_DIR`), `Read(~/.*)` and
+      `Read(~/.*/**)` seal every hidden home path, `Read(//<root>/**)` every
+      image root directory except `/home` and `/tmp`, and
+      `Read(//tmp/openclaw-cli-mcp-*/**)` the per-turn MCP config holding
+      the bearer header. Live probe 2026-11-09 from the new workspace: Read
+      `IDENTITY.md` and Grep in the workspace allowed; Read `~/.bashrc`,
+      `~/.claude.json`, `~/.openclaw/openclaw.json`, a `/tmp/openclaw-cli-mcp-*`
+      dummy, `/etc/hostname` and Grep in `~/.openclaw` denied by rule;
+      `skills list` shows `captain-plan` ready from the new workspace.
 - [ ] Recursive Grep/Glob from a parent such as `/home/node` is blocked in
       headless Claude only by the outside-cwd permission prompt, not by a
-      rule. In OpenClaw turns that prompt goes to OpenClaw's permission
-      tool; verify it refuses (or add a rule-level guard) before the planner
+      rule (hidden subtrees are denied, `/home/node` itself is not). In
+      OpenClaw turns that prompt goes to OpenClaw's permission tool; verify
+      it refuses (or add a rule-level guard) before the planner
       runs unattended.
 - [ ] Offline deterministic path stays (replay clients) so the test gate
       needs no subscription.

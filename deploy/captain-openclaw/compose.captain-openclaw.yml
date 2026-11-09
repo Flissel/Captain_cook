@@ -16,6 +16,10 @@ x-openclaw-env: &openclaw-env
   # Read by openclaw.json via ${CAPTAIN_MCP_TOKEN}; never written into config.
   CAPTAIN_MCP_TOKEN: ${CAPTAIN_MCP_TOKEN:?CAPTAIN_MCP_TOKEN is required}
   CAPTAIN_MCP_URL: ${CAPTAIN_MCP_URL:-http://host.docker.internal:18121/mcp}
+  # Workspace outside every hidden directory, so Claude Code's native read
+  # denials can cover all of ~/.* (credentials, OpenClaw state, MCP config)
+  # by default instead of by a list of known secret files.
+  OPENCLAW_WORKSPACE_DIR: /home/node/workspace
 
 services:
   # One-shot seed into the home volume:
@@ -30,16 +34,16 @@ services:
     entrypoint: ["sh", "-c"]
     command:
       - >-
-        mkdir -p /home/node/.openclaw/workspace/skills/captain-plan /home/node/.claude &&
+        mkdir -p /home/node/workspace/skills/captain-plan /home/node/.claude &&
         if [ -f /home/node/.openclaw/openclaw.json ]; then
         echo "openclaw.json exists, leaving it unchanged";
         else cp /seed/openclaw.json /home/node/.openclaw/openclaw.json &&
         echo "seeded openclaw.json"; fi &&
         cp /seed/workspace/AGENTS.md /seed/workspace/SOUL.md
-        /seed/workspace/IDENTITY.md /home/node/.openclaw/workspace/ &&
-        rm -f /home/node/.openclaw/workspace/BOOTSTRAP.md &&
+        /seed/workspace/IDENTITY.md /home/node/workspace/ &&
+        rm -f /home/node/workspace/BOOTSTRAP.md &&
         cp /seed/workspace/skills/captain-plan/SKILL.md
-        /home/node/.openclaw/workspace/skills/captain-plan/SKILL.md &&
+        /home/node/workspace/skills/captain-plan/SKILL.md &&
         cp /seed/claude-settings.json /home/node/.claude/settings.json &&
         echo "seeded Captain role files and Claude Code settings"
     volumes:
