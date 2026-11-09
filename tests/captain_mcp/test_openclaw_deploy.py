@@ -77,3 +77,11 @@ def test_secrets_are_required_not_defaulted() -> None:
 
     assert "${OPENCLAW_GATEWAY_TOKEN:?" in rendered
     assert "${CAPTAIN_MCP_TOKEN:?" in rendered
+
+
+def test_container_seed_files_are_lf_on_every_checkout() -> None:
+    """The seed service copies these bytes verbatim into the Linux container."""
+
+    for path in DEPLOY.rglob("*"):
+        if path.is_file() and path.suffix in {".md", ".json", ".yml"}:
+            assert b"\r" not in path.read_bytes(), path

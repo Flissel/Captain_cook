@@ -45,3 +45,8 @@ gateway/capability_factory_runtime_closure.json text eol=lf
 gateway/capability_tool_host_app.py text eol=lf
 config/generic_tool_registry.json text eol=lf
 config/demo_tool_data/*.json text eol=lf
+
+# Bind-mounted into the Linux OpenClaw container (seed config, planner role,
+# skill frontmatter). A Windows CRLF checkout would hand the container CRLF
+# files. Do not remove this line as "noise".
+deploy/captain-openclaw/** text eol=lf
