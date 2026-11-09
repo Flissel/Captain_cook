@@ -14,19 +14,43 @@ from agenten.agent_factory.business_benchmark_production_ports import (
 from config.llm_provider import NEBIUS_BASE_URL
 
 
-def test_nebius_and_openai_are_allowlisted():
+def test_metered_providers_are_allowlisted():
+    assert require_benchmark_provider("anthropic") == "anthropic"
     assert require_benchmark_provider("nebius") == "nebius"
     assert require_benchmark_provider("openai") == "openai"
 
 
-def test_other_providers_are_rejected():
-    with pytest.raises(ValueError, match="nebius, openai"):
-        require_benchmark_provider("anthropic")
+@pytest.mark.parametrize("provider", ["claude-code", "custom", "openrouter"])
+def test_other_providers_are_rejected(provider):
+    # The subscription shim has no API key secret or per-call cost to bound.
+    with pytest.raises(ValueError, match="anthropic, nebius, openai"):
+        require_benchmark_provider(provider)
 
 
 def test_secret_names_follow_the_provider():
+    assert benchmark_provider_secret_name("anthropic") == "ANTHROPIC_API_KEY"
     assert benchmark_provider_secret_name("nebius") == "NEBIUS_API_KEY"
     assert benchmark_provider_secret_name("openai") == "OPENAI_API_KEY"
+
+
+def test_anthropic_benchmark_client_uses_the_messages_api(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        benchmark_providers, "AnthropicChatCompletionClient", lambda **kw: captured.update(kw) or object()
+    )
+    monkeypatch.setattr(benchmark_providers, "OpenAIChatCompletionClient", _refuse)
+
+    build_benchmark_model_client(provider="anthropic", api_key="sk-ant-test", model="claude-sonnet-5-5")
+
+    assert captured["api_key"] == "sk-ant-test"
+    assert captured["model"] == "claude-sonnet-5-5"
+    assert captured["temperature"] == 0
+    assert captured["max_retries"] == 0
+    assert captured["model_info"]["function_calling"] is True
+
+
+def _refuse(**kw: Any) -> object:
+    raise AssertionError("anthropic must not build an OpenAI client")
 
 
 def test_nebius_benchmark_client_targets_token_factory(monkeypatch: pytest.MonkeyPatch):

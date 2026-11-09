@@ -32,6 +32,26 @@ from config.llm_provider import (
 )
 
 
+def anthropic_model_info(
+    model: str, *, tool_calling: bool = True, structured_output: bool = False
+) -> ModelInfo:
+    """Declared capabilities for a current Claude model id.
+
+    AutoGen 0.7.5 predates the current Claude ids and would otherwise fall
+    back to Claude 3.5 capabilities without tool calling. Its Anthropic client
+    has no typed (Pydantic) structured output, so that stays off by default.
+    """
+
+    return ModelInfo(
+        vision=True,
+        function_calling=tool_calling,
+        json_output=True,
+        family=ModelFamily.CLAUDE_4_OPUS if "opus" in model else ModelFamily.CLAUDE_4_SONNET,
+        structured_output=structured_output,
+        multiple_system_messages=False,
+    )
+
+
 def build_model_client(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
@@ -61,23 +81,14 @@ def build_model_client(
             raise ProviderConfigurationError(
                 "ANTHROPIC_API_KEY is not configured for the anthropic provider"
             )
-        # AutoGen 0.7.5 predates the current Claude ids and would fall back to
-        # Claude 3.5 capabilities without tool calling, so declare them.
         anthropic_kwargs: dict[str, object] = {
             "model": resolved_model,
             "api_key": resolved_api_key,
             "max_retries": 0,
-            "model_info": ModelInfo(
-                vision=True,
-                function_calling=active.tool_calling,
-                json_output=True,
-                family=(
-                    ModelFamily.CLAUDE_4_OPUS
-                    if "opus" in resolved_model
-                    else ModelFamily.CLAUDE_4_SONNET
-                ),
+            "model_info": anthropic_model_info(
+                resolved_model,
+                tool_calling=active.tool_calling,
                 structured_output=active.structured_output,
-                multiple_system_messages=False,
             ),
         }
         if resolved_base_url:
