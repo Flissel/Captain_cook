@@ -629,9 +629,9 @@ def test_services_forward_and_redact_the_hermes_endpoint_secrets() -> None:
     )[0]
     redaction = source.split("$runtimeSecretValueKeys = @(", 1)[1].split(")", 1)[0]
 
-    for name in ("CAPTAIN_HERMES_BASE_URL", "NEBIUS_API_KEY", "CAPTAIN_HERMES_API_KEY"):
+    for name in ("CAPTAIN_HERMES_BASE_URL", "NEBIUS_API_KEY", "CAPTAIN_HERMES_API_KEY", "ANTHROPIC_API_KEY"):
         assert f"'{name}'" in local_allowlist
         # Read from .env and copied into the runtime environment.
         assert start.count(f"'{name}'") == 2
-    for secret in ("NEBIUS_API_KEY", "CAPTAIN_HERMES_API_KEY"):
+    for secret in ("NEBIUS_API_KEY", "CAPTAIN_HERMES_API_KEY", "ANTHROPIC_API_KEY"):
         assert f"'{secret}'" in redaction
