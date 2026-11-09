@@ -113,7 +113,9 @@ lifecycle (authorization). Order is by risk and independence:
       lifecycle `batch_done` (`:944`). Refuse new delivery `batch_done`
       appends; keep stored ones readable. The lifecycle block is the only
       terminal record.
-- [ ] `batch_dead_lettered`: Captain route marks a non-terminal batch as
+- [x] Dead letter: `batch_cancelled` with the new reason `unroutable` (no new
+      terminal status, so status filters and projectors stay unchanged). Was:
+      `batch_dead_lettered`: Captain route marks a non-terminal batch as
       permanently unroutable (reason, detail), terminal status
       `dead_lettered`, replay-idempotent like `batch_cancelled`.
 - [ ] `agent_registered` (agent_id, version, owner, spec_sha256) and

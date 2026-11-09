@@ -841,7 +841,11 @@ BatchStatus: TypeAlias = Literal[
     "failed_after_max_iterations",
     "aborted_infra",
 ]
-CancelReason: TypeAlias = Literal["captain_cancelled", "operator_cancelled", "policy_violation"]
+# `unroutable` is the dead letter: no registered agent can serve the batch
+# and Captain gives up on it permanently.
+CancelReason: TypeAlias = Literal[
+    "captain_cancelled", "operator_cancelled", "policy_violation", "unroutable"
+]
 TerminalOutcome: TypeAlias = Literal[
     "succeeded",
     "failed",

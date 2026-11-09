@@ -82,6 +82,33 @@ def test_cancel_request_accepts_only_known_reasons() -> None:
         BatchCancelRequest.model_validate({"reason": "captain_cancelled", "extra": 1})
 
 
+def test_unroutable_is_a_cancel_reason_for_dead_lettered_work() -> None:
+    """Permanently unroutable work is recorded durably as a Captain cancel."""
+
+    assert BatchCancelRequest(reason="unroutable").reason == "unroutable"
+    projection = project_batch(
+        [work_batch(), cancelled(11, claim_iteration=0, reason="unroutable")],
+        "batch-1",
+        now=NOW,
+    )
+
+    assert projection.status == "cancelled"
+    assert projection.cancel_reason == "unroutable"
+
+
+def test_delivery_client_reads_an_unroutable_cancel() -> None:
+    from agenten.delivery.gateway_client import GatewayBatchProjection
+
+    projection = project_batch(
+        [work_batch(), cancelled(11, claim_iteration=0, reason="unroutable")],
+        "batch-1",
+        now=NOW,
+    )
+
+    parsed = GatewayBatchProjection.model_validate(projection.model_dump(mode="json"))
+    assert parsed.cancel_reason == "unroutable"
+
+
 def test_cancel_event_is_gateway_owned() -> None:
     with pytest.raises(HTTPException) as excinfo:
         require_generic_block_type(BATCH_CANCELLED_BLOCK_TYPE)
@@ -277,3 +304,12 @@ def test_projection_exposes_the_cancel_reason() -> None:
     )
 
     assert projection.cancel_reason == "policy_violation"
+
+
+def test_delivery_client_cancel_reasons_match_the_gateway() -> None:
+    from typing import get_args
+
+    from agenten.delivery.gateway_client import BatchCancelReason
+    from gateway.contracts import CancelReason
+
+    assert set(get_args(BatchCancelReason)) == set(get_args(CancelReason))

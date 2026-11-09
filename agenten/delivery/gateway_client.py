@@ -28,6 +28,10 @@ BatchStatus: TypeAlias = Literal[
     "failed_after_max_iterations",
     "aborted_infra",
 ]
+# Mirrors gateway.contracts.CancelReason; `unroutable` is the dead letter.
+BatchCancelReason: TypeAlias = Literal[
+    "captain_cancelled", "operator_cancelled", "policy_violation", "unroutable"
+]
 TerminalOutcome: TypeAlias = Literal[
     "succeeded",
     "failed",
@@ -69,9 +73,7 @@ class GatewayBatchProjection(BaseModel):
     passing_review_recorded: bool = False
     failed_review_count: int = Field(default=0, ge=0, strict=True)
     claim_agent_id: str | None = None
-    cancel_reason: (
-        Literal["captain_cancelled", "operator_cancelled", "policy_violation"] | None
-    ) = None
+    cancel_reason: BatchCancelReason | None = None
 
 
 class GatewayClaim(BaseModel):
@@ -193,7 +195,7 @@ class _CancelResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     batch_id: str = Field(min_length=1)
-    reason: Literal["captain_cancelled", "operator_cancelled", "policy_violation"]
+    reason: BatchCancelReason
     claim_iteration: int = Field(ge=0, strict=True)
 
 
@@ -438,7 +440,7 @@ class GatewayDeliveryClient:
         self,
         batch_id: str,
         *,
-        reason: Literal["captain_cancelled", "operator_cancelled", "policy_violation"],
+        reason: BatchCancelReason,
     ) -> None:
         """Captain-only: terminally cancel a batch and revoke its claim."""
 
