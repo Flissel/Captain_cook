@@ -111,3 +111,34 @@ async def test_claude_code_provider_calls_a_tool_and_answers_with_its_result(shi
     assert second.finish_reason == "stop"
     assert isinstance(second.content, str)
     assert "42" in second.content
+
+
+@pytest.mark.asyncio
+async def test_claude_code_provider_returns_validated_structured_output(shim_url: str) -> None:
+    """A typed answer arrives as the CLI-validated object, never fenced prose."""
+
+    from autogen_core.models import SystemMessage
+
+    from agenten.household.llm_executor import HouseholderReportModel
+
+    profile = resolve_provider(
+        {
+            "CAPTAIN_LLM_PROVIDER": "claude-code",
+            "CAPTAIN_LLM_BASE_URL": shim_url,
+            "CAPTAIN_MODEL": "claude-code-haiku",
+        }
+    )
+    client = build_model_client(profile=profile)
+    try:
+        result = await client.create(
+            [
+                SystemMessage(content="You are an offline auditor; you cannot run anything."),
+                UserMessage(content="Subproblem s1: 'Write the ledger audit summary'. Report.", source="user"),
+            ],
+            json_output=HouseholderReportModel,
+        )
+    finally:
+        await client.close()
+
+    assert isinstance(result.content, str)
+    HouseholderReportModel.model_validate_json(result.content)

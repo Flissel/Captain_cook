@@ -16,6 +16,9 @@ Each tool call variant pins the function name and that function's parameter
 schema, so the CLI validates the arguments before the shim returns them as
 OpenAI ``tool_calls``. The caller executes the functions and sends the
 results back as ``tool`` messages, exactly as with a native endpoint.
+A ``json_schema`` response format is enforced the same way: the CLI validates
+the answer against the schema and the shim returns that validated object, so
+prose or code fences around the JSON never reach the caller.
 
 Every request runs the CLI in an empty working directory with project and
 user settings switched off, so a planning call does not drag the ~44k token
@@ -162,6 +165,29 @@ def schema_instruction(response_format: Any) -> str:
     )
 
 
+def response_schema(response_format: Any) -> dict[str, Any] | None:
+    """The JSON Schema of a ``json_schema`` response format, or None."""
+
+    if not isinstance(response_format, dict) or response_format.get("type") != "json_schema":
+        return None
+    spec = response_format.get("json_schema") or {}
+    schema = spec.get("schema") or spec.get("json_schema")
+    return schema if isinstance(schema, dict) and schema else None
+
+
+def strip_code_fence(text: str) -> str:
+    """Drop one surrounding Markdown code fence (```json ... ```), if any."""
+
+    stripped = text.strip()
+    if not stripped.startswith("```") or not stripped.endswith("```"):
+        return text
+    body = stripped[3:-3]
+    first_newline = body.find("\n")
+    if first_newline != -1 and body[:first_newline].strip().isalnum():
+        body = body[first_newline + 1 :]
+    return body.strip()
+
+
 def _functions(tools: Any) -> list[dict[str, Any]]:
     """The OpenAI ``function`` tools of a request, as name/description/parameters."""
 
@@ -270,8 +296,8 @@ def run_claude(
     model: str | None,
     timeout: float,
     response_format: Any = None,
-    tool_schema: dict[str, Any] | None = None,
-    tool_prompt: str = "",
+    output_schema: dict[str, Any] | None = None,
+    output_prompt: str = "",
 ) -> dict[str, Any]:
     cli = resolve_cli()
     argv: list[str] = [cli, "-p", "--output-format", "json"]
@@ -344,11 +370,12 @@ def run_claude(
             "instead."
         )
 
-    if tool_schema is not None:
-        # The caller executes the functions; Claude Code's own tools stay off
-        # and the envelope schema makes the CLI validate every call.
-        argv += ["--tools", "", "--json-schema", json.dumps(tool_schema)]
-        system_prompt += tool_prompt
+    if output_schema is not None:
+        # The CLI validates the final answer against the schema (a tool-call
+        # envelope or the caller's response schema). Claude Code's own tools
+        # stay off; for tool requests the caller executes the functions.
+        argv += ["--tools", "", "--json-schema", json.dumps(output_schema)]
+        system_prompt += output_prompt
     else:
         system_prompt += schema_instruction(response_format)
 
@@ -457,13 +484,22 @@ def to_completion(
     payload: dict[str, Any],
     model: str,
     tool_schema: dict[str, Any] | None = None,
+    response_format: Any = None,
 ) -> dict[str, Any]:
     if tool_schema is not None:
         message, finish_reason = to_tool_message(payload, tool_schema)
+    elif response_schema(response_format) is not None:
+        validated = payload.get("structured_output")
+        if validated is None:
+            raise ShimError("Claude Code returned no structured output for a json_schema request")
+        message = {"role": "assistant", "content": json.dumps(validated)}
+        finish_reason = "stop"
     else:
         text = payload.get("result")
         if not isinstance(text, str):
             raise ShimError("Claude Code result did not contain text")
+        if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+            text = strip_code_fence(text)
         message = {"role": "assistant", "content": text}
         stop_reason = str(payload.get("stop_reason") or "end_turn")
         finish_reason = "length" if stop_reason == "max_tokens" else "stop"
@@ -500,17 +536,24 @@ def complete_chat(body: dict[str, Any], *, timeout: float) -> dict[str, Any]:
     model = str(body.get("model") or DEFAULT_MODEL_ID)
     system_prompt, transcript = render_messages(body.get("messages") or [])
     tools = body.get("tools")
+    response_format = body.get("response_format")
     tool_schema = tool_envelope_schema(tools, body.get("tool_choice"))
+    if tool_schema is not None:
+        output_schema: dict[str, Any] | None = tool_schema
+        output_prompt = tool_instruction(tools, tool_schema)
+    else:
+        output_schema = response_schema(response_format)
+        output_prompt = schema_instruction(response_format) if output_schema else ""
     payload = run_claude(
         system_prompt=system_prompt,
         transcript=transcript,
         model=model,
         timeout=timeout,
-        response_format=body.get("response_format"),
-        tool_schema=tool_schema,
-        tool_prompt=tool_instruction(tools, tool_schema) if tool_schema else "",
+        response_format=response_format,
+        output_schema=output_schema,
+        output_prompt=output_prompt,
     )
-    return to_completion(payload, model, tool_schema)
+    return to_completion(payload, model, tool_schema, response_format)
 
 
 def stream_chunks(completion: dict[str, Any]) -> list[dict[str, Any]]:

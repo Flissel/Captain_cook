@@ -262,3 +262,73 @@ def test_tool_calls_stream_as_one_delta(shim: ModuleType) -> None:
 def test_tool_choice_naming_an_unoffered_tool_is_a_client_error(shim: ModuleType) -> None:
     with pytest.raises(shim.ShimRequestError, match="not offered"):
         shim.tool_envelope_schema([ADD_TOOL], {"type": "function", "function": {"name": "lookup"}})
+
+
+# --- structured output -------------------------------------------------------
+
+REPORT_SCHEMA = {
+    "$defs": {"Finding": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}},
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "findings": {"type": "array", "items": {"$ref": "#/$defs/Finding"}},
+    },
+    "required": ["summary", "findings"],
+    "additionalProperties": False,
+}
+
+
+def test_a_json_schema_response_format_is_enforced_by_the_cli(
+    shim: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = {"summary": "ok", "findings": [{"text": "a"}]}
+    fake = FakeCli({**structured(report), "result": "```json\n" + json.dumps(report) + "\n```"})
+
+    completion = complete(
+        shim,
+        fake,
+        {
+            "messages": [{"role": "user", "content": "audit"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "Report", "schema": REPORT_SCHEMA, "strict": True},
+            },
+        },
+        monkeypatch,
+    )
+
+    assert json.loads(fake.flag("--json-schema")) == REPORT_SCHEMA
+    assert fake.flag("--tools") == ""
+    # The validated object, never the fenced prose the model printed.
+    assert json.loads(completion["choices"][0]["message"]["content"]) == report
+
+
+def test_a_json_schema_answer_without_structured_output_is_an_error(
+    shim: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeCli({"type": "result", "is_error": False, "result": "{}", "usage": {}})
+
+    with pytest.raises(shim.ShimError, match="structured"):
+        complete(
+            shim,
+            fake,
+            {
+                "messages": [{"role": "user", "content": "audit"}],
+                "response_format": {"type": "json_schema", "json_schema": {"name": "R", "schema": REPORT_SCHEMA}},
+            },
+            monkeypatch,
+        )
+
+
+def test_json_object_mode_strips_a_code_fence(shim: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeCli({"type": "result", "is_error": False, "result": '```json\n{"a": 1}\n```', "usage": {}})
+
+    completion = complete(
+        shim,
+        fake,
+        {"messages": [{"role": "user", "content": "x"}], "response_format": {"type": "json_object"}},
+        monkeypatch,
+    )
+
+    assert "--json-schema" not in fake.argv
+    assert json.loads(completion["choices"][0]["message"]["content"]) == {"a": 1}

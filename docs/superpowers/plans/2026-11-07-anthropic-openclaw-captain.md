@@ -185,9 +185,17 @@ gains tool calling), the provider proxy is retired, live gates allowed.
       uncommitted changes in that file.
 - [ ] Delete `agenten/provider_proxy/` once the live demo no longer runs
       Codex on OpenAI.
-- [ ] Shim structured output (no tools) is still prompt-based; consider
-      `--json-schema` there too after checking Pydantic schemas (`$defs`)
-      against the CLI.
+- [x] Shim structured output: prompt-only JSON came back in Markdown code
+      fences, so `main.py demo --householder-executor llm` stalled after two
+      failed householder attempts. A `json_schema` response format now runs
+      through `--json-schema` and the shim returns the validated object;
+      `json_object` strips a surrounding fence. Live: the LLM demo completes
+      on the subscription (4/4 subproblems done, `claude-code-haiku`).
+- [ ] Check a Pydantic schema with `$defs`/`$ref` against the CLI's
+      `--json-schema` (the householder report has none).
+- [ ] The event-driven demo waits forever when a householder fails
+      permanently instead of ending with a failed terminal state; related
+      to the known missing dead-letter for unroutable work.
 - [ ] Shim hardening: `--tools ""` is set only for tool requests; the
       plain-text path relies on non-interactive permission denials.
 
