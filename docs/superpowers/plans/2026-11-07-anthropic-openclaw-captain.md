@@ -136,9 +136,10 @@ lifecycle (authorization). Order is by risk and independence:
       (`POST /batches/{id}/assign`); other agents and shared-token workers
       get 403. Latest assignment wins; reassigning needs an unclaimed batch,
       never a retired agent. Projection field `assigned_agent_id`.
-- [ ] Agent outcomes: derived read model over batch projections
-      (`claim_agent_id` + terminal status), not a second written record, so
-      there is no dual write to keep consistent.
+- [x] Agent outcomes: derived read model over batch projections, not a
+      second written record, so there is no dual write to keep consistent.
+      `GET /agents/{id}/outcomes` lists each claim (batch, fencing token) with
+      its terminal status, `superseded`, `released` or `active`.
 - [ ] Agent liveness independent of a batch claim: deferred. A 20 s
       heartbeat does not belong in the hash chain; needs a non-ledger store.
 

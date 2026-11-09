@@ -123,6 +123,7 @@ from gateway.agent_lifecycle import (
     AgentCapabilityGrantRequest,
     AgentCapabilityRevokedEvent,
     AgentCapabilityRevokeRequest,
+    AgentClaimOutcome,
     AgentProjection,
     AgentRegisteredEvent,
     AgentRetiredEvent,
@@ -1731,6 +1732,13 @@ def create_app(
         if replayed:
             response.status_code = status.HTTP_200_OK
         return AgentCapabilityRevokedEvent.model_validate(block["data"])
+
+    @app.get("/agents/{agent_id}/outcomes")
+    async def get_agent_outcomes(
+        agent_id: str,
+        _: GatewayRole = Depends(require_reader),
+    ) -> list[AgentClaimOutcome]:
+        return get_store().agent_outcomes(agent_id)
 
     @app.get("/agents/{agent_id}")
     async def get_agent(

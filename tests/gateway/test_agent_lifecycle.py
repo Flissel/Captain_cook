@@ -21,9 +21,11 @@ from gateway.agent_lifecycle import (
     AgentProjection,
     AgentRegisteredEvent,
     AgentRetireRequest,
+    claim_outcome,
     project_agent,
 )
 from gateway.app import create_app
+from gateway.contracts import BatchProjection
 from gateway.settings import GatewaySettings
 from gateway.store import GatewayStore, require_generic_block_type
 
@@ -372,3 +374,31 @@ def test_assignment_route_is_captain_only_and_needs_a_token_holding_agent() -> N
 
     assert (worker.status_code, ghost.status_code, created.status_code) == (403, 422, 201)
     assert store.assigned == [("batch-1", "openclaw")]
+
+
+# --- derived claim outcomes -------------------------------------------------
+
+def _batch(status: str, claim_iteration: int, recovered_iteration: int | None = None) -> BatchProjection:
+    return BatchProjection(
+        batch_id="batch-1",
+        parent_index=10,
+        status=status,  # type: ignore[arg-type]
+        claim_iteration=claim_iteration,
+        recovered_iteration=recovered_iteration,
+    )
+
+
+@pytest.mark.parametrize(
+    ("projection", "fencing_token", "expected"),
+    [
+        (_batch("succeeded", 1), 1, "succeeded"),
+        (_batch("cancelled", 2), 2, "cancelled"),
+        (_batch("succeeded", 2), 1, "superseded"),
+        (_batch("pending", 1, recovered_iteration=1), 1, "released"),
+        (_batch("claimed", 1), 1, "active"),
+    ],
+)
+def test_claim_outcome_is_derived_from_the_batch_projection(
+    projection: BatchProjection, fencing_token: int, expected: str
+) -> None:
+    assert claim_outcome(projection, fencing_token) == expected

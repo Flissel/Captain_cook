@@ -1779,3 +1779,20 @@ def test_batch_cannot_be_assigned_to_a_retired_agent(storage: MariaDBStorage) ->
 
     assert refused.value.status_code == 409
     assert store.batch_projection("batch-1").assigned_agent_id is None
+
+
+def test_agent_outcomes_are_derived_from_its_claims(storage: MariaDBStorage) -> None:
+    store = GatewayStore(storage)
+    store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-1")), None)
+    store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-2")), None)
+    store.claim("batch-1", "openclaw")
+    store.cancel("batch-1", "unroutable")
+    store.claim("batch-2", "openclaw")
+
+    outcomes = store.agent_outcomes("openclaw")
+
+    assert [(item.batch_id, item.fencing_token, item.outcome) for item in outcomes] == [
+        ("batch-1", 1, "cancelled"),
+        ("batch-2", 1, "active"),
+    ]
+    assert store.agent_outcomes("other-agent") == []

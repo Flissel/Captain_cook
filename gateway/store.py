@@ -158,12 +158,14 @@ from gateway.agent_lifecycle import (
     AgentCapabilityGrantedEvent,
     AgentCapabilityGrantRequest,
     AgentCapabilityRevokedEvent,
+    AgentClaimOutcome,
     AgentLedgerError,
     AgentProjection,
     AgentRegisteredEvent,
     AgentRetiredEvent,
     RetireReason,
     RevokeReason,
+    claim_outcome,
     project_agent,
 )
 from gateway.registry_feed import (
@@ -8455,6 +8457,40 @@ class GatewayStore:
                 return self._project_agent_blocks(
                     self._agent_blocks(cursor, agent_id, for_update=False), agent_id
                 )
+
+    def agent_outcomes(self, agent_id: str) -> list[AgentClaimOutcome]:
+        """Every claim the agent held, with how its batch ended under it."""
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT data FROM blocks
+                    WHERE block_type = 'batch_claimed'
+                      AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.agent_id')) = %s
+                    ORDER BY `index`
+                    """,
+                    (agent_id,),
+                )
+                claims = []
+                for row in cursor.fetchall():
+                    data = row["data"]
+                    if isinstance(data, str):
+                        data = json.loads(data)
+                    claims.append((str(data["batch_id"]), int(data["fencing_token"])))
+        projections: dict[str, BatchProjection] = {}
+        outcomes: list[AgentClaimOutcome] = []
+        for batch_id, fencing_token in claims:
+            if batch_id not in projections:
+                projections[batch_id] = self.batch_projection(batch_id)
+            outcomes.append(
+                AgentClaimOutcome(
+                    batch_id=batch_id,
+                    fencing_token=fencing_token,
+                    outcome=claim_outcome(projections[batch_id], fencing_token),
+                )
+            )
+        return outcomes
 
     def require_active_agent(self, agent_id: str | None) -> None:
         """A retired agent's token no longer authorizes writes (reads stay open).

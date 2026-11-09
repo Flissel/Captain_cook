@@ -22,6 +22,7 @@ from typing import Any, Literal, TypeAlias
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 from agenten.agent_runtime.contracts import AGENT_ID_PATTERN
+from gateway.contracts import BatchProjection
 
 AGENT_REGISTERED_BLOCK_TYPE = "agent_registered"
 AGENT_RETIRED_BLOCK_TYPE = "agent_retired"
@@ -206,3 +207,45 @@ def project_agent(blocks: Sequence[dict[str, Any]], agent_id: str) -> AgentProje
         retire_reason=retired.reason if retired is not None else None,
         grants=tuple(grants.values()),
     )
+
+
+# --- derived claim outcomes ---------------------------------------------------
+#
+# What an agent achieved is read from the batch projections, not written a
+# second time: each `batch_claimed` names the agent and its fencing token,
+# and the batch's own lifecycle says how that claim ended.
+
+ClaimOutcome: TypeAlias = Literal[
+    "succeeded",
+    "failed",
+    "rejected",
+    "cancelled",
+    "failed_after_max_iterations",
+    "aborted_infra",
+    "superseded",
+    "released",
+    "active",
+]
+_TERMINAL_STATUSES = frozenset(
+    {"succeeded", "failed", "rejected", "cancelled", "failed_after_max_iterations", "aborted_infra"}
+)
+
+
+class AgentClaimOutcome(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    batch_id: str
+    fencing_token: int = Field(ge=1)
+    outcome: ClaimOutcome
+
+
+def claim_outcome(projection: BatchProjection, fencing_token: int) -> ClaimOutcome:
+    """How the claim with `fencing_token` on this batch ended (or not yet)."""
+
+    if fencing_token < projection.claim_iteration:
+        return "superseded"
+    if projection.status in _TERMINAL_STATUSES:
+        return projection.status  # type: ignore[return-value]
+    if projection.recovered_iteration == fencing_token:
+        return "released"
+    return "active"
