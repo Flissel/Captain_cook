@@ -72,8 +72,13 @@ Run from the repository root with the project venv.
    docker compose -f $c --profile cli run --rm captain-openclaw-cli agent --agent main --message "Use the captain tools: list pending batches, then read spike-batch-1 and report its status."
    ```
 
-   Success: the answer names `spike-batch-1` with status `pending`, and the
-   MCP server log shows the calls.
+   Success: the answer names `spike-batch-1` with status `pending`.
+   Verified 2026-11-09 with OpenClaw 2026.10.4 and Claude Code 2.1.319.
+
+Steps 5 and 6 run in an interactive terminal: `models auth login` refuses
+to run without a TTY, so do not pass `-T`. The CLI service shares the
+gateway's PID namespace on purpose; without it OpenClaw refuses state
+access (`GatewayLockNamespaceError`).
 
 ## Stop and clean up
 
@@ -90,7 +95,14 @@ docker compose -p captain-openclaw-ledger -f docker-compose.yml down
 - Anthropic's terms for subscription use in third-party harnesses changed in
   2026. OpenClaw's docs treat `claude -p` as sanctioned; re-check before any
   production use. The API-key path stays the fallback.
-- OpenClaw may rewrite `openclaw.json` on `models auth login`; check that the
-  `${CAPTAIN_MCP_TOKEN}` reference survives instead of a resolved value.
+- OpenClaw rewrites `openclaw.json` on `models auth login` (backup in
+  `openclaw.json.bak`). In the 2026-11-09 run the `${...}` references
+  survived; re-check after upgrades. `mcp doctor` still warns about a
+  literal secret in `headers.Authorization`.
+- OpenClaw's `memory-core` plugin schedules a background "dreaming" job,
+  which can start model turns on the subscription while the gateway runs.
+- The container can reach every host loopback service through
+  `host.docker.internal`, including the Captain gateway (it holds no
+  gateway token).
 - Image `ghcr.io/openclaw/openclaw:2026.10.4` is pinned; override with
   `CAPTAIN_OPENCLAW_IMAGE` if that tag is unavailable.

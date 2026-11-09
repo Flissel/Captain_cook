@@ -162,11 +162,33 @@ Phase 1). No generic `/blocks` write tool.
 
 ## Phase 5 - OpenClaw container
 
-- [ ] Compose service `captain-openclaw` (Node + OpenClaw + Claude Code CLI),
+- [x] Compose service `captain-openclaw` (Node + OpenClaw + Claude Code CLI),
       persisted home volume; user logs Claude Code in once inside the
       container. Validate compose config before starting.
-- [ ] `openclaw.json`: `mcp.servers.captain` -> Phase 4 server; model via
+      (`deploy/captain-openclaw/`, spike 2026-11-09.)
+- [x] `openclaw.json`: `mcp.servers.captain` -> Phase 4 server; model via
       bundled `claude-cli` backend.
+
+Spike result 2026-11-09 (OpenClaw 2026.10.4, Claude Code 2.1.319, read-only
+MCP server with `list_batches`/`get_batch`): one `agent --agent main` turn
+listed pending batches and read `spike-batch-1` from the throwaway ledger
+through the subscription-backed `claude-cli` runtime
+(`anthropic/claude-opus-5-5`). Findings:
+
+- [x] The CLI container must share the gateway's PID namespace
+      (`pid: service:...`); OpenClaw refuses state access from a foreign
+      namespace (`GatewayLockNamespaceError`). Fixed in the spike compose.
+- [ ] `models auth login` needs a TTY; no non-interactive path for the
+      `cli` method. Provisioning stays an operator step.
+- [ ] `mcp doctor` warns that `headers.Authorization` holds a literal
+      secret although it is `Bearer ${CAPTAIN_MCP_TOKEN}`; check whether a
+      whole-value env reference silences it.
+- [ ] `memory-core` creates a "dreaming" cron job on boot; decide whether
+      the Captain planner container disables it (unplanned LLM turns).
+- [ ] The container also reaches the Captain gateway on the host (8090);
+      it holds no gateway token, but the production shape should network-
+      isolate the planner to the MCP server only.
+- [ ] Gateway container uses about 1.3 GiB RAM idle.
 - [ ] Captain role prompt/skill: plan -> constitution check -> `compile_plan`
       -> approve -> monitor -> release decision; never writes raw blocks.
 - [ ] Offline deterministic path stays (replay clients) so the test gate

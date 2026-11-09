@@ -46,6 +46,14 @@ def test_container_home_is_persisted_as_a_whole() -> None:
         assert "captain-openclaw-home:/home/node" in compose()["services"][name]["volumes"]
 
 
+def test_cli_shares_gateway_network_and_pid_namespace() -> None:
+    """OpenClaw verifies its state-database owner by PID (GatewayLockNamespaceError)."""
+
+    cli = compose()["services"]["captain-openclaw-cli"]
+    assert cli["network_mode"] == "service:captain-openclaw-gateway"
+    assert cli["pid"] == "service:captain-openclaw-gateway"
+
+
 def test_no_service_mounts_the_docker_socket_or_restarts_on_boot() -> None:
     rendered = (DEPLOY / "compose.captain-openclaw.yml").read_text(encoding="utf-8")
     assert "docker.sock" not in rendered

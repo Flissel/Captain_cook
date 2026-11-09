@@ -67,7 +67,9 @@ services:
     # Spike: started by hand, never on Docker Desktop boot.
     restart: "no"
 
-  # CLI shares the gateway's network namespace (OpenClaw's documented shape).
+  # CLI shares the gateway's network namespace (OpenClaw's documented shape)
+  # and its PID namespace: OpenClaw verifies the state-database owner by PID
+  # and refuses state access from a foreign namespace while the gateway runs.
   captain-openclaw-cli:
     image: ${CAPTAIN_OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:2026.10.4}
     entrypoint: ["node", "dist/index.js"]
@@ -77,6 +79,7 @@ services:
     volumes:
       - captain-openclaw-home:/home/node
     network_mode: "service:captain-openclaw-gateway"
+    pid: "service:captain-openclaw-gateway"
     depends_on:
       - captain-openclaw-gateway
     stdin_open: true
