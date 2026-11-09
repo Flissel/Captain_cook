@@ -20,8 +20,23 @@
       }
     }
   },
+  "agents": {
+    "defaults": {
+      // The seed service manages AGENTS.md and the captain-plan skill.
+      "skipBootstrap": true
+    }
+  },
+  "plugins": {
+    "entries": {
+      // No unplanned LLM turns: the memory "dreaming" job is off.
+      "memory-core": { "config": { "dreaming": { "enabled": false } } }
+    }
+  },
   "tools": {
     // Keep the few Captain tools visible upfront instead of deferred.
-    "toolSearch": false
+    "toolSearch": false,
+    // The planner plans through MCP only: no shell/process execution and
+    // no scheduler, gateway or plugin administration.
+    "deny": ["group:runtime", "group:automation"]
   }
 }

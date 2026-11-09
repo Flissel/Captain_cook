@@ -113,6 +113,25 @@ the constitution check rejects, then recompiles and releases every batch as `pen
 operator approves it. That needs `GATEWAY_APPROVAL_ENABLED=true` on the
 gateway; without it the batches stay held.
 
+## Captain planner role
+
+`workspace/AGENTS.md` (loaded into every OpenClaw session) defines the
+planner role and its hard rules; `workspace/skills/captain-plan/SKILL.md`
+carries the plan format and procedure: draft -> `check_constitution` ->
+`compile_plan` -> operator consent -> `publish_plan` -> operator approval
+-> monitor. The seed service copies both into the workspace on every start,
+so edit them here, not in the container. Tests keep the role's tool lists
+in step with the real MCP surface.
+
+The seed config also denies shell/process execution and scheduler/gateway
+administration (`tools.deny`), turns off the memory "dreaming" job and
+skips OpenClaw's own bootstrap files. `openclaw.json` is copied only once:
+an existing volume from the spike keeps its old config, so apply those keys
+there by hand (`openclaw config set ...` in the CLI container) or start
+with a fresh `captain-openclaw-home` volume after asking the operator.
+Whether these keys take effect on OpenClaw 2026.10.4 still needs one live
+check (`openclaw doctor`, then a planner turn).
+
 ## Stop and clean up
 
 ```powershell

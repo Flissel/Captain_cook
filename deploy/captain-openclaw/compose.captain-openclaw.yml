@@ -18,23 +18,34 @@ x-openclaw-env: &openclaw-env
   CAPTAIN_MCP_URL: ${CAPTAIN_MCP_URL:-http://host.docker.internal:18121/mcp}
 
 services:
-  # One-shot: seed openclaw.json into the home volume if it is not there yet.
-  # Never overwrites an existing config (OpenClaw rewrites it on auth login).
+  # One-shot seed into the home volume:
+  # - openclaw.json only if it is not there yet (OpenClaw rewrites it on
+  #   auth login, so an existing config is never overwritten);
+  # - the Captain-owned role files (workspace/AGENTS.md and the captain-plan
+  #   skill) on every start, so the repository stays the source of truth.
   captain-openclaw-seed:
     image: ${CAPTAIN_OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:2026.10.4}
     entrypoint: ["sh", "-c"]
     command:
       - >-
-        mkdir -p /home/node/.openclaw/workspace &&
+        mkdir -p /home/node/.openclaw/workspace/skills/captain-plan &&
         if [ -f /home/node/.openclaw/openclaw.json ]; then
         echo "openclaw.json exists, leaving it unchanged";
         else cp /seed/openclaw.json /home/node/.openclaw/openclaw.json &&
-        echo "seeded openclaw.json"; fi
+        echo "seeded openclaw.json"; fi &&
+        cp /seed/workspace/AGENTS.md /home/node/.openclaw/workspace/AGENTS.md &&
+        cp /seed/workspace/skills/captain-plan/SKILL.md
+        /home/node/.openclaw/workspace/skills/captain-plan/SKILL.md &&
+        echo "seeded Captain role files"
     volumes:
       - captain-openclaw-home:/home/node
       - type: bind
         source: ./openclaw.json
         target: /seed/openclaw.json
+        read_only: true
+      - type: bind
+        source: ./workspace
+        target: /seed/workspace
         read_only: true
     restart: "no"
 

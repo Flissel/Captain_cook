@@ -251,15 +251,26 @@ through the subscription-backed `claude-cli` runtime
 - [ ] `mcp doctor` warns that `headers.Authorization` holds a literal
       secret although it is `Bearer ${CAPTAIN_MCP_TOKEN}`; check whether a
       whole-value env reference silences it.
-- [ ] `memory-core` creates a "dreaming" cron job on boot; decide whether
+- [x] `memory-core` creates a "dreaming" cron job on boot; decide whether
       the Captain planner container disables it (unplanned LLM turns).
+      Decided: off (`plugins.entries.memory-core.config.dreaming.enabled:
+      false` in the seed config). Live confirmation pending.
 - [ ] The container also reaches the Captain gateway on the host (8090);
       it holds no gateway token, but the production shape should network-
       isolate the planner to the MCP server only.
 - [ ] Gateway container uses about 1.3 GiB RAM idle.
-- [ ] Captain role prompt/skill: plan -> constitution check -> `compile_plan`
+- [x] Captain role prompt/skill: plan -> constitution check -> `compile_plan`
       -> `publish_plan` -> (operator approves) -> monitor -> release
-      decision; never writes raw blocks.
+      decision; never writes raw blocks. Done (2026-11-09):
+      `deploy/captain-openclaw/workspace/AGENTS.md` (role, hard rules,
+      confirmation before every ledger write, holdout secrecy) and the
+      `captain-plan` skill (plan format, enforced rules, procedure), seeded
+      on every start; drift tests in `tests/captain_mcp/test_openclaw_role.py`
+      (confirmation list == write tools, skill example compiles). Seed
+      config denies `group:runtime` and `group:automation`.
+- [ ] Live check of the role on OpenClaw 2026.10.4: `openclaw doctor`
+      accepts the new config keys, the skill is listed, `exec` is denied,
+      and one planner turn runs check -> compile without publishing.
 - [ ] Offline deterministic path stays (replay clients) so the test gate
       needs no subscription.
 
