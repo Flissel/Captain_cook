@@ -95,6 +95,7 @@ class SupervisorAgent:
         circuit_failure_threshold: float = 0.5,
         circuit_window: int = 20,
         circuit_half_open_after_seconds: float = 60.0,
+        circuit_min_samples: int = 5,
         now: Callable[[], float] = time.time,
     ) -> None:
         self._bus = bus
@@ -117,6 +118,12 @@ class SupervisorAgent:
         self._circuit_failure_threshold = circuit_failure_threshold
         self._circuit_window = circuit_window
         self._circuit_half_open_after_seconds = circuit_half_open_after_seconds
+        # A closed circuit needs this many outcomes before it may open, so a
+        # single subproblem exhausting its retries (1 + max_retries
+        # failures) is escalated by the retry policy instead of locking the
+        # whole agent type behind probe cooldowns. Half_open is unaffected:
+        # one failed probe re-opens.
+        self._circuit_min_samples = circuit_min_samples
         self._now = now
 
         # subproblem_id -> number of retries already granted for it.
@@ -277,8 +284,10 @@ class SupervisorAgent:
         info.outcomes.append(failure)
 
         if failure:
+            enough_samples = info.state == "half_open" or len(info.outcomes) >= self._circuit_min_samples
             if (
                 info.state in ("closed", "half_open")
+                and enough_samples
                 and self._failure_fraction(info) > self._circuit_failure_threshold
             ):
                 await self._set_circuit_state(agent_type, info, "open")
@@ -331,6 +340,7 @@ class SupervisorAgent:
             ),
             agent_type=agent_type,
             state=state,
+            probe_after_seconds=self._circuit_half_open_after_seconds if state == "open" else None,
         )
         await self._bus.publish(topic_for(CircuitStateChanged), changed)
 

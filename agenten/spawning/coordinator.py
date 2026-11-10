@@ -86,6 +86,10 @@ class SpawnCoordinatorAgent:
         # would otherwise have its own, possibly stale, view of which agent
         # types are open. Out of scope for this unit.
         self._circuit_state: Dict[str, str] = {}
+        # agent_type -> earliest time one probe may be assigned while the
+        # circuit is open; removed once that probe is sent, so the rest wait
+        # for the supervisor's verdict on it.
+        self._circuit_probe_at: Dict[str, float] = {}
 
         # EventBus.publish documents at-least-once (not exactly-once)
         # delivery, and requires handlers to be idempotent w.r.t.
@@ -142,6 +146,10 @@ class SpawnCoordinatorAgent:
 
     async def handle_circuit_state_changed(self, event: CircuitStateChanged) -> None:
         self._circuit_state[event.agent_type] = event.state
+        if event.state == "open" and event.probe_after_seconds is not None:
+            self._circuit_probe_at[event.agent_type] = self._now() + event.probe_after_seconds
+        else:
+            self._circuit_probe_at.pop(event.agent_type, None)
 
     # -- internals ---------------------------------------------------------
 
@@ -207,7 +215,7 @@ class SpawnCoordinatorAgent:
             )
             return
 
-        if self._circuit_state.get(agent_type) == "open":
+        if self._circuit_state.get(agent_type) == "open" and not self._take_circuit_probe(agent_type):
             await self._defer(
                 subproblem_id=subproblem_id,
                 root_problem_id=root_problem_id,
@@ -241,6 +249,14 @@ class SpawnCoordinatorAgent:
             lease_expires_at=lease_expires_at,
         )
         await self._bus.publish(topic_for(SubproblemAssigned), assigned)
+
+    def _take_circuit_probe(self, agent_type: str) -> bool:
+        probe_at = self._circuit_probe_at.get(agent_type)
+        if probe_at is None or self._now() < probe_at:
+            return False
+        del self._circuit_probe_at[agent_type]
+        logger.info("Circuit open for agent_type=%r: sending one probe assignment", agent_type)
+        return True
 
     async def _defer(
         self, subproblem_id: str, root_problem_id: str, attempt: int, delay_seconds: float, reason: str
