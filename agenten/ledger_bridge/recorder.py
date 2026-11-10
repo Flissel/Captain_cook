@@ -62,7 +62,10 @@ already permits) the moment the Coordinator re-publishes
 `SubproblemAssigned` after a `RetryRequested`-driven backoff. Deciding
 *when* to give up retrying (retry-count/backoff policy, publishing
 `EscalateToRedecompose`) is the Supervisor's (U6) job, not this unit's —
-this unit only records what happened.
+this unit only records what happened. It does record the escalation: the
+escalated block moves to `Stage.FAILED` (`metadata["escalated"]`), because
+its own retries are over and any re-decomposition proposes new child
+blocks. Left in `RETRYING`, nothing would ever make it terminal.
 
 Robustness note
 ----------------
@@ -86,6 +89,7 @@ from blockchain.Blockchain_modell import Block, Blockchain
 
 from agenten.decomposition.budget import BudgetLedger, DecompositionBudget
 from agenten.events.schemas import (
+    EscalateToRedecompose,
     LeaseExpired,
     ProblemSubmitted,
     SubproblemAccepted,
@@ -126,6 +130,7 @@ RECORDER_SUBSCRIPTION_SPEC: List[Tuple[type, str]] = [
     (SubproblemFailed, "handle_subproblem_failed"),
     (SubproblemUnroutable, "handle_subproblem_unroutable"),
     (LeaseExpired, "handle_lease_expired"),
+    (EscalateToRedecompose, "handle_escalate_to_redecompose"),
 ]
 
 RECORDER_TOPICS: List[str] = [
@@ -320,6 +325,9 @@ class LedgerRecorderAgent:
 
     async def handle_lease_expired(self, event: LeaseExpired) -> None:
         await self._inbox.put((self._apply_lease_expired, event))
+
+    async def handle_escalate_to_redecompose(self, event: EscalateToRedecompose) -> None:
+        await self._inbox.put((self._apply_escalate_to_redecompose, event))
 
     # ------------------------------------------------------------------
     # writer loop — the ONLY place blockchain mutation happens
@@ -931,6 +939,25 @@ class LedgerRecorderAgent:
         failure_reason = f"lease_expired (agent_type={event.agent_type}, agent_key={event.agent_key})"
         self._apply_retry_transition(idx, failure_reason, "lease_expired")
 
+    async def _apply_escalate_to_redecompose(self, event: EscalateToRedecompose) -> None:
+        found = self._require_block(event.subproblem_id, "EscalateToRedecompose")
+        if found is None:
+            return
+        idx, current = found
+        if Stage(current.status) == Stage.FAILED:
+            # Non-retriable failure: already terminal with its own reason.
+            current.metadata["escalated"] = True
+            self._touch(idx)
+            return
+        block = self._can_transition(idx, Stage.FAILED)
+        if block is None:
+            self._record_late_event(idx, "escalate_to_redecompose", {"reason": event.reason})
+            return
+        block.metadata["failure_reason"] = event.reason
+        block.metadata["retriable"] = False
+        block.metadata["escalated"] = True
+        self._transition(idx, Stage.FAILED)
+
 
 def subscribe_recorder(
     bus: SubscribableEventBus,
@@ -1036,6 +1063,10 @@ if autogen_core is not None:
         @message_handler
         async def on_lease_expired(self, message: LeaseExpired, ctx: MessageContext) -> None:
             await self._inner.handle_lease_expired(message)
+
+        @message_handler
+        async def on_escalate_to_redecompose(self, message: EscalateToRedecompose, ctx: MessageContext) -> None:
+            await self._inner.handle_escalate_to_redecompose(message)
 
 else:  # pragma: no cover - exercised by the "no autogen_core" import check
     LedgerRecorderRoutedAgent = None  # type: ignore[assignment,misc]

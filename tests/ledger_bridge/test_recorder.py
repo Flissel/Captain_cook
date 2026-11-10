@@ -1015,3 +1015,88 @@ def test_budget_consumed_is_crash_safe_even_without_problem_submitted():
     # top of the same blockchain rehydrates the same count.
     rehydrated = InProcessBudgetLedger(blockchain)
     assert rehydrated.consumed("orphan-root") == 1
+
+
+def test_escalated_subproblem_is_closed_as_a_terminal_failure():
+    """EscalateToRedecompose ends this subproblem's own retries; any
+    re-decomposition proposes NEW child blocks. Left in RETRYING, the parent
+    never reached a terminal stage and the demo waited out its timeout."""
+    from agenten.events.schemas import EscalateToRedecompose
+
+    async def scenario():
+        bus, blockchain, budget_ledger, recorder = make_recorder()
+        await recorder.start()
+
+        await submit_problem(bus, "root-1")
+        await propose(bus, "s1")
+        await accept(bus, "s1")
+        await assign(bus, "s1")
+        await bus.publish(
+            topic_for(SubproblemFailed),
+            SubproblemFailed(
+                meta=make_meta(correlation_id="s1", root_problem_id="root-1", attempt=3),
+                subproblem_id="s1",
+                error="householder failed",
+                retriable=True,
+            ),
+        )
+        await bus.publish(
+            topic_for(EscalateToRedecompose),
+            EscalateToRedecompose(
+                meta=make_meta(correlation_id="s1", root_problem_id="root-1", attempt=3),
+                subproblem_id="s1",
+                reason="subproblem s1 exceeded max_retries (3): householder failed",
+            ),
+        )
+        await recorder.stop()
+
+        block = blockchain.get_block(recorder._subproblem_index["s1"])
+        assert block.status == Stage.FAILED.value
+        assert block.metadata["escalated"] is True
+        assert block.metadata["failure_reason"] == "subproblem s1 exceeded max_retries (3): householder failed"
+        assert block.metadata["retriable"] is False
+        assert block.metadata["retry_history"]  # the retry evidence stays
+        assert recorder.errors == []
+
+    run(scenario())
+
+
+def test_escalation_after_a_non_retriable_failure_only_marks_the_block():
+    """A non-retriable failure is already FAILED when the supervisor's
+    escalation arrives; that is the normal path, not an illegal transition."""
+    from agenten.events.schemas import EscalateToRedecompose
+
+    async def scenario():
+        bus, blockchain, budget_ledger, recorder = make_recorder()
+        await recorder.start()
+
+        await submit_problem(bus, "root-1")
+        await propose(bus, "s1")
+        await accept(bus, "s1")
+        await assign(bus, "s1")
+        await bus.publish(
+            topic_for(SubproblemFailed),
+            SubproblemFailed(
+                meta=make_meta(correlation_id="s1", root_problem_id="root-1"),
+                subproblem_id="s1",
+                error="bad input",
+                retriable=False,
+            ),
+        )
+        await bus.publish(
+            topic_for(EscalateToRedecompose),
+            EscalateToRedecompose(
+                meta=make_meta(correlation_id="s1", root_problem_id="root-1"),
+                subproblem_id="s1",
+                reason="non-retriable failure for subproblem s1: bad input",
+            ),
+        )
+        await recorder.stop()
+
+        block = blockchain.get_block(recorder._subproblem_index["s1"])
+        assert block.status == Stage.FAILED.value
+        assert block.metadata["failure_reason"] == "bad input"
+        assert block.metadata["escalated"] is True
+        assert recorder.errors == []
+
+    run(scenario())

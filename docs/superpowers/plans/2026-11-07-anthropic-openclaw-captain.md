@@ -179,10 +179,9 @@ gains tool calling), the provider proxy is retired, live gates allowed.
 - [x] Tests pinning the Nebius default updated.
 - [x] `.env.example`, README: Claude subscription default, provider table,
       migration note.
-- [ ] `scripts/live-demo-services.ps1` forwards and redacts only
-      `NEBIUS_API_KEY` for Hermes; the `anthropic` Hermes path also needs
-      `ANTHROPIC_API_KEY` there. Left alone: the live-demo session has
-      uncommitted changes in that file.
+- [x] `scripts/live-demo-services.ps1` forwards and redacts
+      `ANTHROPIC_API_KEY` next to `NEBIUS_API_KEY` (local allow-list,
+      secret redaction, both runtime-adapter lists).
 - [ ] Delete `agenten/provider_proxy/` once the live demo no longer runs
       Codex on OpenAI.
 - [x] Shim structured output: prompt-only JSON came back in Markdown code
@@ -191,11 +190,26 @@ gains tool calling), the provider proxy is retired, live gates allowed.
       through `--json-schema` and the shim returns the validated object;
       `json_object` strips a surrounding fence. Live: the LLM demo completes
       on the subscription (4/4 subproblems done, `claude-code-haiku`).
-- [ ] Check a Pydantic schema with `$defs`/`$ref` against the CLI's
-      `--json-schema` (the householder report has none).
-- [ ] The event-driven demo waits forever when a householder fails
-      permanently instead of ending with a failed terminal state; related
-      to the known missing dead-letter for unroutable work.
+- [x] Check a Pydantic schema with `$defs`/`$ref` against the CLI's
+      `--json-schema`: live test with nested models passes
+      (`tests/live/test_live_claude_code_shim_tools.py`).
+- [x] The event-driven demo waits forever when a householder fails
+      permanently. Three causes, each fixed with a test:
+      the first failure opened the agent type's circuit (1/1 > 0.5, no
+      minimum sample count); the coordinator cached "open" and deferred
+      every 30 s forever, so no outcome ever reached the supervisor's lazy
+      half-open check; and an escalated block stayed `RETRYING` for good.
+      Now the circuit needs `circuit_min_samples` (5) outcomes before it
+      opens, `CircuitStateChanged(open)` carries `probe_after_seconds` and
+      the coordinator lets exactly one probe through after it, and the
+      recorder closes an escalated block as `FAILED` (`escalated=True`).
+      The offline demo with an always-failing replay client ends after
+      about 28 s with `success=False` and 4 failed blocks.
+- [ ] Retry delays sleep inline in the publish chain (`InMemoryEventBus`
+      runs handlers nested inside the recorder's writer loop), so
+      subproblems are worked one after another and ledger writes wait for
+      backoff sleeps; the 4 failing householders above take 4 x 7 s
+      serially. Schedule delayed retries instead of sleeping in the handler.
 - [ ] Shim hardening: `--tools ""` is set only for tool requests; the
       plain-text path relies on non-interactive permission denials.
 

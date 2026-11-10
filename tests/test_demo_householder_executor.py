@@ -209,3 +209,36 @@ def test_demo_help_no_longer_claims_offline_only(capsys):
         main.parse_args(["--help"])
 
     assert "offline audited pipeline demo" not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_permanently_failing_householders_end_the_demo_as_failed(monkeypatch):
+    """Regression: one failing householder used to open its circuit for good
+    and the escalated blocks stayed RETRYING, so the demo never converged."""
+    import asyncio
+
+    from config.app_settings import RETRY_POLICY
+
+    from agenten import demo
+
+    monkeypatch.setitem(RETRY_POLICY, "backoff_initial_delay_seconds", 0.0)
+    pipelines = []
+
+    def capture(**kwargs):
+        pipelines.append(build_pipeline(**kwargs))
+        return pipelines[-1]
+
+    build_pipeline = demo.build_pipeline
+    monkeypatch.setattr(demo, "build_pipeline", capture)
+    client = build_replay_model_client(["not json"] * 50)
+
+    summary = await asyncio.wait_for(
+        run_demo(None, householder_model_client=client, householder_model="replay"),
+        timeout=30.0,
+    )
+
+    assert summary.success is False
+    assert (summary.terminal_count, summary.done_count) == (4, 0)
+    subproblems = [block for block in summary.blocks if block["block_type"] == "subproblem"]
+    assert [block["status"] for block in subproblems] == ["failed"] * 4
+    assert pipelines[0].recorder.errors == []
