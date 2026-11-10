@@ -15,6 +15,7 @@ from agenten.agent_factory.candidate_evaluation import (
     ResolvedFactoryCandidate,
 )
 from agenten.agent_factory.evidence_store import FilesystemSkillEvaluationEvidenceStore
+from agenten.agent_factory import orchestration
 from agenten.agent_factory.n8n_tools import TypedN8nTool
 from agenten.agent_factory.orchestration import (
     FactoryDispatchError,
@@ -626,21 +627,42 @@ async def test_sealed_evidence_replaces_future_hermes_timestamps_with_captain_ti
     assert result.evidence.candidate.created_at == captain_now
 
 
+class FrozenMonotonic:
+    """Stand-in for the coordinator's ``time`` module with a frozen monotonic clock.
+
+    Only the coordinator's own deadline bookkeeping is frozen; the event loop
+    still runs on real time, so ``asyncio.wait_for`` timeouts fire normally.
+    """
+
+    def __init__(self, value: float) -> None:
+        self._value = value
+
+    def monotonic(self) -> float:
+        return self._value
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "blocked_operation",
+    ("blocked_operation", "operation_label"),
     [
-        "record_receipt",
-        "record_candidate_evaluation",
-        "record_tool_gap",
-        "record_evaluation",
-        "retain_candidate",
+        ("record_receipt", "usage receipt persistence"),
+        ("record_candidate_evaluation", "candidate evaluation persistence"),
+        ("record_tool_gap", "tool gap persistence"),
+        ("record_evaluation", "evaluation evidence persistence"),
+        ("retain_candidate", "candidate retention"),
     ],
 )
 async def test_absolute_deadline_cancels_final_store_operations_before_success(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     blocked_operation: str,
+    operation_label: str,
 ) -> None:
+    # Freeze the coordinator's monotonic deadline as well as the lease clock so
+    # the earlier steps cannot exhaust the 0.25 s budget on a slow runner. The
+    # only thing that can expire is the lease-derived ``asyncio.wait_for``
+    # around the blocked store operation, which is what this test proves.
+    monkeypatch.setattr(orchestration, "time", FrozenMonotonic(1_000.0))
     candidate, archive = _candidate(tmp_path)
     request = _request(candidate)
     candidate_result = FactoryCandidateEvaluator().evaluate_skill(
@@ -655,6 +677,7 @@ async def test_absolute_deadline_cancels_final_store_operations_before_success(
 
     class BlockingStore:
         def __init__(self) -> None:
+            self.entered = asyncio.Event()
             self.cancelled = False
 
         async def record_receipt(self, receipt):
@@ -673,6 +696,7 @@ async def test_absolute_deadline_cancels_final_store_operations_before_success(
             return await inner.record_tool_gap(evaluation_id, marker)
 
         async def _block(self):
+            self.entered.set()
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
@@ -706,9 +730,13 @@ async def test_absolute_deadline_cancels_final_store_operations_before_success(
         clock=Clock(request.lease.expires_at - timedelta(seconds=0.25)),
     )
 
-    with pytest.raises(FactoryDispatchError, match="timed out"):
-        await asyncio.wait_for(coordinator.evaluate(request), timeout=1)
+    with pytest.raises(
+        FactoryDispatchError,
+        match=f"{operation_label} timed out within the active lease",
+    ):
+        await asyncio.wait_for(coordinator.evaluate(request), timeout=10)
 
+    assert store.entered.is_set()
     assert store.cancelled is True
 
 
