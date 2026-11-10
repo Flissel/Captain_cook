@@ -236,6 +236,14 @@ class LedgerRecorderAgent:
             self._stop_requested = False
             self._writer_task = asyncio.create_task(self._writer_loop())
 
+    async def wait_until_drained(self) -> None:
+        """Wait until every queued item, including items that applying them
+        enqueued in turn, has been applied. Returns at once when the writer
+        loop is not running (nothing would drain the queue)."""
+        if self._writer_task is None or self._writer_task.done():
+            return
+        await self._inbox.join()
+
     async def stop(self) -> None:
         """Drain everything already queued, then stop the writer task.
 

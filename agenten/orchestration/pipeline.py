@@ -65,6 +65,7 @@ from agenten.events.schemas import (
 from agenten.ledger_bridge.query import InProcessBudgetLedger, LedgerQueryImpl
 from agenten.ledger_bridge.recorder import LedgerRecorderAgent, subscribe_recorder
 from agenten.ledger_bridge.stage_machine import Stage
+from agenten.runtime.background import BackgroundTasks
 from agenten.runtime.event_bus import InMemoryEventBus, SubscribableEventBus
 from agenten.spawning.capability_registry import CapabilityRegistry
 from agenten.spawning.coordinator import SpawnCoordinatorAgent
@@ -138,6 +139,9 @@ class SupplyChainPipeline:
     reaper: ReaperAgent
     supervisor: SupervisorAgent
     default_budget: DecompositionBudget
+    # Worker executions, run outside the publish chain (see build_pipeline's
+    # worker-fleet section); stop() waits for them.
+    worker_tasks: BackgroundTasks
     # Count of subproblems rejected for budget exhaustion. These are the
     # one terminal outcome with NO ledger block (the Recorder deliberately
     # writes no block for a budget-rejected proposal -- see
@@ -166,15 +170,29 @@ class SupplyChainPipeline:
         self.started = True
 
     async def stop(self) -> None:
-        """Drain everything already queued, then stop the writer-loop task.
-        See ``LedgerRecorderAgent.stop``'s docstring for the draining
-        guarantee and its limits.
+        """Let running workers finish and drain everything already queued,
+        then stop the writer-loop task. Retries still waiting out a backoff
+        are cancelled instead of waited for: they would otherwise publish
+        into a stopped recorder later. See ``LedgerRecorderAgent.stop``'s
+        docstring for the draining guarantee and its limits.
         """
         self.started = False
-        # Retries still waiting out a backoff would otherwise publish into a
-        # stopped recorder later; cancel them before draining the ledger.
+        await self._quiesce()
         await self.coordinator.cancel_pending_retries()
+        # A retry cancelled while it was assigning may have started a worker.
+        await self._quiesce()
         await self.recorder.stop()
+
+    async def _quiesce(self) -> None:
+        """Wait until no worker runs and the ledger queue is drained. Each
+        side can feed the other (a completion is a ledger write; applying an
+        accepted subproblem starts a worker), so repeat until both are idle.
+        """
+        while True:
+            await self.worker_tasks.wait_idle()
+            await self.recorder.wait_until_drained()
+            if self.worker_tasks.count == 0:
+                return
 
     async def _on_subproblem_rejected(self, event: SubproblemRejected) -> None:
         """Track budget-exhaustion rejections (the blockless terminal
@@ -340,12 +358,11 @@ def build_pipeline(
     # (SubproblemFailed/SubproblemCompleted carry no agent_type field).
     #
     # Subscription-order note: InMemoryEventBus delivers to handlers
-    # sequentially in subscription order, and a worker's
-    # handle_subproblem_assigned runs the whole execution inline -- so
-    # handle_assigned MUST be subscribed before any worker's
-    # SubproblemAssigned handler (i.e. before the worker-fleet section
-    # below), or a failure published from inside the very first delivery
-    # would reach handle_failed before the assignment was ever recorded.
+    # sequentially in subscription order. Workers execute as background
+    # tasks (see the worker-fleet section below), so a failure is published
+    # only after the SubproblemAssigned delivery returned; handle_assigned is
+    # still subscribed before any worker so the assignment is recorded first
+    # even if a handler in between yields to the event loop.
     #
     # An injected `supervisor` (for non-default retry/backoff/circuit
     # policy) must have been constructed against this same `bus` -- pass
@@ -383,6 +400,12 @@ def build_pipeline(
     # anchored to the subscription actually happening, not to a dict entry
     # that could be added without one.
     subscribed_worker_types: set[str] = set()
+    # A worker's handle_subproblem_assigned awaits its whole execute().
+    # Subscribed directly, that would run nested inside whoever published
+    # SubproblemAssigned -- the Ledger Recorder's writer loop -- so every
+    # ledger write and every other subproblem would wait for it. Each
+    # delivery runs as a background task instead.
+    worker_tasks = BackgroundTasks("worker")
 
     def register_worker(worker: WorkerAgent) -> None:
         if worker.agent_type in workers:
@@ -395,7 +418,7 @@ def build_pipeline(
             )
         for tag in worker.capability_tags:
             capability_registry.register(tag, worker.agent_type)
-        bus.subscribe(topic_for(SubproblemAssigned), worker.handle_subproblem_assigned)
+        bus.subscribe(topic_for(SubproblemAssigned), worker_tasks.detach(worker.handle_subproblem_assigned))
         subscribed_worker_types.add(worker.agent_type)
         workers[worker.agent_type] = worker
 
@@ -471,6 +494,7 @@ def build_pipeline(
         reaper=reaper,
         supervisor=supervisor,
         default_budget=resolved_default_budget,
+        worker_tasks=worker_tasks,
     )
     # Budget-exhaustion rejections are terminal but blockless (the Recorder
     # writes no block for them), so the pipeline handle itself tracks them

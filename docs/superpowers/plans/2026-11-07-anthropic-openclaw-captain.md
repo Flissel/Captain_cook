@@ -213,12 +213,14 @@ gains tool calling), the provider proxy is retired, live gates allowed.
       `wait_for_pending_retries`, `cancel_pending_retries`; the pipeline's
       `stop` cancels waiting retries). The same offline demo ends after
       about 7 s instead of 28 s.
-- [ ] Worker execution still runs nested in the publish chain: a
-      `SubproblemAssigned` handler awaits the whole `execute()` inside the
-      recorder's writer loop, so first attempts of different subproblems
-      run one after another and ledger writes wait for them. Needs a worker
-      dispatch that returns before execution; the supervisor's
-      `handle_assigned` ordering note in `pipeline.py` must still hold.
+- [x] Worker execution ran nested in the publish chain: a
+      `SubproblemAssigned` handler awaited the whole `execute()` inside the
+      recorder's writer loop, so subproblems ran one after another and
+      ledger writes waited for them. `build_pipeline` now subscribes workers
+      through `BackgroundTasks.detach` (`agenten/runtime/background.py`,
+      also used for the coordinator's delayed retries); `stop()` waits until
+      workers and the ledger queue are idle. Live LLM demo: all four
+      householders are assigned within about 4 s of each other.
 - [ ] Shim hardening: `--tools ""` is set only for tool requests; the
       plain-text path relies on non-interactive permission denials.
 

@@ -222,9 +222,11 @@ sequenceDiagram
    positive delay as a background task (`SpawnCoordinatorAgent.
    _retry_after_delay`) and returns, so a backoff no longer blocks the
    publishing chain; `SupplyChainPipeline.stop` cancels retries still
-   waiting. A zero delay still runs inline. Worker execution itself still
-   runs nested in the publish chain on `InMemoryEventBus`, so first attempts
-   of different subproblems run one after another.
+   waiting. A zero delay still runs inline. `build_pipeline` subscribes each
+   worker through `BackgroundTasks.detach` (`agenten/runtime/background.py`),
+   so executions run concurrently outside the writer loop;
+   `SupplyChainPipeline.stop` waits until workers and the ledger queue are
+   both idle before stopping the recorder.
 
 ## 6. Interfaces to other parts
 

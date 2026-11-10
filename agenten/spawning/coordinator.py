@@ -12,7 +12,8 @@ task instead of sleeping inside the handler. On ``InMemoryEventBus`` a
 handler runs nested in whoever published, which is usually the Ledger
 Recorder's writer loop: an inline backoff would stall every ledger write and
 serialize all subproblems behind one retry. ``cancel_pending_retries`` (called
-by the pipeline's ``stop``) and ``wait_for_pending_retries`` manage them.
+by the pipeline's ``stop``) and ``wait_for_pending_retries`` manage them
+(``agenten.runtime.background.BackgroundTasks``).
 
 ``agent_key = subproblem_id`` is the detail that matters most downstream:
 it is what gives AutoGen's ``AgentId(agent_type, agent_key)`` addressing an
@@ -42,6 +43,7 @@ from agenten.events.schemas import (
     topic_for,
 )
 from agenten.ledger_bridge.stage_machine import LedgerQuery, Stage
+from agenten.runtime.background import BackgroundTasks
 from agenten.runtime.event_bus import EventBus
 from agenten.spawning.capability_registry import CapabilityRegistry, NoCapableAgentType
 
@@ -108,9 +110,8 @@ class SpawnCoordinatorAgent:
         self._processed_event_ids: Set[str] = set()
         self._processed_event_id_order: Deque[str] = deque(maxlen=_PROCESSED_EVENT_ID_HISTORY)
 
-        # Retries waiting out their backoff. Held strongly so the event loop
-        # cannot garbage-collect a pending task; removed when it finishes.
-        self._pending_retries: Set["asyncio.Task[None]"] = set()
+        # Retries waiting out their backoff.
+        self._pending_retries = BackgroundTasks("spawn coordinator retry")
 
     async def handle_subproblem_accepted(self, event: SubproblemAccepted) -> None:
         if self._already_processed(event.meta.event_id):
@@ -141,33 +142,26 @@ class SpawnCoordinatorAgent:
         if event.delay_seconds <= 0:
             await self._retry(event)
             return
-        task = asyncio.ensure_future(self._retry_after_delay(event))
-        self._pending_retries.add(task)
-        task.add_done_callback(self._pending_retries.discard)
+        self._pending_retries.spawn(
+            self._retry_after_delay(event), f"retry for subproblem_id={event.subproblem_id}"
+        )
 
     @property
     def pending_retry_count(self) -> int:
-        return len(self._pending_retries)
+        return self._pending_retries.count
 
     async def wait_for_pending_retries(self) -> None:
         """Wait until no retry is waiting out its backoff, including retries
         that the awaited ones schedule in turn."""
-        while self._pending_retries:
-            await asyncio.gather(*list(self._pending_retries), return_exceptions=True)
+        await self._pending_retries.wait_idle()
 
     async def cancel_pending_retries(self) -> None:
         """Cancel every retry still waiting out its backoff (shutdown)."""
-        pending = list(self._pending_retries)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        await self._pending_retries.cancel_all()
 
     async def _retry_after_delay(self, event: RetryRequested) -> None:
         await asyncio.sleep(event.delay_seconds)
-        try:
-            await self._retry(event)
-        except Exception:  # noqa: BLE001 - a background task has no caller to report to
-            logger.exception("Delayed retry for subproblem_id=%s failed", event.subproblem_id)
+        await self._retry(event)
 
     async def _retry(self, event: RetryRequested) -> None:
         block = self._find_block_for_subproblem(event.subproblem_id)
