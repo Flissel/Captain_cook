@@ -171,6 +171,9 @@ class SupplyChainPipeline:
         guarantee and its limits.
         """
         self.started = False
+        # Retries still waiting out a backoff would otherwise publish into a
+        # stopped recorder later; cancel them before draining the ledger.
+        await self.coordinator.cancel_pending_retries()
         await self.recorder.stop()
 
     async def _on_subproblem_rejected(self, event: SubproblemRejected) -> None:

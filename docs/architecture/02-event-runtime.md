@@ -138,7 +138,7 @@ sequenceDiagram
     alt no capable type
         Co->>Bus: SubproblemUnroutable → Rec: FAILED
     else deferred
-        Co->>Bus: RetryRequested(delay) → Co (sleeps, retries)
+        Co->>Bus: RetryRequested(delay) → Co (schedules a task, retries after delay)
     else
         Co->>Bus: SubproblemAssigned(agent_key=subproblem_id, lease_expires_at)
         Bus->>Sup: handle_assigned (records agent_type)
@@ -218,10 +218,13 @@ sequenceDiagram
    `agenten/planning/captain_pipeline.py` and imports nothing from this event
    runtime. The two pipelines are parallel systems, not one flow.
 9. **Coordinator retry semantics.** `RetryRequested` is reused for
-   backpressure and circuit deferrals (`coordinator.py:249-254`), and
-   `handle_retry_requested` sleeps inline (`coordinator.py:126`). On
-   `InMemoryEventBus` this blocks the publishing chain for the whole backoff,
-   so "async retry" is in practice a nested wait.
+   backpressure and circuit deferrals. `handle_retry_requested` schedules a
+   positive delay as a background task (`SpawnCoordinatorAgent.
+   _retry_after_delay`) and returns, so a backoff no longer blocks the
+   publishing chain; `SupplyChainPipeline.stop` cancels retries still
+   waiting. A zero delay still runs inline. Worker execution itself still
+   runs nested in the publish chain on `InMemoryEventBus`, so first attempts
+   of different subproblems run one after another.
 
 ## 6. Interfaces to other parts
 

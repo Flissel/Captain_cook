@@ -352,6 +352,71 @@ async def test_permanently_failing_agent_type_escalates_instead_of_deferring_for
     bus.subscribe(topic_for(CircuitStateChanged), coordinator.handle_circuit_state_changed)
 
     await coordinator.handle_subproblem_accepted(make_accepted_event("sp-1", block_index=1))
+    await coordinator.wait_for_pending_retries()
 
     assert len(assigned.events) == 3  # first try + max_retries probes
     assert [e.subproblem_id for e in escalated.events] == ["sp-1"]
+
+
+def delayed_retry_for(subproblem_id: str, delay_seconds: float) -> RetryRequested:
+    return RetryRequested(
+        meta=make_meta(correlation_id=subproblem_id, root_problem_id="root-1"),
+        subproblem_id=subproblem_id,
+        delay_seconds=delay_seconds,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delayed_retry_does_not_block_the_publishing_handler():
+    """A backoff must not sleep inside the bus handler: on InMemoryEventBus
+    that handler runs nested in the Ledger Recorder's writer loop, so every
+    other subproblem and every ledger write would wait for the backoff."""
+    ledger = FakeLedgerQuery()
+    ledger.add(1, Stage.ACCEPTED, {"subproblem_id": "sp-1", "capability_tags": ["research"]})
+    coordinator, assigned, retried = make_coordinator(ledger)
+
+    await asyncio.wait_for(coordinator.handle_retry_requested(delayed_retry_for("sp-1", 60.0)), timeout=1.0)
+
+    assert assigned.events == []
+    assert coordinator.pending_retry_count == 1
+
+    await coordinator.cancel_pending_retries()
+
+    assert coordinator.pending_retry_count == 0
+    assert assigned.events == []
+
+
+@pytest.mark.asyncio
+async def test_delayed_retry_assigns_once_its_delay_elapses():
+    ledger = FakeLedgerQuery()
+    ledger.add(1, Stage.ACCEPTED, {"subproblem_id": "sp-1", "capability_tags": ["research"]})
+    ledger.add(2, Stage.ACCEPTED, {"subproblem_id": "sp-2", "capability_tags": ["research"]})
+    coordinator, assigned, retried = make_coordinator(ledger)
+
+    await coordinator.handle_retry_requested(delayed_retry_for("sp-1", 0.05))
+    await coordinator.handle_retry_requested(delayed_retry_for("sp-2", 0.05))
+    assert coordinator.pending_retry_count == 2
+
+    await asyncio.wait_for(coordinator.wait_for_pending_retries(), timeout=2.0)
+
+    assert sorted(e.subproblem_id for e in assigned.events) == ["sp-1", "sp-2"]
+    assert coordinator.pending_retry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_failing_delayed_retry_is_logged_not_lost(caplog):
+    ledger = FakeLedgerQuery()
+    ledger.add(1, Stage.ACCEPTED, {"subproblem_id": "sp-1", "capability_tags": ["research"]})
+    coordinator, assigned, retried = make_coordinator(ledger)
+
+    async def broken_assignment(**kwargs: Any) -> None:
+        raise RuntimeError("bus down")
+
+    coordinator._attempt_assignment = broken_assignment  # type: ignore[method-assign]
+
+    with caplog.at_level("ERROR"):
+        await coordinator.handle_retry_requested(delayed_retry_for("sp-1", 0.01))
+        await asyncio.wait_for(coordinator.wait_for_pending_retries(), timeout=2.0)
+
+    assert coordinator.pending_retry_count == 0
+    assert any("sp-1" in record.getMessage() for record in caplog.records)

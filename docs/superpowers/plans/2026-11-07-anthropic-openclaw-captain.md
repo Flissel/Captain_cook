@@ -205,11 +205,20 @@ gains tool calling), the provider proxy is retired, live gates allowed.
       recorder closes an escalated block as `FAILED` (`escalated=True`).
       The offline demo with an always-failing replay client ends after
       about 28 s with `success=False` and 4 failed blocks.
-- [ ] Retry delays sleep inline in the publish chain (`InMemoryEventBus`
-      runs handlers nested inside the recorder's writer loop), so
-      subproblems are worked one after another and ledger writes wait for
-      backoff sleeps; the 4 failing householders above take 4 x 7 s
-      serially. Schedule delayed retries instead of sleeping in the handler.
+- [x] Retry delays slept inline in the publish chain (`InMemoryEventBus`
+      runs handlers nested inside the recorder's writer loop), so ledger
+      writes waited for backoff sleeps and the 4 failing householders above
+      took 4 x 7 s serially. The coordinator now schedules a positive delay
+      as a background task (`pending_retry_count`,
+      `wait_for_pending_retries`, `cancel_pending_retries`; the pipeline's
+      `stop` cancels waiting retries). The same offline demo ends after
+      about 7 s instead of 28 s.
+- [ ] Worker execution still runs nested in the publish chain: a
+      `SubproblemAssigned` handler awaits the whole `execute()` inside the
+      recorder's writer loop, so first attempts of different subproblems
+      run one after another and ledger writes wait for them. Needs a worker
+      dispatch that returns before execution; the supervisor's
+      `handle_assigned` ordering note in `pipeline.py` must still hold.
 - [ ] Shim hardening: `--tools ""` is set only for tool requests; the
       plain-text path relies on non-interactive permission denials.
 

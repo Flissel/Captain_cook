@@ -19,6 +19,8 @@ Decomposer once retries are exhausted) is covered by the two
 test_failure_path_* tests at the bottom of this module, against the same
 full build_pipeline() wiring.
 """
+import asyncio
+
 import pytest
 
 from blockchain.Blockchain_modell import Blockchain
@@ -611,3 +613,26 @@ async def test_failure_path_exhausted_retries_escalate_to_redecompose():
     assert flaky_block.metadata["escalated"] is True
     assert flaky_block.metadata["failure_reason"] == escalate_events[0].reason
     assert len(flaky_block.metadata["retry_history"]) == 2  # both failed attempts
+
+
+async def test_stop_cancels_retries_still_waiting_for_their_backoff():
+    """A retry scheduled with a long backoff must not outlive the pipeline:
+    stop() cancels it instead of leaving a task that later publishes into a
+    stopped Ledger Recorder."""
+    from agenten.events.schemas import RetryRequested, make_meta, topic_for
+
+    pipeline = make_pipeline()
+    await pipeline.start()
+    await pipeline.bus.publish(
+        topic_for(RetryRequested),
+        RetryRequested(
+            meta=make_meta(correlation_id="sp-late", root_problem_id="root-late"),
+            subproblem_id="sp-late",
+            delay_seconds=3600.0,
+        ),
+    )
+    assert pipeline.coordinator.pending_retry_count == 1
+
+    await asyncio.wait_for(pipeline.stop(), timeout=5.0)
+
+    assert pipeline.coordinator.pending_retry_count == 0
