@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
+import time
 from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import TypeVar
@@ -13,6 +15,8 @@ import openai
 
 
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 
 class LlmStage(str, Enum):
@@ -86,8 +90,9 @@ async def run_llm_stage(
         raise ValueError("max_attempts must be greater than zero")
 
     for attempt in range(1, max_attempts + 1):
+        started = time.monotonic()
         try:
-            return await asyncio.wait_for(operation(), timeout=timeout_seconds)
+            result = await asyncio.wait_for(operation(), timeout=timeout_seconds)
         except LlmSchemaError as exc:
             if exc.stage is stage and exc.attempts == attempt:
                 raise
@@ -99,8 +104,32 @@ async def run_llm_stage(
         except TimeoutError as exc:
             if attempt == max_attempts:
                 raise LlmTimeoutError(stage, attempt) from exc
+            _log_retry(stage, attempt, max_attempts, started, f"timeout after {timeout_seconds:g}s")
         except _TRANSIENT_PROVIDER_ERRORS as exc:
             if attempt == max_attempts:
                 raise LlmStageError(stage, attempt, "provider") from exc
+            # The type only: provider messages may echo request content.
+            _log_retry(stage, attempt, max_attempts, started, f"provider error {type(exc).__name__}")
+        else:
+            if attempt > 1:
+                logger.info(
+                    "%s LLM stage succeeded on attempt %d/%d after %.1fs",
+                    stage.value,
+                    attempt,
+                    max_attempts,
+                    time.monotonic() - started,
+                )
+            return result
 
     raise AssertionError("unreachable")
+
+
+def _log_retry(stage: LlmStage, attempt: int, max_attempts: int, started: float, reason: str) -> None:
+    logger.warning(
+        "%s LLM stage attempt %d/%d failed after %.1fs (%s); retrying",
+        stage.value,
+        attempt,
+        max_attempts,
+        time.monotonic() - started,
+        reason,
+    )

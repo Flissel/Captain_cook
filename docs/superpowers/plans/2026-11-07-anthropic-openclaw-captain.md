@@ -227,9 +227,11 @@ gains tool calling), the provider proxy is retired, live gates allowed.
       convergence limit covers one householder exhausting every executor
       attempt on every supervisor retry (757 s worst case). Two live runs
       afterwards: 4/4 done, no retries, 60 s and 80 s.
-- [ ] `run_llm_stage` does not log an attempt that timed out or failed
+- [x] `run_llm_stage` did not log an attempt that timed out or failed
       before the next one, so a slow householder (76 s in one live run)
-      cannot be told apart from a retried one. Log each failed attempt.
+      could not be told apart from a retried one. It now logs each retried
+      attempt (warning: stage, attempt n/m, duration, reason; provider
+      errors by type only) and a success after a retry (info).
 - [ ] Shim hardening: `--tools ""` is set only for tool requests; the
       plain-text path relies on non-interactive permission denials.
 

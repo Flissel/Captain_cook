@@ -278,3 +278,63 @@ async def test_external_cancellation_propagates_after_operation_cleanup() -> Non
         await task
 
     assert cleaned.is_set()
+
+
+@pytest.mark.asyncio
+async def test_a_retried_attempt_is_logged_with_its_reason(caplog) -> None:
+    """Without this a slow stage and a silently retried one look the same."""
+    calls = 0
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.sleep(1)
+        return "ok"
+
+    with caplog.at_level("INFO", logger="agenten.llm.resilience"):
+        result = await run_llm_stage(
+            LlmStage.HOUSEHOLDER_EXECUTE,
+            operation,
+            timeout_seconds=0.01,
+            max_attempts=2,
+        )
+
+    assert result == "ok"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "householder_execute" in message and "attempt 1/2" in message and "timeout" in message
+        for message in messages
+    )
+    assert any("householder_execute" in message and "succeeded on attempt 2/2" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_provider_retry_logs_the_error_type_not_its_message(caplog) -> None:
+    calls = 0
+    failure = _provider_errors()[0]
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise failure
+        return "ok"
+
+    with caplog.at_level("INFO", logger="agenten.llm.resilience"):
+        await run_llm_stage(LlmStage.DECOMPOSE, operation, timeout_seconds=1.0, max_attempts=2)
+
+    retried = [record.getMessage() for record in caplog.records if "attempt 1/2" in record.getMessage()]
+    assert retried and type(failure).__name__ in retried[0]
+    assert str(failure) not in retried[0]
+
+
+@pytest.mark.asyncio
+async def test_a_first_attempt_success_logs_nothing(caplog) -> None:
+    async def operation() -> str:
+        return "ok"
+
+    with caplog.at_level("INFO", logger="agenten.llm.resilience"):
+        await run_llm_stage(LlmStage.ALIGN, operation, timeout_seconds=1.0, max_attempts=2)
+
+    assert caplog.records == []
