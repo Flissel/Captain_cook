@@ -343,6 +343,11 @@ def run_claude(
 
     argv += ["--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": mcp_servers})]
     argv += ["--setting-sources", ""]
+    # No built-in Claude Code tool on any path. Without this they are offered
+    # and only refused for lack of a TTY, and the refusal comes back as the
+    # answer ("I need your permission to read that file"). The artifact
+    # store's MCP tools above are separate and stay available.
+    argv += ["--tools", ""]
     if allowed_tools:
         argv += ["--allowedTools", *allowed_tools]
 
@@ -372,9 +377,9 @@ def run_claude(
 
     if output_schema is not None:
         # The CLI validates the final answer against the schema (a tool-call
-        # envelope or the caller's response schema). Claude Code's own tools
-        # stay off; for tool requests the caller executes the functions.
-        argv += ["--tools", "", "--json-schema", json.dumps(output_schema)]
+        # envelope or the caller's response schema). For tool requests the
+        # caller executes the functions.
+        argv += ["--json-schema", json.dumps(output_schema)]
         system_prompt += output_prompt
     else:
         system_prompt += schema_instruction(response_format)

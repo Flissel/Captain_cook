@@ -332,3 +332,36 @@ def test_json_object_mode_strips_a_code_fence(shim: ModuleType, monkeypatch: pyt
 
     assert "--json-schema" not in fake.argv
     assert json.loads(completion["choices"][0]["message"]["content"]) == {"a": 1}
+
+
+def test_the_plain_text_path_offers_no_built_in_tools(shim: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without this the CLI's own tools are offered and only refused for lack
+    of a TTY; the refusal then comes back as the answer ("I need your
+    permission to read that file")."""
+    fake = FakeCli({"type": "result", "is_error": False, "result": "plain", "usage": {}})
+
+    complete(shim, fake, {"messages": [{"role": "user", "content": "x"}]}, monkeypatch)
+
+    assert fake.flag("--tools") == ""
+    assert "--allowedTools" not in fake.argv
+
+
+def test_the_artifact_store_adds_only_its_mcp_tools(
+    shim: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mcp_script = tmp_path / "captain_artifact_mcp.py"
+    mcp_script.write_text("", encoding="utf-8")
+    monkeypatch.setenv("CAPTAIN_ARTIFACT_ROOT", str(tmp_path / "store"))
+    monkeypatch.setenv("CAPTAIN_ARTIFACT_MCP", str(mcp_script))
+    fake = FakeCli({"type": "result", "is_error": False, "result": "plain", "usage": {}})
+
+    complete(shim, fake, {"messages": [{"role": "user", "content": "x"}]}, monkeypatch)
+
+    assert fake.flag("--tools") == ""
+    start = fake.argv.index("--allowedTools") + 1
+    assert fake.argv[start : start + 3] == [
+        "mcp__captain__write_artifact",
+        "mcp__captain__read_artifact",
+        "mcp__captain__get_contract_schema",
+    ]
+    assert fake.argv.count("--tools") == 1

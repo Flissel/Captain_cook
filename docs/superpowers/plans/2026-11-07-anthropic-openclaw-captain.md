@@ -232,8 +232,14 @@ gains tool calling), the provider proxy is retired, live gates allowed.
       could not be told apart from a retried one. It now logs each retried
       attempt (warning: stage, attempt n/m, duration, reason; provider
       errors by type only) and a success after a retry (info).
-- [ ] Shim hardening: `--tools ""` is set only for tool requests; the
-      plain-text path relies on non-interactive permission denials.
+- [x] Shim hardening: `--tools ""` was set only for structured/tool
+      requests; the plain-text path relied on non-interactive permission
+      denials (live probe 2026-11-11: `Read` outside the temp cwd and
+      `WebSearch` were refused, and the refusal came back as the answer).
+      Every path now passes `--tools ""`; the artifact store's MCP tools
+      stay available (live: `write_artifact` stored an artifact). A plain
+      request that asks for a tool now gets tool markup as text and nothing
+      runs.
 
 ## Phase 4 - Captain MCP server
 
