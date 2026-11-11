@@ -15,16 +15,26 @@ from agenten.household.llm_executor import LlmHouseholderExecutor
 from agenten.household.worker import create_householder_worker_factories
 from agenten.ledger_bridge.stage_machine import Stage, TERMINAL_STAGES
 from agenten.orchestration.pipeline import build_pipeline
+from config.app_settings import RETRY_POLICY
 
 DEMO_PROBLEM = "Prepare a small engineering brief for a new workflow automation."
 EXPECTED_SUBPROBLEM_COUNT = 4
 DETERMINISTIC_CONVERGENCE_TIMEOUT_SECONDS = 5.0
-LLM_CALL_TIMEOUT_SECONDS = 30.0
+# Householder calls through the Claude Code shim (structured output) take
+# 14-25 s and sometimes over 30 s; a 30 s limit escalated whole subproblems.
+LLM_CALL_TIMEOUT_SECONDS = 90.0
 LLM_CALL_MAX_ATTEMPTS = 2
 LLM_CONVERGENCE_MARGIN_SECONDS = 30.0
-# Worst case: every householder runs sequentially and exhausts all attempts.
+# Householders run concurrently, so the worst case is one householder that
+# exhausts every executor attempt on every supervisor retry, plus backoffs.
+_SUPERVISOR_TRIES = 1 + RETRY_POLICY["max_retries"]
+_SUPERVISOR_BACKOFF_SECONDS = sum(
+    RETRY_POLICY["backoff_initial_delay_seconds"] * RETRY_POLICY["backoff_base"] ** n
+    for n in range(RETRY_POLICY["max_retries"])
+)
 LLM_CONVERGENCE_TIMEOUT_SECONDS = (
-    EXPECTED_SUBPROBLEM_COUNT * LLM_CALL_TIMEOUT_SECONDS * LLM_CALL_MAX_ATTEMPTS
+    _SUPERVISOR_TRIES * LLM_CALL_MAX_ATTEMPTS * LLM_CALL_TIMEOUT_SECONDS
+    + _SUPERVISOR_BACKOFF_SECONDS
     + LLM_CONVERGENCE_MARGIN_SECONDS
 )
 

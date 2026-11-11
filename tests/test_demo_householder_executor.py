@@ -88,8 +88,27 @@ async def test_llm_path_timeout_covers_the_executor_worst_case(monkeypatch):
 
     timeout = await _timeout_seen_by_pipeline(monkeypatch, householder_model_client=client)
 
-    assert timeout == demo.LLM_CONVERGENCE_TIMEOUT_SECONDS == 270.0
-    assert timeout >= 4 * demo.LLM_CALL_TIMEOUT_SECONDS * demo.LLM_CALL_MAX_ATTEMPTS
+    from config.app_settings import RETRY_POLICY
+
+    # Householders run concurrently, so the worst case is one householder
+    # exhausting every executor attempt on every supervisor retry.
+    tries = 1 + RETRY_POLICY["max_retries"]
+    backoff = sum(
+        RETRY_POLICY["backoff_initial_delay_seconds"] * RETRY_POLICY["backoff_base"] ** n
+        for n in range(RETRY_POLICY["max_retries"])
+    )
+    worst_case = tries * demo.LLM_CALL_MAX_ATTEMPTS * demo.LLM_CALL_TIMEOUT_SECONDS + backoff
+    assert timeout == demo.LLM_CONVERGENCE_TIMEOUT_SECONDS
+    assert timeout > worst_case
+
+
+def test_llm_call_timeout_leaves_room_for_the_subscription_shim():
+    """Householder calls through the Claude Code shim (structured output)
+    took 14-25 s, with some over 30 s (live, 2026-11-10); a 30 s limit
+    escalated whole subproblems."""
+    from agenten import demo
+
+    assert demo.LLM_CALL_TIMEOUT_SECONDS >= 90.0
 
 
 @pytest.mark.asyncio

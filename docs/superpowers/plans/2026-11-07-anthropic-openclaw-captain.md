@@ -221,6 +221,15 @@ gains tool calling), the provider proxy is retired, live gates allowed.
       also used for the coordinator's delayed retries); `stop()` waits until
       workers and the ledger queue are idle. Live LLM demo: all four
       householders are assigned within about 4 s of each other.
+- [x] Demo LLM call timeout: 30 s (sized for Nebius) cut off householder
+      calls through the subscription shim, which take 14-25 s and sometimes
+      over 30 s; live runs escalated whole subproblems. Now 90 s, and the
+      convergence limit covers one householder exhausting every executor
+      attempt on every supervisor retry (757 s worst case). Two live runs
+      afterwards: 4/4 done, no retries, 60 s and 80 s.
+- [ ] `run_llm_stage` does not log an attempt that timed out or failed
+      before the next one, so a slow householder (76 s in one live run)
+      cannot be told apart from a retried one. Log each failed attempt.
 - [ ] Shim hardening: `--tools ""` is set only for tool requests; the
       plain-text path relies on non-interactive permission denials.
 
