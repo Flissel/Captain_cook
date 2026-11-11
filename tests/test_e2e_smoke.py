@@ -19,6 +19,8 @@ Decomposer once retries are exhausted) is covered by the two
 test_failure_path_* tests at the bottom of this module, against the same
 full build_pipeline() wiring.
 """
+import asyncio
+
 import pytest
 
 from blockchain.Blockchain_modell import Blockchain
@@ -572,10 +574,9 @@ async def test_failure_path_exhausted_retries_escalate_to_redecompose():
 
     await pipeline.start()
     await pipeline.submit_problem("Problem G: flaky work that needs re-planning")
-    # Terminal outcomes: only the replacement (echo) subproblem reaches
-    # DONE. The escalated flaky block itself deliberately stays at
-    # Stage.RETRYING -- see below.
-    converged = await pipeline.wait_until_terminal(expected_subproblem_count=1, timeout=5.0)
+    # Terminal outcomes: the escalated flaky block (FAILED) and the
+    # replacement (echo) subproblem (DONE) -- see below.
+    converged = await pipeline.wait_until_terminal(expected_subproblem_count=2, timeout=5.0)
     await pipeline.stop()
 
     assert converged, "replacement subproblem did not reach a terminal ledger state within the timeout"
@@ -600,13 +601,38 @@ async def test_failure_path_exhausted_retries_escalate_to_redecompose():
     assert done_blocks[0].data["agent_type"] == "echo_worker"
     assert done_blocks[0].data["description"] == "Replacement echo step for problem G"
 
-    # ...while the escalated flaky block stays parked at Stage.RETRYING
-    # with its full failure forensics: escalation is terminal for the
-    # Supervisor (the Decomposer re-plans), but the Recorder has no
-    # EscalateToRedecompose handler, so nothing further touches the block.
-    retrying_blocks = pipeline.ledger_query.blocks_in_stage(Stage.RETRYING)
-    assert len(retrying_blocks) == 1
-    flaky_block = retrying_blocks[0]
+    # ...while the Recorder closes the escalated flaky block as FAILED with
+    # its full failure forensics: its own retries are over and the
+    # Decomposer's replacement carries the work as a new block.
+    assert pipeline.ledger_query.blocks_in_stage(Stage.RETRYING) == []
+    failed_blocks = pipeline.ledger_query.blocks_in_stage(Stage.FAILED)
+    assert len(failed_blocks) == 1
+    flaky_block = failed_blocks[0]
     assert flaky_block.data["description"] == flaky_description
     assert escalate_events[0].subproblem_id == flaky_block.data["subproblem_id"]
+    assert flaky_block.metadata["escalated"] is True
+    assert flaky_block.metadata["failure_reason"] == escalate_events[0].reason
     assert len(flaky_block.metadata["retry_history"]) == 2  # both failed attempts
+
+
+async def test_stop_cancels_retries_still_waiting_for_their_backoff():
+    """A retry scheduled with a long backoff must not outlive the pipeline:
+    stop() cancels it instead of leaving a task that later publishes into a
+    stopped Ledger Recorder."""
+    from agenten.events.schemas import RetryRequested, make_meta, topic_for
+
+    pipeline = make_pipeline()
+    await pipeline.start()
+    await pipeline.bus.publish(
+        topic_for(RetryRequested),
+        RetryRequested(
+            meta=make_meta(correlation_id="sp-late", root_problem_id="root-late"),
+            subproblem_id="sp-late",
+            delay_seconds=3600.0,
+        ),
+    )
+    assert pipeline.coordinator.pending_retry_count == 1
+
+    await asyncio.wait_for(pipeline.stop(), timeout=5.0)
+
+    assert pipeline.coordinator.pending_retry_count == 0

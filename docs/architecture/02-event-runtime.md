@@ -68,7 +68,7 @@ stateDiagram-v2
     VALIDATING --> REJECTED: SubproblemRejected (gatekeeper)
     VALIDATING --> ACCEPTED: SubproblemAccepted (gatekeeper, block_index=None) - Recorder re-publishes it with block_index
     ACCEPTED --> FAILED: SubproblemUnroutable (no capable agent type)
-    ACCEPTED --> ACCEPTED: RetryRequested (backpressure 5s / circuit open 30s) - coordinator defers, no ledger change
+    ACCEPTED --> ACCEPTED: RetryRequested (backpressure 5s / circuit open 30s, one probe after probe_after_seconds) - coordinator defers, no ledger change
     ACCEPTED --> ASSIGNED: SubproblemAssigned (lease = now + 120s)
     ASSIGNED --> IN_PROGRESS: first WorkerHeartbeat
     ASSIGNED --> VERIFYING: SubproblemCompleted (via IN_PROGRESS)
@@ -79,14 +79,12 @@ stateDiagram-v2
     ASSIGNED --> FAILED: SubproblemFailed(retriable=False)
     IN_PROGRESS --> FAILED: SubproblemFailed(retriable=False)
     RETRYING --> ASSIGNED: Supervisor RetryRequested(backoff 1s x 2^n) then coordinator SubproblemAssigned
-    RETRYING --> Escalated: attempts >= max_retries (3) - EscalateToRedecompose
-    FAILED --> Escalated: non-retriable - EscalateToRedecompose
-    Escalated --> [*]: Decomposer proposes children (parent_id = this id)
-    note right of Escalated
-        GAP: the Recorder does not subscribe to EscalateToRedecompose.
-        An exhausted RETRYING block stays RETRYING (non-terminal) forever.
-        If the decomposer returns no children (demo decomposer at depth>0),
-        the work disappears without a terminal record.
+    RETRYING --> FAILED: attempts >= max_retries (3) - EscalateToRedecompose (metadata escalated=true)
+    note right of FAILED
+        The Recorder closes an escalated block as FAILED; the Decomposer
+        may propose children (parent_id = this id) as new blocks. With no
+        children (demo decomposer at depth>0) the FAILED block is the
+        terminal record.
     end note
     DONE --> [*]
     FAILED --> [*]
@@ -140,7 +138,7 @@ sequenceDiagram
     alt no capable type
         Co->>Bus: SubproblemUnroutable → Rec: FAILED
     else deferred
-        Co->>Bus: RetryRequested(delay) → Co (sleeps, retries)
+        Co->>Bus: RetryRequested(delay) → Co (schedules a task, retries after delay)
     else
         Co->>Bus: SubproblemAssigned(agent_key=subproblem_id, lease_expires_at)
         Bus->>Sup: handle_assigned (records agent_type)
@@ -176,7 +174,7 @@ sequenceDiagram
 | Worker factory injection, one owner per tag | Implemented | `pipeline.py:384-408`; [householder contract spec](../superpowers/specs/2026-07-15-householder-runtime-contract-design.md) |
 | Four deterministic householders in the demo | Implemented | `demo.py:52-76`, `134-139`; [householder runtime spec](../superpowers/specs/2026-07-15-householder-runtime-design.md) |
 | Durable outcome for unroutable work | Implemented | `coordinator.py:186-208`, `recorder.py:902-918`; [gap todos L39](../superpowers/plans/2026-07-15-architecture-gap-todos.md) |
-| Terminal record for escalated (exhausted) subproblems | **Missing** | Recorder spec list has no `EscalateToRedecompose` (`recorder.py:118-129`); supervisor escalation at `supervisor.py:154-172` |
+| Terminal record for escalated (exhausted) subproblems | Implemented | Recorder `_apply_escalate_to_redecompose` → `FAILED` with `escalated=True` |
 | Retry/backoff/escalation and circuit breaker | Implemented (in-memory, single process) | `supervisor.py:137-182`, `271-335`; `config/app_settings.py:6-10` |
 | Lease reaping | Implemented, but poll-only and not started by `build_pipeline` | `reaper.py:60-110`; `pipeline.py:440-451` |
 | Lease renewal on heartbeat | **Not implemented** (deliberate) | `recorder.py:775-783` |
@@ -190,8 +188,8 @@ sequenceDiagram
 
 1. **`AGENTS.md`** ("Known active concerns") says unroutable work lacks a
    durable dead-letter event. That is stale: `SubproblemUnroutable` → `FAILED`
-   is implemented, and the gap-todo L39 is checked. The real remaining gap is
-   the escalation and RETRYING limbo described in §3.
+   is implemented, and the gap-todo L39 is checked. The escalation and
+   RETRYING limbo described in §3 is closed as well (escalated → `FAILED`).
 2. **Gap todo L38** asks to replace "`AutoGenEventBus.subscribe`
    `NotImplementedError`". That method no longer exists; the segregation spec
    removed it (`autogen_bus.py:50-70`). The checkbox is stale.
@@ -220,10 +218,15 @@ sequenceDiagram
    `agenten/planning/captain_pipeline.py` and imports nothing from this event
    runtime. The two pipelines are parallel systems, not one flow.
 9. **Coordinator retry semantics.** `RetryRequested` is reused for
-   backpressure and circuit deferrals (`coordinator.py:249-254`), and
-   `handle_retry_requested` sleeps inline (`coordinator.py:126`). On
-   `InMemoryEventBus` this blocks the publishing chain for the whole backoff,
-   so "async retry" is in practice a nested wait.
+   backpressure and circuit deferrals. `handle_retry_requested` schedules a
+   positive delay as a background task (`SpawnCoordinatorAgent.
+   _retry_after_delay`) and returns, so a backoff no longer blocks the
+   publishing chain; `SupplyChainPipeline.stop` cancels retries still
+   waiting. A zero delay still runs inline. `build_pipeline` subscribes each
+   worker through `BackgroundTasks.detach` (`agenten/runtime/background.py`),
+   so executions run concurrently outside the writer loop;
+   `SupplyChainPipeline.stop` waits until workers and the ledger queue are
+   both idle before stopping the recorder.
 
 ## 6. Interfaces to other parts
 

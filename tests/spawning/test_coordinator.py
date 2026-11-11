@@ -253,3 +253,170 @@ async def test_import_with_or_without_autogen_core():
     else:
         assert coordinator_module.autogen_core is None
         assert coordinator_module.RoutedSpawnCoordinatorAgent is None
+
+
+def open_circuit(probe_after_seconds: Optional[float]) -> CircuitStateChanged:
+    return CircuitStateChanged(
+        meta=make_meta(correlation_id="ResearchAgent", root_problem_id="__circuit__"),
+        agent_type="ResearchAgent",
+        state="open",
+        probe_after_seconds=probe_after_seconds,
+    )
+
+
+def retry_for(subproblem_id: str) -> RetryRequested:
+    return RetryRequested(
+        meta=make_meta(correlation_id=subproblem_id, root_problem_id="root-1"),
+        subproblem_id=subproblem_id,
+        delay_seconds=0.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_open_circuit_lets_exactly_one_probe_through_after_its_cooldown():
+    ledger = FakeLedgerQuery()
+    ledger.add(1, Stage.ACCEPTED, {"subproblem_id": "sp-1", "capability_tags": ["research"]})
+    ledger.add(2, Stage.ACCEPTED, {"subproblem_id": "sp-2", "capability_tags": ["research"]})
+    clock = {"now": 1000.0}
+    coordinator, assigned, retried = make_coordinator(ledger, now=lambda: clock["now"])
+
+    await coordinator.handle_circuit_state_changed(open_circuit(probe_after_seconds=60.0))
+    clock["now"] = 1030.0
+    await coordinator.handle_retry_requested(retry_for("sp-1"))
+    assert assigned.events == []
+
+    clock["now"] = 1061.0
+    await coordinator.handle_retry_requested(retry_for("sp-1"))
+    assert [e.subproblem_id for e in assigned.events] == ["sp-1"]
+
+    # The probe is outstanding: everything else waits for its verdict.
+    await coordinator.handle_retry_requested(retry_for("sp-2"))
+    assert [e.subproblem_id for e in assigned.events] == ["sp-1"]
+
+    # The probe failed and the circuit re-opened: a fresh cooldown starts.
+    await coordinator.handle_circuit_state_changed(open_circuit(probe_after_seconds=60.0))
+    clock["now"] = 1100.0
+    await coordinator.handle_retry_requested(retry_for("sp-2"))
+    assert [e.subproblem_id for e in assigned.events] == ["sp-1"]
+    clock["now"] = 1122.0
+    await coordinator.handle_retry_requested(retry_for("sp-2"))
+    assert [e.subproblem_id for e in assigned.events] == ["sp-1", "sp-2"]
+
+
+@pytest.mark.asyncio
+async def test_permanently_failing_agent_type_escalates_instead_of_deferring_forever(monkeypatch):
+    """Regression for the demo hang: one householder failure opened the
+    circuit, after which every attempt was deferred for good."""
+    from agenten.events.schemas import EscalateToRedecompose, SubproblemFailed
+    from agenten.spawning import coordinator as coordinator_module
+    from agenten.supervision.supervisor import SupervisorAgent
+
+    ledger = FakeLedgerQuery()
+    ledger.add(1, Stage.ACCEPTED, {"subproblem_id": "sp-1", "capability_tags": ["research"]})
+    clock = {"now": 1000.0}
+    sleeps: List[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) > 50:
+            raise AssertionError("coordinator keeps deferring: circuit livelock")
+        clock["now"] += seconds
+
+    monkeypatch.setattr(coordinator_module.asyncio, "sleep", fake_sleep)
+    coordinator, assigned, retried = make_coordinator(ledger, now=lambda: clock["now"])
+    bus = coordinator._bus
+    supervisor = SupervisorAgent(
+        bus,
+        max_retries=2,
+        circuit_min_samples=1,  # open on the first failure: exercise the probe path
+        circuit_half_open_after_seconds=60.0,
+        now=lambda: clock["now"],
+    )
+    escalated = Collector(bus, topic_for(EscalateToRedecompose))
+
+    async def failing_worker(event: SubproblemAssigned) -> None:
+        await bus.publish(
+            topic_for(SubproblemFailed),
+            SubproblemFailed(
+                meta=make_meta(correlation_id=event.subproblem_id, root_problem_id="root-1", attempt=event.meta.attempt),
+                subproblem_id=event.subproblem_id,
+                error="householder failed",
+                retriable=True,
+            ),
+        )
+
+    bus.subscribe(topic_for(SubproblemAssigned), supervisor.handle_assigned)
+    bus.subscribe(topic_for(SubproblemAssigned), failing_worker)
+    bus.subscribe(topic_for(SubproblemFailed), supervisor.handle_failed)
+    bus.subscribe(topic_for(RetryRequested), coordinator.handle_retry_requested)
+    bus.subscribe(topic_for(CircuitStateChanged), coordinator.handle_circuit_state_changed)
+
+    await coordinator.handle_subproblem_accepted(make_accepted_event("sp-1", block_index=1))
+    await coordinator.wait_for_pending_retries()
+
+    assert len(assigned.events) == 3  # first try + max_retries probes
+    assert [e.subproblem_id for e in escalated.events] == ["sp-1"]
+
+
+def delayed_retry_for(subproblem_id: str, delay_seconds: float) -> RetryRequested:
+    return RetryRequested(
+        meta=make_meta(correlation_id=subproblem_id, root_problem_id="root-1"),
+        subproblem_id=subproblem_id,
+        delay_seconds=delay_seconds,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delayed_retry_does_not_block_the_publishing_handler():
+    """A backoff must not sleep inside the bus handler: on InMemoryEventBus
+    that handler runs nested in the Ledger Recorder's writer loop, so every
+    other subproblem and every ledger write would wait for the backoff."""
+    ledger = FakeLedgerQuery()
+    ledger.add(1, Stage.ACCEPTED, {"subproblem_id": "sp-1", "capability_tags": ["research"]})
+    coordinator, assigned, retried = make_coordinator(ledger)
+
+    await asyncio.wait_for(coordinator.handle_retry_requested(delayed_retry_for("sp-1", 60.0)), timeout=1.0)
+
+    assert assigned.events == []
+    assert coordinator.pending_retry_count == 1
+
+    await coordinator.cancel_pending_retries()
+
+    assert coordinator.pending_retry_count == 0
+    assert assigned.events == []
+
+
+@pytest.mark.asyncio
+async def test_delayed_retry_assigns_once_its_delay_elapses():
+    ledger = FakeLedgerQuery()
+    ledger.add(1, Stage.ACCEPTED, {"subproblem_id": "sp-1", "capability_tags": ["research"]})
+    ledger.add(2, Stage.ACCEPTED, {"subproblem_id": "sp-2", "capability_tags": ["research"]})
+    coordinator, assigned, retried = make_coordinator(ledger)
+
+    await coordinator.handle_retry_requested(delayed_retry_for("sp-1", 0.05))
+    await coordinator.handle_retry_requested(delayed_retry_for("sp-2", 0.05))
+    assert coordinator.pending_retry_count == 2
+
+    await asyncio.wait_for(coordinator.wait_for_pending_retries(), timeout=2.0)
+
+    assert sorted(e.subproblem_id for e in assigned.events) == ["sp-1", "sp-2"]
+    assert coordinator.pending_retry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_failing_delayed_retry_is_logged_not_lost(caplog):
+    ledger = FakeLedgerQuery()
+    ledger.add(1, Stage.ACCEPTED, {"subproblem_id": "sp-1", "capability_tags": ["research"]})
+    coordinator, assigned, retried = make_coordinator(ledger)
+
+    async def broken_assignment(**kwargs: Any) -> None:
+        raise RuntimeError("bus down")
+
+    coordinator._attempt_assignment = broken_assignment  # type: ignore[method-assign]
+
+    with caplog.at_level("ERROR"):
+        await coordinator.handle_retry_requested(delayed_retry_for("sp-1", 0.01))
+        await asyncio.wait_for(coordinator.wait_for_pending_retries(), timeout=2.0)
+
+    assert coordinator.pending_retry_count == 0
+    assert any("sp-1" in record.getMessage() for record in caplog.records)

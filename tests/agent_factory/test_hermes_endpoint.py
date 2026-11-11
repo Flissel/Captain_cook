@@ -70,3 +70,61 @@ def test_overrides_never_touch_the_process_environment(monkeypatch: pytest.Monke
 
     assert "OPENAI_BASE_URL" not in os.environ
     assert "OPENAI_API_KEY" not in os.environ
+
+
+# --- provider defaults ------------------------------------------------------
+
+from agenten.agent_factory.hermes_endpoint import hermes_provider_settings  # noqa: E402
+from config.llm_provider import CLAUDE_CODE_SHIM_BASE_URL  # noqa: E402
+
+
+def test_unconfigured_hermes_runs_on_the_claude_code_shim() -> None:
+    settings = hermes_provider_settings({"NEBIUS_API_KEY": "nb-must-not-leak"})
+
+    assert settings.provider == "custom"
+    assert settings.model == "claude-code"
+    assert dict(settings.environment_overrides) == {
+        "OPENAI_BASE_URL": CLAUDE_CODE_SHIM_BASE_URL,
+        "OPENAI_API_KEY": HERMES_LOCAL_ENDPOINT_PLACEHOLDER_KEY,
+    }
+
+
+def test_an_explicit_hermes_endpoint_is_kept() -> None:
+    settings = hermes_provider_settings(
+        {
+            "CAPTAIN_HERMES_PROVIDER": "custom",
+            "CAPTAIN_HERMES_MODEL": "nvidia/x",
+            "CAPTAIN_HERMES_BASE_URL": NEBIUS_BASE_URL,
+            "NEBIUS_API_KEY": "nb-test",
+        }
+    )
+
+    assert (settings.provider, settings.model) == ("custom", "nvidia/x")
+    assert settings.environment_overrides["OPENAI_BASE_URL"] == NEBIUS_BASE_URL
+
+
+def test_a_partial_hermes_configuration_is_not_completed_silently() -> None:
+    settings = hermes_provider_settings({"CAPTAIN_HERMES_PROVIDER": "custom"})
+
+    assert (settings.provider, settings.model) == ("custom", None)
+
+
+def test_the_anthropic_hermes_provider_gets_only_its_key() -> None:
+    settings = hermes_provider_settings(
+        {
+            "CAPTAIN_HERMES_PROVIDER": "anthropic",
+            "CAPTAIN_HERMES_MODEL": "claude-sonnet-5-5",
+            "ANTHROPIC_API_KEY": " sk-ant-test ",
+            "OPENAI_API_KEY": "sk-must-not-leak",
+        }
+    )
+
+    assert dict(settings.environment_overrides) == {"ANTHROPIC_API_KEY": "sk-ant-test"}
+    assert "sk-ant-test" not in repr(settings)
+
+
+def test_the_anthropic_hermes_provider_requires_its_key() -> None:
+    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
+        hermes_provider_settings(
+            {"CAPTAIN_HERMES_PROVIDER": "anthropic", "CAPTAIN_HERMES_MODEL": "claude-sonnet-5-5"}
+        )

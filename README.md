@@ -95,15 +95,25 @@ Demo complete: 4 subproblems reached done
 
 The command writes [artifacts/demo-run.json](artifacts/demo-run.json), a compact evidence artifact containing the generated problem ID, terminal counts, and every ledger block in the run. See [docs/DEMO.md](docs/DEMO.md) for the schema and inspection steps.
 
-## Running on Nebius Token Factory (NVIDIA Nemotron)
+## LLM providers (Claude subscription by default)
 
-Captain's planner, judge, decomposition, Hermes fleet, evaluation, and
-business benchmark call NVIDIA Nemotron through Nebius Token Factory's
-OpenAI-compatible API by default.
+Captain's planner, judge, decomposition, Hermes fleet and evaluation call
+Anthropic models on the operator's Claude subscription by default
+(`CAPTAIN_LLM_PROVIDER=claude-code`). They reach it through
+`scripts/claude_code_openai_shim.py`, a local OpenAI-compatible server that
+runs `claude -p` and needs no API key. The shim supports OpenAI tool calling:
+it switches Claude Code's own tools off and makes the CLI validate every call
+against the offered function schemas, so tool-using roles stay on the
+subscription.
 
-1. Put `NEBIUS_API_KEY=<your key>` into the ignored `.env`.
-2. Optional: set `CAPTAIN_MODEL` to another Token Factory model id; the
-   default is Nemotron 3 Super.
+1. Log in to Claude Code once (`claude`), then start the shim:
+   `.\.venv\Scripts\python.exe scripts/claude_code_openai_shim.py`
+   (default `http://127.0.0.1:8114/v1`; `--port` and `CAPTAIN_LLM_BASE_URL`
+   move it).
+2. Optional: `CAPTAIN_MODEL=claude-code-opus`, `claude-code-sonnet` or
+   `claude-code-haiku` pins a tier; the default `claude-code` uses the
+   account default. Other model ids are rejected instead of silently falling
+   back.
 3. Run the pipeline demo with LLM householders:
    `.\.venv\Scripts\python.exe main.py demo --householder-executor llm --output artifacts/demo-run-llm.json`
    (that gitignored path is also the default for `--householder-executor llm`;
@@ -111,16 +121,26 @@ OpenAI-compatible API by default.
    overwritten by an LLM run). The JSON records `householder_executor` and
    the `model` id.
 
-`CAPTAIN_LLM_PROVIDER=openai` or `=custom` (with `CAPTAIN_LLM_BASE_URL`)
-switch back to OpenAI or a local endpoint. The offline demo
-(`main.py demo`) needs no key.
+Unconfigured Hermes uses the same shim (provider `custom`, model
+`claude-code`). Other providers stay available on request:
 
-Migrating a Build-Week `.env`: an old `.env` usually still contains
-`CAPTAIN_MODEL=gpt-5.6`. With the Nebius default that OpenAI model id is
-rejected when a model client is built. Either remove the `CAPTAIN_MODEL` line
-(and add `NEBIUS_API_KEY`) to use Nemotron, or keep it and set
-`CAPTAIN_LLM_PROVIDER=openai` to stay on OpenAI. The offline demo and test
-suite are unaffected either way.
+| `CAPTAIN_LLM_PROVIDER` | Backend | Key |
+|---|---|---|
+| `claude-code` (default) | Claude subscription via the local shim | none |
+| `anthropic` | Anthropic Messages API, metered | `ANTHROPIC_API_KEY` |
+| `nebius` | NVIDIA Nemotron on Nebius Token Factory | `NEBIUS_API_KEY` |
+| `openai` | OpenAI | `OPENAI_API_KEY` |
+| `custom` | any OpenAI-compatible `CAPTAIN_LLM_BASE_URL` (no tool calling assumed) | optional |
+
+The business benchmark is metered by design and accepts `anthropic`,
+`nebius` or `openai`. The offline demo (`main.py demo`) and the default test
+suite need no provider at all.
+
+Migrating an older `.env`: a missing `CAPTAIN_LLM_PROVIDER` used to mean
+Nebius and now means `claude-code`. Set `CAPTAIN_LLM_PROVIDER=nebius` to keep
+Nemotron. A leftover `CAPTAIN_MODEL` such as `gpt-5.6` or a Nemotron id is
+rejected under `claude-code` when a model client is built; remove it or select
+the matching provider.
 
 ## What is working now
 
@@ -150,10 +170,8 @@ python -m agenten.planning.cli docs/superpowers/specs/2026-07-15-hackathon-pipel
   --output artifacts/captain-release
 ```
 
-The command uses the configured provider: Nemotron on Nebius Token Factory
-with `NEBIUS_API_KEY` by default (`CAPTAIN_MODEL` selects another Token
-Factory model id), or OpenAI with `CAPTAIN_LLM_PROVIDER=openai` and
-`OPENAI_API_KEY`.
+The command uses the configured provider: the Claude subscription through the
+local shim by default, or any provider from the table above with its key.
 It writes build-visible contracts to `batches/<batch-id>.json` and hidden
 evaluation inputs to `holdouts/<batch-id>.json`. Releases are idempotent:
 re-running identical output succeeds, while conflicting content for an
@@ -197,10 +215,9 @@ exit code `1`. Provider cost is reported as unavailable when the client cannot
 provide a trustworthy value.
 
 The real-model smoke gate is opt-in and fixes its own stricter budget. It uses
-the configured provider (Nebius Token Factory by default). Set
-`AGENTFARM_INPUT_PATH` and that provider's key (`NEBIUS_API_KEY`, or
-`OPENAI_API_KEY` with `CAPTAIN_LLM_PROVIDER=openai`) only in the local process
-environment, then run:
+the configured provider (the Claude subscription shim by default, which must
+be running). Set `AGENTFARM_INPUT_PATH`, and for a metered provider its key,
+only in the local process environment, then run:
 
 ```powershell
 python -m pytest -q -m live tests/live/test_agentfarm_input_evaluation_live.py

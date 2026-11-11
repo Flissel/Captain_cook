@@ -3,11 +3,13 @@ instances.
 
 Two entry points:
 
-- `build_model_client`: a real OpenAI-backed client
-  (`autogen_ext.models.openai.OpenAIChatCompletionClient`), defaulting
+- `build_model_client`: a real client for the configured provider, defaulting
   provider, endpoint, key and model from `config.llm_config.get_profile()`
   (resolved at build time, never at import time) so callers don't have to
-  duplicate that env-var wiring. SDK-level
+  duplicate that env-var wiring. The `anthropic` provider gets
+  `autogen_ext.models.anthropic.AnthropicChatCompletionClient`; every other
+  provider, including the default `claude-code` subscription shim, speaks the
+  OpenAI wire format through `OpenAIChatCompletionClient`. SDK-level
   retries are disabled so the Captain stage wrapper remains the sole retry
   owner.
 - `build_replay_model_client`: a deterministic, offline client
@@ -18,6 +20,7 @@ Two entry points:
 from typing import List, Optional
 
 from autogen_core.models import ChatCompletionClient, ModelFamily, ModelInfo
+from autogen_ext.models.anthropic import AnthropicChatCompletionClient
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_ext.models.replay import ReplayChatCompletionClient
 
@@ -29,6 +32,26 @@ from config.llm_provider import (
 )
 
 
+def anthropic_model_info(
+    model: str, *, tool_calling: bool = True, structured_output: bool = False
+) -> ModelInfo:
+    """Declared capabilities for a current Claude model id.
+
+    AutoGen 0.7.5 predates the current Claude ids and would otherwise fall
+    back to Claude 3.5 capabilities without tool calling. Its Anthropic client
+    has no typed (Pydantic) structured output, so that stays off by default.
+    """
+
+    return ModelInfo(
+        vision=True,
+        function_calling=tool_calling,
+        json_output=True,
+        family=ModelFamily.CLAUDE_4_OPUS if "opus" in model else ModelFamily.CLAUDE_4_SONNET,
+        structured_output=structured_output,
+        multiple_system_messages=False,
+    )
+
+
 def build_model_client(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
@@ -38,9 +61,8 @@ def build_model_client(
 ) -> ChatCompletionClient:
     """Build a real `ChatCompletionClient` for the configured provider.
 
-    Defaults come from `config.llm_config.get_profile()` (Nebius Token
-    Factory with Nemotron unless the environment opts into OpenAI or a custom
-    endpoint). It is resolved here, so a contradictory configuration raises
+    Defaults come from `config.llm_config.get_profile()` (the Claude Code
+    subscription shim unless the environment selects another provider). It is resolved here, so a contradictory configuration raises
     `ProviderConfigurationError` at construction instead of at import.
     Explicit arguments override the profile. SDK retries stay disabled so the
     Captain stage wrapper remains the sole retry owner.
@@ -54,6 +76,24 @@ def build_model_client(
         raise ProviderConfigurationError(
             "NEBIUS_API_KEY is not configured for the Nebius Token Factory provider"
         )
+    if active.name == "anthropic":
+        if resolved_api_key is None:
+            raise ProviderConfigurationError(
+                "ANTHROPIC_API_KEY is not configured for the anthropic provider"
+            )
+        anthropic_kwargs: dict[str, object] = {
+            "model": resolved_model,
+            "api_key": resolved_api_key,
+            "max_retries": 0,
+            "model_info": anthropic_model_info(
+                resolved_model,
+                tool_calling=active.tool_calling,
+                structured_output=active.structured_output,
+            ),
+        }
+        if resolved_base_url:
+            anthropic_kwargs["base_url"] = resolved_base_url
+        return AnthropicChatCompletionClient(**anthropic_kwargs)
 
     kwargs: dict[str, object] = {
         "model": resolved_model,

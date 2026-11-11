@@ -6,6 +6,15 @@ Status as of 2026-10-12, branch `feat/nebius-claude-sandbox`. Code is the
 authority; where specs or plans disagree with code, the code statement wins and
 the disagreement is flagged in [section 5](#5-implemented-vs-planned).
 
+> **Update 2026-11-09 (Anthropic switch, Phase 3 of
+> `docs/superpowers/plans/2026-11-07-anthropic-openclaw-captain.md`):** Captain's
+> default LLM provider is now `claude-code`, Anthropic models on the operator's
+> Claude subscription through `scripts/claude_code_openai_shim.py`. The
+> provider proxy is **retired from the Anthropic path**: it stays only as the
+> budget proxy for the legacy Codex/OpenAI live demo, gets no new features, and
+> the planned `/v1/messages` Nemotron relay below will not be built. Remove
+> `agenten/provider_proxy/` once the live demo no longer runs Codex on OpenAI.
+
 ## 1. Purpose and authority
 
 This part turns a coding request from an AutoGen team agent into verified code

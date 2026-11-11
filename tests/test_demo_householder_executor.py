@@ -88,8 +88,27 @@ async def test_llm_path_timeout_covers_the_executor_worst_case(monkeypatch):
 
     timeout = await _timeout_seen_by_pipeline(monkeypatch, householder_model_client=client)
 
-    assert timeout == demo.LLM_CONVERGENCE_TIMEOUT_SECONDS == 270.0
-    assert timeout >= 4 * demo.LLM_CALL_TIMEOUT_SECONDS * demo.LLM_CALL_MAX_ATTEMPTS
+    from config.app_settings import RETRY_POLICY
+
+    # Householders run concurrently, so the worst case is one householder
+    # exhausting every executor attempt on every supervisor retry.
+    tries = 1 + RETRY_POLICY["max_retries"]
+    backoff = sum(
+        RETRY_POLICY["backoff_initial_delay_seconds"] * RETRY_POLICY["backoff_base"] ** n
+        for n in range(RETRY_POLICY["max_retries"])
+    )
+    worst_case = tries * demo.LLM_CALL_MAX_ATTEMPTS * demo.LLM_CALL_TIMEOUT_SECONDS + backoff
+    assert timeout == demo.LLM_CONVERGENCE_TIMEOUT_SECONDS
+    assert timeout > worst_case
+
+
+def test_llm_call_timeout_leaves_room_for_the_subscription_shim():
+    """Householder calls through the Claude Code shim (structured output)
+    took 14-25 s, with some over 30 s (live, 2026-11-10); a 30 s limit
+    escalated whole subproblems."""
+    from agenten import demo
+
+    assert demo.LLM_CALL_TIMEOUT_SECONDS >= 90.0
 
 
 @pytest.mark.asyncio
@@ -209,3 +228,36 @@ def test_demo_help_no_longer_claims_offline_only(capsys):
         main.parse_args(["--help"])
 
     assert "offline audited pipeline demo" not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_permanently_failing_householders_end_the_demo_as_failed(monkeypatch):
+    """Regression: one failing householder used to open its circuit for good
+    and the escalated blocks stayed RETRYING, so the demo never converged."""
+    import asyncio
+
+    from config.app_settings import RETRY_POLICY
+
+    from agenten import demo
+
+    monkeypatch.setitem(RETRY_POLICY, "backoff_initial_delay_seconds", 0.0)
+    pipelines = []
+
+    def capture(**kwargs):
+        pipelines.append(build_pipeline(**kwargs))
+        return pipelines[-1]
+
+    build_pipeline = demo.build_pipeline
+    monkeypatch.setattr(demo, "build_pipeline", capture)
+    client = build_replay_model_client(["not json"] * 50)
+
+    summary = await asyncio.wait_for(
+        run_demo(None, householder_model_client=client, householder_model="replay"),
+        timeout=30.0,
+    )
+
+    assert summary.success is False
+    assert (summary.terminal_count, summary.done_count) == (4, 0)
+    subproblems = [block for block in summary.blocks if block["block_type"] == "subproblem"]
+    assert [block["status"] for block in subproblems] == ["failed"] * 4
+    assert pipelines[0].recorder.errors == []

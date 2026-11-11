@@ -26,6 +26,7 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_ext.models.replay import ReplayChatCompletionClient
 from pydantic import BaseModel, ValidationError
 
+from agenten.llm.model_client import build_model_client
 from config.llm_provider import ProviderConfigurationError, ProviderProfile, resolve_provider
 
 from .models import EvaluationStatus, EvaluationTelemetry, ProviderCallReservation
@@ -197,40 +198,34 @@ def build_evaluation_model_client(
     profile: ProviderProfile,
     model: str | None = None,
 ) -> ChatCompletionClient:
-    """Build the real tool-capable provider with concurrent tool calls disabled."""
+    """Build the real tool-capable provider with concurrent tool calls disabled.
+
+    OpenAI keeps its GPT-5 settings here; every other provider goes through the
+    shared `build_model_client`, which owns key checks and capabilities.
+    """
 
     if not profile.tool_calling:
         raise ProviderConfigurationError(
             f"evaluation needs tool calling; provider {profile.name} does not declare it"
         )
+    if profile.name != "openai":
+        return build_model_client(model=model, profile=profile)
     if profile.api_key is None:
-        secret = "NEBIUS_API_KEY" if profile.name == "nebius" else "OPENAI_API_KEY"
-        raise ProviderConfigurationError(f"{secret} is not configured for evaluation")
-    kwargs: dict[str, object] = {
-        "model": model or profile.model,
-        "api_key": profile.api_key,
-        "max_retries": 0,
-        "parallel_tool_calls": False,
-    }
-    if profile.name == "openai":
-        kwargs["reasoning_effort"] = "none"
-        kwargs["model_info"] = ModelInfo(
+        raise ProviderConfigurationError("OPENAI_API_KEY is not configured for evaluation")
+    return OpenAIChatCompletionClient(
+        model=model or profile.model,
+        api_key=profile.api_key,
+        max_retries=0,
+        parallel_tool_calls=False,
+        reasoning_effort="none",
+        model_info=ModelInfo(
             vision=True,
             function_calling=True,
             json_output=True,
             family=ModelFamily.GPT_5,
             structured_output=True,
-        )
-    else:
-        kwargs["base_url"] = profile.base_url
-        kwargs["model_info"] = ModelInfo(
-            vision=False,
-            function_calling=profile.tool_calling,
-            json_output=True,
-            family=ModelFamily.UNKNOWN,
-            structured_output=profile.structured_output,
-        )
-    return OpenAIChatCompletionClient(**kwargs)
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

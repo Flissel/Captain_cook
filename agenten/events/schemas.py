@@ -188,3 +188,7 @@ class CircuitStateChanged(BaseModel):
     meta: EventMeta
     agent_type: str
     state: CircuitState
+    # Set only on "open": seconds after which one probe assignment may go
+    # through. The supervisor's open -> half_open check is lazy (driven by
+    # the next outcome), so without a probe no outcome ever arrives.
+    probe_after_seconds: Optional[float] = None

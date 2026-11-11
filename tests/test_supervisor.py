@@ -191,6 +191,7 @@ async def test_circuit_opens_after_threshold_failures():
     clock = FakeClock()
     supervisor = SupervisorAgent(
         bus,
+        circuit_min_samples=1,
         max_retries=100,
         circuit_window=4,
         circuit_failure_threshold=0.5,
@@ -245,6 +246,7 @@ async def test_circuit_moves_to_half_open_after_timeout():
     clock = FakeClock()
     supervisor = SupervisorAgent(
         bus,
+        circuit_min_samples=1,
         max_retries=100,
         circuit_window=4,
         circuit_failure_threshold=0.5,
@@ -275,6 +277,7 @@ async def test_success_during_half_open_closes_circuit():
     clock = FakeClock()
     supervisor = SupervisorAgent(
         bus,
+        circuit_min_samples=1,
         max_retries=100,
         circuit_window=4,
         circuit_failure_threshold=0.5,
@@ -299,6 +302,7 @@ async def test_full_circuit_cycle_closed_open_half_open_closed():
     clock = FakeClock()
     supervisor = SupervisorAgent(
         bus,
+        circuit_min_samples=1,
         max_retries=100,
         circuit_window=4,
         circuit_failure_threshold=0.5,
@@ -337,6 +341,7 @@ async def test_half_open_trial_window_is_cleared_of_stale_failures():
     clock = FakeClock()
     supervisor = SupervisorAgent(
         bus,
+        circuit_min_samples=1,
         max_retries=100,
         circuit_window=8,
         circuit_failure_threshold=0.5,
@@ -362,7 +367,7 @@ async def test_failed_event_drives_circuit_via_assignment_mapping():
     lets the supervisor attribute the failure to the assigned agent_type.
     """
     bus, recorded = make_bus_with_recorder(*CIRCUIT_EVENTS)
-    supervisor = SupervisorAgent(bus, max_retries=100, circuit_failure_threshold=0.5)
+    supervisor = SupervisorAgent(bus, circuit_min_samples=1, max_retries=100, circuit_failure_threshold=0.5)
 
     await supervisor.handle_assigned(assigned_event(subproblem_id="sp-1", agent_type="writer"))
     await supervisor.handle_failed(failed_event(subproblem_id="sp-1"))
@@ -387,7 +392,7 @@ async def test_failed_event_without_known_assignment_moves_no_circuit():
 @pytest.mark.asyncio
 async def test_circuit_state_is_per_agent_type():
     bus, recorded = make_bus_with_recorder(*CIRCUIT_EVENTS)
-    supervisor = SupervisorAgent(bus, max_retries=100, circuit_failure_threshold=0.5)
+    supervisor = SupervisorAgent(bus, circuit_min_samples=1, max_retries=100, circuit_failure_threshold=0.5)
 
     await supervisor.handle_lease_expired(
         lease_expired_event(subproblem_id="sp-1", agent_type="researcher")
@@ -407,6 +412,7 @@ async def test_completed_event_drives_record_success_via_assignment_mapping():
     clock = FakeClock()
     supervisor = SupervisorAgent(
         bus,
+        circuit_min_samples=1,
         max_retries=100,
         circuit_failure_threshold=0.5,
         circuit_half_open_after_seconds=60.0,
@@ -449,6 +455,7 @@ async def test_half_open_probe_failure_records_before_inline_retry_success():
     clock = FakeClock()
     supervisor = SupervisorAgent(
         bus,
+        circuit_min_samples=1,
         max_retries=100,
         circuit_failure_threshold=0.5,
         circuit_half_open_after_seconds=60.0,
@@ -511,3 +518,59 @@ def test_import_without_autogen_core(monkeypatch):
 
     assert module.autogen_core is None
     assert module.SupervisorRoutedAgent is None
+
+
+@pytest.mark.asyncio
+async def test_opening_circuit_announces_when_a_probe_is_allowed():
+    """Without the cooldown on the event, the coordinator caches "open"
+    forever: it never assigns, so the supervisor never sees an outcome and
+    never applies its lazy open -> half_open check (a livelock).
+    """
+    bus, recorded = make_bus_with_recorder(*CIRCUIT_EVENTS)
+    clock = FakeClock(start=1000.0)
+    supervisor = SupervisorAgent(
+        bus,
+        circuit_min_samples=1,
+        max_retries=100,
+        circuit_failure_threshold=0.5,
+        circuit_half_open_after_seconds=60.0,
+        now=clock,
+    )
+
+    await supervisor.handle_lease_expired(lease_expired_event(agent_type="researcher"))
+    clock.advance(61.0)
+    await supervisor.record_success("researcher")
+
+    opened, half_open, closed = recorded[CircuitStateChanged]
+    assert opened.state == "open"
+    assert opened.probe_after_seconds == 60.0
+    assert (half_open.state, half_open.probe_after_seconds) == ("half_open", None)
+    assert (closed.state, closed.probe_after_seconds) == ("closed", None)
+
+
+@pytest.mark.asyncio
+async def test_one_permanently_failing_subproblem_escalates_without_tripping_the_circuit():
+    """A lone subproblem burning its retries is the retry policy's job; the
+    circuit is for an agent type failing across several subproblems. Opening
+    on the first sample turned every retry into a 60 s probe cooldown."""
+    bus, recorded = make_bus_with_recorder(*CIRCUIT_EVENTS)
+    supervisor = SupervisorAgent(bus, max_retries=3)
+
+    for _ in range(4):  # first try + 3 retries
+        await supervisor.handle_assigned(assigned_event(agent_type="householder_architect"))
+        await supervisor.handle_failed(failed_event())
+
+    assert recorded[CircuitStateChanged] == []
+    assert [e.subproblem_id for e in recorded[EscalateToRedecompose]] == ["sp-1"]
+    assert [e.delay_seconds for e in recorded[RetryRequested]] == [1.0, 2.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_circuit_opens_once_minimum_samples_are_failing():
+    bus, recorded = make_bus_with_recorder(*CIRCUIT_EVENTS)
+    supervisor = SupervisorAgent(bus, max_retries=100, circuit_min_samples=3)
+
+    for index in range(3):
+        await supervisor.handle_lease_expired(lease_expired_event(subproblem_id=f"sp-{index}"))
+
+    assert [c.state for c in recorded[CircuitStateChanged]] == ["open"]

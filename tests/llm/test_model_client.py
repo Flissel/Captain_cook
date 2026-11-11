@@ -16,6 +16,10 @@ _NEBIUS = ProviderProfile(
     "nebius", "nvidia/Nemotron-3-Super-120b-a12b", NEBIUS_BASE_URL, "nb-test", True, True
 )
 _SHIM = ProviderProfile("custom", "claude-code", "http://127.0.0.1:8114/v1", None, False, True)
+_CLAUDE_CODE = ProviderProfile(
+    "claude-code", "claude-code", "http://127.0.0.1:8114/v1", None, True, True
+)
+_ANTHROPIC = ProviderProfile("anthropic", "claude-opus-5-5", None, "sk-ant-test", True, False)
 
 
 def _capture(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
@@ -102,3 +106,59 @@ def test_default_profile_is_resolved_at_build_time(monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(ProviderConfigurationError, match="gpt-5.6"):
         model_client_module.build_model_client()
+
+
+def test_claude_code_profile_targets_the_shim_with_tool_calling(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _capture(monkeypatch)
+
+    model_client_module.build_model_client(profile=_CLAUDE_CODE)
+
+    assert captured["base_url"] == "http://127.0.0.1:8114/v1"
+    assert captured["api_key"] == CUSTOM_ENDPOINT_PLACEHOLDER_KEY
+    assert captured["model"] == "claude-code"
+    assert captured["max_retries"] == 0
+    assert captured["parallel_tool_calls"] is False
+    assert captured["model_info"]["function_calling"] is True
+
+
+def _capture_anthropic(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
+
+    def build_stub(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(model_client_module, "AnthropicChatCompletionClient", build_stub)
+    monkeypatch.setattr(model_client_module, "OpenAIChatCompletionClient", _refuse)
+    return captured
+
+
+def _refuse(**kwargs: Any) -> object:
+    raise AssertionError("the anthropic provider must not build an OpenAI client")
+
+
+def test_anthropic_profile_builds_the_messages_api_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _capture_anthropic(monkeypatch)
+
+    model_client_module.build_model_client(profile=_ANTHROPIC)
+
+    assert captured["model"] == "claude-opus-5-5"
+    assert captured["api_key"] == "sk-ant-test"
+    assert captured["max_retries"] == 0
+    assert captured["model_info"]["function_calling"] is True
+    assert captured["model_info"]["structured_output"] is False
+    assert "base_url" not in captured
+
+
+def test_anthropic_without_key_fails_at_construction(monkeypatch: pytest.MonkeyPatch) -> None:
+    _capture_anthropic(monkeypatch)
+    keyless = ProviderProfile("anthropic", "claude-opus-5-5", None, None, True, False)
+
+    with pytest.raises(ProviderConfigurationError, match="ANTHROPIC_API_KEY"):
+        model_client_module.build_model_client(profile=keyless)
+
+
+def test_the_real_anthropic_client_constructs_offline() -> None:
+    client = model_client_module.build_model_client(profile=_ANTHROPIC)
+
+    assert client.model_info["function_calling"] is True

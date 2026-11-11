@@ -145,36 +145,101 @@ lifecycle (authorization). Order is by risk and independence:
 
 ## Phase 3 - Anthropic as default provider
 
-- [ ] `config/llm_provider.py`: add `claude-code` (shim, subscription) and
-      `anthropic` (API key) providers; make `claude-code` the default instead
-      of `nebius`. Keep `nebius`/`openai` optional.
-- [ ] `agenten/llm/model_client.py`: `anthropic` builds
-      `AnthropicChatCompletionClient`; add `autogen-ext[anthropic]` pinned to
-      the existing autogen version in `requirements.txt` (verify the extra).
-- [ ] `agenten/evaluation/cli.py:209-233`: reuse the shared client builder.
-- [ ] `agenten/agent_factory/benchmark_providers.py`: extend
-      `BENCHMARK_PROVIDERS`.
-- [ ] Hermes: default `CAPTAIN_HERMES_PROVIDER=custom` +
-      `CAPTAIN_HERMES_BASE_URL=http://127.0.0.1:8114/v1`,
-      `CAPTAIN_HERMES_MODEL=claude-code`; API-key path forwards
-      `ANTHROPIC_API_KEY` to the child (`hermes_endpoint.py`); teach
-      `parse_hermes_usage` Claude/shim pricing (subscription = 0 marginal
-      cost, but keep call/time budgets).
-- [ ] Shim limits: `custom` sets `tool_calling=False`; decide whether the shim
-      gains tool calling or tool-using roles move to the API-key path.
-- [ ] Provider proxy (`agenten/provider_proxy/`) is pinned to OpenAI
-      `/v1/responses`: retire or port.
-- [ ] Update the 14 test files that pin Nebius/Nemotron defaults
-      (`tests/test_llm_provider.py`, `tests/test_llm_config.py`,
-      `tests/llm/test_model_client.py`,
-      `tests/agent_factory/test_benchmark_providers.py`,
-      `tests/evaluation/test_cli_provider.py`,
-      `tests/agent_factory/test_hermes_endpoint.py`,
-      `tests/agent_factory/test_live_demo_hermes_provider.py`,
-      `tests/agent_runtime/test_captain_production_adapters.py`,
-      `tests/test_demo_householder_executor.py`,
-      `tests/test_live_demo_operations.py`, live Nebius tests, ...).
-- [ ] `.env.example`, README: Anthropic/shim as default; Nebius optional.
+Branch `feat/anthropic-default-provider` (stacked on PR 34). Operator
+decisions 2026-11-09: tool-using roles stay on the subscription (the shim
+gains tool calling), the provider proxy is retired, live gates allowed.
+
+- [x] `config/llm_provider.py`: `claude-code` (shim, subscription, default,
+      tool calling) and `anthropic` (API key) providers. `claude-code` reads
+      no API key and rejects model ids the shim would silently map to the
+      account default. `nebius`/`openai`/`custom` stay on request.
+- [x] `agenten/llm/model_client.py`: `anthropic` builds
+      `AnthropicChatCompletionClient` with declared capabilities
+      (`anthropic_model_info`); `autogen-ext[openai,anthropic]==0.7.5`
+      (adds only `anthropic`, `docstring-parser`, `httpx2`, `httpcore2`,
+      `truststore`). AutoGen 0.7.5's Anthropic client has no typed
+      structured output, so that profile declares `structured_output=False`.
+- [x] `agenten/evaluation/cli.py`: non-OpenAI providers go through the
+      shared builder.
+- [x] `agenten/agent_factory/benchmark_providers.py`: `anthropic` added.
+      `claude-code` stays out: benchmarks need a per-provider key secret and
+      a per-call cost ceiling.
+- [x] Hermes: `hermes_provider_settings` defaults unconfigured Hermes to
+      provider `custom`, model `claude-code`, shim URL; `anthropic` forwards
+      `ANTHROPIC_API_KEY` to the child only. `parse_hermes_usage` needed no
+      change: it records Hermes' own cost and `cost_status`.
+- [x] Shim limits: the shim supports OpenAI tool calling (`--tools ""`,
+      `--json-schema` envelope pinning each function name and parameter
+      schema, `tool_calls` responses and streaming). Live-verified with
+      AutoGen's OpenAI client: call, execute, answer
+      (`tests/live/test_live_claude_code_shim_tools.py`).
+- [x] Provider proxy: retired from the Anthropic path, not ported. It stays
+      only as the Codex/OpenAI live-demo budget proxy (package docstring,
+      `.env.example`, `docs/architecture/06-coding-execution.md`).
+- [x] Tests pinning the Nebius default updated.
+- [x] `.env.example`, README: Claude subscription default, provider table,
+      migration note.
+- [x] `scripts/live-demo-services.ps1` forwards and redacts
+      `ANTHROPIC_API_KEY` next to `NEBIUS_API_KEY` (local allow-list,
+      secret redaction, both runtime-adapter lists).
+- [ ] Delete `agenten/provider_proxy/` once the live demo no longer runs
+      Codex on OpenAI.
+- [x] Shim structured output: prompt-only JSON came back in Markdown code
+      fences, so `main.py demo --householder-executor llm` stalled after two
+      failed householder attempts. A `json_schema` response format now runs
+      through `--json-schema` and the shim returns the validated object;
+      `json_object` strips a surrounding fence. Live: the LLM demo completes
+      on the subscription (4/4 subproblems done, `claude-code-haiku`).
+- [x] Check a Pydantic schema with `$defs`/`$ref` against the CLI's
+      `--json-schema`: live test with nested models passes
+      (`tests/live/test_live_claude_code_shim_tools.py`).
+- [x] The event-driven demo waits forever when a householder fails
+      permanently. Three causes, each fixed with a test:
+      the first failure opened the agent type's circuit (1/1 > 0.5, no
+      minimum sample count); the coordinator cached "open" and deferred
+      every 30 s forever, so no outcome ever reached the supervisor's lazy
+      half-open check; and an escalated block stayed `RETRYING` for good.
+      Now the circuit needs `circuit_min_samples` (5) outcomes before it
+      opens, `CircuitStateChanged(open)` carries `probe_after_seconds` and
+      the coordinator lets exactly one probe through after it, and the
+      recorder closes an escalated block as `FAILED` (`escalated=True`).
+      The offline demo with an always-failing replay client ends after
+      about 28 s with `success=False` and 4 failed blocks.
+- [x] Retry delays slept inline in the publish chain (`InMemoryEventBus`
+      runs handlers nested inside the recorder's writer loop), so ledger
+      writes waited for backoff sleeps and the 4 failing householders above
+      took 4 x 7 s serially. The coordinator now schedules a positive delay
+      as a background task (`pending_retry_count`,
+      `wait_for_pending_retries`, `cancel_pending_retries`; the pipeline's
+      `stop` cancels waiting retries). The same offline demo ends after
+      about 7 s instead of 28 s.
+- [x] Worker execution ran nested in the publish chain: a
+      `SubproblemAssigned` handler awaited the whole `execute()` inside the
+      recorder's writer loop, so subproblems ran one after another and
+      ledger writes waited for them. `build_pipeline` now subscribes workers
+      through `BackgroundTasks.detach` (`agenten/runtime/background.py`,
+      also used for the coordinator's delayed retries); `stop()` waits until
+      workers and the ledger queue are idle. Live LLM demo: all four
+      householders are assigned within about 4 s of each other.
+- [x] Demo LLM call timeout: 30 s (sized for Nebius) cut off householder
+      calls through the subscription shim, which take 14-25 s and sometimes
+      over 30 s; live runs escalated whole subproblems. Now 90 s, and the
+      convergence limit covers one householder exhausting every executor
+      attempt on every supervisor retry (757 s worst case). Two live runs
+      afterwards: 4/4 done, no retries, 60 s and 80 s.
+- [x] `run_llm_stage` did not log an attempt that timed out or failed
+      before the next one, so a slow householder (76 s in one live run)
+      could not be told apart from a retried one. It now logs each retried
+      attempt (warning: stage, attempt n/m, duration, reason; provider
+      errors by type only) and a success after a retry (info).
+- [x] Shim hardening: `--tools ""` was set only for structured/tool
+      requests; the plain-text path relied on non-interactive permission
+      denials (live probe 2026-11-11: `Read` outside the temp cwd and
+      `WebSearch` were refused, and the refusal came back as the answer).
+      Every path now passes `--tools ""`; the artifact store's MCP tools
+      stay available (live: `write_artifact` stored an artifact). A plain
+      request that asks for a tool now gets tool markup as text and nothing
+      runs.
 
 ## Phase 4 - Captain MCP server
 

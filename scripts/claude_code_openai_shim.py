@@ -9,6 +9,17 @@ metered API key:
     GET  /v1/models             -> advertises the shim's model ids
     POST /v1/chat/completions   -> runs ``claude -p --output-format json``
 
+OpenAI function calling is supported: when a request offers ``tools``, the
+CLI runs with its own tools switched off and ``--json-schema`` set to an
+envelope that is either ``{"tool_calls": [...]}`` or ``{"content": "..."}``.
+Each tool call variant pins the function name and that function's parameter
+schema, so the CLI validates the arguments before the shim returns them as
+OpenAI ``tool_calls``. The caller executes the functions and sends the
+results back as ``tool`` messages, exactly as with a native endpoint.
+A ``json_schema`` response format is enforced the same way: the CLI validates
+the answer against the schema and the shim returns that validated object, so
+prose or code fences around the JSON never reach the caller.
+
 Every request runs the CLI in an empty working directory with project and
 user settings switched off, so a planning call does not drag the ~44k token
 repository context into the subscription on every turn.
@@ -53,6 +64,10 @@ class ShimError(RuntimeError):
     """Raised when the CLI could not produce a usable answer."""
 
 
+class ShimRequestError(ShimError):
+    """Raised when the client request itself is unusable (HTTP 400)."""
+
+
 def resolve_cli() -> str:
     explicit = os.environ.get("CLAUDE_CODE_CLI", "").strip()
     if explicit:
@@ -76,6 +91,7 @@ def render_messages(messages: list[dict[str, Any]]) -> tuple[str, str]:
 
     system_parts: list[str] = []
     turns: list[str] = []
+    call_names: dict[str, str] = {}
     for message in messages or []:
         role = str(message.get("role", "user"))
         content = message.get("content", "")
@@ -86,11 +102,27 @@ def render_messages(messages: list[dict[str, Any]]) -> tuple[str, str]:
                 for part in content
                 if isinstance(part, dict) and part.get("type") == "text"
             )
-        content = str(content)
+        content = "" if content is None else str(content)
         if role == "system":
             system_parts.append(content)
         elif role == "assistant":
-            turns.append(f"Assistant: {content}")
+            if content:
+                turns.append(f"Assistant: {content}")
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") or {}
+                name = str(function.get("name") or "?")
+                call_id = str(call.get("id") or "?")
+                call_names[call_id] = name
+                turns.append(
+                    f"Assistant called {name} with {function.get('arguments') or '{}'} "
+                    f"(call {call_id})"
+                )
+        elif role == "tool":
+            call_id = str(message.get("tool_call_id") or "?")
+            name = call_names.get(call_id, "?")
+            turns.append(f"Tool result for {call_id} ({name}): {content}")
         else:
             turns.append(f"{role.capitalize()}: {content}")
 
@@ -133,6 +165,130 @@ def schema_instruction(response_format: Any) -> str:
     )
 
 
+def response_schema(response_format: Any) -> dict[str, Any] | None:
+    """The JSON Schema of a ``json_schema`` response format, or None."""
+
+    if not isinstance(response_format, dict) or response_format.get("type") != "json_schema":
+        return None
+    spec = response_format.get("json_schema") or {}
+    schema = spec.get("schema") or spec.get("json_schema")
+    return schema if isinstance(schema, dict) and schema else None
+
+
+def strip_code_fence(text: str) -> str:
+    """Drop one surrounding Markdown code fence (```json ... ```), if any."""
+
+    stripped = text.strip()
+    if not stripped.startswith("```") or not stripped.endswith("```"):
+        return text
+    body = stripped[3:-3]
+    first_newline = body.find("\n")
+    if first_newline != -1 and body[:first_newline].strip().isalnum():
+        body = body[first_newline + 1 :]
+    return body.strip()
+
+
+def _functions(tools: Any) -> list[dict[str, Any]]:
+    """The OpenAI ``function`` tools of a request, as name/description/parameters."""
+
+    functions: list[dict[str, Any]] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict) or tool.get("type", "function") != "function":
+            continue
+        function = tool.get("function") or {}
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            raise ShimRequestError("every function tool needs a name")
+        parameters = function.get("parameters") or {"type": "object", "properties": {}}
+        functions.append(
+            {
+                "name": name,
+                "description": str(function.get("description") or ""),
+                "parameters": parameters,
+            }
+        )
+    return functions
+
+
+def tool_envelope_schema(tools: Any, tool_choice: Any = None) -> dict[str, Any] | None:
+    """The ``--json-schema`` envelope for a tool-offering request, or None.
+
+    None means the request takes the plain text path: no tools offered, or
+    ``tool_choice`` is ``"none"``. ``"required"`` and a named function drop
+    the ``content`` branch so the model has to call.
+    """
+
+    functions = _functions(tools)
+    if not functions or tool_choice == "none":
+        return None
+    must_call = tool_choice == "required"
+    if isinstance(tool_choice, dict):
+        wanted = (tool_choice.get("function") or {}).get("name")
+        functions = [f for f in functions if f["name"] == wanted]
+        if not functions:
+            raise ShimRequestError(f"tool_choice names a tool that is not offered: {wanted!r}")
+        must_call = True
+
+    calls: dict[str, Any] = {
+        "type": "array",
+        "items": {
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {"const": f["name"]},
+                        "arguments": f["parameters"],
+                    },
+                    "required": ["name", "arguments"],
+                    "additionalProperties": False,
+                }
+                for f in functions
+            ]
+        },
+    }
+    if must_call:
+        calls["minItems"] = 1
+        return {
+            "type": "object",
+            "properties": {"tool_calls": calls},
+            "required": ["tool_calls"],
+            "additionalProperties": False,
+        }
+    return {
+        "type": "object",
+        "properties": {"tool_calls": calls, "content": {"type": "string"}},
+        "additionalProperties": False,
+    }
+
+
+def tool_instruction(tools: Any, schema: dict[str, Any]) -> str:
+    """Describe the offered functions and the reply envelope to the model."""
+
+    offered = {
+        variant["properties"]["name"]["const"]
+        for variant in schema["properties"]["tool_calls"]["items"]["anyOf"]
+    }
+    listing = [
+        {"name": f["name"], "description": f["description"], "parameters": f["parameters"]}
+        for f in _functions(tools)
+        if f["name"] in offered
+    ]
+    rule = (
+        "You must call at least one function now."
+        if "content" not in schema["properties"]
+        else "Either call one or more functions, or give your final answer."
+    )
+    return (
+        "\n\nFunctions you can call. You do not run them; the caller runs them "
+        "and sends each result back as a tool result in the conversation.\n"
+        + json.dumps(listing)
+        + "\n\nReply format: a single JSON object. To call functions use "
+        '{"tool_calls": [{"name": <function name>, "arguments": {...}}]}; for '
+        'the final answer use {"content": <answer text>}. '
+        + rule
+    )
+
+
 def run_claude(
     *,
     system_prompt: str,
@@ -140,6 +296,8 @@ def run_claude(
     model: str | None,
     timeout: float,
     response_format: Any = None,
+    output_schema: dict[str, Any] | None = None,
+    output_prompt: str = "",
 ) -> dict[str, Any]:
     cli = resolve_cli()
     argv: list[str] = [cli, "-p", "--output-format", "json"]
@@ -185,6 +343,11 @@ def run_claude(
 
     argv += ["--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": mcp_servers})]
     argv += ["--setting-sources", ""]
+    # No built-in Claude Code tool on any path. Without this they are offered
+    # and only refused for lack of a TTY, and the refusal comes back as the
+    # answer ("I need your permission to read that file"). The artifact
+    # store's MCP tools above are separate and stay available.
+    argv += ["--tools", ""]
     if allowed_tools:
         argv += ["--allowedTools", *allowed_tools]
 
@@ -212,7 +375,14 @@ def run_claude(
             "instead."
         )
 
-    system_prompt += schema_instruction(response_format)
+    if output_schema is not None:
+        # The CLI validates the final answer against the schema (a tool-call
+        # envelope or the caller's response schema). For tool requests the
+        # caller executes the functions.
+        argv += ["--json-schema", json.dumps(output_schema)]
+        system_prompt += output_prompt
+    else:
+        system_prompt += schema_instruction(response_format)
 
     # The system prompt goes through a file, never the command line: a real
     # agent system prompt runs to tens of thousands of characters and Windows
@@ -277,19 +447,73 @@ def run_claude(
     return payload
 
 
-def to_completion(payload: dict[str, Any], model: str) -> dict[str, Any]:
-    text = payload.get("result")
-    if not isinstance(text, str):
-        raise ShimError("Claude Code result did not contain text")
+def to_tool_message(payload: dict[str, Any], tool_schema: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Turn the CLI's validated envelope into an OpenAI assistant message."""
+
+    envelope = payload.get("structured_output")
+    if not isinstance(envelope, dict):
+        raise ShimError("Claude Code returned no structured output for a tool request")
+    offered = {
+        variant["properties"]["name"]["const"]
+        for variant in tool_schema["properties"]["tool_calls"]["items"]["anyOf"]
+    }
+    calls: list[dict[str, Any]] = []
+    for call in envelope.get("tool_calls") or []:
+        name = call.get("name") if isinstance(call, dict) else None
+        arguments = call.get("arguments") if isinstance(call, dict) else None
+        if name not in offered:
+            raise ShimError(f"Claude Code called an unoffered tool: {name!r}")
+        if not isinstance(arguments, dict):
+            raise ShimError(f"Claude Code sent non-object arguments for {name}")
+        calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(arguments)},
+            }
+        )
+    content = envelope.get("content")
+    if not calls and not isinstance(content, str):
+        raise ShimError("Claude Code returned neither tool calls nor content")
+    if calls:
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": content if isinstance(content, str) and content else None,
+            "tool_calls": calls,
+        }
+        return message, "tool_calls"
+    return {"role": "assistant", "content": content}, "stop"
+
+
+def to_completion(
+    payload: dict[str, Any],
+    model: str,
+    tool_schema: dict[str, Any] | None = None,
+    response_format: Any = None,
+) -> dict[str, Any]:
+    if tool_schema is not None:
+        message, finish_reason = to_tool_message(payload, tool_schema)
+    elif response_schema(response_format) is not None:
+        validated = payload.get("structured_output")
+        if validated is None:
+            raise ShimError("Claude Code returned no structured output for a json_schema request")
+        message = {"role": "assistant", "content": json.dumps(validated)}
+        finish_reason = "stop"
+    else:
+        text = payload.get("result")
+        if not isinstance(text, str):
+            raise ShimError("Claude Code result did not contain text")
+        if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+            text = strip_code_fence(text)
+        message = {"role": "assistant", "content": text}
+        stop_reason = str(payload.get("stop_reason") or "end_turn")
+        finish_reason = "length" if stop_reason == "max_tokens" else "stop"
 
     usage = payload.get("usage") or {}
     prompt_tokens = int(usage.get("input_tokens") or 0) + int(
         usage.get("cache_read_input_tokens") or 0
     )
     completion_tokens = int(usage.get("output_tokens") or 0)
-
-    stop_reason = str(payload.get("stop_reason") or "end_turn")
-    finish_reason = "length" if stop_reason == "max_tokens" else "stop"
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -299,7 +523,7 @@ def to_completion(payload: dict[str, Any], model: str) -> dict[str, Any]:
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
+                "message": message,
                 "finish_reason": finish_reason,
             }
         ],
@@ -309,6 +533,56 @@ def to_completion(payload: dict[str, Any], model: str) -> dict[str, Any]:
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
+
+
+def complete_chat(body: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+    """Answer one OpenAI chat completion request through the CLI."""
+
+    model = str(body.get("model") or DEFAULT_MODEL_ID)
+    system_prompt, transcript = render_messages(body.get("messages") or [])
+    tools = body.get("tools")
+    response_format = body.get("response_format")
+    tool_schema = tool_envelope_schema(tools, body.get("tool_choice"))
+    if tool_schema is not None:
+        output_schema: dict[str, Any] | None = tool_schema
+        output_prompt = tool_instruction(tools, tool_schema)
+    else:
+        output_schema = response_schema(response_format)
+        output_prompt = schema_instruction(response_format) if output_schema else ""
+    payload = run_claude(
+        system_prompt=system_prompt,
+        transcript=transcript,
+        model=model,
+        timeout=timeout,
+        response_format=response_format,
+        output_schema=output_schema,
+        output_prompt=output_prompt,
+    )
+    return to_completion(payload, model, tool_schema, response_format)
+
+
+def stream_chunks(completion: dict[str, Any]) -> list[dict[str, Any]]:
+    """The SSE chunks for a finished completion: one delta, then the finish."""
+
+    choice = completion["choices"][0]
+    message = choice["message"]
+    delta: dict[str, Any] = {"role": "assistant"}
+    if message.get("content") is not None:
+        delta["content"] = message["content"]
+    if message.get("tool_calls"):
+        delta["tool_calls"] = [
+            {"index": index, **call} for index, call in enumerate(message["tool_calls"])
+        ]
+    base = {
+        "id": completion["id"],
+        "object": "chat.completion.chunk",
+        "created": completion["created"],
+        "model": completion["model"],
+    }
+    return [
+        {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+        {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}]},
+    ]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -336,23 +610,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        content = completion["choices"][0]["message"]["content"]
-        chunk = {
-            "id": completion["id"],
-            "object": "chat.completion.chunk",
-            "created": completion["created"],
-            "model": completion["model"],
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": content},
-                    "finish_reason": None,
-                }
-            ],
-        }
-        final = dict(chunk)
-        final["choices"] = [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-        for item in (chunk, final):
+        for item in stream_chunks(completion):
             self.wfile.write(f"data: {json.dumps(item)}\n\n".encode("utf-8"))
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
@@ -423,14 +681,10 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.flush()
 
         try:
-            payload = run_claude(
-                system_prompt=system_prompt,
-                transcript=transcript,
-                model=model,
-                timeout=self.timeout_seconds,
-                response_format=body.get("response_format"),
-            )
-            completion = to_completion(payload, model)
+            completion = complete_chat(body, timeout=self.timeout_seconds)
+        except ShimRequestError as exc:
+            self._send_error(400, str(exc))
+            return
         except ShimError as exc:
             self._send_error(502, str(exc))
             return
